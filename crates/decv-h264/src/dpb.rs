@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use crate::{H264Error, Result, Yuv420Picture};
+use crate::{H264Error, ReferenceListModification, Result, Yuv420Picture};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceKind {
@@ -65,31 +65,85 @@ impl DecodedPictureBuffer {
     /// ascending long-term frame index.
     pub fn default_p_list0(&self, current_frame_num: u32) -> Result<Vec<Arc<Yuv420Picture>>> {
         self.ensure_frame_num(current_frame_num)?;
-        let mut short: Vec<&DpbReference> = self
-            .references
-            .iter()
-            .filter(|reference| reference.kind == ReferenceKind::ShortTerm)
-            .collect();
-        short.sort_unstable_by_key(|reference| {
-            std::cmp::Reverse(frame_num_wrap(
-                reference.frame_num,
-                current_frame_num,
-                self.max_frame_num,
-            ))
-        });
-        let mut long: Vec<&DpbReference> = self
-            .references
-            .iter()
-            .filter(|reference| matches!(reference.kind, ReferenceKind::LongTerm { .. }))
-            .collect();
-        long.sort_unstable_by_key(|reference| match reference.kind {
-            ReferenceKind::LongTerm { frame_index } => frame_index,
-            ReferenceKind::ShortTerm => unreachable!(),
-        });
-        Ok(short
+        Ok(self
+            .ordered_p_references(current_frame_num)
             .into_iter()
-            .chain(long)
             .map(|reference| reference.picture.clone())
+            .collect())
+    }
+
+    /// Builds and modifies an active P List 0. Missing initial entries are
+    /// retained as `None`, so a legal stream may declare more active indices
+    /// than it actually selects without weakening validation at use sites.
+    pub fn p_list0(
+        &self,
+        current_frame_num: u32,
+        active_count: u8,
+        modifications: &[ReferenceListModification],
+    ) -> Result<Vec<Option<Arc<Yuv420Picture>>>> {
+        self.ensure_frame_num(current_frame_num)?;
+        if active_count == 0 || active_count > 32 {
+            return Err(H264Error::InvalidSyntax(
+                "P List 0 active count is outside 1..=32",
+            ));
+        }
+        let active_count = usize::from(active_count);
+        let ordered = self.ordered_p_references(current_frame_num);
+        let mut list: Vec<Option<&DpbReference>> =
+            ordered.into_iter().take(active_count).map(Some).collect();
+        list.resize(active_count + 1, None);
+
+        let mut reference_index = 0usize;
+        let mut predicted_pic_num = i64::from(current_frame_num);
+        for modification in modifications {
+            if reference_index >= active_count {
+                return Err(H264Error::InvalidSyntax(
+                    "P List 0 modifications exceed the active list",
+                ));
+            }
+            let selected = match *modification {
+                ReferenceListModification::SubtractPicNum { abs_diff_pic_num } => {
+                    predicted_pic_num = (predicted_pic_num - i64::from(abs_diff_pic_num))
+                        .rem_euclid(i64::from(self.max_frame_num));
+                    self.short_term_by_modified_pic_num(current_frame_num, predicted_pic_num)?
+                }
+                ReferenceListModification::AddPicNum { abs_diff_pic_num } => {
+                    predicted_pic_num = (predicted_pic_num + i64::from(abs_diff_pic_num))
+                        .rem_euclid(i64::from(self.max_frame_num));
+                    self.short_term_by_modified_pic_num(current_frame_num, predicted_pic_num)?
+                }
+                ReferenceListModification::LongTerm { long_term_pic_num } => self
+                    .references
+                    .iter()
+                    .find(|reference| {
+                        reference.kind
+                            == ReferenceKind::LongTerm {
+                                frame_index: long_term_pic_num,
+                            }
+                    })
+                    .ok_or(H264Error::InvalidSyntax(
+                        "P List 0 modification names a missing long-term reference",
+                    ))?,
+            };
+            for index in (reference_index + 1..=active_count).rev() {
+                list[index] = list[index - 1];
+            }
+            list[reference_index] = Some(selected);
+            reference_index += 1;
+
+            let mut write = reference_index;
+            for read in reference_index..=active_count {
+                if list[read].is_some_and(|reference| !std::ptr::eq(reference, selected)) {
+                    list[write] = list[read];
+                    write += 1;
+                }
+            }
+            list[write..=active_count].fill(None);
+        }
+        list.truncate(active_count);
+        Ok(list
+            .into_iter()
+            .map(|reference| reference.map(|reference| reference.picture.clone()))
             .collect())
     }
 
@@ -167,6 +221,54 @@ impl DecodedPictureBuffer {
             return Err(H264Error::InvalidSyntax("frame_num exceeds MaxFrameNum"));
         }
         Ok(())
+    }
+
+    fn ordered_p_references(&self, current_frame_num: u32) -> Vec<&DpbReference> {
+        let mut short: Vec<&DpbReference> = self
+            .references
+            .iter()
+            .filter(|reference| reference.kind == ReferenceKind::ShortTerm)
+            .collect();
+        short.sort_unstable_by_key(|reference| {
+            std::cmp::Reverse(frame_num_wrap(
+                reference.frame_num,
+                current_frame_num,
+                self.max_frame_num,
+            ))
+        });
+        let mut long: Vec<&DpbReference> = self
+            .references
+            .iter()
+            .filter(|reference| matches!(reference.kind, ReferenceKind::LongTerm { .. }))
+            .collect();
+        long.sort_unstable_by_key(|reference| match reference.kind {
+            ReferenceKind::LongTerm { frame_index } => frame_index,
+            ReferenceKind::ShortTerm => unreachable!(),
+        });
+        short.extend(long);
+        short
+    }
+
+    fn short_term_by_modified_pic_num(
+        &self,
+        current_frame_num: u32,
+        pic_num_no_wrap: i64,
+    ) -> Result<&DpbReference> {
+        let pic_num = if pic_num_no_wrap > i64::from(current_frame_num) {
+            pic_num_no_wrap - i64::from(self.max_frame_num)
+        } else {
+            pic_num_no_wrap
+        };
+        self.references
+            .iter()
+            .find(|reference| {
+                reference.kind == ReferenceKind::ShortTerm
+                    && frame_num_wrap(reference.frame_num, current_frame_num, self.max_frame_num)
+                        == pic_num
+            })
+            .ok_or(H264Error::InvalidSyntax(
+                "P List 0 modification names a missing short-term reference",
+            ))
     }
 
     fn ensure_can_store(&self, picture: &Yuv420Picture) -> Result<()> {
@@ -270,5 +372,58 @@ mod tests {
         ));
         assert_eq!(dpb.len(), 1);
         assert_eq!(luma_value(&dpb.default_p_list0(1).unwrap()[0]), 1);
+    }
+
+    #[test]
+    fn applies_short_and_long_term_list_modifications_in_order() {
+        let mut dpb = DecodedPictureBuffer::new(4, 4).unwrap();
+        dpb.store_idr(0, picture(9), true).unwrap();
+        dpb.store_short_term(1, 1, picture(1)).unwrap();
+        dpb.store_short_term(2, 2, picture(2)).unwrap();
+        dpb.store_short_term(3, 3, picture(3)).unwrap();
+
+        let list = dpb
+            .p_list0(
+                4,
+                4,
+                &[
+                    ReferenceListModification::SubtractPicNum {
+                        abs_diff_pic_num: 3,
+                    },
+                    ReferenceListModification::AddPicNum {
+                        abs_diff_pic_num: 1,
+                    },
+                    ReferenceListModification::LongTerm {
+                        long_term_pic_num: 0,
+                    },
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            list.iter()
+                .map(|picture| luma_value(picture.as_ref().unwrap()))
+                .collect::<Vec<_>>(),
+            [1, 2, 9, 3]
+        );
+    }
+
+    #[test]
+    fn preserves_missing_active_entries_and_rejects_missing_targets() {
+        let mut dpb = DecodedPictureBuffer::new(2, 4).unwrap();
+        dpb.store_short_term(0, 0, picture(7)).unwrap();
+        let list = dpb.p_list0(1, 3, &[]).unwrap();
+        assert_eq!(list.len(), 3);
+        assert!(list[0].is_some());
+        assert!(list[1..].iter().all(Option::is_none));
+        assert!(matches!(
+            dpb.p_list0(
+                1,
+                1,
+                &[ReferenceListModification::LongTerm {
+                    long_term_pic_num: 0
+                }]
+            ),
+            Err(H264Error::InvalidSyntax(_))
+        ));
     }
 }
