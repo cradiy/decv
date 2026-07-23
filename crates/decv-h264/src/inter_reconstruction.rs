@@ -1016,11 +1016,80 @@ fn add_prediction_and_residual<const SIZE: usize>(
     prediction: &[[u8; SIZE]; SIZE],
     residual: &[[i32; SIZE]; SIZE],
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if SIZE == 8 || SIZE == 16 {
+        // SAFETY: SSE2 is part of the x86_64 baseline. The caller-provided
+        // plane ranges were validated at the macroblock level, and the helper
+        // only reads fixed-size rows from the two square input matrices.
+        unsafe {
+            add_prediction_and_residual_sse2(plane, stride, x, y, prediction, residual);
+        }
+        return;
+    }
     for row in 0..SIZE {
         let output = &mut plane[(y + row) * stride + x..(y + row) * stride + x + SIZE];
         for column in 0..SIZE {
-            output[column] =
-                (i32::from(prediction[row][column]) + residual[row][column]).clamp(0, 255) as u8;
+            output[column] = i32::from(prediction[row][column])
+                .saturating_add(residual[row][column])
+                .clamp(0, 255) as u8;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn add_prediction_and_residual_sse2<const SIZE: usize>(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    prediction: &[[u8; SIZE]; SIZE],
+    residual: &[[i32; SIZE]; SIZE],
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_adds_epi16, _mm_loadl_epi64, _mm_loadu_si128, _mm_packs_epi32,
+        _mm_packus_epi16, _mm_setzero_si128, _mm_storel_epi64, _mm_storeu_si128, _mm_unpackhi_epi8,
+        _mm_unpacklo_epi8,
+    };
+
+    let zero = _mm_setzero_si128();
+    for row in 0..SIZE {
+        let prediction_ptr = prediction[row].as_ptr();
+        let residual_ptr = residual[row].as_ptr();
+        let output_ptr = plane.as_mut_ptr().wrapping_add((y + row) * stride + x);
+        if SIZE == 16 {
+            // SAFETY: A 16-wide matrix row contains every loaded element, and
+            // macroblock validation proves the 16-byte output row is valid.
+            unsafe {
+                let predicted = _mm_loadu_si128(prediction_ptr.cast::<__m128i>());
+                let residual_0 = _mm_loadu_si128(residual_ptr.cast::<__m128i>());
+                let residual_1 = _mm_loadu_si128(residual_ptr.add(4).cast::<__m128i>());
+                let residual_2 = _mm_loadu_si128(residual_ptr.add(8).cast::<__m128i>());
+                let residual_3 = _mm_loadu_si128(residual_ptr.add(12).cast::<__m128i>());
+                let low = _mm_adds_epi16(
+                    _mm_unpacklo_epi8(predicted, zero),
+                    _mm_packs_epi32(residual_0, residual_1),
+                );
+                let high = _mm_adds_epi16(
+                    _mm_unpackhi_epi8(predicted, zero),
+                    _mm_packs_epi32(residual_2, residual_3),
+                );
+                _mm_storeu_si128(output_ptr.cast::<__m128i>(), _mm_packus_epi16(low, high));
+            }
+        } else {
+            debug_assert_eq!(SIZE, 8);
+            // SAFETY: An 8-wide matrix row contains every loaded element, and
+            // macroblock validation proves the 8-byte output row is valid.
+            unsafe {
+                let predicted = _mm_loadl_epi64(prediction_ptr.cast::<__m128i>());
+                let residual_0 = _mm_loadu_si128(residual_ptr.cast::<__m128i>());
+                let residual_1 = _mm_loadu_si128(residual_ptr.add(4).cast::<__m128i>());
+                let sum = _mm_adds_epi16(
+                    _mm_unpacklo_epi8(predicted, zero),
+                    _mm_packs_epi32(residual_0, residual_1),
+                );
+                _mm_storel_epi64(output_ptr.cast::<__m128i>(), _mm_packus_epi16(sum, zero));
+            }
         }
     }
 }
@@ -1368,6 +1437,48 @@ mod tests {
                 assert_eq!(&actual[..length], &expected[..length]);
             }
         }
+    }
+
+    #[test]
+    fn simd_prediction_plus_residual_matches_scalar_saturation() {
+        fn check<const SIZE: usize>() {
+            let prediction: [[u8; SIZE]; SIZE] = std::array::from_fn(|row| {
+                std::array::from_fn(|column| ((row * 37 + column * 19) & 255) as u8)
+            });
+            let values = [
+                i32::MIN,
+                -65_536,
+                -32_768,
+                -256,
+                -255,
+                -1,
+                0,
+                1,
+                255,
+                256,
+                32_767,
+                65_535,
+                i32::MAX,
+            ];
+            let residual: [[i32; SIZE]; SIZE] = std::array::from_fn(|row| {
+                std::array::from_fn(|column| values[(row * SIZE + column) % values.len()])
+            });
+            let expected: [[u8; SIZE]; SIZE] = std::array::from_fn(|row| {
+                std::array::from_fn::<_, SIZE, _>(|column| {
+                    i32::from(prediction[row][column])
+                        .saturating_add(residual[row][column])
+                        .clamp(0, 255) as u8
+                })
+            });
+            let mut actual = vec![0; SIZE * SIZE];
+            add_prediction_and_residual(&mut actual, SIZE, 0, 0, &prediction, &residual);
+            for (row, expected) in expected.iter().enumerate() {
+                assert_eq!(&actual[row * SIZE..(row + 1) * SIZE], expected);
+            }
+        }
+
+        check::<8>();
+        check::<16>();
     }
 
     #[test]

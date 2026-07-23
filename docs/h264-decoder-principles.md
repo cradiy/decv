@@ -677,6 +677,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - implicit B weighting uses a byte-exact SSE2 row kernel on x86_64 for 8- and
   16-sample spans, including signed exceptional weights and saturating output,
   with a scalar tail and a fully scalar fallback on other architectures;
+- prediction-plus-residual output uses SSE2 saturated narrowing for complete
+  8- and 16-sample rows on x86_64; the scalar fallback uses saturating `i32`
+  addition as well, so malformed extreme residuals cannot wrap before clipping;
 - transactional CAVLC inter residual decoding plus 4x4/8x8 inverse transform
   paths using the Inter scaling lists;
 - a transactional complete non-skipped CAVLC P-macroblock entry point that
