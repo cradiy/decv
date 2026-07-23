@@ -53,13 +53,6 @@ const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
 ];
 const LUMA_8X8_COORDINATES: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct CompletedMacroblock {
-    slice_id: u32,
-    is_intra: bool,
-    deblock: MacroblockDeblockInfo,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct IntraSliceConfig {
     header_bit_size: usize,
@@ -197,7 +190,8 @@ pub struct IntraPictureReconstructor {
     motion: PMotionState,
     b_motion: BMotionState,
     reference_motion: MotionFieldBuilder,
-    completed: Vec<Option<CompletedMacroblock>>,
+    completed: Vec<bool>,
+    deblock: Vec<MacroblockDeblockInfo>,
     scaling_lists: ResolvedScalingLists4x4,
     scaling_lists_8x8: ResolvedScalingLists8x8,
     scan_mode: ScanMode,
@@ -242,7 +236,8 @@ impl IntraPictureReconstructor {
             motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
             b_motion: BMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
             reference_motion: MotionFieldBuilder::new(coded_size)?,
-            completed: vec![None; macroblock_count],
+            completed: vec![false; macroblock_count],
+            deblock: vec![MacroblockDeblockInfo::default(); macroblock_count],
             scaling_lists,
             scaling_lists_8x8,
             scan_mode: ScanMode::Frame,
@@ -1853,11 +1848,8 @@ impl IntraPictureReconstructor {
         macroblock_address: usize,
         deblock: MacroblockDeblockInfo,
     ) {
-        self.completed[macroblock_address] = Some(CompletedMacroblock {
-            slice_id: deblock.slice_id,
-            is_intra: false,
-            deblock,
-        });
+        self.deblock[macroblock_address] = deblock;
+        self.completed[macroblock_address] = true;
     }
 
     /// Reconstructs one decoded CAVLC intra macroblock.
@@ -1996,29 +1988,26 @@ impl IntraPictureReconstructor {
             self.reference_motion.clear_macroblock(macroblock_address)?;
             return Err(error);
         }
-        self.completed[macroblock_address] = Some(CompletedMacroblock {
+        self.deblock[macroblock_address] = MacroblockDeblockInfo {
             slice_id,
             is_intra: true,
-            deblock: MacroblockDeblockInfo {
-                slice_id,
-                is_intra: true,
-                luma_qp: if is_pcm { 0 } else { quantizer.luma },
-                cb_qp: if is_pcm {
-                    pcm_chroma_qp[0]
-                } else {
-                    quantizer.chroma_cb
-                },
-                cr_qp: if is_pcm {
-                    pcm_chroma_qp[1]
-                } else {
-                    quantizer.chroma_cr
-                },
-                transform_8x8,
-                luma_nonzero: [false; 16],
-                motion: [DeblockMotion::default(); 16],
-                filter: deblocking_filter,
+            luma_qp: if is_pcm { 0 } else { quantizer.luma },
+            cb_qp: if is_pcm {
+                pcm_chroma_qp[0]
+            } else {
+                quantizer.chroma_cb
             },
-        });
+            cr_qp: if is_pcm {
+                pcm_chroma_qp[1]
+            } else {
+                quantizer.chroma_cr
+            },
+            transform_8x8,
+            luma_nonzero: [false; 16],
+            motion: [DeblockMotion::default(); 16],
+            filter: deblocking_filter,
+        };
+        self.completed[macroblock_address] = true;
         Ok(())
     }
 
@@ -2174,21 +2163,12 @@ impl IntraPictureReconstructor {
     pub(crate) fn into_deblocked_reference_picture(
         mut self,
     ) -> Result<(Yuv420Picture, ReferenceMotionField)> {
-        if self.completed.iter().any(Option::is_none) {
+        if self.completed.iter().any(|&completed| !completed) {
             return Err(H264Error::InvalidSyntax(
                 "cannot output an incomplete reconstructed picture",
             ));
         }
-        let macroblocks = self
-            .completed
-            .iter()
-            .map(|macroblock| {
-                macroblock
-                    .expect("picture completeness was checked above")
-                    .deblock
-            })
-            .collect::<Vec<_>>();
-        filter_420_picture(&mut self.picture, &macroblocks, self.width_in_macroblocks)?;
+        filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
         let motion = self.reference_motion.finish()?;
         Ok((self.picture, motion))
     }
@@ -2437,10 +2417,9 @@ impl IntraPictureReconstructor {
     }
 
     fn is_available(&self, address: usize, slice_id: u32) -> bool {
-        self.completed[address].is_some_and(|macroblock| {
-            macroblock.slice_id == slice_id
-                && (!self.constrained_intra_prediction || macroblock.is_intra)
-        })
+        self.completed[address]
+            && self.deblock[address].slice_id == slice_id
+            && (!self.constrained_intra_prediction || self.deblock[address].is_intra)
     }
 
     fn validate_new_macroblock(&self, address: usize) -> Result<(usize, usize)> {
@@ -2449,7 +2428,7 @@ impl IntraPictureReconstructor {
                 "macroblock address exceeds reconstructed picture",
             ));
         }
-        if self.completed[address].is_some() {
+        if self.completed[address] {
             return Err(H264Error::InvalidSyntax(
                 "macroblock was already reconstructed",
             ));

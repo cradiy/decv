@@ -720,6 +720,10 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - deblocking fast rejection before pixel loads for zero-strength and
   zero-threshold edges, with validation and invariant `alpha`/`beta`/`tc0`
   preparation performed once per edge segment instead of once per sample;
+- structure-of-arrays reconstruction bookkeeping keeps completion flags
+  separate from deblocking metadata, so picture finalization filters the
+  in-place metadata instead of allocating and copying one large record per
+  macroblock;
 - bidirectional deblocking motion comparison with List 0/List 1 reference
   identity, motion-vector thresholds, and equivalent swapped-list handling;
 - a bounded POC output-reorder buffer kept separate from the reference DPB,

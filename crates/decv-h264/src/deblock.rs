@@ -50,7 +50,7 @@ pub struct FilteredDeblockEdge {
     pub q: [u8; 3],
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MacroblockDeblockInfo {
     pub slice_id: u32,
     pub is_intra: bool,
