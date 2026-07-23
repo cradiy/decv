@@ -15,6 +15,7 @@ mod macroblock;
 mod nal;
 mod parameter_sets;
 mod picture;
+mod picture_surface;
 mod pps;
 mod prediction;
 mod quantization;
@@ -38,6 +39,7 @@ pub use macroblock::{
 pub use nal::{NalHeader, NalUnit, NalUnitType};
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
 pub use picture::{FieldOrderCount, PictureOrderCount, PictureOrderCountState};
+pub use picture_surface::{ChromaPlane, IntraReferenceAvailability, Yuv420Picture};
 pub use pps::{
     EntropyCodingMode, PictureParameterSet, SliceGroupMap, SliceGroupRectangle,
     WeightedBiprediction,
