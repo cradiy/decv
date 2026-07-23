@@ -49,6 +49,12 @@ pub(crate) struct MacroblockPixels {
     cr: [[u8; 8]; 8],
 }
 
+impl MacroblockPixels {
+    pub(crate) const fn new(luma: [[u8; 16]; 16], cb: [[u8; 8]; 8], cr: [[u8; 8]; 8]) -> Self {
+        Self { luma, cb, cr }
+    }
+}
+
 impl Yuv420Picture {
     pub fn new(coded_size: Size) -> Result<Self> {
         if coded_size.width == 0 || coded_size.height == 0 {

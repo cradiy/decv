@@ -1,5 +1,8 @@
 //! P-macroblock assembly from reference prediction and spatial residuals.
 
+use decv_core::Size;
+
+use crate::picture_surface::MacroblockPixels;
 use crate::{
     H264Error, InterPrediction420, PredictionWeight, PredictionWeightTable,
     ReconstructedInterResidual, ReconstructedLumaResidual, ResolvedBListMotion,
@@ -245,13 +248,39 @@ fn reconstruct_b_macroblock_from_lists_inner(
     residual: &ReconstructedInterResidual,
     weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<()> {
+    let pixels = reconstruct_b_macroblock_pixels_from_lists_inner(
+        current.coded_size(),
+        references_l0,
+        references_l1,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        weight_mode,
+    )?;
+    current.restore_macroblock(macroblock_x, macroblock_y, &pixels);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_b_macroblock_pixels_from_lists_inner(
+    current_size: Size,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: &ReconstructedInterResidual,
+    weight_mode: BPredictionWeightMode<'_>,
+) -> Result<MacroblockPixels> {
     let luma_x = macroblock_x
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
     let luma_y = macroblock_y
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
-    let (width, height) = current.dimensions();
+    let width = usize::try_from(current_size.width).map_err(|_| H264Error::IntegerOverflow)?;
+    let height = usize::try_from(current_size.height).map_err(|_| H264Error::IntegerOverflow)?;
     if luma_x.checked_add(16).is_none_or(|right| right > width)
         || luma_y.checked_add(16).is_none_or(|bottom| bottom > height)
     {
@@ -269,7 +298,7 @@ fn reconstruct_b_macroblock_from_lists_inner(
     for partition in &motion.partitions {
         let has_l0 = predict_b_partition_list_into(
             references_l0,
-            current.coded_size(),
+            current_size,
             macroblock_x,
             macroblock_y,
             *partition,
@@ -279,7 +308,7 @@ fn reconstruct_b_macroblock_from_lists_inner(
         )?;
         let has_l1 = predict_b_partition_list_into(
             references_l1,
-            current.coded_size(),
+            current_size,
             macroblock_x,
             macroblock_y,
             *partition,
@@ -329,28 +358,20 @@ fn reconstruct_b_macroblock_from_lists_inner(
     }
 
     let (residual_luma, residual_cb, residual_cr) = assemble_residual(residual);
-    let chroma_x = macroblock_x * 8;
-    let chroma_y = macroblock_y * 8;
-    let chroma_stride = width / 2;
-    let (luma, cb, cr) = current.planes_mut();
-    add_prediction_and_residual(luma, width, luma_x, luma_y, &predicted_luma, &residual_luma);
+    let mut luma = [[0u8; 16]; 16];
+    let mut cb = [[0u8; 8]; 8];
+    let mut cr = [[0u8; 8]; 8];
     add_prediction_and_residual(
-        cb,
-        chroma_stride,
-        chroma_x,
-        chroma_y,
-        &predicted_cb,
-        &residual_cb,
+        luma.as_flattened_mut(),
+        16,
+        0,
+        0,
+        &predicted_luma,
+        &residual_luma,
     );
-    add_prediction_and_residual(
-        cr,
-        chroma_stride,
-        chroma_x,
-        chroma_y,
-        &predicted_cr,
-        &residual_cr,
-    );
-    Ok(())
+    add_prediction_and_residual(cb.as_flattened_mut(), 8, 0, 0, &predicted_cb, &residual_cb);
+    add_prediction_and_residual(cr.as_flattened_mut(), 8, 0, 0, &predicted_cr, &residual_cr);
+    Ok(MacroblockPixels::new(luma, cb, cr))
 }
 
 #[allow(clippy::too_many_arguments)]

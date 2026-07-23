@@ -171,6 +171,10 @@ does not justify a thread-pool dependency.
 7. Design deblocking wavefront scheduling only if reconstruction parallelism
    still leaves 1080p60 below target.
 
+Current status: stage 1 is implemented for B macroblocks. Reconstruction first
+produces an owned `MacroblockPixels` value and the existing serial caller
+commits it only after successful prediction and residual processing.
+
 ## Acceptance Checks
 
 Every parallel stage must pass:
