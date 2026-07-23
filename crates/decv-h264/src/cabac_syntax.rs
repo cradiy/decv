@@ -3,15 +3,22 @@
 use bit_readers::BitReader;
 
 use crate::{
-    CabacContextSet, CabacDecoder, CabacInitializationTable, H264Error, Result, SliceType,
-    consume_cabac_alignment,
+    CabacContextSet, CabacDecoder, CabacInitializationTable, CodedBlockPattern, H264Error,
+    IntraPredictionModeSyntax, Result, SliceType, consume_cabac_alignment,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CabacMacroblockSummary {
+    pub skipped: bool,
+    pub intra16_or_pcm: bool,
+    pub intra_chroma_prediction: Option<u8>,
+    pub coded_block_pattern: CodedBlockPattern,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompletedCabacMacroblock {
     slice_id: u32,
-    skipped: bool,
-    intra16_or_pcm: bool,
+    summary: CabacMacroblockSummary,
 }
 
 /// Completed-neighbour state used for macroblock-level CABAC contexts.
@@ -67,7 +74,7 @@ impl CabacMacroblockState {
         }
         let mut context_index = 3;
         for neighbour in self.left_and_top(macroblock_address, slice_id)? {
-            if neighbour.is_some_and(|macroblock| macroblock.intra16_or_pcm) {
+            if neighbour.is_some_and(|macroblock| macroblock.summary.intra16_or_pcm) {
                 context_index += 1;
             }
         }
@@ -87,14 +94,60 @@ impl CabacMacroblockState {
         Ok(macroblock_type)
     }
 
+    pub fn decode_intra_chroma_prediction_mode(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<u8> {
+        let context_increment = self
+            .left_and_top(macroblock_address, slice_id)?
+            .into_iter()
+            .filter(|neighbour| {
+                neighbour.is_some_and(|macroblock| {
+                    macroblock.summary.intra_chroma_prediction.unwrap_or(0) != 0
+                })
+            })
+            .count();
+        decode_intra_chroma_prediction_mode(64 + context_increment, |context_index| {
+            syntax.decision(context_index)
+        })
+    }
+
+    pub fn decode_coded_block_pattern(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<CodedBlockPattern> {
+        let [left, top] = self.left_and_top(macroblock_address, slice_id)?;
+        let left_pattern = left.map(|macroblock| macroblock.summary.coded_block_pattern);
+        let top_pattern = top.map(|macroblock| macroblock.summary.coded_block_pattern);
+        let luma = decode_luma_coded_block_pattern(left_pattern, top_pattern, |context_index| {
+            syntax.decision(context_index)
+        })?;
+        let chroma =
+            decode_chroma_coded_block_pattern(left_pattern, top_pattern, |context_index| {
+                syntax.decision(context_index)
+            })?;
+        Ok(CodedBlockPattern { luma, chroma })
+    }
+
     /// Records the properties needed by later macroblocks in the same slice.
     pub fn record_macroblock(
         &mut self,
         macroblock_address: usize,
         slice_id: u32,
-        skipped: bool,
-        intra16_or_pcm: bool,
+        summary: CabacMacroblockSummary,
     ) -> Result<()> {
+        if summary.intra_chroma_prediction.is_some_and(|mode| mode > 3)
+            || summary.coded_block_pattern.luma > 15
+            || summary.coded_block_pattern.chroma > 2
+        {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC macroblock summary contains an out-of-range value",
+            ));
+        }
         let slot = self
             .completed
             .get_mut(macroblock_address)
@@ -106,11 +159,7 @@ impl CabacMacroblockState {
                 "CABAC macroblock was already completed",
             ));
         }
-        *slot = Some(CompletedCabacMacroblock {
-            slice_id,
-            skipped,
-            intra16_or_pcm,
-        });
+        *slot = Some(CompletedCabacMacroblock { slice_id, summary });
         Ok(())
     }
 
@@ -132,7 +181,7 @@ impl CabacMacroblockState {
         let context_increment = self
             .left_and_top(macroblock_address, slice_id)?
             .into_iter()
-            .filter(|neighbour| neighbour.is_some_and(|macroblock| !macroblock.skipped))
+            .filter(|neighbour| neighbour.is_some_and(|macroblock| !macroblock.summary.skipped))
             .count();
         Ok(base + context_increment)
     }
@@ -248,6 +297,10 @@ impl<'syntax, 'data> CabacSyntaxDecoder<'syntax, 'data> {
     #[inline]
     pub fn terminate(&mut self) -> Result<u8> {
         self.arithmetic.decode_terminate()
+    }
+
+    pub fn intra_prediction_mode(&mut self) -> Result<IntraPredictionModeSyntax> {
+        decode_intra_prediction_mode(|context_index| self.decision(context_index))
     }
 
     /// Decodes a fixed-length bypass-coded bin string, MSB first.
@@ -369,11 +422,93 @@ fn decode_intra_macroblock_type(
     Ok(macroblock_type)
 }
 
+fn decode_intra_prediction_mode(
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<IntraPredictionModeSyntax> {
+    if decision(68)? != 0 {
+        return Ok(IntraPredictionModeSyntax {
+            use_predicted: true,
+            remaining_mode: None,
+        });
+    }
+    let mut remaining_mode = 0;
+    for bit_index in 0..3 {
+        remaining_mode |= decision(69)? << bit_index;
+    }
+    Ok(IntraPredictionModeSyntax {
+        use_predicted: false,
+        remaining_mode: Some(remaining_mode),
+    })
+}
+
+fn decode_intra_chroma_prediction_mode(
+    first_context_index: usize,
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<u8> {
+    if decision(first_context_index)? == 0 {
+        return Ok(0);
+    }
+    if decision(67)? == 0 {
+        return Ok(1);
+    }
+    Ok(2 + decision(67)?)
+}
+
+fn decode_luma_coded_block_pattern(
+    left: Option<CodedBlockPattern>,
+    top: Option<CodedBlockPattern>,
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<u8> {
+    let left = left.map_or(0x0f, |pattern| pattern.luma);
+    let top = top.map_or(0x0f, |pattern| pattern.luma);
+    let mut current = 0u8;
+
+    let context = usize::from(left & 0x02 == 0) + 2 * usize::from(top & 0x04 == 0);
+    current |= decision(73 + context)?;
+    let context = usize::from(current & 0x01 == 0) + 2 * usize::from(top & 0x08 == 0);
+    current |= decision(73 + context)? << 1;
+    let context = usize::from(left & 0x08 == 0) + 2 * usize::from(current & 0x01 == 0);
+    current |= decision(73 + context)? << 2;
+    let context = usize::from(current & 0x04 == 0) + 2 * usize::from(current & 0x02 == 0);
+    current |= decision(73 + context)? << 3;
+    Ok(current)
+}
+
+fn decode_chroma_coded_block_pattern(
+    left: Option<CodedBlockPattern>,
+    top: Option<CodedBlockPattern>,
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<u8> {
+    let left = left.map_or(0, |pattern| pattern.chroma);
+    let top = top.map_or(0, |pattern| pattern.chroma);
+    let context = usize::from(left > 0) + 2 * usize::from(top > 0);
+    if decision(77 + context)? == 0 {
+        return Ok(0);
+    }
+    let context = 4 + usize::from(left == 2) + 2 * usize::from(top == 2);
+    Ok(1 + decision(77 + context)?)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
     use super::*;
+
+    fn summary(
+        skipped: bool,
+        intra16_or_pcm: bool,
+        intra_chroma_prediction: Option<u8>,
+        luma: u8,
+        chroma: u8,
+    ) -> CabacMacroblockSummary {
+        CabacMacroblockSummary {
+            skipped,
+            intra16_or_pcm,
+            intra_chroma_prediction,
+            coded_block_pattern: CodedBlockPattern { luma, chroma },
+        }
+    }
 
     #[test]
     fn decodes_fixed_length_bits_most_significant_first() {
@@ -462,12 +597,16 @@ mod tests {
             state.skip_flag_context_index(0, 1, SliceType::P).unwrap(),
             11
         );
-        state.record_macroblock(0, 1, false, false).unwrap();
+        state
+            .record_macroblock(0, 1, summary(false, false, None, 0, 0))
+            .unwrap();
         assert_eq!(
             state.skip_flag_context_index(1, 1, SliceType::P).unwrap(),
             12
         );
-        state.record_macroblock(1, 1, true, false).unwrap();
+        state
+            .record_macroblock(1, 1, summary(true, false, None, 0, 0))
+            .unwrap();
         assert_eq!(
             state.skip_flag_context_index(2, 1, SliceType::P).unwrap(),
             12
@@ -481,7 +620,11 @@ mod tests {
             25
         );
         assert!(state.skip_flag_context_index(2, 1, SliceType::I).is_err());
-        assert!(state.record_macroblock(0, 1, false, false).is_err());
+        assert!(
+            state
+                .record_macroblock(0, 1, summary(false, false, None, 0, 0))
+                .is_err()
+        );
         assert!(state.skip_flag_context_index(4, 1, SliceType::P).is_err());
     }
 
@@ -528,15 +671,104 @@ mod tests {
     #[test]
     fn intra_macroblock_context_counts_only_intra16_and_pcm_neighbours() {
         let mut state = CabacMacroblockState::new(2, 2).unwrap();
-        state.record_macroblock(0, 7, false, true).unwrap();
-        state.record_macroblock(1, 7, false, false).unwrap();
+        state
+            .record_macroblock(0, 7, summary(false, true, Some(0), 0, 0))
+            .unwrap();
+        state
+            .record_macroblock(1, 7, summary(false, false, Some(0), 0, 0))
+            .unwrap();
         let neighbours = state.left_and_top(2, 7).unwrap();
         assert_eq!(
             neighbours
                 .into_iter()
-                .filter(|entry| entry.is_some_and(|macroblock| macroblock.intra16_or_pcm))
+                .filter(|entry| {
+                    entry.is_some_and(|macroblock| macroblock.summary.intra16_or_pcm)
+                })
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn decodes_luma_and_chroma_coded_block_patterns() {
+        let left = CodedBlockPattern {
+            luma: 0b1010,
+            chroma: 2,
+        };
+        let top = CodedBlockPattern {
+            luma: 0b0101,
+            chroma: 1,
+        };
+        let mut bins = VecDeque::from([1, 0, 1, 1]);
+        let mut visited = Vec::new();
+        assert_eq!(
+            decode_luma_coded_block_pattern(Some(left), Some(top), |context_index| {
+                visited.push(context_index);
+                Ok(bins.pop_front().unwrap())
+            })
+            .unwrap(),
+            0b1101
+        );
+        assert_eq!(visited, [73, 75, 73, 75]);
+
+        let mut bins = VecDeque::from([1, 1]);
+        let mut visited = Vec::new();
+        assert_eq!(
+            decode_chroma_coded_block_pattern(Some(left), Some(top), |context_index| {
+                visited.push(context_index);
+                Ok(bins.pop_front().unwrap())
+            })
+            .unwrap(),
+            2
+        );
+        assert_eq!(visited, [80, 82]);
+    }
+
+    #[test]
+    fn validates_recorded_macroblock_summary_values() {
+        let mut state = CabacMacroblockState::new(1, 1).unwrap();
+        assert!(
+            state
+                .record_macroblock(0, 1, summary(false, false, Some(4), 0, 0))
+                .is_err()
+        );
+        assert!(
+            state
+                .record_macroblock(0, 1, summary(false, false, None, 16, 0))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn decodes_intra_luma_and_chroma_prediction_modes() {
+        let mut predicted = VecDeque::from([1]);
+        assert_eq!(
+            decode_intra_prediction_mode(|_| Ok(predicted.pop_front().unwrap())).unwrap(),
+            IntraPredictionModeSyntax {
+                use_predicted: true,
+                remaining_mode: None,
+            }
+        );
+
+        let mut explicit = VecDeque::from([0, 1, 0, 1]);
+        assert_eq!(
+            decode_intra_prediction_mode(|_| Ok(explicit.pop_front().unwrap())).unwrap(),
+            IntraPredictionModeSyntax {
+                use_predicted: false,
+                remaining_mode: Some(5),
+            }
+        );
+
+        let mut chroma = VecDeque::from([1, 1, 0]);
+        let mut visited = Vec::new();
+        assert_eq!(
+            decode_intra_chroma_prediction_mode(66, |context_index| {
+                visited.push(context_index);
+                Ok(chroma.pop_front().unwrap())
+            })
+            .unwrap(),
+            2
+        );
+        assert_eq!(visited, [66, 67, 67]);
     }
 }

@@ -754,7 +754,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   and truncated-unary binarization readers plus a long-lived slice session
   that consumes alignment and preserves arithmetic/context state across
   macroblocks; progressive-frame P/B `mb_skip_flag` and I/SI `mb_type` now
-  derive their contexts from completed same-slice neighbours;
+  derive their contexts from completed same-slice neighbours, followed by
+  CABAC intra luma/chroma prediction modes and neighbour-dependent luma/chroma
+  coded-block-pattern decoding;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band

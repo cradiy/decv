@@ -45,7 +45,9 @@ pub use cabac::{
     CabacContextSet, CabacContextState, CabacDecoder, CabacInitializationTable,
     consume_cabac_alignment,
 };
-pub use cabac_syntax::{CabacMacroblockState, CabacSliceDecoder, CabacSyntaxDecoder};
+pub use cabac_syntax::{
+    CabacMacroblockState, CabacMacroblockSummary, CabacSliceDecoder, CabacSyntaxDecoder,
+};
 pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
 };
