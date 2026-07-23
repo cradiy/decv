@@ -58,6 +58,8 @@ pub(crate) struct MacroblockDeblockInfo {
     pub cb_qp: u8,
     pub cr_qp: u8,
     pub transform_8x8: bool,
+    /// All internal edges are known to have boundary strength zero.
+    pub internal_edges_zero: bool,
     /// Non-zero luma coefficients at raster-ordered 4x4 granularity.
     pub luma_nonzero: u16,
     /// List-0 reference identity and motion at raster-ordered 4x4 granularity.
@@ -276,11 +278,7 @@ pub(crate) fn filter_420_picture(
                     boundary_strength(previous, block_row * 4 + 3, current, block_row * 4, true);
             }
         }
-        let internal_edges_zero = !current.is_intra
-            && current.luma_nonzero == 0
-            && current.motion[1..]
-                .iter()
-                .all(|&motion| motion == current.motion[0]);
+        let internal_edges_zero = current.internal_edges_zero;
         if !internal_edges_zero {
             for block_column in 1..4 {
                 if block_column == 2 || !current.transform_8x8 {
@@ -1577,6 +1575,7 @@ mod tests {
             cb_qp: 40,
             cr_qp: 40,
             transform_8x8: false,
+            internal_edges_zero: false,
             luma_nonzero: 0,
             motion: [DeblockMotion::default(); 16],
             filter: DeblockingFilter {
@@ -1590,6 +1589,7 @@ mod tests {
     fn inter_macroblock(reference_id: u8, vector: MotionVector) -> MacroblockDeblockInfo {
         MacroblockDeblockInfo {
             is_intra: false,
+            internal_edges_zero: true,
             motion: [DeblockMotion::new(
                 DeblockListMotion {
                     reference_id,

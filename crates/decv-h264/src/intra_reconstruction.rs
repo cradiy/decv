@@ -2278,6 +2278,7 @@ impl IntraPictureReconstructor {
                 quantizer.chroma_cr
             },
             transform_8x8,
+            internal_edges_zero: false,
             luma_nonzero: 0,
             motion: [DeblockMotion::default(); 16],
             filter: deblocking_filter,
@@ -2781,6 +2782,8 @@ fn inter_deblock_info(
     references_l0: &DeblockReferenceList,
 ) -> Result<MacroblockDeblockInfo> {
     let mut motion = [DeblockMotion::default(); 16];
+    let mut first_motion = None;
+    let mut uniform_motion = true;
     for partition in &resolved.partitions {
         let reference_id =
             references_l0
@@ -2803,19 +2806,26 @@ fn inter_deblock_info(
                 "P partition is not aligned to the deblocking grid",
             ));
         }
+        let partition_motion = DeblockMotion::new(
+            DeblockListMotion {
+                reference_id,
+                vector: partition.motion_vector,
+            },
+            DeblockListMotion::default(),
+        );
+        if let Some(first_motion) = first_motion {
+            uniform_motion &= partition_motion == first_motion;
+        } else {
+            first_motion = Some(partition_motion);
+        }
         for y in start_y..end_y {
             for x in start_x..end_x {
-                motion[y * 4 + x] = DeblockMotion::new(
-                    DeblockListMotion {
-                        reference_id,
-                        vector: partition.motion_vector,
-                    },
-                    DeblockListMotion::default(),
-                );
+                motion[y * 4 + x] = partition_motion;
             }
         }
     }
 
+    let luma_nonzero = inter_luma_nonzero(transform_8x8, residual);
     Ok(MacroblockDeblockInfo {
         slice_id,
         is_intra: false,
@@ -2823,7 +2833,8 @@ fn inter_deblock_info(
         cb_qp: quantizer.chroma_cb,
         cr_qp: quantizer.chroma_cr,
         transform_8x8,
-        luma_nonzero: inter_luma_nonzero(transform_8x8, residual),
+        internal_edges_zero: luma_nonzero == 0 && first_motion.is_some() && uniform_motion,
+        luma_nonzero,
         motion,
         filter,
     })
@@ -2841,6 +2852,8 @@ fn b_inter_deblock_info(
     references_l1: &DeblockReferenceList,
 ) -> Result<MacroblockDeblockInfo> {
     let mut motion = [DeblockMotion::default(); 16];
+    let mut first_motion = None;
+    let mut uniform_motion = true;
     for partition in &resolved.partitions {
         let start_x = usize::from(partition.x) / 4;
         let start_y = usize::from(partition.y) / 4;
@@ -2859,12 +2872,19 @@ fn b_inter_deblock_info(
         }
         let list0 = b_deblock_list_motion(partition.list0, references_l0, "List 0")?;
         let list1 = b_deblock_list_motion(partition.list1, references_l1, "List 1")?;
+        let partition_motion = DeblockMotion::new(list0, list1);
+        if let Some(first_motion) = first_motion {
+            uniform_motion &= partition_motion == first_motion;
+        } else {
+            first_motion = Some(partition_motion);
+        }
         for y in start_y..end_y {
             for x in start_x..end_x {
-                motion[y * 4 + x] = DeblockMotion::new(list0, list1);
+                motion[y * 4 + x] = partition_motion;
             }
         }
     }
+    let luma_nonzero = inter_luma_nonzero(transform_8x8, residual);
     Ok(MacroblockDeblockInfo {
         slice_id,
         is_intra: false,
@@ -2872,7 +2892,8 @@ fn b_inter_deblock_info(
         cb_qp: quantizer.chroma_cb,
         cr_qp: quantizer.chroma_cr,
         transform_8x8,
-        luma_nonzero: inter_luma_nonzero(transform_8x8, residual),
+        internal_edges_zero: luma_nonzero == 0 && first_motion.is_some() && uniform_motion,
+        luma_nonzero,
         motion,
         filter,
     })
