@@ -143,9 +143,42 @@ impl H264Decoder {
                                 .reconstructor
                                 .decode_cavlc_p_slice(rbsp.as_ref(), &parsed, &borrowed)?;
                         }
-                        SliceType::B | SliceType::Sp | SliceType::Si => {
+                        SliceType::B => {
+                            let current_poc = picture_order_count.stored.picture_order_count();
+                            let (references_l0, references_l1) = self
+                                .dpb
+                                .as_ref()
+                                .expect("the DPB is initialized with the picture")
+                                .b_lists(
+                                    parsed.header.frame_num,
+                                    current_poc,
+                                    parsed.header.num_ref_idx_l0_active,
+                                    &parsed.header.ref_pic_list_modifications_l0,
+                                    parsed.header.num_ref_idx_l1_active,
+                                    &parsed.header.ref_pic_list_modifications_l1,
+                                )?;
+                            let borrowed_l0 = references_l0
+                                .iter()
+                                .map(|picture| picture.as_deref())
+                                .collect::<Vec<_>>();
+                            let borrowed_l1 = references_l1
+                                .iter()
+                                .map(|picture| picture.as_deref())
+                                .collect::<Vec<_>>();
+                            self.current_picture
+                                .as_mut()
+                                .expect("the picture is initialized above")
+                                .reconstructor
+                                .decode_cavlc_b_slice(
+                                    rbsp.as_ref(),
+                                    &parsed,
+                                    &borrowed_l0,
+                                    &borrowed_l1,
+                                )?;
+                        }
+                        SliceType::Sp | SliceType::Si => {
                             return Err(H264Error::UnsupportedFeature(
-                                "top-level reconstruction of B, SP, and SI slices",
+                                "top-level reconstruction of SP and SI slices",
                             ));
                         }
                     }
@@ -802,6 +835,47 @@ mod tests {
     }
 
     #[test]
+    fn decodes_and_reorders_an_explicit_bidirectional_b_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x01, single_macroblock_explicit_b_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        // Decode order is I(1), P(2), B(3); POC display order is I, B, P.
+        for expected_id in [1, 3, 2] {
+            let frame = match decoder.receive_frame().unwrap() {
+                DecodeOutput::Frame(frame) => frame,
+                output => panic!("expected decoded frame, got {output:?}"),
+            };
+            assert_eq!(frame.id, expected_id);
+            let FrameStorage::Cpu(cpu) = frame.storage else {
+                panic!("expected CPU frame");
+            };
+            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        }
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
     fn decodes_explicitly_weighted_reference_p_picture() {
         let stream = annex_b_stream(&[
             (0x67, single_macroblock_sps_rbsp()),
@@ -1304,6 +1378,26 @@ mod tests {
         writer.finish_rbsp()
     }
 
+    fn single_macroblock_main_sps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_bits(77, 8); // Main profile
+        writer.write_bits(0, 8); // constraints + reserved_zero_2bits
+        writer.write_bits(10, 8); // level_idc
+        writer.write_ue(0); // seq_parameter_set_id
+        writer.write_ue(0); // log2_max_frame_num_minus4
+        writer.write_ue(0); // pic_order_cnt_type
+        writer.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        writer.write_ue(2); // max_num_ref_frames
+        writer.write_flag(false); // gaps_in_frame_num_value_allowed_flag
+        writer.write_ue(0); // pic_width_in_mbs_minus1
+        writer.write_ue(0); // pic_height_in_map_units_minus1
+        writer.write_flag(true); // frame_mbs_only_flag
+        writer.write_flag(true); // direct_8x8_inference_flag
+        writer.write_flag(false); // frame_cropping_flag
+        writer.write_flag(false); // vui_parameters_present_flag
+        writer.finish_rbsp()
+    }
+
     fn single_macroblock_pps_rbsp() -> Vec<u8> {
         let mut writer = BitWriter::default();
         writer.write_ue(0); // pic_parameter_set_id
@@ -1377,6 +1471,44 @@ mod tests {
         writer.write_flag(false); // adaptive_ref_pic_marking_mode_flag
         writer.write_se(0); // slice_qp_delta
         writer.write_ue(1); // mb_skip_run
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_p_skip_at_poc_rbsp(poc_lsb: u64) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(0); // P slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num
+        writer.write_bits(poc_lsb, 4); // pic_order_cnt_lsb
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // adaptive_ref_pic_marking_mode_flag
+        writer.write_se(0); // slice_qp_delta
+        writer.write_ue(1); // mb_skip_run
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_explicit_b_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(1); // B slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num (non-reference pictures do not advance it)
+        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_flag(true); // direct_spatial_mv_pred_flag
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // ref_pic_list_modification_flag_l1
+        writer.write_se(0); // slice_qp_delta
+
+        writer.write_ue(0); // mb_skip_run
+        writer.write_ue(3); // B_Bi_16x16
+        writer.write_se(0); // mvd_l0.x
+        writer.write_se(0); // mvd_l0.y
+        writer.write_se(0); // mvd_l1.x
+        writer.write_se(0); // mvd_l1.y
+        writer.write_ue(0); // coded_block_pattern -> zero
         writer.finish_rbsp()
     }
 

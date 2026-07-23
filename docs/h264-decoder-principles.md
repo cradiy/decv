@@ -717,6 +717,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   identity, motion-vector thresholds, and equivalent swapped-list handling;
 - a bounded POC output-reorder buffer kept separate from the reference DPB,
   with stable equal-POC ordering, drain, and discontinuity discard semantics;
+- top-level B-slice dispatch that derives both active reference lists from the
+  DPB at the current POC and queues the decoded picture for display reordering;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
