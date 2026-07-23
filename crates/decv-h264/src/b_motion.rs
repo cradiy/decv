@@ -271,6 +271,7 @@ impl BMotionState {
                 partitions.push(partition);
             }
         }
+        coalesce_uniform_direct_grid(&mut partitions);
         self.commit_local_cells(macroblock_address, local);
         Ok(ResolvedBMacroblock {
             direct: true,
@@ -317,6 +318,7 @@ impl BMotionState {
                 partitions.push(partition);
             }
         }
+        coalesce_uniform_direct_grid(&mut partitions);
         self.commit_local_cells(macroblock_address, local);
         Ok(ResolvedBMacroblock {
             direct: true,
@@ -1166,6 +1168,27 @@ fn fill_direct_partition_cells(
     }
 }
 
+fn coalesce_uniform_direct_grid(partitions: &mut SmallVec<[ResolvedBPartition; 4]>) {
+    let Some(first) = partitions.first().copied() else {
+        return;
+    };
+    if partitions.len() > 1
+        && partitions
+            .iter()
+            .all(|partition| partition.list0 == first.list0 && partition.list1 == first.list1)
+    {
+        partitions.clear();
+        partitions.push(ResolvedBPartition {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            list0: first.list0,
+            list1: first.list1,
+        });
+    }
+}
+
 fn add_motion_vector_difference(
     predictor: MotionVector,
     difference: MotionVectorDifference,
@@ -1548,8 +1571,17 @@ mod tests {
             )
             .unwrap();
         assert!(resolved.direct);
-        assert_eq!(resolved.partitions.len(), 4);
+        assert_eq!(resolved.partitions.len(), 1);
         assert!(!resolved.partitions.spilled());
+        assert_eq!(
+            (
+                resolved.partitions[0].x,
+                resolved.partitions[0].y,
+                resolved.partitions[0].width,
+                resolved.partitions[0].height,
+            ),
+            (0, 0, 16, 16)
+        );
         assert!(resolved.partitions.iter().all(|partition| {
             partition.list0
                 == Some(ResolvedBListMotion {
@@ -1710,7 +1742,16 @@ mod tests {
                 },
             )
             .unwrap();
-        assert_eq!(resolved.partitions.len(), 16);
+        assert_eq!(resolved.partitions.len(), 1);
+        assert_eq!(
+            (
+                resolved.partitions[0].x,
+                resolved.partitions[0].y,
+                resolved.partitions[0].width,
+                resolved.partitions[0].height,
+            ),
+            (0, 0, 16, 16)
+        );
         assert!(resolved.partitions.iter().all(|partition| {
             partition.list0.unwrap().motion_vector == MotionVector::default()
                 && partition.list1.unwrap().motion_vector == MotionVector::default()
