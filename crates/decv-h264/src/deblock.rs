@@ -276,12 +276,28 @@ pub(crate) fn filter_420_picture(
                     boundary_strength(previous, block_row * 4 + 3, current, block_row * 4, true);
             }
         }
-        for block_column in 1..4 {
-            if block_column == 2 || !current.transform_8x8 {
-                for block_row in 0..4 {
-                    let q = block_row * 4 + block_column;
-                    vertical_strengths[block_column][block_row] =
-                        boundary_strength(current, q - 1, current, q, false);
+        let internal_edges_zero = !current.is_intra
+            && !current.luma_nonzero.iter().any(|&nonzero| nonzero)
+            && current.motion[1..]
+                .iter()
+                .all(|&motion| motion == current.motion[0]);
+        if !internal_edges_zero {
+            for block_column in 1..4 {
+                if block_column == 2 || !current.transform_8x8 {
+                    for block_row in 0..4 {
+                        let q = block_row * 4 + block_column;
+                        vertical_strengths[block_column][block_row] =
+                            boundary_strength(current, q - 1, current, q, false);
+                    }
+                }
+            }
+            for block_row in 1..4 {
+                if block_row == 2 || !current.transform_8x8 {
+                    for block_column in 0..4 {
+                        let q = block_row * 4 + block_column;
+                        horizontal_strengths[block_row][block_column] =
+                            boundary_strength(current, q - 4, current, q, false);
+                    }
                 }
             }
         }
@@ -292,21 +308,16 @@ pub(crate) fn filter_420_picture(
                     boundary_strength(previous, 12 + block_column, current, block_column, true);
             }
         }
-        for block_row in 1..4 {
-            if block_row == 2 || !current.transform_8x8 {
-                for block_column in 0..4 {
-                    let q = block_row * 4 + block_column;
-                    horizontal_strengths[block_row][block_column] =
-                        boundary_strength(current, q - 4, current, q, false);
-                }
-            }
-        }
 
-        let internal_thresholds = [
-            edge_thresholds(current, current, 0)?,
-            edge_thresholds(current, current, 1)?,
-            edge_thresholds(current, current, 2)?,
-        ];
+        let internal_thresholds = if internal_edges_zero {
+            [None; 3]
+        } else {
+            [
+                edge_thresholds(current, current, 0)?,
+                edge_thresholds(current, current, 1)?,
+                edge_thresholds(current, current, 2)?,
+            ]
+        };
         let left_thresholds = if filter_left {
             let previous = left.expect("filter_left requires a neighbor");
             [
