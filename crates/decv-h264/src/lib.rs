@@ -19,6 +19,7 @@ mod intra_modes;
 mod intra_reconstruction;
 mod macroblock;
 mod motion;
+mod motion_field;
 mod nal;
 mod parameter_sets;
 mod picture;
@@ -53,7 +54,7 @@ pub use inter_reconstruction::{
     reconstruct_weighted_p_macroblock_from_list_420,
 };
 pub use intra_modes::IntraModeState;
-pub use intra_reconstruction::IntraPictureReconstructor;
+pub use intra_reconstruction::{IntraPictureReconstructor, ReconstructionReferenceList};
 pub use macroblock::{
     BInterMacroblockHeader, BMacroblockContext, BPartitionMode, BPartitionMotion, BPredictionMode,
     BSliceMacroblock, BSubMacroblockType, CodedBlockPattern, DecodedBSliceMacroblock,
@@ -68,6 +69,7 @@ pub use motion::{
     MotionVector, PMotionState, ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition,
     ResolvedPMacroblock, ResolvedPPartition,
 };
+pub use motion_field::{MotionFieldCell, ReferenceMotionField, StoredListMotion};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
 pub use picture::{FieldOrderCount, PictureOrderCount, PictureOrderCountState};

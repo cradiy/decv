@@ -721,6 +721,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   DPB at the current POC and queues the decoded picture for display reordering;
 - stable DPB reference identities plus active-list POC and short/long-term
   metadata, ready for temporal Direct mapping and implicit B weighting;
+- immutable per-4x4 Intra/List-0/List-1 motion fields retained beside each DPB
+  reference picture, with motion entries mapped back to stable reference IDs;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;

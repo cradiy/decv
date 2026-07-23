@@ -10,6 +10,7 @@ use crate::inter_reconstruction::{
     reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
 };
+use crate::motion_field::MotionFieldBuilder;
 use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, BMacroblockContext, BMotionState, CavlcNeighborState, ChromaPlane,
@@ -18,13 +19,13 @@ use crate::{
     IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability,
     MacroblockQuantizer, MacroblockQuantizerState, PMacroblockContext, PMotionState,
     ParsedSliceHeader, PredictionWeightTable, ReconstructedIntraResidual,
-    ReconstructedLumaResidual, ResolvedBListMotion, ResolvedBMacroblock, ResolvedPMacroblock,
-    ResolvedScalingLists4x4, ResolvedScalingLists8x8, Result, ScanMode, SliceType,
-    WeightedBiprediction, Yuv420Picture, consume_rbsp_trailing_bits, derive_chroma_qp,
-    parse_cavlc_mb_skip_run, predict_intra_4x4, predict_intra_8x8, predict_intra_16x16,
-    predict_intra_chroma_420, reconstruct_b_inter_residual, reconstruct_inter_residual,
-    reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4,
-    resolve_scaling_lists_8x8,
+    ReconstructedLumaResidual, ReferenceId, ReferenceMotionField, ResolvedBListMotion,
+    ResolvedBMacroblock, ResolvedPMacroblock, ResolvedScalingLists4x4, ResolvedScalingLists8x8,
+    Result, ScanMode, SliceType, WeightedBiprediction, Yuv420Picture, consume_rbsp_trailing_bits,
+    derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4, predict_intra_8x8,
+    predict_intra_16x16, predict_intra_chroma_420, reconstruct_b_inter_residual,
+    reconstruct_inter_residual, reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420,
+    resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -66,6 +67,31 @@ struct IntraSliceConfig {
     deblocking_filter: DeblockingFilter,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReconstructionReferenceList<'a> {
+    pictures: &'a [Option<&'a Yuv420Picture>],
+    reference_ids: Option<&'a [Option<ReferenceId>]>,
+}
+
+impl<'a> ReconstructionReferenceList<'a> {
+    pub const fn new(pictures: &'a [Option<&'a Yuv420Picture>]) -> Self {
+        Self {
+            pictures,
+            reference_ids: None,
+        }
+    }
+
+    pub const fn with_ids(
+        pictures: &'a [Option<&'a Yuv420Picture>],
+        reference_ids: &'a [Option<ReferenceId>],
+    ) -> Self {
+        Self {
+            pictures,
+            reference_ids: Some(reference_ids),
+        }
+    }
+}
+
 /// Reconstructs one progressively scanned intra picture in macroblock order.
 #[derive(Debug, Clone)]
 pub struct IntraPictureReconstructor {
@@ -75,6 +101,7 @@ pub struct IntraPictureReconstructor {
     modes: IntraModeState,
     motion: PMotionState,
     b_motion: BMotionState,
+    reference_motion: MotionFieldBuilder,
     completed: Vec<Option<CompletedMacroblock>>,
     scaling_lists: ResolvedScalingLists4x4,
     scaling_lists_8x8: ResolvedScalingLists8x8,
@@ -118,6 +145,7 @@ impl IntraPictureReconstructor {
             modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
             motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
             b_motion: BMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
+            reference_motion: MotionFieldBuilder::new(coded_size)?,
             completed: vec![None; macroblock_count],
             scaling_lists,
             scaling_lists_8x8,
@@ -207,7 +235,7 @@ impl IntraPictureReconstructor {
         &mut self,
         rbsp: &[u8],
         parsed: &ParsedSliceHeader,
-        references_l0: &[Option<&Yuv420Picture>],
+        references_l0: ReconstructionReferenceList<'_>,
     ) -> Result<usize> {
         let header = &parsed.header;
         let sps = &parsed.parameter_sets.sequence;
@@ -262,8 +290,8 @@ impl IntraPictureReconstructor {
         &mut self,
         rbsp: &[u8],
         parsed: &ParsedSliceHeader,
-        references_l0: &[Option<&Yuv420Picture>],
-        references_l1: &[Option<&Yuv420Picture>],
+        references_l0: ReconstructionReferenceList<'_>,
+        references_l1: ReconstructionReferenceList<'_>,
     ) -> Result<usize> {
         let header = &parsed.header;
         let sps = &parsed.parameter_sets.sequence;
@@ -404,9 +432,11 @@ impl IntraPictureReconstructor {
         rbsp: &[u8],
         config: IntraSliceConfig,
         num_ref_idx_l0_active: u8,
-        references_l0: &[Option<&Yuv420Picture>],
+        references_l0: ReconstructionReferenceList<'_>,
         prediction_weights: Option<&PredictionWeightTable>,
     ) -> Result<usize> {
+        let reference_ids_l0 = references_l0.reference_ids;
+        let references_l0 = references_l0.pictures;
         let mut reader = BitReader::new(rbsp);
         if !reader.skip_bits(config.header_bit_size) {
             return Err(H264Error::UnexpectedEof);
@@ -449,6 +479,18 @@ impl IntraPictureReconstructor {
                 let motion = self
                     .motion
                     .resolve_skip_macroblock(macroblock_address, slice_id)?;
+                if let Err(error) =
+                    self.reference_motion
+                        .record_p(macroblock_address, &motion, reference_ids_l0)
+                {
+                    self.motion.clear_macroblock(macroblock_address)?;
+                    self.cavlc.restore_macroblock(
+                        u32::try_from(macroblock_x).map_err(|_| H264Error::IntegerOverflow)?,
+                        u32::try_from(macroblock_y).map_err(|_| H264Error::IntegerOverflow)?,
+                        cavlc_snapshot,
+                    );
+                    return Err(error);
+                }
                 let reconstruction = if let Some(weights) = prediction_weights {
                     reconstruct_weighted_p_skip_macroblock_from_list_420(
                         &mut self.picture,
@@ -471,6 +513,7 @@ impl IntraPictureReconstructor {
                     .and_then(|()| self.modes.record_inter(macroblock_address, slice_id));
                 if let Err(error) = result {
                     self.motion.clear_macroblock(macroblock_address)?;
+                    self.reference_motion.clear_macroblock(macroblock_address)?;
                     self.cavlc.restore_macroblock(
                         u32::try_from(macroblock_x).map_err(|_| H264Error::IntegerOverflow)?,
                         u32::try_from(macroblock_y).map_err(|_| H264Error::IntegerOverflow)?,
@@ -532,6 +575,14 @@ impl IntraPictureReconstructor {
                         slice_id,
                         header,
                     )?;
+                    if let Err(error) = self.reference_motion.record_p(
+                        macroblock_address,
+                        &motion,
+                        reference_ids_l0,
+                    ) {
+                        self.motion.clear_macroblock(macroblock_address)?;
+                        return Err(error);
+                    }
                     let reconstruction = if let Some(weights) = prediction_weights {
                         reconstruct_weighted_p_macroblock_from_list_420(
                             &mut self.picture,
@@ -556,6 +607,7 @@ impl IntraPictureReconstructor {
                         .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
                     {
                         self.motion.clear_macroblock(macroblock_address)?;
+                        self.reference_motion.clear_macroblock(macroblock_address)?;
                         return Err(error);
                     }
                     self.complete_inter_macroblock(
@@ -602,10 +654,14 @@ impl IntraPictureReconstructor {
         rbsp: &[u8],
         config: IntraSliceConfig,
         context: BMacroblockContext,
-        references_l0: &[Option<&Yuv420Picture>],
-        references_l1: &[Option<&Yuv420Picture>],
+        references_l0: ReconstructionReferenceList<'_>,
+        references_l1: ReconstructionReferenceList<'_>,
         prediction_weights: Option<&PredictionWeightTable>,
     ) -> Result<usize> {
+        let reference_ids_l0 = references_l0.reference_ids;
+        let reference_ids_l1 = references_l1.reference_ids;
+        let references_l0 = references_l0.pictures;
+        let references_l1 = references_l1.pictures;
         let mut reader = BitReader::new(rbsp);
         if !reader.skip_bits(config.header_bit_size) {
             return Err(H264Error::UnexpectedEof);
@@ -671,6 +727,15 @@ impl IntraPictureReconstructor {
                         slice_id,
                         header,
                     )?;
+                    if let Err(error) = self.reference_motion.record_b(
+                        macroblock_address,
+                        &motion,
+                        reference_ids_l0,
+                        reference_ids_l1,
+                    ) {
+                        self.b_motion.clear_macroblock(macroblock_address)?;
+                        return Err(error);
+                    }
                     let deblock = match b_inter_deblock_info(
                         slice_id,
                         quantizer,
@@ -684,6 +749,7 @@ impl IntraPictureReconstructor {
                         Ok(deblock) => deblock,
                         Err(error) => {
                             self.b_motion.clear_macroblock(macroblock_address)?;
+                            self.reference_motion.clear_macroblock(macroblock_address)?;
                             return Err(error);
                         }
                     };
@@ -721,6 +787,7 @@ impl IntraPictureReconstructor {
                             &picture_snapshot,
                         );
                         self.b_motion.clear_macroblock(macroblock_address)?;
+                        self.reference_motion.clear_macroblock(macroblock_address)?;
                         self.modes.clear_macroblock(macroblock_address)?;
                         return Err(error);
                     }
@@ -888,13 +955,20 @@ impl IntraPictureReconstructor {
                 }
             }
         }
-        self.b_motion
-            .record_intra_macroblock(macroblock_address, slice_id)?;
+        self.reference_motion.record_intra(macroblock_address)?;
+        if let Err(error) = self
+            .b_motion
+            .record_intra_macroblock(macroblock_address, slice_id)
+        {
+            self.reference_motion.clear_macroblock(macroblock_address)?;
+            return Err(error);
+        }
         if let Err(error) = self
             .motion
             .record_intra_macroblock(macroblock_address, slice_id)
         {
             self.b_motion.clear_macroblock(macroblock_address)?;
+            self.reference_motion.clear_macroblock(macroblock_address)?;
             return Err(error);
         }
         self.completed[macroblock_address] = Some(CompletedMacroblock {
@@ -1068,7 +1142,13 @@ impl IntraPictureReconstructor {
             .into_nv12_frame(id, pts, duration, format)
     }
 
-    pub(crate) fn into_deblocked_picture(mut self) -> Result<Yuv420Picture> {
+    pub(crate) fn into_deblocked_picture(self) -> Result<Yuv420Picture> {
+        Ok(self.into_deblocked_reference_picture()?.0)
+    }
+
+    pub(crate) fn into_deblocked_reference_picture(
+        mut self,
+    ) -> Result<(Yuv420Picture, ReferenceMotionField)> {
         if self.completed.iter().any(Option::is_none) {
             return Err(H264Error::InvalidSyntax(
                 "cannot output an incomplete reconstructed picture",
@@ -1084,7 +1164,8 @@ impl IntraPictureReconstructor {
             })
             .collect::<Vec<_>>();
         filter_420_picture(&mut self.picture, &macroblocks, self.width_in_macroblocks)?;
-        Ok(self.picture)
+        let motion = self.reference_motion.finish()?;
+        Ok((self.picture, motion))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1565,7 +1646,7 @@ fn assemble_chroma_residual(blocks: &[[[i32; 4]; 4]; 4]) -> [[i32; 8]; 8] {
 mod tests {
     use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
 
-    use super::{IntraPictureReconstructor, IntraSliceConfig};
+    use super::{IntraPictureReconstructor, IntraSliceConfig, ReconstructionReferenceList};
     use crate::{
         BMacroblockContext, CodedBlockPattern, DeblockingFilter, DecodedIntraMacroblock, H264Error,
         IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax,
@@ -1714,7 +1795,7 @@ mod tests {
                 &bit_string("111111"),
                 p_slice_config(),
                 1,
-                &references,
+                ReconstructionReferenceList::new(&references),
                 None,
             ),
             Ok(1)
@@ -1736,7 +1817,7 @@ mod tests {
                 &bit_string("0101"),
                 p_slice_config(),
                 1,
-                &references,
+                ReconstructionReferenceList::new(&references),
                 None,
             ),
             Ok(1)
@@ -1770,8 +1851,8 @@ mod tests {
                 &bit_string("10101111"),
                 p_slice_config(),
                 b_macroblock_context(),
-                &references_l0,
-                &references_l1,
+                ReconstructionReferenceList::new(&references_l0),
+                ReconstructionReferenceList::new(&references_l1),
                 None,
             ),
             Ok(1)
@@ -1788,8 +1869,8 @@ mod tests {
                 &bit_string("100100111111"),
                 p_slice_config(),
                 b_macroblock_context(),
-                &references_l0,
-                &references_l1,
+                ReconstructionReferenceList::new(&references_l0),
+                ReconstructionReferenceList::new(&references_l1),
                 None,
             ),
             Ok(1)
@@ -1805,8 +1886,8 @@ mod tests {
                 &bit_string("0101"),
                 p_slice_config(),
                 b_macroblock_context(),
-                &references_l0,
-                &references_l1,
+                ReconstructionReferenceList::new(&references_l0),
+                ReconstructionReferenceList::new(&references_l1),
                 None,
             ),
             Err(H264Error::UnsupportedFeature(_))

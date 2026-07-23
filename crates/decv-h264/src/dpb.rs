@@ -15,7 +15,7 @@ pub type ActiveReferenceInfoList = Vec<Option<ActiveReferenceInfo>>;
 pub type ActiveBReferenceInfoLists = (ActiveReferenceInfoList, ActiveReferenceInfoList);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ReferenceId(u64);
+pub struct ReferenceId(pub(crate) u64);
 
 impl ReferenceId {
     #[inline]
@@ -37,6 +37,7 @@ pub struct DpbReference {
     pub picture_order_count: i32,
     pub kind: ReferenceKind,
     pub picture: ReferencePicture,
+    pub motion: Arc<crate::ReferenceMotionField>,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +46,7 @@ pub struct ActiveReferenceInfo {
     pub picture_order_count: i32,
     pub kind: ReferenceKind,
     pub picture: ReferencePicture,
+    pub motion: Arc<crate::ReferenceMotionField>,
 }
 
 /// Reference-picture subset of the decoded picture buffer.
@@ -119,6 +121,16 @@ impl DecodedPictureBuffer {
         self.ensure_frame_num(current_frame_num)?;
         let ordered = self.ordered_p_references(current_frame_num);
         self.active_reference_list(current_frame_num, active_count, modifications, ordered)
+    }
+
+    pub fn p_reference_info_list(
+        &self,
+        current_frame_num: u32,
+        active_count: u8,
+        modifications: &[ReferenceListModification],
+    ) -> Result<ActiveReferenceInfoList> {
+        let list = self.p_list0(current_frame_num, active_count, modifications)?;
+        self.reference_info_for_active_list(list)
     }
 
     /// Builds the default reference lists for a progressive B slice.
@@ -218,6 +230,7 @@ impl DecodedPictureBuffer {
                             picture_order_count: reference.picture_order_count,
                             kind: reference.kind,
                             picture,
+                            motion: reference.motion.clone(),
                         })
                     })
                     .transpose()
@@ -304,6 +317,19 @@ impl DecodedPictureBuffer {
         picture: ReferencePicture,
         long_term_reference: bool,
     ) -> Result<()> {
+        let motion = Arc::new(crate::ReferenceMotionField::all_intra(
+            picture.coded_size(),
+        )?);
+        self.store_idr_with_motion(picture_order_count, picture, motion, long_term_reference)
+    }
+
+    pub fn store_idr_with_motion(
+        &mut self,
+        picture_order_count: i32,
+        picture: ReferencePicture,
+        motion: Arc<crate::ReferenceMotionField>,
+        long_term_reference: bool,
+    ) -> Result<()> {
         let kind = if long_term_reference {
             self.max_long_term_frame_idx = Some(0);
             ReferenceKind::LongTerm { frame_index: 0 }
@@ -320,6 +346,7 @@ impl DecodedPictureBuffer {
             picture_order_count,
             kind,
             picture,
+            motion,
         });
         Ok(())
     }
@@ -331,6 +358,19 @@ impl DecodedPictureBuffer {
         frame_num: u32,
         picture_order_count: i32,
         picture: ReferencePicture,
+    ) -> Result<()> {
+        let motion = Arc::new(crate::ReferenceMotionField::all_intra(
+            picture.coded_size(),
+        )?);
+        self.store_short_term_with_motion(frame_num, picture_order_count, picture, motion)
+    }
+
+    pub fn store_short_term_with_motion(
+        &mut self,
+        frame_num: u32,
+        picture_order_count: i32,
+        picture: ReferencePicture,
+        motion: Arc<crate::ReferenceMotionField>,
     ) -> Result<()> {
         self.ensure_frame_num(frame_num)?;
         self.ensure_can_store(&picture)?;
@@ -363,6 +403,7 @@ impl DecodedPictureBuffer {
             picture_order_count,
             kind: ReferenceKind::ShortTerm,
             picture,
+            motion,
         });
         Ok(())
     }
@@ -374,6 +415,20 @@ impl DecodedPictureBuffer {
         frame_num: u32,
         picture_order_count: i32,
         picture: ReferencePicture,
+        operations: &[MemoryManagementOperation],
+    ) -> Result<()> {
+        let motion = Arc::new(crate::ReferenceMotionField::all_intra(
+            picture.coded_size(),
+        )?);
+        self.store_adaptive_with_motion(frame_num, picture_order_count, picture, motion, operations)
+    }
+
+    pub fn store_adaptive_with_motion(
+        &mut self,
+        frame_num: u32,
+        picture_order_count: i32,
+        picture: ReferencePicture,
+        motion: Arc<crate::ReferenceMotionField>,
         operations: &[MemoryManagementOperation],
     ) -> Result<()> {
         self.ensure_frame_num(frame_num)?;
@@ -473,6 +528,7 @@ impl DecodedPictureBuffer {
             picture_order_count,
             kind: current_kind,
             picture,
+            motion,
         });
         self.references = references;
         self.max_long_term_frame_idx = max_long_term_frame_idx;

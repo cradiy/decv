@@ -9,6 +9,7 @@ use decv_core::{
 };
 
 use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
+use crate::intra_reconstruction::ReconstructionReferenceList;
 use crate::reorder::PictureReorderBuffer;
 use crate::{
     AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, H264Error, IntraPictureReconstructor,
@@ -153,20 +154,32 @@ impl H264Decoder {
                             .dpb
                             .as_ref()
                             .expect("the DPB is initialized with the picture")
-                            .p_list0(
+                            .p_reference_info_list(
                                 parsed.header.frame_num,
                                 parsed.header.num_ref_idx_l0_active,
                                 &parsed.header.ref_pic_list_modifications_l0,
                             )?;
                         let borrowed = references
                             .iter()
-                            .map(|picture| picture.as_deref())
+                            .map(|reference| {
+                                reference
+                                    .as_ref()
+                                    .map(|reference| reference.picture.as_ref())
+                            })
+                            .collect::<Vec<_>>();
+                        let reference_ids = references
+                            .iter()
+                            .map(|reference| reference.as_ref().map(|reference| reference.id))
                             .collect::<Vec<_>>();
                         self.current_picture
                             .as_mut()
                             .expect("the picture is initialized above")
                             .reconstructor
-                            .decode_cavlc_p_slice(rbsp.as_ref(), &parsed, &borrowed)?;
+                            .decode_cavlc_p_slice(
+                                rbsp.as_ref(),
+                                &parsed,
+                                ReconstructionReferenceList::with_ids(&borrowed, &reference_ids),
+                            )?;
                     }
                     SliceType::B => {
                         let current_poc = picture_order_count.stored.picture_order_count();
@@ -174,7 +187,7 @@ impl H264Decoder {
                             .dpb
                             .as_ref()
                             .expect("the DPB is initialized with the picture")
-                            .b_lists(
+                            .b_reference_info_lists(
                                 parsed.header.frame_num,
                                 current_poc,
                                 parsed.header.num_ref_idx_l0_active,
@@ -184,11 +197,27 @@ impl H264Decoder {
                             )?;
                         let borrowed_l0 = references_l0
                             .iter()
-                            .map(|picture| picture.as_deref())
+                            .map(|reference| {
+                                reference
+                                    .as_ref()
+                                    .map(|reference| reference.picture.as_ref())
+                            })
                             .collect::<Vec<_>>();
                         let borrowed_l1 = references_l1
                             .iter()
-                            .map(|picture| picture.as_deref())
+                            .map(|reference| {
+                                reference
+                                    .as_ref()
+                                    .map(|reference| reference.picture.as_ref())
+                            })
+                            .collect::<Vec<_>>();
+                        let reference_ids_l0 = references_l0
+                            .iter()
+                            .map(|reference| reference.as_ref().map(|reference| reference.id))
+                            .collect::<Vec<_>>();
+                        let reference_ids_l1 = references_l1
+                            .iter()
+                            .map(|reference| reference.as_ref().map(|reference| reference.id))
                             .collect::<Vec<_>>();
                         self.current_picture
                             .as_mut()
@@ -197,8 +226,14 @@ impl H264Decoder {
                             .decode_cavlc_b_slice(
                                 rbsp.as_ref(),
                                 &parsed,
-                                &borrowed_l0,
-                                &borrowed_l1,
+                                ReconstructionReferenceList::with_ids(
+                                    &borrowed_l0,
+                                    &reference_ids_l0,
+                                ),
+                                ReconstructionReferenceList::with_ids(
+                                    &borrowed_l1,
+                                    &reference_ids_l1,
+                                ),
                             )?;
                     }
                     SliceType::Sp | SliceType::Si => {
@@ -233,7 +268,9 @@ impl H264Decoder {
             .next_frame_id
             .checked_add(1)
             .ok_or(H264Error::IntegerOverflow)?;
-        let decoded = Arc::new(picture.reconstructor.into_deblocked_picture()?);
+        let (decoded, motion) = picture.reconstructor.into_deblocked_reference_picture()?;
+        let decoded = Arc::new(decoded);
+        let motion = Arc::new(motion);
         let frame = decoded.to_nv12_frame(
             self.next_frame_id,
             picture.pts,
@@ -250,14 +287,23 @@ impl H264Decoder {
                 ReferencePictureMarking::Idr {
                     long_term_reference,
                     ..
-                } => dpb.store_idr(picture_order_count, decoded.clone(), *long_term_reference)?,
-                ReferencePictureMarking::SlidingWindow => {
-                    dpb.store_short_term(picture.frame_num, picture_order_count, decoded.clone())?
-                }
-                ReferencePictureMarking::Adaptive(operations) => dpb.store_adaptive(
+                } => dpb.store_idr_with_motion(
+                    picture_order_count,
+                    decoded.clone(),
+                    motion.clone(),
+                    *long_term_reference,
+                )?,
+                ReferencePictureMarking::SlidingWindow => dpb.store_short_term_with_motion(
                     picture.frame_num,
                     picture_order_count,
                     decoded.clone(),
+                    motion.clone(),
+                )?,
+                ReferencePictureMarking::Adaptive(operations) => dpb.store_adaptive_with_motion(
+                    picture.frame_num,
+                    picture_order_count,
+                    decoded.clone(),
+                    motion.clone(),
                     operations,
                 )?,
                 ReferencePictureMarking::None => {
@@ -682,7 +728,9 @@ mod tests {
     };
 
     use super::{H264Decoder, H264StreamParser, ParserEvent, PictureIdentity};
-    use crate::{AnnexBReader, H264Error, IntraPictureReconstructor, NalHeader, NalUnit};
+    use crate::{
+        AnnexBReader, H264Error, IntraPictureReconstructor, MotionVector, NalHeader, NalUnit,
+    };
 
     #[test]
     fn dispatches_an_annex_b_stream_and_detects_picture_boundaries() {
@@ -855,6 +903,17 @@ mod tests {
             DecodeInputStatus::Accepted
         ));
         decoder.drain().unwrap();
+
+        let references = decoder
+            .dpb
+            .as_ref()
+            .unwrap()
+            .p_reference_info_list(2, 1, &[])
+            .unwrap();
+        let p_reference = references[0].as_ref().unwrap();
+        let p_motion = p_reference.motion.cell(0, 0).unwrap();
+        assert_eq!(p_motion.list0.unwrap().reference_id.unwrap().get(), 1);
+        assert_eq!(p_motion.list0.unwrap().vector, MotionVector::default());
 
         assert!(matches!(
             decoder.receive_frame().unwrap(),
