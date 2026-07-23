@@ -368,14 +368,16 @@ impl BlockGrid {
             .map_or(unavailable_value, |state| state.coded)
     }
 
-    fn record(&mut self, x: usize, y: usize, slice_id: u32, coded: bool) -> Result<()> {
-        if x >= self.width || y >= self.height {
-            return Err(H264Error::InvalidSyntax(
-                "CABAC residual block lies outside the picture",
-            ));
+    #[inline(always)]
+    fn record_known(&mut self, x: usize, y: usize, slice_id: u32, coded: bool) {
+        debug_assert!(x < self.width && y < self.height);
+        let index = y * self.width + x;
+        // SAFETY: all internal callers derive x/y from a validated macroblock
+        // and a normative block identifier. The assertion checks the same
+        // invariant in debug builds.
+        unsafe {
+            *self.entries.get_unchecked_mut(index) = Some(BlockState { slice_id, coded });
         }
-        self.entries[y * self.width + x] = Some(BlockState { slice_id, coded });
-        Ok(())
     }
 }
 
@@ -450,6 +452,19 @@ impl CabacResidualState {
         coded: bool,
     ) -> Result<()> {
         self.validate_block(macroblock_address, block)?;
+        self.record_block_known(macroblock_address, slice_id, block, coded);
+        Ok(())
+    }
+
+    #[inline]
+    fn record_block_known(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        block: CabacResidualBlock,
+        coded: bool,
+    ) {
+        debug_assert!(self.validate_block(macroblock_address, block).is_ok());
         if let CabacResidualBlock::Luma8x8(index) = block {
             let macroblock_x = macroblock_address % self.width_in_macroblocks;
             let macroblock_y = macroblock_address / self.width_in_macroblocks;
@@ -457,13 +472,13 @@ impl CabacResidualState {
             let base_y = macroblock_y * 4 + usize::from(index / 2) * 2;
             for y in base_y..base_y + 2 {
                 for x in base_x..base_x + 2 {
-                    self.luma.record(x, y, slice_id, coded)?;
+                    self.luma.record_known(x, y, slice_id, coded);
                 }
             }
-            return Ok(());
+            return;
         }
-        let (grid, x, y) = self.grid_and_coordinates_mut(macroblock_address, block)?;
-        grid.record(x, y, slice_id, coded)
+        let (grid, x, y) = self.grid_and_coordinates_mut_known(macroblock_address, block);
+        grid.record_known(x, y, slice_id, coded);
     }
 
     pub fn record_pcm_macroblock(
@@ -472,34 +487,34 @@ impl CabacResidualState {
         slice_id: u32,
     ) -> Result<()> {
         self.validate_macroblock(macroblock_address)?;
-        self.record_block(
+        self.record_block_known(
             macroblock_address,
             slice_id,
             CabacResidualBlock::LumaDc,
             true,
-        )?;
+        );
         for block in 0..16 {
-            self.record_block(
+            self.record_block_known(
                 macroblock_address,
                 slice_id,
                 CabacResidualBlock::Luma4x4(block),
                 true,
-            )?;
+            );
         }
         for plane in 0..2 {
-            self.record_block(
+            self.record_block_known(
                 macroblock_address,
                 slice_id,
                 CabacResidualBlock::ChromaDc { plane },
                 true,
-            )?;
+            );
             for block in 0..4 {
-                self.record_block(
+                self.record_block_known(
                     macroblock_address,
                     slice_id,
                     CabacResidualBlock::ChromaAc { plane, block },
                     true,
-                )?;
+                );
             }
         }
         Ok(())
@@ -619,12 +634,12 @@ impl CabacResidualState {
                 CabacResidualBlock::LumaDc,
             )?)
         } else {
-            self.record_block(
+            self.record_block_known(
                 macroblock_address,
                 slice_id,
                 CabacResidualBlock::LumaDc,
                 false,
-            )?;
+            );
             None
         };
         let transform_size_8x8 =
@@ -665,12 +680,12 @@ impl CabacResidualState {
         coded_block_pattern: CodedBlockPattern,
         transform_size_8x8: bool,
     ) -> Result<InterResidual> {
-        self.record_block(
+        self.record_block_known(
             macroblock_address,
             slice_id,
             CabacResidualBlock::LumaDc,
             false,
-        )?;
+        );
         let mut residual = InterResidual {
             luma: [ResidualBlock::empty(16); 16],
             chroma_dc: [ResidualBlock::empty(4); 2],
@@ -714,7 +729,7 @@ impl CabacResidualState {
             for region in 0..4u8 {
                 let block = CabacResidualBlock::Luma8x8(region);
                 if coded_block_pattern_luma & (1 << region) == 0 {
-                    self.record_block(macroblock_address, slice_id, block, false)?;
+                    self.record_block_known(macroblock_address, slice_id, block, false);
                     continue;
                 }
                 let coefficients = self
@@ -739,7 +754,7 @@ impl CabacResidualState {
                 CabacResidualBlock::Luma4x4(block_index)
             };
             if coded_block_pattern_luma & (1 << (block_index / 4)) == 0 {
-                self.record_block(macroblock_address, slice_id, block, false)?;
+                self.record_block_known(macroblock_address, slice_id, block, false);
                 continue;
             }
             luma[usize::from(block_index)] = self.decode_residual_block(
@@ -767,7 +782,7 @@ impl CabacResidualState {
         for plane in 0..2u8 {
             let block = CabacResidualBlock::ChromaDc { plane };
             if coded_block_pattern_chroma == 0 {
-                self.record_block(macroblock_address, slice_id, block, false)?;
+                self.record_block_known(macroblock_address, slice_id, block, false);
             } else {
                 chroma_dc[usize::from(plane)] = self.decode_residual_block(
                     syntax,
@@ -786,7 +801,7 @@ impl CabacResidualState {
                     block: block_index,
                 };
                 if coded_block_pattern_chroma < 2 {
-                    self.record_block(macroblock_address, slice_id, block, false)?;
+                    self.record_block_known(macroblock_address, slice_id, block, false);
                 } else {
                     chroma_ac[usize::from(plane)][usize::from(block_index)] = self
                         .decode_residual_block(
@@ -842,12 +857,12 @@ impl CabacResidualState {
             None => true,
         };
         if !coded {
-            self.record_block(macroblock_address, slice_id, block, false)?;
+            self.record_block_known(macroblock_address, slice_id, block, false);
             return Ok(None);
         }
 
         let coefficients = decode_cabac_coefficient_block(syntax, block.category())?;
-        self.record_block(macroblock_address, slice_id, block, true)?;
+        self.record_block_known(macroblock_address, slice_id, block, true);
         Ok(Some(coefficients))
     }
 
@@ -940,39 +955,44 @@ impl CabacResidualState {
         }
     }
 
-    fn grid_and_coordinates_mut(
+    #[inline]
+    fn grid_and_coordinates_mut_known(
         &mut self,
         macroblock_address: usize,
         block: CabacResidualBlock,
-    ) -> Result<(&mut BlockGrid, usize, usize)> {
-        self.validate_block(macroblock_address, block)?;
+    ) -> (&mut BlockGrid, usize, usize) {
+        debug_assert!(self.validate_block(macroblock_address, block).is_ok());
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
         match block {
-            CabacResidualBlock::LumaDc => Ok((&mut self.luma_dc, macroblock_x, macroblock_y)),
+            CabacResidualBlock::LumaDc => (&mut self.luma_dc, macroblock_x, macroblock_y),
             CabacResidualBlock::LumaAc(index) | CabacResidualBlock::Luma4x4(index) => {
-                let (x, y) = LUMA_BLOCK_COORDINATES[usize::from(index)];
-                Ok((&mut self.luma, macroblock_x * 4 + x, macroblock_y * 4 + y))
+                // SAFETY: internal block identifiers are normative and the
+                // debug assertion above checks the bound.
+                let &(x, y) = unsafe { LUMA_BLOCK_COORDINATES.get_unchecked(usize::from(index)) };
+                (&mut self.luma, macroblock_x * 4 + x, macroblock_y * 4 + y)
             }
             CabacResidualBlock::ChromaDc { plane: 0 } => {
-                Ok((&mut self.chroma_dc_cb, macroblock_x, macroblock_y))
+                (&mut self.chroma_dc_cb, macroblock_x, macroblock_y)
             }
             CabacResidualBlock::ChromaDc { plane: 1 } => {
-                Ok((&mut self.chroma_dc_cr, macroblock_x, macroblock_y))
+                (&mut self.chroma_dc_cr, macroblock_x, macroblock_y)
             }
             CabacResidualBlock::ChromaAc { plane, block } => {
-                let (x, y) = CHROMA_BLOCK_COORDINATES[usize::from(block)];
+                // SAFETY: internal block identifiers are normative and the
+                // debug assertion above checks the bound.
+                let &(x, y) = unsafe { CHROMA_BLOCK_COORDINATES.get_unchecked(usize::from(block)) };
                 let grid = if plane == 0 {
                     &mut self.chroma_cb
                 } else {
                     &mut self.chroma_cr
                 };
-                Ok((grid, macroblock_x * 2 + x, macroblock_y * 2 + y))
+                (grid, macroblock_x * 2 + x, macroblock_y * 2 + y)
             }
             CabacResidualBlock::Luma8x8(index) => {
                 let x = macroblock_x * 4 + usize::from(index % 2) * 2;
                 let y = macroblock_y * 4 + usize::from(index / 2) * 2;
-                Ok((&mut self.luma, x, y))
+                (&mut self.luma, x, y)
             }
             CabacResidualBlock::ChromaDc { .. } => unreachable!("plane validated below"),
         }
