@@ -414,21 +414,17 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
         ));
     }
 
-    let (residual_luma, residual_cb, residual_cr) = assemble_residual(residual);
-    let mut luma = [[0u8; 16]; 16];
-    let mut cb = [[0u8; 8]; 8];
-    let mut cr = [[0u8; 8]; 8];
-    add_prediction_and_residual(
-        luma.as_flattened_mut(),
-        16,
-        0,
-        0,
-        &predicted_luma,
-        &residual_luma,
+    add_inter_residual_to_prediction(
+        &mut predicted_luma,
+        &mut predicted_cb,
+        &mut predicted_cr,
+        residual,
     );
-    add_prediction_and_residual(cb.as_flattened_mut(), 8, 0, 0, &predicted_cb, &residual_cb);
-    add_prediction_and_residual(cr.as_flattened_mut(), 8, 0, 0, &predicted_cr, &residual_cr);
-    Ok(MacroblockPixels::new(luma, cb, cr))
+    Ok(MacroblockPixels::new(
+        predicted_luma,
+        predicted_cb,
+        predicted_cr,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -733,6 +729,154 @@ fn assemble_residual(residual: &ReconstructedInterResidual) -> MacroblockResidua
         );
     }
     (residual_luma, residual_cb, residual_cr)
+}
+
+fn add_inter_residual_to_prediction(
+    luma: &mut [[u8; 16]; 16],
+    cb: &mut [[u8; 8]; 8],
+    cr: &mut [[u8; 8]; 8],
+    residual: &ReconstructedInterResidual,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is part of the x86_64 baseline. All pointers come from
+        // fixed-size prediction and residual matrices, and the helper visits
+        // only complete normative 4x4 or 8x8 block rows.
+        unsafe {
+            add_inter_residual_to_prediction_sse2(luma, cb, cr, residual);
+        }
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        match &residual.luma {
+            ReconstructedLumaResidual::FourByFour(blocks) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
+                    add_residual_block(luma, block_x * 4, block_y * 4, block);
+                }
+            }
+            ReconstructedLumaResidual::EightByEight(blocks) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    add_residual_block(luma, index % 2 * 8, index / 2 * 8, block);
+                }
+            }
+        }
+        for index in 0..4 {
+            add_residual_block(cb, index % 2 * 4, index / 2 * 4, &residual.chroma_cb[index]);
+            add_residual_block(cr, index % 2 * 4, index / 2 * 4, &residual.chroma_cr[index]);
+        }
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn add_residual_block<const OUTPUT: usize, const BLOCK: usize>(
+    prediction: &mut [[u8; OUTPUT]; OUTPUT],
+    x: usize,
+    y: usize,
+    residual: &[[i32; BLOCK]; BLOCK],
+) {
+    for row in 0..BLOCK {
+        for column in 0..BLOCK {
+            prediction[y + row][x + column] = i32::from(prediction[y + row][x + column])
+                .saturating_add(residual[row][column])
+                .clamp(0, 255) as u8;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn add_inter_residual_to_prediction_sse2(
+    luma: &mut [[u8; 16]; 16],
+    cb: &mut [[u8; 8]; 8],
+    cr: &mut [[u8; 8]; 8],
+    residual: &ReconstructedInterResidual,
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_adds_epi16, _mm_loadl_epi64, _mm_loadu_si128, _mm_packs_epi32,
+        _mm_packus_epi16, _mm_setzero_si128, _mm_storel_epi64, _mm_storeu_si128, _mm_unpackhi_epi8,
+        _mm_unpacklo_epi8,
+    };
+
+    const BLOCKS_4X4_BY_ROW: [[usize; 4]; 4] =
+        [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
+
+    let zero = _mm_setzero_si128();
+    match &residual.luma {
+        ReconstructedLumaResidual::FourByFour(blocks) => {
+            for (y, prediction_row) in luma.iter_mut().enumerate() {
+                let block_row = BLOCKS_4X4_BY_ROW[y / 4];
+                let row = y % 4;
+                // SAFETY: Every selected residual row has four i32 values and
+                // every prediction row has sixteen u8 values.
+                unsafe {
+                    let prediction = _mm_loadu_si128(prediction_row.as_ptr().cast::<__m128i>());
+                    let residual_low = _mm_packs_epi32(
+                        _mm_loadu_si128(blocks[block_row[0]][row].as_ptr().cast::<__m128i>()),
+                        _mm_loadu_si128(blocks[block_row[1]][row].as_ptr().cast::<__m128i>()),
+                    );
+                    let residual_high = _mm_packs_epi32(
+                        _mm_loadu_si128(blocks[block_row[2]][row].as_ptr().cast::<__m128i>()),
+                        _mm_loadu_si128(blocks[block_row[3]][row].as_ptr().cast::<__m128i>()),
+                    );
+                    let low = _mm_adds_epi16(_mm_unpacklo_epi8(prediction, zero), residual_low);
+                    let high = _mm_adds_epi16(_mm_unpackhi_epi8(prediction, zero), residual_high);
+                    _mm_storeu_si128(
+                        prediction_row.as_mut_ptr().cast::<__m128i>(),
+                        _mm_packus_epi16(low, high),
+                    );
+                }
+            }
+        }
+        ReconstructedLumaResidual::EightByEight(blocks) => {
+            for (y, prediction_row) in luma.iter_mut().enumerate() {
+                let first = (y / 8) * 2;
+                let row = y % 8;
+                // SAFETY: Each residual row has eight i32 values and each
+                // prediction row has sixteen u8 values.
+                unsafe {
+                    let prediction = _mm_loadu_si128(prediction_row.as_ptr().cast::<__m128i>());
+                    let residual_low = _mm_packs_epi32(
+                        _mm_loadu_si128(blocks[first][row].as_ptr().cast::<__m128i>()),
+                        _mm_loadu_si128(blocks[first][row].as_ptr().add(4).cast::<__m128i>()),
+                    );
+                    let residual_high = _mm_packs_epi32(
+                        _mm_loadu_si128(blocks[first + 1][row].as_ptr().cast::<__m128i>()),
+                        _mm_loadu_si128(blocks[first + 1][row].as_ptr().add(4).cast::<__m128i>()),
+                    );
+                    let low = _mm_adds_epi16(_mm_unpacklo_epi8(prediction, zero), residual_low);
+                    let high = _mm_adds_epi16(_mm_unpackhi_epi8(prediction, zero), residual_high);
+                    _mm_storeu_si128(
+                        prediction_row.as_mut_ptr().cast::<__m128i>(),
+                        _mm_packus_epi16(low, high),
+                    );
+                }
+            }
+        }
+    }
+
+    for (prediction, blocks) in [(cb, &residual.chroma_cb), (cr, &residual.chroma_cr)] {
+        for (y, prediction_row) in prediction.iter_mut().enumerate() {
+            let first = (y / 4) * 2;
+            let row = y % 4;
+            // SAFETY: Each selected residual row has four i32 values and each
+            // prediction row has eight u8 values.
+            unsafe {
+                let packed_prediction = _mm_loadl_epi64(prediction_row.as_ptr().cast::<__m128i>());
+                let packed_residual = _mm_packs_epi32(
+                    _mm_loadu_si128(blocks[first][row].as_ptr().cast::<__m128i>()),
+                    _mm_loadu_si128(blocks[first + 1][row].as_ptr().cast::<__m128i>()),
+                );
+                let sum =
+                    _mm_adds_epi16(_mm_unpacklo_epi8(packed_prediction, zero), packed_residual);
+                _mm_storel_epi64(
+                    prediction_row.as_mut_ptr().cast::<__m128i>(),
+                    _mm_packus_epi16(sum, zero),
+                );
+            }
+        }
+    }
 }
 
 fn apply_prediction_weights(
@@ -1347,6 +1491,114 @@ mod tests {
             luma: ReconstructedLumaResidual::FourByFour(Box::new([[[0; 4]; 4]; 16])),
             chroma_cb: [[[0; 4]; 4]; 4],
             chroma_cr: [[[0; 4]; 4]; 4],
+        }
+    }
+
+    #[test]
+    fn direct_inter_residual_fusion_matches_assembled_oracle() {
+        const VALUES: [i32; 12] = [
+            i32::MIN,
+            -40_000,
+            -256,
+            -1,
+            0,
+            1,
+            127,
+            255,
+            256,
+            40_000,
+            i32::MAX,
+            17,
+        ];
+        let chroma = |seed: usize| {
+            std::array::from_fn(|block| {
+                std::array::from_fn(|row| {
+                    std::array::from_fn(|column| {
+                        VALUES[(seed + block * 7 + row * 3 + column) % VALUES.len()]
+                    })
+                })
+            })
+        };
+        let residuals = [
+            ReconstructedInterResidual {
+                luma: ReconstructedLumaResidual::FourByFour(Box::new(std::array::from_fn(
+                    |block| {
+                        std::array::from_fn(|row| {
+                            std::array::from_fn(|column| {
+                                VALUES[(block * 5 + row * 3 + column) % VALUES.len()]
+                            })
+                        })
+                    },
+                ))),
+                chroma_cb: chroma(1),
+                chroma_cr: chroma(5),
+            },
+            ReconstructedInterResidual {
+                luma: ReconstructedLumaResidual::EightByEight(Box::new(std::array::from_fn(
+                    |block| {
+                        std::array::from_fn(|row| {
+                            std::array::from_fn(|column| {
+                                VALUES[(block * 11 + row * 5 + column) % VALUES.len()]
+                            })
+                        })
+                    },
+                ))),
+                chroma_cb: chroma(2),
+                chroma_cr: chroma(7),
+            },
+        ];
+
+        for residual in &residuals {
+            let prediction_luma = std::array::from_fn(|row| {
+                std::array::from_fn(|column| ((row * 31 + column * 17) & 255) as u8)
+            });
+            let prediction_cb = std::array::from_fn(|row| {
+                std::array::from_fn(|column| ((row * 47 + column * 13) & 255) as u8)
+            });
+            let prediction_cr = std::array::from_fn(|row| {
+                std::array::from_fn(|column| ((row * 19 + column * 43) & 255) as u8)
+            });
+            let (residual_luma, residual_cb, residual_cr) = assemble_residual(residual);
+            let mut expected_luma = [[0; 16]; 16];
+            let mut expected_cb = [[0; 8]; 8];
+            let mut expected_cr = [[0; 8]; 8];
+            add_prediction_and_residual(
+                expected_luma.as_flattened_mut(),
+                16,
+                0,
+                0,
+                &prediction_luma,
+                &residual_luma,
+            );
+            add_prediction_and_residual(
+                expected_cb.as_flattened_mut(),
+                8,
+                0,
+                0,
+                &prediction_cb,
+                &residual_cb,
+            );
+            add_prediction_and_residual(
+                expected_cr.as_flattened_mut(),
+                8,
+                0,
+                0,
+                &prediction_cr,
+                &residual_cr,
+            );
+
+            let mut actual_luma = prediction_luma;
+            let mut actual_cb = prediction_cb;
+            let mut actual_cr = prediction_cr;
+            add_inter_residual_to_prediction(
+                &mut actual_luma,
+                &mut actual_cb,
+                &mut actual_cr,
+                residual,
+            );
+            assert_eq!(actual_luma, expected_luma);
+            assert_eq!(actual_cb, expected_cb);
+            assert_eq!(actual_cr, expected_cr);
         }
     }
 
