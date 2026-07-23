@@ -652,6 +652,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - transactional CAVLC I_4x4, I_8x8, I_16x16, and I_PCM macroblocks;
 - transactional frame-coded CAVLC P macroblock headers, including skip runs,
   reference indices, all P partition shapes, and motion-vector differences;
+- slice-aware frame-coded P motion-vector prediction at 4x4 granularity,
+  including A/B/C/D lookup, C-to-D fallback, directional 16x8/8x16 rules,
+  median prediction, P_Skip inference, and transactional state updates;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
@@ -697,7 +700,7 @@ still rejects or has not yet connected:
 The next dependency chain is:
 
 ```text
-inter macroblock syntax and motion vectors
+inter residual decoding and reference-picture storage
     -> fractional-sample motion compensation
     -> DPB reference marking and POC-based output
     -> CABAC

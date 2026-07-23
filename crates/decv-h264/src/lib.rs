@@ -14,6 +14,7 @@ mod error;
 mod intra_modes;
 mod intra_reconstruction;
 mod macroblock;
+mod motion;
 mod nal;
 mod parameter_sets;
 mod picture;
@@ -43,6 +44,7 @@ pub use macroblock::{
     PSubMacroblockType, PcmMacroblock, parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run,
     parse_cavlc_p_macroblock,
 };
+pub use motion::{MotionVector, PMotionState, ResolvedPMacroblock, ResolvedPPartition};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
 pub use picture::{FieldOrderCount, PictureOrderCount, PictureOrderCountState};
