@@ -6,10 +6,16 @@ use std::{
 };
 
 use decv_core::{
-    BitstreamFormat, DecodeInputStatus, DecodeOutput, EncodedVideoPacket, FrameStorage,
-    PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
+    BitstreamFormat, DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket,
+    FrameStorage, PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
 };
-use decv_h264::H264Decoder;
+use decv_h264::{AnnexBReader, H264Decoder};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PullState {
+    NeedInput,
+    EndOfStream,
+}
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
@@ -28,15 +34,50 @@ fn main() -> Result<(), Box<dyn Error>> {
         bitstream_format: BitstreamFormat::ByteStream,
         codec_data: None,
     })?;
-    match decoder.send_packet(EncodedVideoPacket::new(data))? {
-        DecodeInputStatus::Accepted => {}
-        DecodeInputStatus::NeedOutput(_) => {
-            return Err("decoder unexpectedly required output before its first packet".into());
+    let mut frame_count = 0u64;
+    for unit in AnnexBReader::new(&data) {
+        let unit = unit?;
+        let mut framed = Vec::with_capacity(4 + unit.bytes().len());
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        framed.extend_from_slice(unit.bytes());
+        let mut packet = EncodedVideoPacket::new(framed);
+        loop {
+            match decoder.send_packet(packet)? {
+                DecodeInputStatus::Accepted => break,
+                DecodeInputStatus::NeedOutput(unconsumed) => {
+                    packet = unconsumed;
+                    if receive_available(&mut decoder, &mut raw_output, &mut frame_count)?
+                        == PullState::EndOfStream
+                    {
+                        return Err("decoder ended before all input was accepted".into());
+                    }
+                }
+            }
+        }
+        if receive_available(&mut decoder, &mut raw_output, &mut frame_count)?
+            == PullState::EndOfStream
+        {
+            return Err("decoder ended before drain".into());
         }
     }
     decoder.drain()?;
+    if receive_available(&mut decoder, &mut raw_output, &mut frame_count)? != PullState::EndOfStream
+    {
+        return Err("decoder requested input after drain".into());
+    }
 
-    let mut frame_count = 0u64;
+    if let Some(output_path) = output_path {
+        println!("wrote raw visible NV12 frames to {output_path}");
+    }
+    println!("decoded {frame_count} frame(s) from {path}");
+    Ok(())
+}
+
+fn receive_available(
+    decoder: &mut H264Decoder,
+    raw_output: &mut Option<File>,
+    frame_count: &mut u64,
+) -> Result<PullState, Box<dyn Error>> {
     loop {
         match decoder.receive_frame()? {
             DecodeOutput::FormatChanged(format) => {
@@ -46,51 +87,51 @@ fn main() -> Result<(), Box<dyn Error>> {
                 );
             }
             DecodeOutput::Frame(frame) => {
-                frame.validate()?;
-                frame_count += 1;
-                let bytes = match &frame.storage {
-                    FrameStorage::Cpu(cpu) => {
-                        let mut visible_bytes = 0usize;
-                        for (plane_index, plane) in cpu.planes.iter().enumerate() {
-                            let (first_row, byte_offset, row_bytes, rows) = visible_plane_layout(
-                                frame.format.pixel_format,
-                                frame.format.visible_rect,
-                                plane_index,
-                            )
-                            .ok_or("unsupported CPU plane layout")?;
-                            visible_bytes = visible_bytes
-                                .checked_add(
-                                    row_bytes
-                                        .checked_mul(rows)
-                                        .ok_or("frame byte count overflow")?,
-                                )
-                                .ok_or("frame byte count overflow")?;
-                            if let Some(output) = raw_output.as_mut() {
-                                for row in 0..rows {
-                                    let start = plane.offset
-                                        + (first_row + row) * plane.stride
-                                        + byte_offset;
-                                    output.write_all(&plane.bytes[start..start + row_bytes])?;
-                                }
-                            }
-                        }
-                        visible_bytes
-                    }
-                    _ => 0,
-                };
+                let bytes = write_visible_frame(&frame, raw_output)?;
+                *frame_count = frame_count
+                    .checked_add(1)
+                    .ok_or("decoded frame count overflow")?;
                 println!("frame id={} bytes={bytes}", frame.id);
             }
-            DecodeOutput::EndOfStream => break,
-            DecodeOutput::NeedInput => {
-                return Err("decoder requested input after drain".into());
-            }
+            DecodeOutput::EndOfStream => return Ok(PullState::EndOfStream),
+            DecodeOutput::NeedInput => return Ok(PullState::NeedInput),
         }
     }
-    if let Some(output_path) = output_path {
-        println!("wrote raw NV12 frames to {output_path}");
+}
+
+fn write_visible_frame(
+    frame: &DecodedVideoFrame,
+    raw_output: &mut Option<File>,
+) -> Result<usize, Box<dyn Error>> {
+    frame.validate()?;
+    match &frame.storage {
+        FrameStorage::Cpu(cpu) => {
+            let mut visible_bytes = 0usize;
+            for (plane_index, plane) in cpu.planes.iter().enumerate() {
+                let (first_row, byte_offset, row_bytes, rows) = visible_plane_layout(
+                    frame.format.pixel_format,
+                    frame.format.visible_rect,
+                    plane_index,
+                )
+                .ok_or("unsupported CPU plane layout")?;
+                visible_bytes = visible_bytes
+                    .checked_add(
+                        row_bytes
+                            .checked_mul(rows)
+                            .ok_or("frame byte count overflow")?,
+                    )
+                    .ok_or("frame byte count overflow")?;
+                if let Some(output) = raw_output.as_mut() {
+                    for row in 0..rows {
+                        let start = plane.offset + (first_row + row) * plane.stride + byte_offset;
+                        output.write_all(&plane.bytes[start..start + row_bytes])?;
+                    }
+                }
+            }
+            Ok(visible_bytes)
+        }
+        _ => Ok(0),
     }
-    println!("decoded {frame_count} frame(s) from {path}");
-    Ok(())
 }
 
 fn visible_plane_layout(
