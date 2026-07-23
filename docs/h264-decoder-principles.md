@@ -666,9 +666,10 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - a progressive CAVLC P-slice driver joining skip runs, QP state, CAVLC
   neighbours, motion state, embedded Intra, List-0 prediction, transforms, and
   picture writes;
-- transactional default-weight P macroblock pixel reconstruction with
-  per-partition List-0 reference selection, complete coverage validation, and
-  saturating prediction-plus-residual writes;
+- transactional default and explicit-weight P macroblock pixel reconstruction
+  with per-reference luma/Cb/Cr weights, normative rounding and clipping,
+  per-partition List-0 selection, complete coverage validation, and saturating
+  prediction-plus-residual writes;
 - an `Arc`-backed progressive reference-picture DPB subset with IDR reset,
   default P List-0 PicNum ordering, frame-number wrap handling, long-term IDR
   index zero, and sliding-window short-term eviction;
@@ -724,15 +725,13 @@ still rejects or has not yet connected:
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;
-- weighted prediction;
 - POC-based display reordering;
 - length-prefixed input and out-of-band `avcC` configuration.
 
 The next dependency chain is:
 
 ```text
-weighted P prediction
-    -> B slices and List 1
+B slices and List 1
     -> POC-based output reordering
     -> CABAC slice data
 ```

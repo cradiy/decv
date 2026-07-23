@@ -4,19 +4,23 @@ use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 
 use crate::deblock::{DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
-use crate::inter_reconstruction::reconstruct_p_skip_macroblock_from_list_420;
+use crate::inter_reconstruction::{
+    reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_p_macroblock_from_list_420,
+    reconstruct_weighted_p_skip_macroblock_from_list_420,
+};
 use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedIntraMacroblock,
     DecodedPSliceMacroblock, EntropyCodingMode, H264Error, InterResidual, IntraLumaPrediction,
     IntraMacroblock, IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax,
     IntraReferenceAvailability, MacroblockQuantizer, MacroblockQuantizerState, PMacroblockContext,
-    PMotionState, ParsedSliceHeader, ReconstructedIntraResidual, ReconstructedLumaResidual,
-    ResolvedPMacroblock, ResolvedScalingLists4x4, ResolvedScalingLists8x8, Result, ScanMode,
-    SliceType, Yuv420Picture, consume_rbsp_trailing_bits, derive_chroma_qp,
-    parse_cavlc_mb_skip_run, predict_intra_4x4, predict_intra_8x8, predict_intra_16x16,
-    predict_intra_chroma_420, reconstruct_inter_residual, reconstruct_intra_residual,
-    reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
+    PMotionState, ParsedSliceHeader, PredictionWeightTable, ReconstructedIntraResidual,
+    ReconstructedLumaResidual, ResolvedPMacroblock, ResolvedScalingLists4x4,
+    ResolvedScalingLists8x8, Result, ScanMode, SliceType, Yuv420Picture,
+    consume_rbsp_trailing_bits, derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4,
+    predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420, reconstruct_inter_residual,
+    reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4,
+    resolve_scaling_lists_8x8,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -191,8 +195,8 @@ impl IntraPictureReconstructor {
         self.decode_cavlc_intra_slice_data(rbsp, config)
     }
 
-    /// Decodes one progressive, unweighted CAVLC P slice against an already
-    /// constructed active List 0.
+    /// Decodes one progressive CAVLC P slice against an already constructed
+    /// active List 0.
     pub fn decode_cavlc_p_slice(
         &mut self,
         rbsp: &[u8],
@@ -206,9 +210,6 @@ impl IntraPictureReconstructor {
             return Err(H264Error::InvalidSyntax(
                 "P slice reconstruction requires a P slice header",
             ));
-        }
-        if pps.weighted_prediction {
-            return Err(H264Error::UnsupportedFeature("weighted P-slice prediction"));
         }
         if pps.entropy_coding_mode != EntropyCodingMode::Cavlc
             || pps.num_slice_groups != 1
@@ -237,7 +238,13 @@ impl IntraPictureReconstructor {
             transform_bypass_enabled: sps.qpprime_y_zero_transform_bypass,
             deblocking_filter: header.deblocking_filter.unwrap_or_default(),
         };
-        self.decode_cavlc_p_slice_data(rbsp, config, header.num_ref_idx_l0_active, references_l0)
+        self.decode_cavlc_p_slice_data(
+            rbsp,
+            config,
+            header.num_ref_idx_l0_active,
+            references_l0,
+            header.prediction_weights.as_ref(),
+        )
     }
 
     fn decode_cavlc_intra_slice_data(
@@ -319,6 +326,7 @@ impl IntraPictureReconstructor {
         config: IntraSliceConfig,
         num_ref_idx_l0_active: u8,
         references_l0: &[Option<&Yuv420Picture>],
+        prediction_weights: Option<&PredictionWeightTable>,
     ) -> Result<usize> {
         let mut reader = BitReader::new(rbsp);
         if !reader.skip_bits(config.header_bit_size) {
@@ -362,14 +370,26 @@ impl IntraPictureReconstructor {
                 let motion = self
                     .motion
                     .resolve_skip_macroblock(macroblock_address, slice_id)?;
-                let result = reconstruct_p_skip_macroblock_from_list_420(
-                    &mut self.picture,
-                    references_l0,
-                    macroblock_x,
-                    macroblock_y,
-                    &motion,
-                )
-                .and_then(|()| self.modes.record_inter(macroblock_address, slice_id));
+                let reconstruction = if let Some(weights) = prediction_weights {
+                    reconstruct_weighted_p_skip_macroblock_from_list_420(
+                        &mut self.picture,
+                        references_l0,
+                        macroblock_x,
+                        macroblock_y,
+                        &motion,
+                        weights,
+                    )
+                } else {
+                    reconstruct_p_skip_macroblock_from_list_420(
+                        &mut self.picture,
+                        references_l0,
+                        macroblock_x,
+                        macroblock_y,
+                        &motion,
+                    )
+                };
+                let result = reconstruction
+                    .and_then(|()| self.modes.record_inter(macroblock_address, slice_id));
                 if let Err(error) = result {
                     self.motion.clear_macroblock(macroblock_address)?;
                     self.cavlc.restore_macroblock(
@@ -433,15 +453,28 @@ impl IntraPictureReconstructor {
                         slice_id,
                         header,
                     )?;
-                    if let Err(error) = reconstruct_p_macroblock_from_list_420(
-                        &mut self.picture,
-                        references_l0,
-                        macroblock_x,
-                        macroblock_y,
-                        &motion,
-                        &reconstructed,
-                    )
-                    .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
+                    let reconstruction = if let Some(weights) = prediction_weights {
+                        reconstruct_weighted_p_macroblock_from_list_420(
+                            &mut self.picture,
+                            references_l0,
+                            macroblock_x,
+                            macroblock_y,
+                            &motion,
+                            &reconstructed,
+                            weights,
+                        )
+                    } else {
+                        reconstruct_p_macroblock_from_list_420(
+                            &mut self.picture,
+                            references_l0,
+                            macroblock_x,
+                            macroblock_y,
+                            &motion,
+                            &reconstructed,
+                        )
+                    };
+                    if let Err(error) = reconstruction
+                        .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
                     {
                         self.motion.clear_macroblock(macroblock_address)?;
                         return Err(error);
@@ -1348,6 +1381,7 @@ mod tests {
                 p_slice_config(),
                 1,
                 &references,
+                None,
             ),
             Ok(1)
         );
@@ -1369,6 +1403,7 @@ mod tests {
                 p_slice_config(),
                 1,
                 &references,
+                None,
             ),
             Ok(1)
         );

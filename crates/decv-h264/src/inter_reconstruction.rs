@@ -1,8 +1,8 @@
 //! P-macroblock assembly from reference prediction and spatial residuals.
 
 use crate::{
-    H264Error, ReconstructedInterResidual, ReconstructedLumaResidual, ResolvedPMacroblock, Result,
-    Yuv420Picture,
+    H264Error, InterPrediction420, PredictionWeightTable, ReconstructedInterResidual,
+    ReconstructedLumaResidual, ResolvedPMacroblock, Result, WeightOffset, Yuv420Picture,
 };
 
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
@@ -65,6 +65,27 @@ pub fn reconstruct_p_macroblock_from_list_420(
         macroblock_y,
         motion,
         Some(residual),
+        None,
+    )
+}
+
+pub fn reconstruct_weighted_p_macroblock_from_list_420(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedPMacroblock,
+    residual: &ReconstructedInterResidual,
+    weights: &PredictionWeightTable,
+) -> Result<()> {
+    reconstruct_p_macroblock_from_list_inner(
+        current,
+        references_l0,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        Some(residual),
+        Some(weights),
     )
 }
 
@@ -82,6 +103,26 @@ pub(crate) fn reconstruct_p_skip_macroblock_from_list_420(
         macroblock_y,
         motion,
         None,
+        None,
+    )
+}
+
+pub(crate) fn reconstruct_weighted_p_skip_macroblock_from_list_420(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedPMacroblock,
+    weights: &PredictionWeightTable,
+) -> Result<()> {
+    reconstruct_p_macroblock_from_list_inner(
+        current,
+        references_l0,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        None,
+        Some(weights),
     )
 }
 
@@ -92,6 +133,7 @@ fn reconstruct_p_macroblock_from_list_inner(
     macroblock_y: usize,
     motion: &ResolvedPMacroblock,
     residual: Option<&ReconstructedInterResidual>,
+    weights: Option<&PredictionWeightTable>,
 ) -> Result<()> {
     let luma_x = macroblock_x
         .checked_mul(16)
@@ -125,7 +167,10 @@ fn reconstruct_p_macroblock_from_list_inner(
                 "P reference picture coded size does not match",
             ));
         }
-        let prediction = reference.predict_inter_420(macroblock_x, macroblock_y, *partition)?;
+        let mut prediction = reference.predict_inter_420(macroblock_x, macroblock_y, *partition)?;
+        if let Some(weights) = weights {
+            apply_prediction_weights(&mut prediction, partition.reference_index, weights)?;
+        }
         for y in 0..usize::from(partition.height) {
             let destination = &mut predicted_luma[usize::from(partition.y) + y]
                 [usize::from(partition.x)..usize::from(partition.x + partition.width)];
@@ -210,6 +255,69 @@ fn reconstruct_p_macroblock_from_list_inner(
         &residual_cr,
     );
     Ok(())
+}
+
+fn apply_prediction_weights(
+    prediction: &mut InterPrediction420,
+    reference_index: u8,
+    table: &PredictionWeightTable,
+) -> Result<()> {
+    let weights = table
+        .list0
+        .get(usize::from(reference_index))
+        .ok_or(H264Error::InvalidSyntax(
+            "weighted P partition reference index exceeds pred_weight_table",
+        ))?;
+    let luma_default = 1i32 << table.luma_log2_weight_denom;
+    let luma = weights.luma.unwrap_or(WeightOffset {
+        weight: luma_default,
+        offset: 0,
+    });
+    for row in prediction
+        .luma
+        .iter_mut()
+        .take(usize::from(prediction.height))
+    {
+        for sample in row.iter_mut().take(usize::from(prediction.width)) {
+            *sample = weighted_sample(*sample, luma, table.luma_log2_weight_denom);
+        }
+    }
+
+    let chroma_default = 1i32 << table.chroma_log2_weight_denom;
+    let chroma = weights.chroma.unwrap_or([
+        WeightOffset {
+            weight: chroma_default,
+            offset: 0,
+        },
+        WeightOffset {
+            weight: chroma_default,
+            offset: 0,
+        },
+    ]);
+    let chroma_height = usize::from(prediction.height / 2);
+    let chroma_width = usize::from(prediction.width / 2);
+    for row in prediction.cb.iter_mut().take(chroma_height) {
+        for sample in row.iter_mut().take(chroma_width) {
+            *sample = weighted_sample(*sample, chroma[0], table.chroma_log2_weight_denom);
+        }
+    }
+    for row in prediction.cr.iter_mut().take(chroma_height) {
+        for sample in row.iter_mut().take(chroma_width) {
+            *sample = weighted_sample(*sample, chroma[1], table.chroma_log2_weight_denom);
+        }
+    }
+    Ok(())
+}
+
+#[inline]
+fn weighted_sample(sample: u8, weight: WeightOffset, denominator: u8) -> u8 {
+    let rounding = if denominator == 0 {
+        0
+    } else {
+        1 << (denominator - 1)
+    };
+    (((weight.weight * i32::from(sample) + rounding) >> denominator) + weight.offset).clamp(0, 255)
+        as u8
 }
 
 fn copy_residual_block<const OUTPUT: usize, const BLOCK: usize>(
@@ -325,6 +433,71 @@ mod tests {
         .unwrap();
         let (luma, cb, _) = current.planes();
         assert_eq!((luma[0], luma[8], cb[0], cb[4]), (20, 80, 21, 81));
+    }
+
+    #[test]
+    fn applies_explicit_and_default_p_prediction_weights() {
+        let reference = picture(40);
+        let mut current = picture(0);
+        reconstruct_weighted_p_macroblock_from_list_420(
+            &mut current,
+            &[Some(&reference)],
+            0,
+            0,
+            &ResolvedPMacroblock {
+                skipped: false,
+                partitions: vec![partition(0, 0, 16, 16, 0)],
+            },
+            &zero_residual(),
+            &PredictionWeightTable {
+                luma_log2_weight_denom: 1,
+                chroma_log2_weight_denom: 1,
+                list0: vec![crate::PredictionWeight {
+                    luma: Some(WeightOffset {
+                        weight: 3,
+                        offset: -5,
+                    }),
+                    chroma: Some([
+                        WeightOffset {
+                            weight: 2,
+                            offset: -10,
+                        },
+                        WeightOffset {
+                            weight: 1,
+                            offset: 20,
+                        },
+                    ]),
+                }],
+                list1: Vec::new(),
+            },
+        )
+        .unwrap();
+        let (luma, cb, cr) = current.planes();
+        assert_eq!((luma[0], cb[0], cr[0]), (55, 31, 41));
+
+        let mut defaulted = picture(0);
+        reconstruct_weighted_p_macroblock_from_list_420(
+            &mut defaulted,
+            &[Some(&reference)],
+            0,
+            0,
+            &ResolvedPMacroblock {
+                skipped: false,
+                partitions: vec![partition(0, 0, 16, 16, 0)],
+            },
+            &zero_residual(),
+            &PredictionWeightTable {
+                luma_log2_weight_denom: 7,
+                chroma_log2_weight_denom: 7,
+                list0: vec![crate::PredictionWeight {
+                    luma: None,
+                    chroma: None,
+                }],
+                list1: Vec::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(defaulted, reference);
     }
 
     #[test]

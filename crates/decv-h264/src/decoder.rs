@@ -747,6 +747,51 @@ mod tests {
     }
 
     #[test]
+    fn decodes_explicitly_weighted_reference_p_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_weighted_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_weighted_p_skip_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(_)
+        ));
+        let frame = match decoder.receive_frame().unwrap() {
+            DecodeOutput::Frame(frame) => frame,
+            output => panic!("expected weighted P frame, got {output:?}"),
+        };
+        let FrameStorage::Cpu(cpu) = frame.storage else {
+            panic!("expected CPU frame");
+        };
+        assert!(
+            cpu.planes[0].bytes[..256]
+                .iter()
+                .all(|&sample| sample == 187)
+        );
+        assert!(
+            cpu.planes[1].bytes[256..]
+                .chunks_exact(2)
+                .all(|samples| samples == [118, 84])
+        );
+    }
+
+    #[test]
     fn returns_unconsumed_packets_while_output_is_pending() {
         let stream = annex_b_stream(&[
             (0x67, single_macroblock_sps_rbsp()),
@@ -1224,6 +1269,26 @@ mod tests {
         writer.finish_rbsp()
     }
 
+    fn single_macroblock_weighted_pps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_ue(0); // seq_parameter_set_id
+        writer.write_flag(false); // entropy_coding_mode_flag: CAVLC
+        writer.write_flag(false); // bottom_field_pic_order_in_frame_present_flag
+        writer.write_ue(0); // num_slice_groups_minus1
+        writer.write_ue(0); // num_ref_idx_l0_default_active_minus1
+        writer.write_ue(0); // num_ref_idx_l1_default_active_minus1
+        writer.write_flag(true); // weighted_pred_flag
+        writer.write_bits(0, 2); // weighted_bipred_idc
+        writer.write_se(0); // pic_init_qp_minus26
+        writer.write_se(0); // pic_init_qs_minus26
+        writer.write_se(0); // chroma_qp_index_offset
+        writer.write_flag(false); // deblocking_filter_control_present_flag
+        writer.write_flag(false); // constrained_intra_pred_flag
+        writer.write_flag(false); // redundant_pic_cnt_present_flag
+        writer.finish_rbsp()
+    }
+
     fn single_macroblock_idr_rbsp() -> Vec<u8> {
         let mut writer = BitWriter::default();
         writer.write_ue(0); // first_mb_in_slice
@@ -1254,6 +1319,31 @@ mod tests {
         writer.write_bits(2, 4); // pic_order_cnt_lsb
         writer.write_flag(false); // num_ref_idx_active_override_flag
         writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // adaptive_ref_pic_marking_mode_flag
+        writer.write_se(0); // slice_qp_delta
+        writer.write_ue(1); // mb_skip_run
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_weighted_p_skip_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(0); // P slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num
+        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_ue(1); // luma_log2_weight_denom
+        writer.write_ue(1); // chroma_log2_weight_denom
+        writer.write_flag(true); // luma_weight_l0_flag
+        writer.write_se(3); // luma_weight_l0
+        writer.write_se(-5); // luma_offset_l0
+        writer.write_flag(true); // chroma_weight_l0_flag
+        writer.write_se(2); // chroma_weight_l0[Cb]
+        writer.write_se(-10); // chroma_offset_l0[Cb]
+        writer.write_se(1); // chroma_weight_l0[Cr]
+        writer.write_se(20); // chroma_offset_l0[Cr]
         writer.write_flag(false); // adaptive_ref_pic_marking_mode_flag
         writer.write_se(0); // slice_qp_delta
         writer.write_ue(1); // mb_skip_run

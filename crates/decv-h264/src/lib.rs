@@ -41,6 +41,7 @@ pub use error::{H264Error, Result};
 pub use inter_prediction::InterPrediction420;
 pub use inter_reconstruction::{
     reconstruct_p_macroblock_420, reconstruct_p_macroblock_from_list_420,
+    reconstruct_weighted_p_macroblock_from_list_420,
 };
 pub use intra_modes::IntraModeState;
 pub use intra_reconstruction::IntraPictureReconstructor;
