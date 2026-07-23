@@ -1,6 +1,6 @@
 use std::{num::NonZeroU32, sync::Arc};
 
-use decv_core::MediaTime;
+use decv_core::{BitstreamFormat, MediaTime, VideoCodec, VideoDecoderConfig};
 
 use crate::{
     BoxHeader, FourCc, Mp4Error, Mp4File, Result,
@@ -231,6 +231,33 @@ impl Track {
         &self.edits
     }
 
+    pub fn decoder_config(&self, description_index: usize) -> Result<VideoDecoderConfig> {
+        let description =
+            self.sample_descriptions
+                .get(description_index)
+                .ok_or(Mp4Error::IndexOutOfRange {
+                    kind: "sample-description",
+                    index: description_index,
+                })?;
+        match description {
+            SampleDescription::Avc(entry) => entry.decoder_config(),
+            SampleDescription::Unsupported { .. } => Err(Mp4Error::UnsupportedFeature(
+                "sample description has no supported video decoder",
+            )),
+        }
+    }
+
+    pub fn decoder_config_for_sample(&self, sample_index: usize) -> Result<VideoDecoderConfig> {
+        let sample = self
+            .samples
+            .get(sample_index)
+            .ok_or(Mp4Error::IndexOutOfRange {
+                kind: "sample",
+                index: sample_index,
+            })?;
+        self.decoder_config(sample.description_index())
+    }
+
     /// Offset that maps raw sample-table times onto the movie presentation
     /// timeline. Complex edit lists return an explicit unsupported-data error.
     pub fn presentation_time_offset(&self) -> Result<MediaTime> {
@@ -288,6 +315,27 @@ impl AvcSampleEntry {
     #[inline]
     pub fn codec_configuration(&self) -> &Arc<[u8]> {
         &self.codec_configuration
+    }
+
+    pub fn decoder_config(&self) -> Result<VideoDecoderConfig> {
+        let data = self.codec_configuration.as_ref();
+        if data.len() < 6 || data[0] != 1 {
+            return Err(Mp4Error::InvalidData(
+                "invalid AVCDecoderConfigurationRecord header",
+            ));
+        }
+        if data[4] & 0xfc != 0xfc || data[5] & 0xe0 != 0xe0 {
+            return Err(Mp4Error::InvalidData(
+                "avcC reserved bits do not have their required values",
+            ));
+        }
+        Ok(VideoDecoderConfig {
+            codec: VideoCodec::H264,
+            bitstream_format: BitstreamFormat::LengthPrefixed {
+                length_size: (data[4] & 3) + 1,
+            },
+            codec_data: Some(Arc::clone(&self.codec_configuration)),
+        })
     }
 }
 
@@ -543,7 +591,12 @@ mod tests {
         hdlr.extend_from_slice(&[0; 12]);
         hdlr.extend_from_slice(b"Video\0");
 
-        let avcc = boxed(*b"avcC", &[1, 100, 0, 40, 0xff, 0xe1]);
+        let avcc = boxed(
+            *b"avcC",
+            &[
+                1, 100, 0, 40, 0xff, 0xe1, 0, 3, 0x67, 1, 2, 1, 0, 2, 0x68, 3,
+            ],
+        );
         let mut avc1 = vec![0; 6];
         avc1.extend_from_slice(&1u16.to_be_bytes());
         avc1.extend_from_slice(&[0; 16]);
@@ -632,8 +685,27 @@ mod tests {
         assert_eq!((entry.width(), entry.height()), (1_920, 1_080));
         assert_eq!(
             entry.codec_configuration().as_ref(),
-            [1, 100, 0, 40, 0xff, 0xe1]
+            [
+                1, 100, 0, 40, 0xff, 0xe1, 0, 3, 0x67, 1, 2, 1, 0, 2, 0x68, 3,
+            ]
         );
+        let config = track.decoder_config_for_sample(0).unwrap();
+        assert_eq!(config.codec, VideoCodec::H264);
+        assert_eq!(
+            config.bitstream_format,
+            BitstreamFormat::LengthPrefixed { length_size: 4 }
+        );
+        assert_eq!(
+            config.codec_data.unwrap().as_ref(),
+            entry.codec_configuration().as_ref()
+        );
+
+        let packet = track.read_packet(&input, 0).unwrap();
+        assert_eq!(packet.data.as_ref(), [0]);
+        assert_eq!(packet.pts, MediaTime::from_parts(-9_000, 90_000));
+        assert_eq!(packet.dts, MediaTime::from_parts(-9_000, 90_000));
+        assert_eq!(packet.duration, MediaTime::from_parts(3_000, 90_000));
+        assert!(packet.keyframe);
     }
 
     #[test]
@@ -668,6 +740,20 @@ mod tests {
             Err(Mp4Error::InvalidData(
                 "stsd has fewer entries than declared"
             ))
+        ));
+    }
+
+    #[test]
+    fn owned_demuxer_reads_indexed_packets() {
+        let demuxer = crate::Mp4Demuxer::open(MemoryInput(synthetic_movie())).unwrap();
+        assert_eq!(demuxer.movie().tracks().len(), 1);
+        assert_eq!(demuxer.read_packet(0, 0).unwrap().data.as_ref(), [0]);
+        assert!(matches!(
+            demuxer.read_packet(1, 0),
+            Err(Mp4Error::IndexOutOfRange {
+                kind: "track",
+                index: 1
+            })
         ));
     }
 }

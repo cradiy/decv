@@ -5,6 +5,7 @@
 //! or depending on a particular storage/network implementation.
 
 mod boxes;
+mod demuxer;
 mod edit;
 mod error;
 mod fourcc;
@@ -13,6 +14,7 @@ mod reader;
 mod sample_table;
 
 pub use boxes::{BoxHeader, BoxIter, Mp4File};
+pub use demuxer::Mp4Demuxer;
 pub use edit::Edit;
 pub use error::{Mp4Error, Result};
 pub use fourcc::FourCc;

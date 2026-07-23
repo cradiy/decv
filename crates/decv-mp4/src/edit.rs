@@ -116,18 +116,18 @@ pub(crate) fn linear_timeline_offset(
                     .ok_or(Mp4Error::IntegerOverflow)?;
             }
             None => {
-                return Err(Mp4Error::InvalidData(
+                return Err(Mp4Error::UnsupportedFeature(
                     "non-linear edit lists are not supported",
                 ));
             }
             Some(_) if media_start.is_some() => {
-                return Err(Mp4Error::InvalidData(
+                return Err(Mp4Error::UnsupportedFeature(
                     "repeated media edits are not supported",
                 ));
             }
             Some(start) => {
                 if edit.media_rate_integer != 1 || edit.media_rate_fraction != 0 {
-                    return Err(Mp4Error::InvalidData(
+                    return Err(Mp4Error::UnsupportedFeature(
                         "non-unit edit-list rates are not supported",
                     ));
                 }
@@ -135,7 +135,7 @@ pub(crate) fn linear_timeline_offset(
             }
         }
     }
-    let media_start = media_start.ok_or(Mp4Error::InvalidData(
+    let media_start = media_start.ok_or(Mp4Error::UnsupportedFeature(
         "an all-empty edit list has no media timeline",
     ))?;
 
@@ -144,7 +144,7 @@ pub(crate) fn linear_timeline_offset(
         .ok_or(Mp4Error::IntegerOverflow)?;
     let movie_scale = u128::from(movie_timescale.get());
     if scaled_numerator % movie_scale != 0 {
-        return Err(Mp4Error::InvalidData(
+        return Err(Mp4Error::UnsupportedFeature(
             "edit-list offset is not exact in the media time scale",
         ));
     }
@@ -239,7 +239,7 @@ mod tests {
                 NonZeroU32::new(3).unwrap(),
                 NonZeroU32::new(2).unwrap()
             ),
-            Err(Mp4Error::InvalidData(
+            Err(Mp4Error::UnsupportedFeature(
                 "edit-list offset is not exact in the media time scale"
             ))
         ));
@@ -251,7 +251,7 @@ mod tests {
                 NonZeroU32::new(1).unwrap(),
                 NonZeroU32::new(1).unwrap()
             ),
-            Err(Mp4Error::InvalidData(
+            Err(Mp4Error::UnsupportedFeature(
                 "repeated media edits are not supported"
             ))
         ));

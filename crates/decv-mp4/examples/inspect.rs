@@ -1,6 +1,6 @@
 use std::{env, error::Error, fs::File};
 
-use decv_mp4::{Movie, Mp4File, SampleDescription};
+use decv_mp4::{Mp4Demuxer, SampleDescription};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
@@ -9,8 +9,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         .ok_or("usage: cargo run -p decv-mp4 --example inspect -- <file.mp4> [--samples]")?;
     let dump_samples = arguments.any(|argument| argument == "--samples");
     let input = File::open(&path)?;
-    let file = Mp4File::open(&input)?;
-    let movie = Movie::parse(file)?;
+    let demuxer = Mp4Demuxer::open(input)?;
+    let movie = demuxer.movie();
 
     println!(
         "movie timescale={} duration={:?} tracks={}",
@@ -18,7 +18,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         movie.duration(),
         movie.tracks().len()
     );
-    for track in movie.tracks() {
+    for (track_index, track) in movie.tracks().iter().enumerate() {
         println!(
             "track id={} handler={} timescale={} duration={:?} samples={}",
             track.id(),
@@ -64,12 +64,15 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         if dump_samples {
             for (index, sample) in track.samples().iter().enumerate() {
+                let packet = demuxer.read_packet(track_index, index)?;
                 println!(
-                    "  sample={index} offset={} size={} dts={} pts={} duration={} description={} sync={}",
+                    "  sample={index} offset={} size={} raw_dts={} raw_pts={} dts={} pts={} duration={} description={} sync={}",
                     sample.offset(),
                     sample.size(),
                     sample.decode_time(),
                     sample.presentation_time(),
+                    packet.dts.map(|time| time.value).unwrap_or_default(),
+                    packet.pts.map(|time| time.value).unwrap_or_default(),
                     sample.duration(),
                     sample.description_index(),
                     sample.is_sync()

@@ -41,7 +41,23 @@ impl MediaInput for Vec<u8> {
     }
 }
 
-impl MediaInput for Arc<[u8]> {
+impl<T> MediaInput for Arc<T>
+where
+    T: MediaInput + ?Sized,
+{
+    fn len(&self) -> io::Result<Option<u64>> {
+        MediaInput::len(self.as_ref())
+    }
+
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+        self.as_ref().read_at(offset, buffer)
+    }
+}
+
+impl<T> MediaInput for Box<T>
+where
+    T: MediaInput + ?Sized,
+{
     fn len(&self) -> io::Result<Option<u64>> {
         MediaInput::len(self.as_ref())
     }
@@ -75,6 +91,8 @@ impl MediaInput for File {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::MediaInput;
 
     #[test]
@@ -85,5 +103,17 @@ mod tests {
         assert_eq!(&buffer, b"cde");
         assert_eq!(input.read_at(9, &mut buffer).unwrap(), 0);
         assert_eq!(MediaInput::len(&input).unwrap(), Some(6));
+    }
+
+    #[test]
+    fn owned_trait_objects_delegate_random_reads() {
+        let input: Arc<dyn MediaInput> = Arc::new(Vec::from(*b"abcdef"));
+        let mut buffer = [0; 2];
+        assert_eq!(input.read_at(3, &mut buffer).unwrap(), 2);
+        assert_eq!(&buffer, b"de");
+
+        let input: Box<dyn MediaInput> = Box::new(Vec::from(*b"uvwxyz"));
+        assert_eq!(input.read_at(1, &mut buffer).unwrap(), 2);
+        assert_eq!(&buffer, b"vw");
     }
 }
