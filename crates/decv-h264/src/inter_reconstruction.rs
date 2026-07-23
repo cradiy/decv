@@ -37,6 +37,62 @@ pub fn reconstruct_p_macroblock_420(
     motion: &ResolvedPMacroblock,
     residual: &ReconstructedInterResidual,
 ) -> Result<()> {
+    let references = references_l0.iter().copied().map(Some).collect::<Vec<_>>();
+    reconstruct_p_macroblock_from_list_420(
+        current,
+        &references,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+    )
+}
+
+/// Variant that preserves explicit "no reference picture" entries in an
+/// active reference list.
+pub fn reconstruct_p_macroblock_from_list_420(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedPMacroblock,
+    residual: &ReconstructedInterResidual,
+) -> Result<()> {
+    reconstruct_p_macroblock_from_list_inner(
+        current,
+        references_l0,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        Some(residual),
+    )
+}
+
+pub(crate) fn reconstruct_p_skip_macroblock_from_list_420(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedPMacroblock,
+) -> Result<()> {
+    reconstruct_p_macroblock_from_list_inner(
+        current,
+        references_l0,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        None,
+    )
+}
+
+fn reconstruct_p_macroblock_from_list_inner(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedPMacroblock,
+    residual: Option<&ReconstructedInterResidual>,
+) -> Result<()> {
     let luma_x = macroblock_x
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
@@ -59,8 +115,10 @@ pub fn reconstruct_p_macroblock_420(
     for partition in &motion.partitions {
         let reference = references_l0
             .get(usize::from(partition.reference_index))
+            .copied()
+            .flatten()
             .ok_or(H264Error::InvalidSyntax(
-                "P partition reference index exceeds List 0",
+                "P partition selects no reference picture in List 0",
             ))?;
         if reference.coded_size() != current.coded_size() {
             return Err(H264Error::InvalidSyntax(
@@ -98,34 +156,36 @@ pub fn reconstruct_p_macroblock_420(
     }
 
     let mut residual_luma = [[0i32; 16]; 16];
-    match &residual.luma {
-        ReconstructedLumaResidual::FourByFour(blocks) => {
-            for (index, block) in blocks.iter().enumerate() {
-                let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
-                copy_residual_block(&mut residual_luma, block_x * 4, block_y * 4, block);
-            }
-        }
-        ReconstructedLumaResidual::EightByEight(blocks) => {
-            for (index, block) in blocks.iter().enumerate() {
-                copy_residual_block(&mut residual_luma, index % 2 * 8, index / 2 * 8, block);
-            }
-        }
-    }
     let mut residual_cb = [[0i32; 8]; 8];
     let mut residual_cr = [[0i32; 8]; 8];
-    for index in 0..4 {
-        copy_residual_block(
-            &mut residual_cb,
-            index % 2 * 4,
-            index / 2 * 4,
-            &residual.chroma_cb[index],
-        );
-        copy_residual_block(
-            &mut residual_cr,
-            index % 2 * 4,
-            index / 2 * 4,
-            &residual.chroma_cr[index],
-        );
+    if let Some(residual) = residual {
+        match &residual.luma {
+            ReconstructedLumaResidual::FourByFour(blocks) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
+                    copy_residual_block(&mut residual_luma, block_x * 4, block_y * 4, block);
+                }
+            }
+            ReconstructedLumaResidual::EightByEight(blocks) => {
+                for (index, block) in blocks.iter().enumerate() {
+                    copy_residual_block(&mut residual_luma, index % 2 * 8, index / 2 * 8, block);
+                }
+            }
+        }
+        for index in 0..4 {
+            copy_residual_block(
+                &mut residual_cb,
+                index % 2 * 4,
+                index / 2 * 4,
+                &residual.chroma_cb[index],
+            );
+            copy_residual_block(
+                &mut residual_cr,
+                index % 2 * 4,
+                index / 2 * 4,
+                &residual.chroma_cr[index],
+            );
+        }
     }
 
     let chroma_x = macroblock_x * 8;

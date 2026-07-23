@@ -663,6 +663,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - a transactional complete non-skipped CAVLC P-macroblock entry point that
   joins P syntax and residuals while correctly mapping embedded Intra and
   I_PCM macroblock types;
+- a progressive CAVLC P-slice driver joining skip runs, QP state, CAVLC
+  neighbours, motion state, embedded Intra, List-0 prediction, transforms, and
+  picture writes; P-picture output remains gated on inter deblocking;
 - transactional default-weight P macroblock pixel reconstruction with
   per-partition List-0 reference selection, complete coverage validation, and
   saturating prediction-plus-residual writes;

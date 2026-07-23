@@ -243,6 +243,17 @@ impl PMotionState {
         })
     }
 
+    pub(crate) fn clear_macroblock(&mut self, macroblock_address: usize) -> Result<()> {
+        if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
+            return Err(H264Error::InvalidSyntax(
+                "motion-state macroblock address exceeds the picture",
+            ));
+        }
+        let start = macroblock_address * 16;
+        self.cells[start..start + 16].fill(None);
+        Ok(())
+    }
+
     fn predict_motion_vector(
         &self,
         macroblock_address: usize,
