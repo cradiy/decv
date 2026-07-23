@@ -276,6 +276,25 @@ fn predict_luma<const CLIP: bool>(
         return;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if !CLIP && matches!(prediction.width, 8 | 16) && x_fraction != 0 && y_fraction != 0 {
+        // SAFETY: SSE2 is part of the x86_64 baseline. The non-clipping
+        // specialization is selected only after validating the complete
+        // horizontal and vertical six-tap footprint.
+        unsafe {
+            predict_luma_two_dimensional_sse2(
+                prediction,
+                plane,
+                width,
+                reference_x as usize,
+                reference_y as usize,
+                x_fraction,
+                y_fraction,
+            );
+        }
+        return;
+    }
+
     for y in 0..usize::from(prediction.height) {
         for x in 0..usize::from(prediction.width) {
             prediction.luma[y][x] = interpolate_luma_inner::<CLIP>(
@@ -418,6 +437,253 @@ unsafe fn predict_luma_axis_sse2(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn predict_luma_two_dimensional_sse2(
+    prediction: &mut InterPrediction420,
+    plane: &[u8],
+    stride: usize,
+    reference_x: usize,
+    reference_y: usize,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_add_epi32, _mm_avg_epu8, _mm_loadl_epi64, _mm_madd_epi16,
+        _mm_mullo_epi16, _mm_packs_epi32, _mm_packus_epi16, _mm_set_epi16, _mm_set1_epi16,
+        _mm_set1_epi32, _mm_setzero_si128, _mm_srai_epi16, _mm_srai_epi32, _mm_storel_epi64,
+        _mm_sub_epi16, _mm_unpackhi_epi16, _mm_unpacklo_epi8, _mm_unpacklo_epi16,
+    };
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load_eight(ptr: *const u8, zero: __m128i) -> __m128i {
+        // SAFETY: The caller validated the complete eight-byte source range.
+        let bytes = unsafe { _mm_loadl_epi64(ptr.cast::<__m128i>()) };
+        _mm_unpacklo_epi8(bytes, zero)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn six_tap_raw(
+        s0: *const u8,
+        s1: *const u8,
+        s2: *const u8,
+        s3: *const u8,
+        s4: *const u8,
+        s5: *const u8,
+        zero: __m128i,
+    ) -> __m128i {
+        // SAFETY: Every pointer addresses eight validated source samples.
+        let s0 = unsafe { load_eight(s0, zero) };
+        // SAFETY: See above.
+        let s1 = unsafe { load_eight(s1, zero) };
+        // SAFETY: See above.
+        let s2 = unsafe { load_eight(s2, zero) };
+        // SAFETY: See above.
+        let s3 = unsafe { load_eight(s3, zero) };
+        // SAFETY: See above.
+        let s4 = unsafe { load_eight(s4, zero) };
+        // SAFETY: See above.
+        let s5 = unsafe { load_eight(s5, zero) };
+        let positive = _mm_add_epi16(
+            _mm_add_epi16(s0, s5),
+            _mm_mullo_epi16(_mm_add_epi16(s2, s3), _mm_set1_epi16(20)),
+        );
+        let negative = _mm_mullo_epi16(_mm_add_epi16(s1, s4), _mm_set1_epi16(5));
+        _mm_sub_epi16(positive, negative)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    fn rounded_half(raw: __m128i, zero: __m128i) -> __m128i {
+        let rounded = _mm_srai_epi16::<5>(_mm_add_epi16(raw, _mm_set1_epi16(16)));
+        _mm_packus_epi16(rounded, zero)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn horizontal_raw(base: *const u8, zero: __m128i) -> __m128i {
+        // SAFETY: The interior footprint includes x - 2 through x + 10 for
+        // this eight-sample output chunk.
+        unsafe {
+            six_tap_raw(
+                base.wrapping_sub(2),
+                base.wrapping_sub(1),
+                base,
+                base.wrapping_add(1),
+                base.wrapping_add(2),
+                base.wrapping_add(3),
+                zero,
+            )
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn vertical_half(base: *const u8, stride: usize, zero: __m128i) -> __m128i {
+        // SAFETY: The interior footprint includes the six required rows.
+        let raw = unsafe {
+            six_tap_raw(
+                base.wrapping_sub(2 * stride),
+                base.wrapping_sub(stride),
+                base,
+                base.wrapping_add(stride),
+                base.wrapping_add(2 * stride),
+                base.wrapping_add(3 * stride),
+                zero,
+            )
+        };
+        rounded_half(raw, zero)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn diagonal_half(base: *const u8, stride: usize, zero: __m128i) -> __m128i {
+        // SAFETY: The interior footprint includes all six horizontal taps on
+        // all six vertical tap rows.
+        let h0 = unsafe { horizontal_raw(base.wrapping_sub(2 * stride), zero) };
+        // SAFETY: See above.
+        let h1 = unsafe { horizontal_raw(base.wrapping_sub(stride), zero) };
+        // SAFETY: See above.
+        let h2 = unsafe { horizontal_raw(base, zero) };
+        // SAFETY: See above.
+        let h3 = unsafe { horizontal_raw(base.wrapping_add(stride), zero) };
+        // SAFETY: See above.
+        let h4 = unsafe { horizontal_raw(base.wrapping_add(2 * stride), zero) };
+        // SAFETY: See above.
+        let h5 = unsafe { horizontal_raw(base.wrapping_add(3 * stride), zero) };
+
+        let coefficients_01 = _mm_set_epi16(-5, 1, -5, 1, -5, 1, -5, 1);
+        let coefficients_23 = _mm_set1_epi16(20);
+        let coefficients_45 = _mm_set_epi16(1, -5, 1, -5, 1, -5, 1, -5);
+        let combine = |first: __m128i, second: __m128i, high: bool| {
+            let pair_01 = if high {
+                _mm_unpackhi_epi16(h0, h1)
+            } else {
+                _mm_unpacklo_epi16(h0, h1)
+            };
+            let pair_23 = if high {
+                _mm_unpackhi_epi16(h2, h3)
+            } else {
+                _mm_unpacklo_epi16(h2, h3)
+            };
+            let pair_45 = if high {
+                _mm_unpackhi_epi16(h4, h5)
+            } else {
+                _mm_unpacklo_epi16(h4, h5)
+            };
+            _mm_add_epi32(
+                _mm_add_epi32(
+                    _mm_madd_epi16(pair_01, first),
+                    _mm_madd_epi16(pair_23, second),
+                ),
+                _mm_madd_epi16(pair_45, coefficients_45),
+            )
+        };
+        let low = combine(coefficients_01, coefficients_23, false);
+        let high = combine(coefficients_01, coefficients_23, true);
+        let low = _mm_srai_epi32::<10>(_mm_add_epi32(low, _mm_set1_epi32(512)));
+        let high = _mm_srai_epi32::<10>(_mm_add_epi32(high, _mm_set1_epi32(512)));
+        _mm_packus_epi16(_mm_packs_epi32(low, high), zero)
+    }
+
+    debug_assert!((1..=3).contains(&x_fraction));
+    debug_assert!((1..=3).contains(&y_fraction));
+    let zero = _mm_setzero_si128();
+    let output_width = usize::from(prediction.width);
+    let output_height = usize::from(prediction.height);
+    for output_y in 0..output_height {
+        for output_x in (0..output_width).step_by(8) {
+            let base = plane
+                .as_ptr()
+                .wrapping_add((reference_y + output_y) * stride + reference_x + output_x);
+            let output = match (x_fraction, y_fraction) {
+                (1, 1) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let horizontal = rounded_half(unsafe { horizontal_raw(base, zero) }, zero);
+                    // SAFETY: See above.
+                    let vertical = unsafe { vertical_half(base, stride, zero) };
+                    _mm_avg_epu8(horizontal, vertical)
+                }
+                (1, 2) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let vertical = unsafe { vertical_half(base, stride, zero) };
+                    // SAFETY: See above.
+                    let diagonal = unsafe { diagonal_half(base, stride, zero) };
+                    _mm_avg_epu8(vertical, diagonal)
+                }
+                (1, 3) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let vertical = unsafe { vertical_half(base, stride, zero) };
+                    // SAFETY: See above.
+                    let horizontal_next = rounded_half(
+                        unsafe { horizontal_raw(base.wrapping_add(stride), zero) },
+                        zero,
+                    );
+                    _mm_avg_epu8(vertical, horizontal_next)
+                }
+                (2, 1) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let horizontal = rounded_half(unsafe { horizontal_raw(base, zero) }, zero);
+                    // SAFETY: See above.
+                    let diagonal = unsafe { diagonal_half(base, stride, zero) };
+                    _mm_avg_epu8(horizontal, diagonal)
+                }
+                (2, 2) => {
+                    // SAFETY: The validated footprint covers the diagonal filter.
+                    unsafe { diagonal_half(base, stride, zero) }
+                }
+                (2, 3) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let diagonal = unsafe { diagonal_half(base, stride, zero) };
+                    // SAFETY: See above.
+                    let horizontal_next = rounded_half(
+                        unsafe { horizontal_raw(base.wrapping_add(stride), zero) },
+                        zero,
+                    );
+                    _mm_avg_epu8(diagonal, horizontal_next)
+                }
+                (3, 1) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let horizontal = rounded_half(unsafe { horizontal_raw(base, zero) }, zero);
+                    // SAFETY: See above.
+                    let vertical_next =
+                        unsafe { vertical_half(base.wrapping_add(1), stride, zero) };
+                    _mm_avg_epu8(horizontal, vertical_next)
+                }
+                (3, 2) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let diagonal = unsafe { diagonal_half(base, stride, zero) };
+                    // SAFETY: See above.
+                    let vertical_next =
+                        unsafe { vertical_half(base.wrapping_add(1), stride, zero) };
+                    _mm_avg_epu8(diagonal, vertical_next)
+                }
+                (3, 3) => {
+                    // SAFETY: The validated footprint covers both filters.
+                    let vertical_next =
+                        unsafe { vertical_half(base.wrapping_add(1), stride, zero) };
+                    // SAFETY: See above.
+                    let horizontal_next = rounded_half(
+                        unsafe { horizontal_raw(base.wrapping_add(stride), zero) },
+                        zero,
+                    );
+                    _mm_avg_epu8(vertical_next, horizontal_next)
+                }
+                _ => unreachable!("two-dimensional luma fractions are in 1..=3"),
+            };
+            let destination = prediction.luma[output_y]
+                .as_mut_ptr()
+                .wrapping_add(output_x);
+            // SAFETY: Width is 8 or 16 and the loop writes one full chunk.
+            unsafe {
+                _mm_storel_epi64(destination.cast::<__m128i>(), output);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn predict_chroma<const CLIP: bool>(
     prediction: &mut InterPrediction420,
@@ -455,6 +721,26 @@ fn predict_chroma<const CLIP: bool>(
         return;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if !CLIP && matches!(prediction.width, 8 | 16) {
+        // SAFETY: SSE2 is part of the x86_64 baseline. The non-clipping path
+        // is selected only after validating the current and next chroma rows,
+        // and luma widths 8/16 map to complete chroma vectors of 4/8 samples.
+        unsafe {
+            predict_chroma_bilinear_sse2(
+                prediction,
+                cb,
+                cr,
+                width,
+                reference_x as usize,
+                reference_y as usize,
+                x_fraction,
+                y_fraction,
+            );
+        }
+        return;
+    }
+
     for output_y in 0..usize::from(prediction.height / 2) {
         for output_x in 0..usize::from(prediction.width / 2) {
             let x = reference_x + output_x as i32;
@@ -464,6 +750,132 @@ fn predict_chroma<const CLIP: bool>(
             prediction.cr[output_y][output_x] =
                 interpolate_chroma_inner::<CLIP>(cr, width, height, x, y, x_fraction, y_fraction);
         }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn predict_chroma_bilinear_sse2(
+    prediction: &mut InterPrediction420,
+    cb: &[u8],
+    cr: &[u8],
+    stride: usize,
+    reference_x: usize,
+    reference_y: usize,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_cvtsi32_si128, _mm_cvtsi128_si32, _mm_loadl_epi64,
+        _mm_mullo_epi16, _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_srli_epi16,
+        _mm_storel_epi64, _mm_unpacklo_epi8,
+    };
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load(ptr: *const u8, width: usize) -> __m128i {
+        if width == 8 {
+            // SAFETY: The caller validated eight source samples.
+            unsafe { _mm_loadl_epi64(ptr.cast::<__m128i>()) }
+        } else {
+            debug_assert_eq!(width, 4);
+            // SAFETY: The caller validated four source samples. The unaligned
+            // integer load has no alignment requirement.
+            let value = unsafe { std::ptr::read_unaligned(ptr.cast::<i32>()) };
+            _mm_cvtsi32_si128(value)
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn predict_plane(
+        output: &mut [[u8; 8]; 8],
+        plane: &[u8],
+        stride: usize,
+        reference_x: usize,
+        reference_y: usize,
+        output_width: usize,
+        output_height: usize,
+        weights: [i16; 4],
+    ) {
+        let zero = _mm_setzero_si128();
+        let w00 = _mm_set1_epi16(weights[0]);
+        let w10 = _mm_set1_epi16(weights[1]);
+        let w01 = _mm_set1_epi16(weights[2]);
+        let w11 = _mm_set1_epi16(weights[3]);
+        let rounding = _mm_set1_epi16(32);
+        for (output_y, output_row) in output.iter_mut().enumerate().take(output_height) {
+            let base = plane
+                .as_ptr()
+                .wrapping_add((reference_y + output_y) * stride + reference_x);
+            // SAFETY: The interior validation includes the current row, the
+            // next row, and one extra sample to the right.
+            let a = _mm_unpacklo_epi8(unsafe { load(base, output_width) }, zero);
+            // SAFETY: See above.
+            let b = _mm_unpacklo_epi8(unsafe { load(base.wrapping_add(1), output_width) }, zero);
+            // SAFETY: See above.
+            let c = _mm_unpacklo_epi8(
+                unsafe { load(base.wrapping_add(stride), output_width) },
+                zero,
+            );
+            // SAFETY: See above.
+            let d = _mm_unpacklo_epi8(
+                unsafe { load(base.wrapping_add(stride + 1), output_width) },
+                zero,
+            );
+            let weighted = _mm_add_epi16(
+                _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(b, w10)),
+                _mm_add_epi16(_mm_mullo_epi16(c, w01), _mm_mullo_epi16(d, w11)),
+            );
+            let packed =
+                _mm_packus_epi16(_mm_srli_epi16::<6>(_mm_add_epi16(weighted, rounding)), zero);
+            if output_width == 8 {
+                // SAFETY: The output row contains eight writable bytes.
+                unsafe {
+                    _mm_storel_epi64(output_row.as_mut_ptr().cast::<__m128i>(), packed);
+                }
+            } else {
+                // SAFETY: The output row contains four writable bytes, and
+                // unaligned integer stores have no alignment requirement.
+                unsafe {
+                    std::ptr::write_unaligned(
+                        output_row.as_mut_ptr().cast::<i32>(),
+                        _mm_cvtsi128_si32(packed),
+                    );
+                }
+            }
+        }
+    }
+
+    let x = i16::from(x_fraction);
+    let y = i16::from(y_fraction);
+    let weights = [(8 - x) * (8 - y), x * (8 - y), (8 - x) * y, x * y];
+    let output_width = usize::from(prediction.width / 2);
+    let output_height = usize::from(prediction.height / 2);
+    // SAFETY: The caller validated the two source rectangles.
+    unsafe {
+        predict_plane(
+            &mut prediction.cb,
+            cb,
+            stride,
+            reference_x,
+            reference_y,
+            output_width,
+            output_height,
+            weights,
+        );
+        predict_plane(
+            &mut prediction.cr,
+            cr,
+            stride,
+            reference_x,
+            reference_y,
+            output_width,
+            output_height,
+            weights,
+        );
     }
 }
 
@@ -802,6 +1214,126 @@ mod tests {
                             ),
                             "size={size} fraction=({x_fraction},{y_fraction}) x={x} y={y}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn two_dimensional_sse2_matches_per_sample_luma_interpolation() {
+        let plane: Vec<u8> = (0..40 * 40)
+            .map(|index| ((index * 73 + index / 11 * 29) & 0xff) as u8)
+            .collect();
+        for width in [8u8, 16] {
+            for height in [4u8, 8, 16] {
+                for y_fraction in 1..=3 {
+                    for x_fraction in 1..=3 {
+                        let mut prediction = InterPrediction420::empty();
+                        prediction.width = width;
+                        prediction.height = height;
+                        // SAFETY: SSE2 is part of the x86_64 baseline, and
+                        // the reference position leaves every six-tap row and
+                        // column inside this 40x40 plane.
+                        unsafe {
+                            predict_luma_two_dimensional_sse2(
+                                &mut prediction,
+                                &plane,
+                                40,
+                                8,
+                                8,
+                                x_fraction,
+                                y_fraction,
+                            );
+                        }
+                        for y in 0..usize::from(height) {
+                            for x in 0..usize::from(width) {
+                                assert_eq!(
+                                    prediction.luma[y][x],
+                                    interpolate_luma_inner::<false>(
+                                        &plane,
+                                        40,
+                                        40,
+                                        8 + x as i32,
+                                        8 + y as i32,
+                                        x_fraction,
+                                        y_fraction,
+                                    ),
+                                    "size={width}x{height} fraction=({x_fraction},{y_fraction}) x={x} y={y}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn chroma_sse2_matches_per_sample_bilinear_interpolation() {
+        let cb: Vec<u8> = (0..40 * 40)
+            .map(|index| ((index * 37 + index / 13 * 19) & 0xff) as u8)
+            .collect();
+        let cr: Vec<u8> = (0..40 * 40)
+            .map(|index| ((index * 61 + index / 7 * 23) & 0xff) as u8)
+            .collect();
+        for width in [8u8, 16] {
+            for height in [4u8, 8, 16] {
+                for y_fraction in 0..8 {
+                    for x_fraction in 0..8 {
+                        if x_fraction == 0 && y_fraction == 0 {
+                            continue;
+                        }
+                        let mut prediction = InterPrediction420::empty();
+                        prediction.width = width;
+                        prediction.height = height;
+                        // SAFETY: SSE2 is part of the x86_64 baseline, and
+                        // the reference rectangle plus right/bottom samples
+                        // lies inside both 40x40 planes.
+                        unsafe {
+                            predict_chroma_bilinear_sse2(
+                                &mut prediction,
+                                &cb,
+                                &cr,
+                                40,
+                                8,
+                                8,
+                                x_fraction,
+                                y_fraction,
+                            );
+                        }
+                        for y in 0..usize::from(height / 2) {
+                            for x in 0..usize::from(width / 2) {
+                                let expected_cb = interpolate_chroma_inner::<false>(
+                                    &cb,
+                                    40,
+                                    40,
+                                    8 + x as i32,
+                                    8 + y as i32,
+                                    x_fraction,
+                                    y_fraction,
+                                );
+                                let expected_cr = interpolate_chroma_inner::<false>(
+                                    &cr,
+                                    40,
+                                    40,
+                                    8 + x as i32,
+                                    8 + y as i32,
+                                    x_fraction,
+                                    y_fraction,
+                                );
+                                assert_eq!(
+                                    prediction.cb[y][x], expected_cb,
+                                    "Cb size={width}x{height} fraction=({x_fraction},{y_fraction}) x={x} y={y}"
+                                );
+                                assert_eq!(
+                                    prediction.cr[y][x], expected_cr,
+                                    "Cr size={width}x{height} fraction=({x_fraction},{y_fraction}) x={x} y={y}"
+                                );
+                            }
+                        }
                     }
                 }
             }
