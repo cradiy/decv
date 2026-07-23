@@ -12,11 +12,11 @@ use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
 use crate::intra_reconstruction::ReconstructionReferenceList;
 use crate::reorder::PictureReorderBuffer;
 use crate::{
-    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, H264Error, ImplicitWeightReference,
-    IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType, ParameterSetStore,
-    ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile, ReferenceKind,
-    ReferencePictureMarking, Result, SequenceParameterSet, SliceType, consume_rbsp_trailing_bits,
-    decode_rbsp,
+    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference, H264Error,
+    ImplicitWeightReference, IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType,
+    ParameterSetStore, ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile,
+    ReferenceKind, ReferencePictureMarking, Result, SequenceParameterSet, SliceType,
+    consume_rbsp_trailing_bits, decode_rbsp,
 };
 
 #[derive(Debug)]
@@ -244,6 +244,34 @@ impl H264Decoder {
                                 })
                             })
                             .collect::<Vec<_>>();
+                        let direct_l0 = references_l0
+                            .iter()
+                            .map(|reference| {
+                                reference.as_ref().map(|reference| DirectReference {
+                                    id: reference.id,
+                                    picture_order_count: reference.picture_order_count,
+                                    long_term: matches!(
+                                        reference.kind,
+                                        ReferenceKind::LongTerm { .. }
+                                    ),
+                                    motion: reference.motion.as_ref(),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let direct_l1 = references_l1
+                            .iter()
+                            .map(|reference| {
+                                reference.as_ref().map(|reference| DirectReference {
+                                    id: reference.id,
+                                    picture_order_count: reference.picture_order_count,
+                                    long_term: matches!(
+                                        reference.kind,
+                                        ReferenceKind::LongTerm { .. }
+                                    ),
+                                    motion: reference.motion.as_ref(),
+                                })
+                            })
+                            .collect::<Vec<_>>();
                         self.current_picture
                             .as_mut()
                             .expect("the picture is initialized above")
@@ -255,11 +283,13 @@ impl H264Decoder {
                                     &borrowed_l0,
                                     &reference_ids_l0,
                                     &implicit_l0,
+                                    &direct_l0,
                                 ),
                                 ReconstructionReferenceList::with_metadata(
                                     &borrowed_l1,
                                     &reference_ids_l1,
                                     &implicit_l1,
+                                    &direct_l1,
                                 ),
                                 current_poc,
                             )?;
@@ -1003,6 +1033,76 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::EndOfStream
         ));
+    }
+
+    #[test]
+    fn decodes_a_spatial_direct_b_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x01, single_macroblock_spatial_direct_b_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        for expected_id in [1, 3, 2] {
+            let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
+                panic!("expected a decoded frame");
+            };
+            assert_eq!(frame.id, expected_id);
+            let FrameStorage::Cpu(cpu) = frame.storage else {
+                panic!("expected CPU frame");
+            };
+            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        }
+    }
+
+    #[test]
+    fn decodes_a_spatially_skipped_b_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x01, single_macroblock_spatial_skip_b_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        for expected_id in [1, 3, 2] {
+            let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
+                panic!("expected a decoded frame");
+            };
+            assert_eq!(frame.id, expected_id);
+            let FrameStorage::Cpu(cpu) = frame.storage else {
+                panic!("expected CPU frame");
+            };
+            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        }
     }
 
     #[test]
@@ -1833,6 +1933,40 @@ mod tests {
         writer.write_se(0); // mvd_l1.x
         writer.write_se(0); // mvd_l1.y
         writer.write_ue(0); // coded_block_pattern -> zero
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_spatial_direct_b_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(1); // B slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num
+        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_flag(true); // direct_spatial_mv_pred_flag
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // ref_pic_list_modification_flag_l1
+        writer.write_se(0); // slice_qp_delta
+        writer.write_ue(0); // mb_skip_run
+        writer.write_ue(0); // B_Direct_16x16
+        writer.write_ue(0); // coded_block_pattern -> zero
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_spatial_skip_b_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(1); // B slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num
+        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_flag(true); // direct_spatial_mv_pred_flag
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // ref_pic_list_modification_flag_l1
+        writer.write_se(0); // slice_qp_delta
+        writer.write_ue(1); // mb_skip_run
         writer.finish_rbsp()
     }
 

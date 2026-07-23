@@ -14,17 +14,18 @@ use crate::inter_reconstruction::{
 use crate::motion_field::MotionFieldBuilder;
 use crate::rbsp::more_rbsp_data;
 use crate::{
-    ActiveParameterSets, BMacroblockContext, BMotionState, CavlcNeighborState, ChromaPlane,
-    DeblockingFilter, DecodedBSliceMacroblock, DecodedIntraMacroblock, DecodedPSliceMacroblock,
-    EntropyCodingMode, H264Error, InterResidual, IntraLumaPrediction, IntraMacroblock,
-    IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability,
-    MacroblockQuantizer, MacroblockQuantizerState, PMacroblockContext, PMotionState,
-    ParsedSliceHeader, PredictionWeightTable, ReconstructedIntraResidual,
+    ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, CavlcNeighborState,
+    ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock, DecodedIntraMacroblock,
+    DecodedPSliceMacroblock, DirectReference, EntropyCodingMode, H264Error, InterResidual,
+    IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraModeState,
+    IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
+    MacroblockQuantizerState, PMacroblockContext, PMotionState, ParsedSliceHeader,
+    PredictionWeightTable, ReconstructedInterResidual, ReconstructedIntraResidual,
     ReconstructedLumaResidual, ReferenceId, ReferenceMotionField, ResolvedBListMotion,
     ResolvedBMacroblock, ResolvedPMacroblock, ResolvedScalingLists4x4, ResolvedScalingLists8x8,
-    Result, ScanMode, SliceType, WeightedBiprediction, Yuv420Picture, consume_rbsp_trailing_bits,
-    derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4, predict_intra_8x8,
-    predict_intra_16x16, predict_intra_chroma_420, reconstruct_b_inter_residual,
+    Result, ScanMode, SliceType, SpatialDirectContext, WeightedBiprediction, Yuv420Picture,
+    consume_rbsp_trailing_bits, derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4,
+    predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420, reconstruct_b_inter_residual,
     reconstruct_inter_residual, reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420,
     resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
 };
@@ -80,10 +81,44 @@ enum BSlicePredictionWeights<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum BDirectPrediction<'a> {
+    Spatial(Option<SpatialDirectContext<'a>>),
+    Temporal,
+}
+
+impl BDirectPrediction<'_> {
+    fn resolve(
+        self,
+        state: &mut BMotionState,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<ResolvedBMacroblock> {
+        match self {
+            Self::Spatial(Some(context)) => {
+                state.resolve_spatial_direct_macroblock(macroblock_address, slice_id, context)
+            }
+            Self::Spatial(None) => Err(H264Error::InvalidSyntax(
+                "spatial Direct requires active List 1 reference metadata",
+            )),
+            Self::Temporal => Err(H264Error::UnsupportedFeature(
+                "temporal Direct B motion-vector derivation",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BReconstructionModes<'a> {
+    weights: BSlicePredictionWeights<'a>,
+    direct: BDirectPrediction<'a>,
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ReconstructionReferenceList<'a> {
     pictures: &'a [Option<&'a Yuv420Picture>],
     reference_ids: Option<&'a [Option<ReferenceId>]>,
     implicit_weights: Option<&'a [Option<ImplicitWeightReference>]>,
+    direct_references: Option<&'a [Option<DirectReference<'a>>]>,
 }
 
 impl<'a> ReconstructionReferenceList<'a> {
@@ -92,6 +127,7 @@ impl<'a> ReconstructionReferenceList<'a> {
             pictures,
             reference_ids: None,
             implicit_weights: None,
+            direct_references: None,
         }
     }
 
@@ -103,6 +139,7 @@ impl<'a> ReconstructionReferenceList<'a> {
             pictures,
             reference_ids: Some(reference_ids),
             implicit_weights: None,
+            direct_references: None,
         }
     }
 
@@ -110,11 +147,13 @@ impl<'a> ReconstructionReferenceList<'a> {
         pictures: &'a [Option<&'a Yuv420Picture>],
         reference_ids: &'a [Option<ReferenceId>],
         implicit_weights: &'a [Option<ImplicitWeightReference>],
+        direct_references: &'a [Option<DirectReference<'a>>],
     ) -> Self {
         Self {
             pictures,
             reference_ids: Some(reference_ids),
             implicit_weights: Some(implicit_weights),
+            direct_references: Some(direct_references),
         }
     }
 }
@@ -361,6 +400,22 @@ impl IntraPictureReconstructor {
                     ))?,
             },
         };
+        let direct_prediction = if header.direct_spatial_mv_prediction == Some(true) {
+            let colocated = references_l1
+                .direct_references
+                .and_then(|references| references.first())
+                .copied()
+                .flatten();
+            BDirectPrediction::Spatial(colocated.map(|colocated| SpatialDirectContext {
+                colocated_motion: colocated.motion,
+                colocated_long_term: colocated.long_term,
+                direct_8x8_inference: sps.direct_8x8_inference,
+                num_ref_idx_l0_active: header.num_ref_idx_l0_active,
+                num_ref_idx_l1_active: header.num_ref_idx_l1_active,
+            }))
+        } else {
+            BDirectPrediction::Temporal
+        };
         if sps.coded_size != self.picture.coded_size()
             || pps.constrained_intra_prediction != self.constrained_intra_prediction
         {
@@ -390,7 +445,10 @@ impl IntraPictureReconstructor {
             },
             references_l0,
             references_l1,
-            prediction_weights,
+            BReconstructionModes {
+                weights: prediction_weights,
+                direct: direct_prediction,
+            },
         )
     }
 
@@ -696,7 +754,7 @@ impl IntraPictureReconstructor {
         context: BMacroblockContext,
         references_l0: ReconstructionReferenceList<'_>,
         references_l1: ReconstructionReferenceList<'_>,
-        prediction_weights: BSlicePredictionWeights<'_>,
+        modes: BReconstructionModes<'_>,
     ) -> Result<usize> {
         let reference_ids_l0 = references_l0.reference_ids;
         let reference_ids_l1 = references_l1.reference_ids;
@@ -729,10 +787,85 @@ impl IntraPictureReconstructor {
             let remaining = self.completed.len().checked_sub(macroblock_address).ok_or(
                 H264Error::InvalidSyntax("B slice starts beyond the reconstructed picture"),
             )?;
-            if parse_cavlc_mb_skip_run(&mut reader, remaining)? != 0 {
-                return Err(H264Error::UnsupportedFeature(
-                    "Direct and skipped B macroblock reconstruction",
-                ));
+            let skip_run = parse_cavlc_mb_skip_run(&mut reader, remaining)?;
+            for _ in 0..skip_run {
+                let (macroblock_x, macroblock_y) =
+                    self.macroblock_coordinates(macroblock_address)?;
+                let mb_x = u32::try_from(macroblock_x).map_err(|_| H264Error::IntegerOverflow)?;
+                let mb_y = u32::try_from(macroblock_y).map_err(|_| H264Error::IntegerOverflow)?;
+                let cavlc_snapshot = self.cavlc.snapshot_macroblock(mb_x, mb_y)?;
+                self.cavlc.record_zero_macroblock(mb_x, mb_y)?;
+                let motion =
+                    match modes
+                        .direct
+                        .resolve(&mut self.b_motion, macroblock_address, slice_id)
+                    {
+                        Ok(motion) => motion,
+                        Err(error) => {
+                            self.cavlc.restore_macroblock(mb_x, mb_y, cavlc_snapshot);
+                            return Err(error);
+                        }
+                    };
+                if let Err(error) = self.reference_motion.record_b(
+                    macroblock_address,
+                    &motion,
+                    reference_ids_l0,
+                    reference_ids_l1,
+                ) {
+                    self.b_motion.clear_macroblock(macroblock_address)?;
+                    self.cavlc.restore_macroblock(mb_x, mb_y, cavlc_snapshot);
+                    return Err(error);
+                }
+                let quantizer = quantizers.derive(0)?;
+                let deblock = match b_inter_deblock_info(
+                    slice_id,
+                    quantizer,
+                    false,
+                    config.deblocking_filter,
+                    &motion,
+                    None,
+                    references_l0,
+                    references_l1,
+                ) {
+                    Ok(deblock) => deblock,
+                    Err(error) => {
+                        self.b_motion.clear_macroblock(macroblock_address)?;
+                        self.reference_motion.clear_macroblock(macroblock_address)?;
+                        self.cavlc.restore_macroblock(mb_x, mb_y, cavlc_snapshot);
+                        return Err(error);
+                    }
+                };
+                let picture_snapshot = self
+                    .picture
+                    .snapshot_macroblock(macroblock_x, macroblock_y)?;
+                let residual = zero_inter_residual();
+                let result = reconstruct_b_prediction(
+                    &mut self.picture,
+                    references_l0,
+                    references_l1,
+                    macroblock_x,
+                    macroblock_y,
+                    &motion,
+                    &residual,
+                    modes.weights,
+                )
+                .and_then(|()| self.modes.record_inter(macroblock_address, slice_id));
+                if let Err(error) = result {
+                    self.picture
+                        .restore_macroblock(macroblock_x, macroblock_y, &picture_snapshot);
+                    self.b_motion.clear_macroblock(macroblock_address)?;
+                    self.reference_motion.clear_macroblock(macroblock_address)?;
+                    self.modes.clear_macroblock(macroblock_address)?;
+                    self.cavlc.restore_macroblock(mb_x, mb_y, cavlc_snapshot);
+                    return Err(error);
+                }
+                self.complete_inter_macroblock(macroblock_address, deblock);
+                macroblock_address = macroblock_address
+                    .checked_add(1)
+                    .ok_or(H264Error::IntegerOverflow)?;
+                decoded_count = decoded_count
+                    .checked_add(1)
+                    .ok_or(H264Error::IntegerOverflow)?;
             }
             if !more_rbsp_data(&reader) {
                 break;
@@ -762,11 +895,17 @@ impl IntraPictureReconstructor {
                         &self.scaling_lists_8x8,
                         self.scan_mode,
                     )?;
-                    let motion = self.b_motion.resolve_inter_macroblock(
-                        macroblock_address,
-                        slice_id,
-                        header,
-                    )?;
+                    let motion = if header.partition_mode == BPartitionMode::Direct16x16 {
+                        modes
+                            .direct
+                            .resolve(&mut self.b_motion, macroblock_address, slice_id)?
+                    } else {
+                        self.b_motion.resolve_inter_macroblock(
+                            macroblock_address,
+                            slice_id,
+                            header,
+                        )?
+                    };
                     if let Err(error) = self.reference_motion.record_b(
                         macroblock_address,
                         &motion,
@@ -796,47 +935,16 @@ impl IntraPictureReconstructor {
                     let picture_snapshot = self
                         .picture
                         .snapshot_macroblock(macroblock_x, macroblock_y)?;
-                    let reconstruction = match prediction_weights {
-                        BSlicePredictionWeights::Default => {
-                            reconstruct_b_macroblock_from_lists_420(
-                                &mut self.picture,
-                                references_l0,
-                                references_l1,
-                                macroblock_x,
-                                macroblock_y,
-                                &motion,
-                                &reconstructed,
-                            )
-                        }
-                        BSlicePredictionWeights::Explicit(weights) => {
-                            reconstruct_weighted_b_macroblock_from_lists_420(
-                                &mut self.picture,
-                                references_l0,
-                                references_l1,
-                                macroblock_x,
-                                macroblock_y,
-                                &motion,
-                                &reconstructed,
-                                weights,
-                            )
-                        }
-                        BSlicePredictionWeights::Implicit {
-                            current_picture_order_count,
-                            list0,
-                            list1,
-                        } => reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
-                            &mut self.picture,
-                            references_l0,
-                            references_l1,
-                            macroblock_x,
-                            macroblock_y,
-                            &motion,
-                            &reconstructed,
-                            current_picture_order_count,
-                            list0,
-                            list1,
-                        ),
-                    };
+                    let reconstruction = reconstruct_b_prediction(
+                        &mut self.picture,
+                        references_l0,
+                        references_l1,
+                        macroblock_x,
+                        macroblock_y,
+                        &motion,
+                        &reconstructed,
+                        modes.weights,
+                    );
                     if let Err(error) = reconstruction
                         .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
                     {
@@ -1495,6 +1603,66 @@ impl IntraPictureReconstructor {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_b_prediction(
+    picture: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: &ReconstructedInterResidual,
+    weights: BSlicePredictionWeights<'_>,
+) -> Result<()> {
+    match weights {
+        BSlicePredictionWeights::Default => reconstruct_b_macroblock_from_lists_420(
+            picture,
+            references_l0,
+            references_l1,
+            macroblock_x,
+            macroblock_y,
+            motion,
+            residual,
+        ),
+        BSlicePredictionWeights::Explicit(weights) => {
+            reconstruct_weighted_b_macroblock_from_lists_420(
+                picture,
+                references_l0,
+                references_l1,
+                macroblock_x,
+                macroblock_y,
+                motion,
+                residual,
+                weights,
+            )
+        }
+        BSlicePredictionWeights::Implicit {
+            current_picture_order_count,
+            list0,
+            list1,
+        } => reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
+            picture,
+            references_l0,
+            references_l1,
+            macroblock_x,
+            macroblock_y,
+            motion,
+            residual,
+            current_picture_order_count,
+            list0,
+            list1,
+        ),
+    }
+}
+
+fn zero_inter_residual() -> ReconstructedInterResidual {
+    ReconstructedInterResidual {
+        luma: ReconstructedLumaResidual::FourByFour(Box::new([[[0; 4]; 4]; 16])),
+        chroma_cb: [[[0; 4]; 4]; 4],
+        chroma_cr: [[[0; 4]; 4]; 4],
+    }
+}
+
 fn inter_deblock_info(
     slice_id: u32,
     quantizer: MacroblockQuantizer,
@@ -1706,8 +1874,8 @@ mod tests {
     use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
 
     use super::{
-        BSlicePredictionWeights, IntraPictureReconstructor, IntraSliceConfig,
-        ReconstructionReferenceList,
+        BDirectPrediction, BReconstructionModes, BSlicePredictionWeights,
+        IntraPictureReconstructor, IntraSliceConfig, ReconstructionReferenceList,
     };
     use crate::{
         BMacroblockContext, CodedBlockPattern, DeblockingFilter, DecodedIntraMacroblock, H264Error,
@@ -1826,6 +1994,13 @@ mod tests {
         }
     }
 
+    fn b_reconstruction_modes() -> BReconstructionModes<'static> {
+        BReconstructionModes {
+            weights: BSlicePredictionWeights::Default,
+            direct: BDirectPrediction::Temporal,
+        }
+    }
+
     fn constant_picture(value: u8) -> crate::Yuv420Picture {
         let mut picture = crate::Yuv420Picture::new(Size::new(16, 16)).unwrap();
         let (luma, cb, cr) = picture.planes_mut();
@@ -1915,7 +2090,7 @@ mod tests {
                 b_macroblock_context(),
                 ReconstructionReferenceList::new(&references_l0),
                 ReconstructionReferenceList::new(&references_l1),
-                BSlicePredictionWeights::Default,
+                b_reconstruction_modes(),
             ),
             Ok(1)
         );
@@ -1933,7 +2108,7 @@ mod tests {
                 b_macroblock_context(),
                 ReconstructionReferenceList::new(&references_l0),
                 ReconstructionReferenceList::new(&references_l1),
-                BSlicePredictionWeights::Default,
+                b_reconstruction_modes(),
             ),
             Ok(1)
         );
@@ -1950,7 +2125,7 @@ mod tests {
                 b_macroblock_context(),
                 ReconstructionReferenceList::new(&references_l0),
                 ReconstructionReferenceList::new(&references_l1),
-                BSlicePredictionWeights::Default,
+                b_reconstruction_modes(),
             ),
             Err(H264Error::UnsupportedFeature(_))
         ));

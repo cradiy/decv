@@ -722,12 +722,16 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - stable DPB reference identities plus active-list POC and short/long-term
   metadata, ready for temporal Direct mapping and implicit B weighting;
 - immutable per-4x4 Intra/List-0/List-1 motion fields retained beside each DPB
-  reference picture, with motion entries mapped back to stable reference IDs;
+  reference picture, retaining original list indices and mapping entries back
+  to stable reference IDs;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
-- a progressive CAVLC B-slice driver for explicit non-Direct List 0, List 1,
-  and bidirectional macroblocks, including residuals and in-loop deblocking;
+- a progressive CAVLC B-slice driver for List 0, List 1, bidirectional,
+  spatial Direct, and spatial B_Skip macroblocks, including residuals and
+  in-loop deblocking;
+- spatial Direct reference-index minima, independent two-list MV prediction,
+  per-8x8 co-located zero-motion handling, and transactional state updates;
 - explicit weighted B prediction for single-list and bidirectional partitions,
   including independent luma and chroma weights and offsets;
 - implicit weighted B prediction derived per active reference pair from current
@@ -758,11 +762,10 @@ This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
 - CABAC slice data;
-- Direct/Skip B, SP, and SI macroblock reconstruction;
+- temporal Direct B, Direct8x8 sub-macroblocks, SP, and SI reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;
-- POC-based display reordering;
 
 The next dependency chain is:
 

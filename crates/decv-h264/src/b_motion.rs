@@ -2,9 +2,26 @@
 
 use crate::{
     BInterMacroblockHeader, BPartitionMode, BPartitionMotion, BPredictionMode, BSubMacroblockType,
-    H264Error, MotionVector, MotionVectorDifference, ResolvedBListMotion, ResolvedBMacroblock,
-    ResolvedBPartition, Result,
+    H264Error, MotionVector, MotionVectorDifference, ReferenceMotionField, ResolvedBListMotion,
+    ResolvedBMacroblock, ResolvedBPartition, Result,
 };
+
+#[derive(Debug, Clone, Copy)]
+pub struct DirectReference<'a> {
+    pub id: crate::ReferenceId,
+    pub picture_order_count: i32,
+    pub long_term: bool,
+    pub motion: &'a ReferenceMotionField,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SpatialDirectContext<'a> {
+    pub colocated_motion: &'a ReferenceMotionField,
+    pub colocated_long_term: bool,
+    pub direct_8x8_inference: bool,
+    pub num_ref_idx_l0_active: u8,
+    pub num_ref_idx_l1_active: u8,
+}
 
 #[derive(Debug, Clone, Copy)]
 struct MotionCell {
@@ -146,6 +163,120 @@ impl BMotionState {
         })
     }
 
+    pub fn resolve_spatial_direct_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        context: SpatialDirectContext<'_>,
+    ) -> Result<ResolvedBMacroblock> {
+        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        let geometry = PartitionGeometry {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            macroblock_partition_index: 0,
+        };
+        let empty = [None; 16];
+        let mut reference_l0 = self.spatial_direct_reference_index(
+            macroblock_address,
+            slice_id,
+            &empty,
+            geometry,
+            false,
+        );
+        let mut reference_l1 = self.spatial_direct_reference_index(
+            macroblock_address,
+            slice_id,
+            &empty,
+            geometry,
+            true,
+        );
+        if reference_l0.is_none() && reference_l1.is_none() {
+            reference_l0 = Some(0);
+            reference_l1 = Some(0);
+        }
+        validate_direct_reference(reference_l0, context.num_ref_idx_l0_active, "List 0")?;
+        validate_direct_reference(reference_l1, context.num_ref_idx_l1_active, "List 1")?;
+
+        let predicted_l0 = reference_l0.map(|reference_index| {
+            (
+                reference_index,
+                self.predict_motion_vector(
+                    macroblock_address,
+                    slice_id,
+                    &empty,
+                    geometry,
+                    DirectionalMode::None,
+                    reference_index,
+                    false,
+                ),
+            )
+        });
+        let predicted_l1 = reference_l1.map(|reference_index| {
+            (
+                reference_index,
+                self.predict_motion_vector(
+                    macroblock_address,
+                    slice_id,
+                    &empty,
+                    geometry,
+                    DirectionalMode::None,
+                    reference_index,
+                    true,
+                ),
+            )
+        });
+
+        let partition_size = if context.direct_8x8_inference { 8 } else { 4 };
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let mut local = [None; 16];
+        let mut partitions = Vec::with_capacity((16 / partition_size) * (16 / partition_size));
+        for y in (0..16).step_by(partition_size) {
+            for x in (0..16).step_by(partition_size) {
+                let colocated = context
+                    .colocated_motion
+                    .cell(macroblock_x * 4 + x / 4, macroblock_y * 4 + y / 4)
+                    .ok_or(H264Error::InvalidSyntax(
+                        "spatial Direct co-located block lies outside the reference motion field",
+                    ))?;
+                let col_zero = colocated_zero_flag(colocated, context.colocated_long_term);
+                let list0 = predicted_l0.map(|(reference_index, vector)| ResolvedBListMotion {
+                    reference_index,
+                    motion_vector: if col_zero && reference_index == 0 {
+                        MotionVector::default()
+                    } else {
+                        vector
+                    },
+                });
+                let list1 = predicted_l1.map(|(reference_index, vector)| ResolvedBListMotion {
+                    reference_index,
+                    motion_vector: if col_zero && reference_index == 0 {
+                        MotionVector::default()
+                    } else {
+                        vector
+                    },
+                });
+                let partition = ResolvedBPartition {
+                    x: x as u8,
+                    y: y as u8,
+                    width: partition_size as u8,
+                    height: partition_size as u8,
+                    list0,
+                    list1,
+                };
+                fill_partition_cells(&mut local, slice_id, partition)?;
+                partitions.push(partition);
+            }
+        }
+        self.commit_local_cells(macroblock_address, local);
+        Ok(ResolvedBMacroblock {
+            direct: true,
+            partitions,
+        })
+    }
+
     pub(crate) fn clear_macroblock(&mut self, macroblock_address: usize) -> Result<()> {
         if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
             return Err(H264Error::InvalidSyntax(
@@ -182,6 +313,28 @@ impl BMotionState {
             reference_index: list.reference_index,
             motion_vector: add_motion_vector_difference(predictor, list.difference)?,
         }))
+    }
+
+    fn spatial_direct_reference_index(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+        local: &[Option<MotionCell>; 16],
+        geometry: PartitionGeometry,
+        list1: bool,
+    ) -> Option<u8> {
+        let [a, b, mut c, d] =
+            self.neighbours(macroblock_address, slice_id, local, geometry, list1);
+        if !c.available {
+            c = d;
+        }
+        [a, b, c]
+            .into_iter()
+            .filter_map(|neighbour| {
+                (neighbour.available && neighbour.reference_index >= 0)
+                    .then_some(neighbour.reference_index as u8)
+            })
+            .min()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -312,6 +465,32 @@ impl BMotionState {
         let start = macroblock_address * 16;
         self.cells[start..start + 16].copy_from_slice(&local);
     }
+}
+
+fn validate_direct_reference(
+    reference_index: Option<u8>,
+    active_count: u8,
+    list_name: &'static str,
+) -> Result<()> {
+    if reference_index.is_some_and(|index| index >= active_count) {
+        return Err(H264Error::InvalidSyntax(match list_name {
+            "List 0" => "spatial Direct List-0 index exceeds the active list",
+            _ => "spatial Direct List-1 index exceeds the active list",
+        }));
+    }
+    Ok(())
+}
+
+fn colocated_zero_flag(cell: crate::MotionFieldCell, colocated_long_term: bool) -> bool {
+    if cell.intra || colocated_long_term {
+        return false;
+    }
+    let Some(motion) = cell.list0.or(cell.list1) else {
+        return false;
+    };
+    motion.reference_index == 0
+        && motion.vector.x.unsigned_abs() <= 1
+        && motion.vector.y.unsigned_abs() <= 1
 }
 
 fn partition_plans(header: &BInterMacroblockHeader) -> Result<Vec<PartitionPlan>> {
@@ -571,7 +750,9 @@ fn median(a: i16, b: i16, c: i16) -> i16 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BPartitionMotion, CodedBlockPattern};
+    use crate::motion_field::MotionFieldBuilder;
+    use crate::{BPartitionMotion, CodedBlockPattern, ResolvedPMacroblock, ResolvedPPartition};
+    use decv_core::Size;
 
     fn difference(x: i16, y: i16) -> MotionVectorDifference {
         MotionVectorDifference { x, y }
@@ -603,6 +784,16 @@ mod tests {
             coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
             transform_size_8x8: false,
             qp_delta: 0,
+        }
+    }
+
+    fn spatial_direct_context(motion: &ReferenceMotionField) -> SpatialDirectContext<'_> {
+        SpatialDirectContext {
+            colocated_motion: motion,
+            colocated_long_term: false,
+            direct_8x8_inference: true,
+            num_ref_idx_l0_active: 2,
+            num_ref_idx_l1_active: 2,
         }
     }
 
@@ -773,6 +964,104 @@ mod tests {
                 )
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn resolves_spatial_direct_from_neighbour_reference_minima() {
+        let mut state = BMotionState::new(2, 1).unwrap();
+        state
+            .resolve_inter_macroblock(
+                0,
+                1,
+                &header(
+                    BPartitionMode::SixteenBySixteen,
+                    vec![partition(
+                        BPredictionMode::Bi,
+                        Some(1),
+                        Some(0),
+                        vec![difference(4, 2)],
+                        vec![difference(-2, 6)],
+                    )],
+                ),
+            )
+            .unwrap();
+        let resolved = state
+            .resolve_spatial_direct_macroblock(
+                1,
+                1,
+                spatial_direct_context(
+                    &ReferenceMotionField::all_intra(Size::new(32, 16)).unwrap(),
+                ),
+            )
+            .unwrap();
+        assert!(resolved.direct);
+        assert_eq!(resolved.partitions.len(), 4);
+        assert!(resolved.partitions.iter().all(|partition| {
+            partition.list0
+                == Some(ResolvedBListMotion {
+                    reference_index: 1,
+                    motion_vector: MotionVector { x: 4, y: 2 },
+                })
+                && partition.list1
+                    == Some(ResolvedBListMotion {
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: -2, y: 6 },
+                    })
+        }));
+    }
+
+    #[test]
+    fn spatial_direct_applies_the_colocated_zero_flag_per_eight_by_eight() {
+        let mut colocated = MotionFieldBuilder::new(Size::new(32, 16)).unwrap();
+        let zero = ResolvedPMacroblock {
+            skipped: true,
+            partitions: vec![ResolvedPPartition {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                reference_index: 0,
+                motion_vector: MotionVector::default(),
+            }],
+        };
+        colocated.record_p(0, &zero, None).unwrap();
+        colocated.record_p(1, &zero, None).unwrap();
+        let colocated = colocated.finish().unwrap();
+
+        let mut state = BMotionState::new(2, 1).unwrap();
+        state
+            .resolve_inter_macroblock(
+                0,
+                1,
+                &header(
+                    BPartitionMode::SixteenBySixteen,
+                    vec![partition(
+                        BPredictionMode::Bi,
+                        Some(0),
+                        Some(0),
+                        vec![difference(4, 2)],
+                        vec![difference(-2, 6)],
+                    )],
+                ),
+            )
+            .unwrap();
+        let resolved = state
+            .resolve_spatial_direct_macroblock(
+                1,
+                1,
+                SpatialDirectContext {
+                    colocated_motion: &colocated,
+                    colocated_long_term: false,
+                    direct_8x8_inference: true,
+                    num_ref_idx_l0_active: 1,
+                    num_ref_idx_l1_active: 1,
+                },
+            )
+            .unwrap();
+        assert!(resolved.partitions.iter().all(|partition| {
+            partition.list0.unwrap().motion_vector == MotionVector::default()
+                && partition.list1.unwrap().motion_vector == MotionVector::default()
+        }));
     }
 
     #[test]

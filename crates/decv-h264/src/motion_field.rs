@@ -8,6 +8,7 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StoredListMotion {
+    pub reference_index: u8,
     /// Stable DPB identity. `None` is allowed only for callers that decode
     /// pixels without supplying reference metadata.
     pub reference_id: Option<ReferenceId>,
@@ -110,6 +111,7 @@ impl MotionFieldBuilder {
                 MotionFieldCell {
                     intra: false,
                     list0: Some(StoredListMotion {
+                        reference_index: partition.reference_index,
                         reference_id,
                         vector: partition.motion_vector,
                     }),
@@ -130,6 +132,7 @@ impl MotionFieldBuilder {
         let mut cells = [None; 16];
         for partition in &motion.partitions {
             let list0 = partition.list0.map(|list| StoredListMotion {
+                reference_index: list.reference_index,
                 reference_id: reference_ids_l0
                     .and_then(|ids| ids.get(usize::from(list.reference_index)))
                     .copied()
@@ -137,6 +140,7 @@ impl MotionFieldBuilder {
                 vector: list.motion_vector,
             });
             let list1 = partition.list1.map(|list| StoredListMotion {
+                reference_index: list.reference_index,
                 reference_id: reference_ids_l1
                     .and_then(|ids| ids.get(usize::from(list.reference_index)))
                     .copied()
