@@ -40,30 +40,30 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 2.00 s | 1.91 s | 79,752 KiB | 90.0 FPS |
-| decv Auto (2 workers) | NV12 | 2.11 s | 2.25 s | 79,556 KiB | 85.3 FPS |
-| FFmpeg 1 thread | NV12 | 0.63 s | 0.71 s | 151,828 KiB | 285.7 FPS |
-| FFmpeg Auto | NV12 | 0.28 s | 1.46 s | 282,960 KiB | 642.9 FPS |
-| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,384 KiB | 305.1 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.99 s | 195,108 KiB | 782.6 FPS |
+| decv Serial | NV12 | 2.00 s | 1.92 s | 80,216 KiB | 90.0 FPS |
+| decv Auto (2 workers) | NV12 | 2.08 s | 2.29 s | 78,960 KiB | 86.5 FPS |
+| FFmpeg 1 thread | NV12 | 0.63 s | 0.70 s | 152,240 KiB | 285.7 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.50 s | 293,132 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,404 KiB | 305.1 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 0.98 s | 192,428 KiB | 782.6 FPS |
 
 On this workload:
 
 - decv Serial takes about **3.2x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **7.5x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **7.7x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.5x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
-  **28%** of FFmpeg Auto NV12 peak RSS;
+  **27%** of FFmpeg Auto NV12 peak RSS;
 - prior measurements with 16 decv workers were slower than the two-worker
   `Auto` policy and consumed far more CPU, confirming that the current parallel
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
 seconds. The current Serial result has about 50.0% throughput headroom over that
-line, and the measured two-worker Auto result has about 42.2%. The ordering
+line, and the measured two-worker Auto result has about 44.2%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -257,6 +257,27 @@ reduced CABAC by another 1.2% to 1.5% and CAVLC by about 0.7%, with instructions
 down a further 2.2% to 2.4%. The complete workspace suite, Clippy, and every
 real FFmpeg byte-exact stream pass. The fixed benchmark is now 2.00 seconds in
 Serial mode and 2.11 seconds in Auto mode.
+
+Completing a CABAC reconstruction batch now borrows each pending job before
+clearing the vector instead of consuming it through `drain(..)`. This prevents
+LLVM from moving each 776- or 848-byte owned job to the stack merely to retain
+its address and deblocking metadata. Pinned CABAC cycles fell about 0.7% and
+wall time about 0.4%. Packing the sixteen luma residual-presence booleans into
+one `u16` then reduced the deblocking record footprint and moved the CABAC and
+CAVLC medians by about 0.6% and 0.3%, respectively; CAVLC cycles fell about
+1.2%. Finally, forcing the high-frequency boundary-strength derivation into
+the sole picture traversal enabled constant propagation of internal versus
+external edge rules. CABAC instructions and branches fell about 0.9%, with an
+eight-pair wall-time median improvement of about 1.2%. CAVLC was neutral to
+slightly faster. The current fixed benchmark remains 2.00 seconds in Serial
+mode at its 0.01-second reporting resolution and measures 2.08 seconds in Auto
+mode.
+
+Writing deblocking records into the whole-picture array as soon as each CABAC
+macroblock was parsed removed a later 188-byte copy, but worsened the
+eight-pair pinned median by about 1.2%. It likely displaced hotter entropy and
+reconstruction state before the batch completed, so that write-timing change
+was rejected.
 
 ## BitReader Checkpoint
 
