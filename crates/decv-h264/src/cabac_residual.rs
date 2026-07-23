@@ -1,6 +1,6 @@
 //! CABAC residual-block categories and coded-block neighbour state.
 
-use crate::{H264Error, Result};
+use crate::{CabacSyntaxDecoder, H264Error, Result};
 
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
     (0, 0),
@@ -21,6 +21,15 @@ const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
     (3, 3),
 ];
 const CHROMA_BLOCK_COORDINATES: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
+const SIGNIFICANT_COEFF_OFFSETS_8X8: [u8; 63] = [
+    0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5, 4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8,
+    7, 7, 6, 11, 12, 13, 11, 6, 7, 8, 9, 14, 10, 9, 8, 6, 11, 12, 13, 11, 6, 9, 14, 10, 9, 11, 12,
+    13, 11, 14, 10, 12,
+];
+const LAST_SIGNIFICANT_COEFF_OFFSETS_8X8: [u8; 63] = [
+    0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
+    3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8,
+];
 
 /// The six residual block categories used by progressive 8-bit 4:2:0 CABAC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -118,6 +127,73 @@ impl CabacResidualBlock {
             Self::Luma8x8(_) => CabacResidualCategory::Luma8x8,
         }
     }
+}
+
+/// Significant coefficient positions in increasing scan order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CabacSignificanceMap {
+    indices: [u8; 64],
+    count: u8,
+}
+
+impl CabacSignificanceMap {
+    #[inline]
+    pub const fn count(self) -> u8 {
+        self.count
+    }
+
+    #[inline]
+    pub fn indices(&self) -> &[u8] {
+        &self.indices[..usize::from(self.count)]
+    }
+}
+
+/// Decodes `significant_coeff_flag` and `last_significant_coeff_flag` for one
+/// block whose coded-block flag is already known to be one.
+pub fn decode_cabac_significance_map(
+    syntax: &mut CabacSyntaxDecoder<'_, '_>,
+    category: CabacResidualCategory,
+) -> Result<CabacSignificanceMap> {
+    decode_significance_map_with(category, |context_index| syntax.decision(context_index))
+}
+
+fn decode_significance_map_with(
+    category: CabacResidualCategory,
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<CabacSignificanceMap> {
+    let maximum = usize::from(category.maximum_coefficients());
+    let mut indices = [0; 64];
+    let mut count = 0usize;
+    for coefficient_index in 0..maximum - 1 {
+        let significant_offset = if category == CabacResidualCategory::Luma8x8 {
+            usize::from(SIGNIFICANT_COEFF_OFFSETS_8X8[coefficient_index])
+        } else {
+            coefficient_index
+        };
+        if decision(category.significant_coeff_context_base() + significant_offset)? == 0 {
+            continue;
+        }
+        indices[count] = u8::try_from(coefficient_index).map_err(|_| H264Error::IntegerOverflow)?;
+        count += 1;
+        let last_offset = if category == CabacResidualCategory::Luma8x8 {
+            usize::from(LAST_SIGNIFICANT_COEFF_OFFSETS_8X8[coefficient_index])
+        } else {
+            coefficient_index
+        };
+        if decision(category.last_significant_coeff_context_base() + last_offset)? != 0 {
+            return Ok(CabacSignificanceMap {
+                indices,
+                count: u8::try_from(count).map_err(|_| H264Error::IntegerOverflow)?,
+            });
+        }
+    }
+
+    indices[count] = u8::try_from(maximum - 1).map_err(|_| H264Error::IntegerOverflow)?;
+    count += 1;
+    Ok(CabacSignificanceMap {
+        indices,
+        count: u8::try_from(count).map_err(|_| H264Error::IntegerOverflow)?,
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -411,6 +487,8 @@ impl CabacResidualState {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+
     use super::*;
 
     #[test]
@@ -528,5 +606,43 @@ mod tests {
                 .record_block(1, 1, CabacResidualBlock::LumaDc, true)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn decodes_linear_significance_and_last_flags() {
+        let mut bins = VecDeque::from([0, 1, 0, 0, 1, 1]);
+        let mut visited = Vec::new();
+        let map = decode_significance_map_with(CabacResidualCategory::Luma4x4, |context_index| {
+            visited.push(context_index);
+            Ok(bins.pop_front().unwrap())
+        })
+        .unwrap();
+        assert_eq!(map.indices(), [1, 3]);
+        assert_eq!(visited, [134, 135, 196, 136, 137, 198]);
+    }
+
+    #[test]
+    fn infers_the_final_coefficient_when_no_last_flag_is_set() {
+        let mut visited = Vec::new();
+        let map = decode_significance_map_with(CabacResidualCategory::LumaDc, |context_index| {
+            visited.push(context_index);
+            Ok(0)
+        })
+        .unwrap();
+        assert_eq!(map.indices(), [15]);
+        assert_eq!(visited, (105..120).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn applies_non_linear_eight_by_eight_significance_contexts() {
+        let mut bins = VecDeque::from([0, 0, 0, 0, 0, 0, 1, 1]);
+        let mut visited = Vec::new();
+        let map = decode_significance_map_with(CabacResidualCategory::Luma8x8, |context_index| {
+            visited.push(context_index);
+            Ok(bins.pop_front().unwrap())
+        })
+        .unwrap();
+        assert_eq!(map.indices(), [6]);
+        assert_eq!(visited, [402, 403, 404, 405, 406, 407, 407, 418]);
     }
 }

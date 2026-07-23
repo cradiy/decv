@@ -761,6 +761,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - CABAC residual category metadata and per-block coded-state grids for luma
   DC/AC/4x4/8x8 plus chroma DC/AC, including same-slice neighbour contexts
   and I_PCM/8x8 coverage propagation;
+- CABAC significant/last-significant coefficient maps, including the
+  non-linear progressive 8x8 context mappings and implicit final coefficient;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band

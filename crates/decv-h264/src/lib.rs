@@ -46,7 +46,10 @@ pub use cabac::{
     CabacContextSet, CabacContextState, CabacDecoder, CabacInitializationTable,
     consume_cabac_alignment,
 };
-pub use cabac_residual::{CabacResidualBlock, CabacResidualCategory, CabacResidualState};
+pub use cabac_residual::{
+    CabacResidualBlock, CabacResidualCategory, CabacResidualState, CabacSignificanceMap,
+    decode_cabac_significance_map,
+};
 pub use cabac_syntax::{
     CabacMacroblockState, CabacMacroblockSummary, CabacSliceDecoder, CabacSyntaxDecoder,
 };
