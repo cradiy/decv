@@ -12,6 +12,7 @@ mod dpb;
 mod error;
 mod macroblock;
 mod nal;
+mod parameter_sets;
 mod picture;
 mod pps;
 mod prediction;
@@ -23,11 +24,17 @@ mod transform;
 pub use annex_b::{AnnexBNalUnit, AnnexBReader};
 pub use error::{H264Error, Result};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
+pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
 pub use pps::{
     EntropyCodingMode, PictureParameterSet, SliceGroupMap, SliceGroupRectangle,
     WeightedBiprediction,
 };
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};
+pub use slice::{
+    DeblockingFilter, MemoryManagementOperation, ParsedSliceHeader, PredictionWeight,
+    PredictionWeightTable, ReferenceListModification, ReferencePictureMarking, SliceHeader,
+    SlicePictureOrder, SliceType, WeightOffset,
+};
 pub use sps::{
     BitstreamRestrictions, PicOrderCount, Profile, SampleAspectRatio, ScalingList, ScalingMatrices,
     SequenceParameterSet, TimingInfo, VuiParameters,
