@@ -530,6 +530,24 @@ impl CabacResidualState {
         }
     }
 
+    /// Decoder-internal variant for a terminal-error path.
+    ///
+    /// Unlike [`Self::decode_intra_residual`], this does not preserve neighbour
+    /// state when decoding fails. The picture decoder abandons the entire
+    /// picture after such an error, so copying the macroblock state first would
+    /// only add work to the valid-stream hot path.
+    pub(crate) fn decode_intra_residual_terminal(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        header: &IntraMacroblockHeader,
+    ) -> Result<IntraResidual> {
+        validate_coded_block_pattern(header.coded_block_pattern)?;
+        self.validate_macroblock(macroblock_address)?;
+        self.decode_intra_residual_inner(syntax, macroblock_address, slice_id, header)
+    }
+
     /// Decodes and records every residual block of one progressive 4:2:0
     /// inter macroblock.
     pub fn decode_inter_residual(
@@ -556,6 +574,29 @@ impl CabacResidualState {
                 Err(error)
             }
         }
+    }
+
+    /// Decoder-internal variant for a terminal-error path.
+    ///
+    /// The caller must discard the picture after an error because this method
+    /// intentionally leaves any partially recorded neighbour state in place.
+    pub(crate) fn decode_inter_residual_terminal(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        coded_block_pattern: CodedBlockPattern,
+        transform_size_8x8: bool,
+    ) -> Result<InterResidual> {
+        validate_coded_block_pattern(coded_block_pattern)?;
+        self.validate_macroblock(macroblock_address)?;
+        self.decode_inter_residual_inner(
+            syntax,
+            macroblock_address,
+            slice_id,
+            coded_block_pattern,
+            transform_size_8x8,
+        )
     }
 
     fn decode_intra_residual_inner(

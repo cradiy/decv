@@ -95,6 +95,25 @@ impl CabacPMacroblockState {
         }
     }
 
+    /// Decoder-internal fast path for a picture that is discarded on error.
+    pub(crate) fn decode_macroblock_terminal(
+        &mut self,
+        cabac: &mut CabacSliceDecoder<'_>,
+        residuals: &mut CabacResidualState,
+        macroblock_address: usize,
+        slice_id: u32,
+        context: CabacPMacroblockContext,
+    ) -> Result<CabacPMacroblockDecode> {
+        if context.num_ref_idx_l0_active == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC P slice has no active List-0 references",
+            ));
+        }
+        self.motion_l0.validate_macroblock(macroblock_address)?;
+        residuals.validate_macroblock(macroblock_address)?;
+        self.decode_macroblock_inner(cabac, residuals, macroblock_address, slice_id, context)
+    }
+
     fn decode_macroblock_inner(
         &mut self,
         cabac: &mut CabacSliceDecoder<'_>,
@@ -115,7 +134,7 @@ impl CabacPMacroblockState {
         if skipped {
             {
                 let mut syntax = cabac.syntax();
-                residuals.decode_inter_residual(
+                residuals.decode_inter_residual_terminal(
                     &mut syntax,
                     macroblock_address,
                     slice_id,
@@ -202,7 +221,7 @@ impl CabacPMacroblockState {
             CabacIntraMacroblockSyntax::Predicted(header) => {
                 let residual = {
                     let mut syntax = cabac.syntax();
-                    residuals.decode_intra_residual(
+                    residuals.decode_intra_residual_terminal(
                         &mut syntax,
                         macroblock_address,
                         slice_id,
@@ -332,7 +351,7 @@ impl CabacPMacroblockState {
         };
         let residual = {
             let mut syntax = cabac.syntax();
-            residuals.decode_inter_residual(
+            residuals.decode_inter_residual_terminal(
                 &mut syntax,
                 macroblock_address,
                 slice_id,

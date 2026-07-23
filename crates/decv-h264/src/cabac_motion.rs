@@ -221,6 +221,10 @@ impl CabacMotionSyntaxState {
         Ok(MacroblockMotionSyntaxSnapshot { cells })
     }
 
+    pub(crate) fn validate_macroblock(&self, macroblock_address: usize) -> Result<()> {
+        self.macroblock_cell_base(macroblock_address).map(drop)
+    }
+
     pub(crate) fn restore_macroblock(
         &mut self,
         macroblock_address: usize,

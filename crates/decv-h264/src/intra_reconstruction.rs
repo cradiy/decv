@@ -868,12 +868,11 @@ impl IntraPictureReconstructor {
                     previous_qp_delta_nonzero,
                 )?
             };
-            let residual_snapshot = self.cabac_residual.snapshot_macroblock(macroblock_address);
             let (decoded, qp_delta, summary) = match syntax {
                 CabacIntraMacroblockSyntax::Predicted(header) => {
                     let residual = {
                         let mut syntax = cabac.syntax();
-                        self.cabac_residual.decode_intra_residual(
+                        self.cabac_residual.decode_intra_residual_terminal(
                             &mut syntax,
                             macroblock_address,
                             slice_id,
@@ -932,7 +931,7 @@ impl IntraPictureReconstructor {
                 let mut syntax = cabac.syntax();
                 syntax.terminate()? != 0
             };
-            if let Err(error) = quantizers.with_macroblock(qp_delta, |quantizer| {
+            quantizers.with_macroblock(qp_delta, |quantizer| {
                 self.reconstruct_macroblock_with_deblocking(
                     macroblock_address,
                     slice_id,
@@ -941,11 +940,7 @@ impl IntraPictureReconstructor {
                     config.deblocking_filter,
                     pcm_chroma_qp,
                 )
-            }) {
-                self.cabac_residual
-                    .restore_macroblock(macroblock_address, residual_snapshot);
-                return Err(error);
-            }
+            })?;
 
             macroblocks.record_macroblock(macroblock_address, slice_id, summary)?;
             previous_qp_delta_nonzero = qp_delta != 0;
@@ -1009,8 +1004,7 @@ impl IntraPictureReconstructor {
 
         loop {
             let (macroblock_x, macroblock_y) = self.macroblock_coordinates(macroblock_address)?;
-            let residual_snapshot = self.cabac_residual.snapshot_macroblock(macroblock_address);
-            let decoded = macroblocks.decode_macroblock(
+            let decoded = macroblocks.decode_macroblock_terminal(
                 &mut cabac,
                 &mut self.cabac_residual,
                 macroblock_address,
@@ -1150,11 +1144,7 @@ impl IntraPictureReconstructor {
                             ),
                     },
                 });
-            if let Err(error) = reconstruction {
-                self.cabac_residual
-                    .restore_macroblock(macroblock_address, residual_snapshot);
-                return Err(error);
-            }
+            reconstruction?;
 
             previous_qp_delta_nonzero = qp_delta != 0;
             macroblock_address = macroblock_address
@@ -1446,8 +1436,7 @@ impl IntraPictureReconstructor {
 
         loop {
             let (macroblock_x, macroblock_y) = self.macroblock_coordinates(macroblock_address)?;
-            let residual_snapshot = self.cabac_residual.snapshot_macroblock(macroblock_address);
-            let decoded = macroblocks.decode_macroblock(
+            let decoded = macroblocks.decode_macroblock_terminal(
                 &mut cabac,
                 &mut self.cabac_residual,
                 macroblock_address,
@@ -1585,11 +1574,7 @@ impl IntraPictureReconstructor {
                         }
                     },
                 });
-            if let Err(error) = reconstruction {
-                self.cabac_residual
-                    .restore_macroblock(macroblock_address, residual_snapshot);
-                return Err(error);
-            }
+            reconstruction?;
             if pending_inter.len() >= inter_batch_limit {
                 self.finish_pending_b_inter(
                     &mut pending_inter,
