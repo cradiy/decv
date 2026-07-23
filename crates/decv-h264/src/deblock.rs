@@ -206,6 +206,7 @@ fn filter_deblock_edge_prepared(
     FilteredDeblockEdge { p, q }
 }
 
+#[allow(clippy::needless_range_loop)]
 pub(crate) fn filter_420_picture(
     picture: &mut Yuv420Picture,
     macroblocks: &[MacroblockDeblockInfo],
@@ -240,6 +241,40 @@ pub(crate) fn filter_420_picture(
         let filter_top = top.is_some_and(|neighbor| {
             current.filter.idc != 2 || neighbor.slice_id == current.slice_id
         });
+        let mut vertical_strengths = [[0u8; 4]; 4];
+        let mut horizontal_strengths = [[0u8; 4]; 4];
+        if filter_left {
+            let previous = left.expect("filter_left requires a neighbor");
+            for block_row in 0..4 {
+                vertical_strengths[0][block_row] =
+                    boundary_strength(previous, block_row * 4 + 3, current, block_row * 4, true);
+            }
+        }
+        for block_column in 1..4 {
+            if block_column == 2 || !current.transform_8x8 {
+                for block_row in 0..4 {
+                    let q = block_row * 4 + block_column;
+                    vertical_strengths[block_column][block_row] =
+                        boundary_strength(current, q - 1, current, q, false);
+                }
+            }
+        }
+        if filter_top {
+            let previous = top.expect("filter_top requires a neighbor");
+            for block_column in 0..4 {
+                horizontal_strengths[0][block_column] =
+                    boundary_strength(previous, 12 + block_column, current, block_column, true);
+            }
+        }
+        for block_row in 1..4 {
+            if block_row == 2 || !current.transform_8x8 {
+                for block_column in 0..4 {
+                    let q = block_row * 4 + block_column;
+                    horizontal_strengths[block_row][block_column] =
+                        boundary_strength(current, q - 4, current, q, false);
+                }
+            }
+        }
 
         let luma_x = macroblock_x * 16;
         let luma_y = macroblock_y * 16;
@@ -252,21 +287,25 @@ pub(crate) fn filter_420_picture(
                     luma_x,
                     luma_y + block_row * 4,
                     4,
-                    edge_parameters(previous, block_row * 4 + 3, current, block_row * 4, true, 0),
+                    edge_parameters(previous, current, vertical_strengths[0][block_row], 0),
                 )?;
             }
         }
         for block_column in 1..4 {
             if block_column == 2 || !current.transform_8x8 {
                 for block_row in 0..4 {
-                    let q = block_row * 4 + block_column;
                     filter_vertical_edge(
                         luma,
                         width,
                         luma_x + block_column * 4,
                         luma_y + block_row * 4,
                         4,
-                        edge_parameters(current, q - 1, current, q, false, 0),
+                        edge_parameters(
+                            current,
+                            current,
+                            vertical_strengths[block_column][block_row],
+                            0,
+                        ),
                     )?;
                 }
             }
@@ -280,21 +319,25 @@ pub(crate) fn filter_420_picture(
                     luma_x + block_column * 4,
                     luma_y,
                     4,
-                    edge_parameters(previous, 12 + block_column, current, block_column, true, 0),
+                    edge_parameters(previous, current, horizontal_strengths[0][block_column], 0),
                 )?;
             }
         }
         for block_row in 1..4 {
             if block_row == 2 || !current.transform_8x8 {
                 for block_column in 0..4 {
-                    let q = block_row * 4 + block_column;
                     filter_horizontal_edge(
                         luma,
                         width,
                         luma_x + block_column * 4,
                         luma_y + block_row * 4,
                         4,
-                        edge_parameters(current, q - 4, current, q, false, 0),
+                        edge_parameters(
+                            current,
+                            current,
+                            horizontal_strengths[block_row][block_column],
+                            0,
+                        ),
                     )?;
                 }
             }
@@ -314,10 +357,8 @@ pub(crate) fn filter_420_picture(
                         2,
                         edge_parameters(
                             previous,
-                            block_row * 4 + 3,
                             current,
-                            block_row * 4,
-                            true,
+                            vertical_strengths[0][block_row],
                             component,
                         ),
                     )?;
@@ -332,10 +373,8 @@ pub(crate) fn filter_420_picture(
                     2,
                     edge_parameters(
                         current,
-                        block_row * 4 + 1,
                         current,
-                        block_row * 4 + 2,
-                        false,
+                        vertical_strengths[2][block_row],
                         component,
                     ),
                 )?;
@@ -351,10 +390,8 @@ pub(crate) fn filter_420_picture(
                         2,
                         edge_parameters(
                             previous,
-                            12 + block_column,
                             current,
-                            block_column,
-                            true,
+                            horizontal_strengths[0][block_column],
                             component,
                         ),
                     )?;
@@ -369,10 +406,8 @@ pub(crate) fn filter_420_picture(
                     2,
                     edge_parameters(
                         current,
-                        4 + block_column,
                         current,
-                        8 + block_column,
-                        false,
+                        horizontal_strengths[2][block_column],
                         component,
                     ),
                 )?;
@@ -433,10 +468,8 @@ fn prepare_edge_parameters(parameters: EdgeParameters) -> Result<Option<Prepared
 
 fn edge_parameters(
     previous: MacroblockDeblockInfo,
-    previous_cell: usize,
     current: MacroblockDeblockInfo,
-    current_cell: usize,
-    external: bool,
+    boundary_strength: u8,
     component: u8,
 ) -> EdgeParameters {
     let qp = |macroblock: MacroblockDeblockInfo| match component {
@@ -445,13 +478,7 @@ fn edge_parameters(
         _ => macroblock.cr_qp,
     };
     EdgeParameters {
-        boundary_strength: boundary_strength(
-            previous,
-            previous_cell,
-            current,
-            current_cell,
-            external,
-        ),
+        boundary_strength,
         qp_p: qp(previous),
         qp_q: qp(current),
         alpha_offset_div2: current.filter.alpha_c0_offset_div2,

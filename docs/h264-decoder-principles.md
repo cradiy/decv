@@ -729,6 +729,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - deblocking fast rejection before pixel loads for zero-strength and
   zero-threshold edges, with validation and invariant `alpha`/`beta`/`tc0`
   preparation performed once per edge segment instead of once per sample;
+- each macroblock derives its 32 luma-grid boundary strengths once and reuses
+  them for Y, Cb, and Cr filtering, avoiding repeated reference-identity and
+  motion-vector comparisons for the two chroma planes;
 - structure-of-arrays reconstruction bookkeeping keeps completion flags
   separate from deblocking metadata, so picture finalization filters the
   in-place metadata instead of allocating and copying one large record per
