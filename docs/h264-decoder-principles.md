@@ -702,6 +702,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   prediction, picture writes, and RBSP trailing-bit validation;
 - complete Annex-B SPS/PPS/IDR-to-NV12 and IDR-to-reference-P integration
   tests;
+- a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
+  and optionally writes tightly packed raw NV12 output;
 - a synchronous `VideoDecoder` implementation with packet ownership,
   backpressure, `FormatChanged`, timestamps, flush, and drain behavior.
 
@@ -749,4 +751,10 @@ Useful verification commands are:
 cargo test --workspace --release
 cargo clippy -p decv-h264 --all-targets -- -D warnings
 cargo bench -p decv-h264 --bench cavlc
+./scripts/verify_real_h264.sh
 ```
+
+The last command generates fresh Baseline/CAVLC streams with libx264 and
+compares every decoded NV12 byte with FFmpeg. It uses a unique temporary
+directory so an old reference output cannot accidentally be compared with a
+new bitstream.
