@@ -218,6 +218,18 @@ fn predict_luma<const CLIP: bool>(
     x_fraction: u8,
     y_fraction: u8,
 ) {
+    if !CLIP && x_fraction == 0 && y_fraction == 0 {
+        let output_width = usize::from(prediction.width);
+        let reference_x = reference_x as usize;
+        let reference_y = reference_y as usize;
+        for output_y in 0..usize::from(prediction.height) {
+            let start = (reference_y + output_y) * width + reference_x;
+            prediction.luma[output_y][..output_width]
+                .copy_from_slice(&plane[start..start + output_width]);
+        }
+        return;
+    }
+
     for y in 0..usize::from(prediction.height) {
         for x in 0..usize::from(prediction.width) {
             prediction.luma[y][x] = interpolate_luma_inner::<CLIP>(
@@ -245,6 +257,19 @@ fn predict_chroma<const CLIP: bool>(
     x_fraction: u8,
     y_fraction: u8,
 ) {
+    if !CLIP && x_fraction == 0 && y_fraction == 0 {
+        let output_width = usize::from(prediction.width / 2);
+        let reference_x = reference_x as usize;
+        let reference_y = reference_y as usize;
+        for output_y in 0..usize::from(prediction.height / 2) {
+            let start = (reference_y + output_y) * width + reference_x;
+            let end = start + output_width;
+            prediction.cb[output_y][..output_width].copy_from_slice(&cb[start..end]);
+            prediction.cr[output_y][..output_width].copy_from_slice(&cr[start..end]);
+        }
+        return;
+    }
+
     for output_y in 0..usize::from(prediction.height / 2) {
         for output_x in 0..usize::from(prediction.width / 2) {
             let x = reference_x + output_x as i32;
