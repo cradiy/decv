@@ -1,6 +1,9 @@
 //! CABAC residual-block categories and coded-block neighbour state.
 
-use crate::{CabacSyntaxDecoder, H264Error, Result};
+use crate::{
+    CabacSyntaxDecoder, CodedBlockPattern, H264Error, InterResidual, IntraLumaPrediction,
+    IntraMacroblockHeader, IntraResidual, ResidualBlock, Result,
+};
 
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
     (0, 0),
@@ -316,6 +319,16 @@ struct BlockState {
     coded: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MacroblockResidualSnapshot {
+    luma: [Option<BlockState>; 16],
+    chroma_cb: [Option<BlockState>; 4],
+    chroma_cr: [Option<BlockState>; 4],
+    luma_dc: Option<BlockState>,
+    chroma_dc_cb: Option<BlockState>,
+    chroma_dc_cr: Option<BlockState>,
+}
+
 #[derive(Debug, Clone)]
 struct BlockGrid {
     width: usize,
@@ -490,6 +503,340 @@ impl CabacResidualState {
         Ok(())
     }
 
+    /// Decodes and records every residual block of one progressive 4:2:0
+    /// intra macroblock.
+    ///
+    /// Neighbour state is committed only after the complete macroblock
+    /// succeeds. A CABAC syntax error remains fatal to the surrounding slice,
+    /// so the arithmetic decoder itself is not rewound.
+    pub fn decode_intra_residual(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        header: &IntraMacroblockHeader,
+    ) -> Result<IntraResidual> {
+        validate_coded_block_pattern(header.coded_block_pattern)?;
+        self.validate_macroblock(macroblock_address)?;
+        let snapshot = self.snapshot_macroblock(macroblock_address);
+        match self.decode_intra_residual_inner(syntax, macroblock_address, slice_id, header) {
+            Ok(residual) => Ok(residual),
+            Err(error) => {
+                self.restore_macroblock(macroblock_address, snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    /// Decodes and records every residual block of one progressive 4:2:0
+    /// inter macroblock.
+    pub fn decode_inter_residual(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        coded_block_pattern: CodedBlockPattern,
+        transform_size_8x8: bool,
+    ) -> Result<InterResidual> {
+        validate_coded_block_pattern(coded_block_pattern)?;
+        self.validate_macroblock(macroblock_address)?;
+        let snapshot = self.snapshot_macroblock(macroblock_address);
+        match self.decode_inter_residual_inner(
+            syntax,
+            macroblock_address,
+            slice_id,
+            coded_block_pattern,
+            transform_size_8x8,
+        ) {
+            Ok(residual) => Ok(residual),
+            Err(error) => {
+                self.restore_macroblock(macroblock_address, snapshot);
+                Err(error)
+            }
+        }
+    }
+
+    fn decode_intra_residual_inner(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        header: &IntraMacroblockHeader,
+    ) -> Result<IntraResidual> {
+        let intra_16x16 = matches!(
+            header.luma_prediction,
+            IntraLumaPrediction::SixteenBySixteen { .. }
+        );
+        let luma_dc = if intra_16x16 {
+            Some(self.decode_residual_block(
+                syntax,
+                macroblock_address,
+                slice_id,
+                true,
+                CabacResidualBlock::LumaDc,
+            )?)
+        } else {
+            None
+        };
+        let transform_size_8x8 =
+            matches!(header.luma_prediction, IntraLumaPrediction::EightByEight(_));
+        let luma = self.decode_luma_residual(
+            syntax,
+            macroblock_address,
+            slice_id,
+            true,
+            header.coded_block_pattern.luma,
+            intra_16x16,
+            transform_size_8x8,
+        )?;
+        let (chroma_dc, chroma_ac) = self.decode_chroma_residual(
+            syntax,
+            macroblock_address,
+            slice_id,
+            true,
+            header.coded_block_pattern.chroma,
+        )?;
+        Ok(IntraResidual {
+            luma_dc,
+            luma,
+            chroma_dc,
+            chroma_ac,
+        })
+    }
+
+    fn decode_inter_residual_inner(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        coded_block_pattern: CodedBlockPattern,
+        transform_size_8x8: bool,
+    ) -> Result<InterResidual> {
+        let luma = self.decode_luma_residual(
+            syntax,
+            macroblock_address,
+            slice_id,
+            false,
+            coded_block_pattern.luma,
+            false,
+            transform_size_8x8,
+        )?;
+        let (chroma_dc, chroma_ac) = self.decode_chroma_residual(
+            syntax,
+            macroblock_address,
+            slice_id,
+            false,
+            coded_block_pattern.chroma,
+        )?;
+        Ok(InterResidual {
+            luma,
+            chroma_dc,
+            chroma_ac,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_luma_residual(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        current_is_intra: bool,
+        coded_block_pattern_luma: u8,
+        intra_16x16: bool,
+        transform_size_8x8: bool,
+    ) -> Result<[ResidualBlock; 16]> {
+        let maximum_coefficients = if intra_16x16 { 15 } else { 16 };
+        let mut luma = [ResidualBlock::empty(maximum_coefficients); 16];
+
+        if transform_size_8x8 {
+            for region in 0..4u8 {
+                let block = CabacResidualBlock::Luma8x8(region);
+                if coded_block_pattern_luma & (1 << region) == 0 {
+                    self.record_block(macroblock_address, slice_id, block, false)?;
+                    continue;
+                }
+                let coefficients = self
+                    .decode_coded_coefficient_block(
+                        syntax,
+                        macroblock_address,
+                        slice_id,
+                        current_is_intra,
+                        block,
+                    )?
+                    .expect("4:2:0 luma 8x8 blocks have no coded_block_flag");
+                let split = split_luma_8x8(coefficients)?;
+                luma[usize::from(region) * 4..usize::from(region + 1) * 4].copy_from_slice(&split);
+            }
+            return Ok(luma);
+        }
+
+        for block_index in 0..16u8 {
+            let block = if intra_16x16 {
+                CabacResidualBlock::LumaAc(block_index)
+            } else {
+                CabacResidualBlock::Luma4x4(block_index)
+            };
+            if coded_block_pattern_luma & (1 << (block_index / 4)) == 0 {
+                self.record_block(macroblock_address, slice_id, block, false)?;
+                continue;
+            }
+            luma[usize::from(block_index)] = self.decode_residual_block(
+                syntax,
+                macroblock_address,
+                slice_id,
+                current_is_intra,
+                block,
+            )?;
+        }
+        Ok(luma)
+    }
+
+    fn decode_chroma_residual(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        current_is_intra: bool,
+        coded_block_pattern_chroma: u8,
+    ) -> Result<([ResidualBlock; 2], [[ResidualBlock; 4]; 2])> {
+        let mut chroma_dc = [ResidualBlock::empty(4); 2];
+        for plane in 0..2u8 {
+            let block = CabacResidualBlock::ChromaDc { plane };
+            if coded_block_pattern_chroma == 0 {
+                self.record_block(macroblock_address, slice_id, block, false)?;
+            } else {
+                chroma_dc[usize::from(plane)] = self.decode_residual_block(
+                    syntax,
+                    macroblock_address,
+                    slice_id,
+                    current_is_intra,
+                    block,
+                )?;
+            }
+        }
+
+        let mut chroma_ac = [[ResidualBlock::empty(15); 4]; 2];
+        for plane in 0..2u8 {
+            for block_index in 0..4u8 {
+                let block = CabacResidualBlock::ChromaAc {
+                    plane,
+                    block: block_index,
+                };
+                if coded_block_pattern_chroma < 2 {
+                    self.record_block(macroblock_address, slice_id, block, false)?;
+                } else {
+                    chroma_ac[usize::from(plane)][usize::from(block_index)] = self
+                        .decode_residual_block(
+                            syntax,
+                            macroblock_address,
+                            slice_id,
+                            current_is_intra,
+                            block,
+                        )?;
+                }
+            }
+        }
+        Ok((chroma_dc, chroma_ac))
+    }
+
+    fn decode_residual_block(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        current_is_intra: bool,
+        block: CabacResidualBlock,
+    ) -> Result<ResidualBlock> {
+        let maximum_coefficients = block.category().maximum_coefficients();
+        let coefficients = self.decode_coded_coefficient_block(
+            syntax,
+            macroblock_address,
+            slice_id,
+            current_is_intra,
+            block,
+        )?;
+        coefficients.map_or_else(
+            || Ok(ResidualBlock::empty(maximum_coefficients)),
+            coefficient_block_to_residual,
+        )
+    }
+
+    fn decode_coded_coefficient_block(
+        &mut self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        current_is_intra: bool,
+        block: CabacResidualBlock,
+    ) -> Result<Option<CabacCoefficientBlock>> {
+        let coded = match self.coded_block_flag_context_index(
+            macroblock_address,
+            slice_id,
+            current_is_intra,
+            block,
+        )? {
+            Some(context_index) => syntax.decision(context_index)? != 0,
+            None => true,
+        };
+        if !coded {
+            self.record_block(macroblock_address, slice_id, block, false)?;
+            return Ok(None);
+        }
+
+        let coefficients = decode_cabac_coefficient_block(syntax, block.category())?;
+        self.record_block(macroblock_address, slice_id, block, true)?;
+        Ok(Some(coefficients))
+    }
+
+    fn snapshot_macroblock(&self, macroblock_address: usize) -> MacroblockResidualSnapshot {
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let mut snapshot = MacroblockResidualSnapshot {
+            luma: [None; 16],
+            chroma_cb: [None; 4],
+            chroma_cr: [None; 4],
+            luma_dc: self.luma_dc.entries[macroblock_address],
+            chroma_dc_cb: self.chroma_dc_cb.entries[macroblock_address],
+            chroma_dc_cr: self.chroma_dc_cr.entries[macroblock_address],
+        };
+        for (index, &(block_x, block_y)) in LUMA_BLOCK_COORDINATES.iter().enumerate() {
+            let x = macroblock_x * 4 + block_x;
+            let y = macroblock_y * 4 + block_y;
+            snapshot.luma[index] = self.luma.entries[y * self.luma.width + x];
+        }
+        for (index, &(block_x, block_y)) in CHROMA_BLOCK_COORDINATES.iter().enumerate() {
+            let x = macroblock_x * 2 + block_x;
+            let y = macroblock_y * 2 + block_y;
+            snapshot.chroma_cb[index] = self.chroma_cb.entries[y * self.chroma_cb.width + x];
+            snapshot.chroma_cr[index] = self.chroma_cr.entries[y * self.chroma_cr.width + x];
+        }
+        snapshot
+    }
+
+    fn restore_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        snapshot: MacroblockResidualSnapshot,
+    ) {
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        self.luma_dc.entries[macroblock_address] = snapshot.luma_dc;
+        self.chroma_dc_cb.entries[macroblock_address] = snapshot.chroma_dc_cb;
+        self.chroma_dc_cr.entries[macroblock_address] = snapshot.chroma_dc_cr;
+        for (index, &(block_x, block_y)) in LUMA_BLOCK_COORDINATES.iter().enumerate() {
+            let x = macroblock_x * 4 + block_x;
+            let y = macroblock_y * 4 + block_y;
+            self.luma.entries[y * self.luma.width + x] = snapshot.luma[index];
+        }
+        for (index, &(block_x, block_y)) in CHROMA_BLOCK_COORDINATES.iter().enumerate() {
+            let x = macroblock_x * 2 + block_x;
+            let y = macroblock_y * 2 + block_y;
+            self.chroma_cb.entries[y * self.chroma_cb.width + x] = snapshot.chroma_cb[index];
+            self.chroma_cr.entries[y * self.chroma_cr.width + x] = snapshot.chroma_cr[index];
+        }
+    }
+
     fn grid_and_coordinates(
         &self,
         macroblock_address: usize,
@@ -599,9 +946,54 @@ impl CabacResidualState {
     }
 }
 
+fn validate_coded_block_pattern(coded_block_pattern: CodedBlockPattern) -> Result<()> {
+    if coded_block_pattern.luma > 15 || coded_block_pattern.chroma > 2 {
+        return Err(H264Error::InvalidSyntax(
+            "coded block pattern exceeds 4:2:0 macroblock bounds",
+        ));
+    }
+    Ok(())
+}
+
+fn coefficient_block_to_residual(block: CabacCoefficientBlock) -> Result<ResidualBlock> {
+    if block.maximum_coefficients > 16 {
+        return Err(H264Error::InvalidSyntax(
+            "CABAC coefficient block does not fit a 4x4 residual",
+        ));
+    }
+    let mut coefficients = [0; 16];
+    coefficients[..usize::from(block.maximum_coefficients)].copy_from_slice(block.coefficients());
+    Ok(ResidualBlock {
+        coefficients,
+        total_coeff: block.coefficient_count,
+        max_num_coeff: block.maximum_coefficients,
+    })
+}
+
+fn split_luma_8x8(block: CabacCoefficientBlock) -> Result<[ResidualBlock; 4]> {
+    if block.maximum_coefficients != 64 {
+        return Err(H264Error::InvalidSyntax(
+            "CABAC luma 8x8 split requires 64 coefficients",
+        ));
+    }
+    let mut output = [ResidualBlock::empty(16); 4];
+    for (coefficient_index, &coefficient) in block.coefficients().iter().enumerate() {
+        let output_block = coefficient_index % 4;
+        output[output_block].coefficients[coefficient_index / 4] = coefficient;
+        output[output_block].total_coeff += u8::from(coefficient != 0);
+    }
+    Ok(output)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+
+    use bit_readers::BitReader;
+
+    use crate::{
+        CabacContextSet, CabacDecoder, CabacInitializationTable, IntraPredictionModeSyntax,
+    };
 
     use super::*;
 
@@ -842,5 +1234,119 @@ mod tests {
             H264Error::InvalidSyntax("CABAC coefficient escape prefix is too long")
         );
         assert_eq!(decision_count, 14);
+    }
+
+    #[test]
+    fn converts_small_blocks_and_interleaves_eight_by_eight_blocks() {
+        let small = CabacCoefficientBlock {
+            coefficients: {
+                let mut coefficients = [0; 64];
+                coefficients[0] = 7;
+                coefficients[14] = -3;
+                coefficients
+            },
+            coefficient_count: 2,
+            maximum_coefficients: 15,
+        };
+        assert_eq!(
+            coefficient_block_to_residual(small).unwrap(),
+            ResidualBlock {
+                coefficients: {
+                    let mut coefficients = [0; 16];
+                    coefficients[0] = 7;
+                    coefficients[14] = -3;
+                    coefficients
+                },
+                total_coeff: 2,
+                max_num_coeff: 15,
+            }
+        );
+
+        let block_8x8 = CabacCoefficientBlock {
+            coefficients: std::array::from_fn(|index| i32::try_from(index + 1).unwrap()),
+            coefficient_count: 64,
+            maximum_coefficients: 64,
+        };
+        let split = split_luma_8x8(block_8x8).unwrap();
+        for (block_index, block) in split.iter().enumerate() {
+            assert_eq!(block.total_coeff, 16);
+            assert_eq!(block.max_num_coeff, 16);
+            assert_eq!(
+                block.coefficients,
+                std::array::from_fn(|index| i32::try_from(index * 4 + block_index + 1).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn assembles_and_records_an_inferred_zero_intra_macroblock() {
+        let mode = IntraPredictionModeSyntax {
+            use_predicted: true,
+            remaining_mode: None,
+        };
+        let header = IntraMacroblockHeader {
+            luma_prediction: IntraLumaPrediction::FourByFour([mode; 16]),
+            chroma_prediction_mode: 0,
+            coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
+            qp_delta: 0,
+        };
+        let mut arithmetic = CabacDecoder::new(BitReader::new(&[0; 2])).unwrap();
+        let mut contexts = CabacContextSet::new(CabacInitializationTable::Intra, 26).unwrap();
+        let mut syntax = CabacSyntaxDecoder::new(&mut arithmetic, &mut contexts);
+        let mut state = CabacResidualState::new(2, 1).unwrap();
+
+        let residual = state
+            .decode_intra_residual(&mut syntax, 0, 7, &header)
+            .unwrap();
+
+        assert!(residual.luma_dc.is_none());
+        assert!(residual.luma.iter().all(|block| block.total_coeff == 0));
+        assert!(
+            residual
+                .chroma_dc
+                .iter()
+                .chain(residual.chroma_ac.iter().flatten())
+                .all(|block| block.total_coeff == 0)
+        );
+        assert_eq!(
+            state
+                .coded_block_flag_context_index(1, 7, true, CabacResidualBlock::Luma4x4(0),)
+                .unwrap(),
+            Some(95)
+        );
+    }
+
+    #[test]
+    fn restores_only_the_current_macroblock_state_after_residual_failure() {
+        let mode = IntraPredictionModeSyntax {
+            use_predicted: true,
+            remaining_mode: None,
+        };
+        let header = IntraMacroblockHeader {
+            luma_prediction: IntraLumaPrediction::FourByFour([mode; 16]),
+            chroma_prediction_mode: 0,
+            coded_block_pattern: CodedBlockPattern {
+                luma: 15,
+                chroma: 2,
+            },
+            qp_delta: 0,
+        };
+        let mut arithmetic = CabacDecoder::new(BitReader::new(&[0; 2])).unwrap();
+        let mut contexts = CabacContextSet::new(CabacInitializationTable::Intra, 26).unwrap();
+        let mut syntax = CabacSyntaxDecoder::new(&mut arithmetic, &mut contexts);
+        let mut state = CabacResidualState::new(2, 1).unwrap();
+        state
+            .record_block(1, 3, CabacResidualBlock::Luma4x4(0), true)
+            .unwrap();
+        let before_current = state.snapshot_macroblock(0);
+        let before_other = state.snapshot_macroblock(1);
+
+        assert!(
+            state
+                .decode_intra_residual(&mut syntax, 0, 3, &header)
+                .is_err()
+        );
+        assert_eq!(state.snapshot_macroblock(0), before_current);
+        assert_eq!(state.snapshot_macroblock(1), before_other);
     }
 }

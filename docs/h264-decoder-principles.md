@@ -765,6 +765,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   non-linear progressive 8x8 context mappings and implicit final coefficient;
 - CABAC coefficient magnitude state transitions, bounded escape decoding, and
   bypass-coded signs in reverse significance order;
+- complete progressive 4:2:0 CABAC residual assembly for intra and inter
+  macroblocks, including coded-block state and 8x8-to-4x4 interleaving;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
