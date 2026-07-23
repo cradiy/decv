@@ -4,9 +4,20 @@ use bit_readers::BitReader;
 
 use crate::{
     CabacContextSet, CabacDecoder, CabacInitializationTable, CodedBlockPattern, H264Error,
-    IntraLumaPrediction, IntraMacroblockHeader, IntraPredictionModeSyntax, PcmMacroblock, Result,
-    SliceType, consume_cabac_alignment,
+    IntraLumaPrediction, IntraMacroblockHeader, IntraPredictionModeSyntax, PSubMacroblockType,
+    PcmMacroblock, Result, SliceType, consume_cabac_alignment,
 };
+
+/// CABAC-decoded `mb_type` for a P slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CabacPMacroblockType {
+    L0_16x16,
+    L0_16x8,
+    L0_8x16,
+    EightByEight,
+    /// Embedded I macroblock type in the ordinary I table's 0..=25 range.
+    Intra(u8),
+}
 
 /// CABAC-decoded I-macroblock syntax before residual or I_PCM sample decoding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +112,25 @@ impl CabacMacroblockState {
         macroblock_type += 2 * syntax.decision(9)?;
         macroblock_type += syntax.decision(10)?;
         Ok(macroblock_type)
+    }
+
+    /// Decodes one non-skipped progressive P-slice `mb_type`.
+    pub fn decode_p_macroblock_type(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+    ) -> Result<CabacPMacroblockType> {
+        decode_p_macroblock_type_with(|request| match request {
+            CabacBinRequest::Decision(context_index) => syntax.decision(context_index),
+            CabacBinRequest::Terminate => syntax.terminate(),
+        })
+    }
+
+    /// Decodes one P-slice `sub_mb_type`.
+    pub fn decode_p_sub_macroblock_type(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+    ) -> Result<PSubMacroblockType> {
+        decode_p_sub_macroblock_type_with(|context_index| syntax.decision(context_index))
     }
 
     /// Decodes the complete prediction/header syntax of one I macroblock.
@@ -472,6 +502,70 @@ fn decode_fixed_length(mut bit_count: u8, mut decode: impl FnMut() -> Result<u8>
         bit_count -= 1;
     }
     Ok(value)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CabacBinRequest {
+    Decision(usize),
+    Terminate,
+}
+
+fn decode_p_macroblock_type_with(
+    mut decode: impl FnMut(CabacBinRequest) -> Result<u8>,
+) -> Result<CabacPMacroblockType> {
+    if decode(CabacBinRequest::Decision(14))? == 0 {
+        if decode(CabacBinRequest::Decision(15))? == 0 {
+            return Ok(if decode(CabacBinRequest::Decision(16))? == 0 {
+                CabacPMacroblockType::L0_16x16
+            } else {
+                CabacPMacroblockType::EightByEight
+            });
+        }
+        return Ok(if decode(CabacBinRequest::Decision(17))? == 0 {
+            CabacPMacroblockType::L0_8x16
+        } else {
+            CabacPMacroblockType::L0_16x8
+        });
+    }
+
+    Ok(CabacPMacroblockType::Intra(
+        decode_embedded_intra_macroblock_type(&mut decode)?,
+    ))
+}
+
+fn decode_embedded_intra_macroblock_type(
+    mut decode: impl FnMut(CabacBinRequest) -> Result<u8>,
+) -> Result<u8> {
+    if decode(CabacBinRequest::Decision(17))? == 0 {
+        return Ok(0);
+    }
+    if decode(CabacBinRequest::Terminate)? != 0 {
+        return Ok(25);
+    }
+    let mut macroblock_type = 1;
+    macroblock_type += 12 * decode(CabacBinRequest::Decision(18))?;
+    if decode(CabacBinRequest::Decision(19))? != 0 {
+        macroblock_type += 4 + 4 * decode(CabacBinRequest::Decision(19))?;
+    }
+    macroblock_type += 2 * decode(CabacBinRequest::Decision(20))?;
+    macroblock_type += decode(CabacBinRequest::Decision(20))?;
+    Ok(macroblock_type)
+}
+
+fn decode_p_sub_macroblock_type_with(
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<PSubMacroblockType> {
+    if decision(21)? != 0 {
+        return Ok(PSubMacroblockType::L0_8x8);
+    }
+    if decision(22)? == 0 {
+        return Ok(PSubMacroblockType::L0_8x4);
+    }
+    Ok(if decision(23)? != 0 {
+        PSubMacroblockType::L0_4x8
+    } else {
+        PSubMacroblockType::L0_4x4
+    })
 }
 
 fn decode_truncated_unary(
@@ -933,6 +1027,83 @@ mod tests {
                 coded_block_pattern.luma,
                 if macroblock_type >= 13 { 15 } else { 0 }
             );
+        }
+    }
+
+    #[test]
+    fn decodes_every_p_macroblock_partition_shape() {
+        let cases = [
+            ([0, 0, 0], CabacPMacroblockType::L0_16x16),
+            ([0, 0, 1], CabacPMacroblockType::EightByEight),
+            ([0, 1, 0], CabacPMacroblockType::L0_8x16),
+            ([0, 1, 1], CabacPMacroblockType::L0_16x8),
+        ];
+        for (bins, expected) in cases {
+            let mut bins = VecDeque::from(bins);
+            let mut visited = Vec::new();
+            let actual = decode_p_macroblock_type_with(|request| match request {
+                CabacBinRequest::Decision(context_index) => {
+                    visited.push(context_index);
+                    Ok(bins.pop_front().unwrap())
+                }
+                CabacBinRequest::Terminate => {
+                    unreachable!("inter P types do not use termination")
+                }
+            })
+            .unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(
+                visited,
+                if matches!(
+                    expected,
+                    CabacPMacroblockType::L0_16x16 | CabacPMacroblockType::EightByEight
+                ) {
+                    vec![14, 15, 16]
+                } else {
+                    vec![14, 15, 17]
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn decodes_embedded_p_intra_and_pcm_types() {
+        let mut nxn_bins = VecDeque::from([1, 0]);
+        assert_eq!(
+            decode_p_macroblock_type_with(|request| match request {
+                CabacBinRequest::Decision(_) => Ok(nxn_bins.pop_front().unwrap()),
+                CabacBinRequest::Terminate => unreachable!(),
+            })
+            .unwrap(),
+            CabacPMacroblockType::Intra(0)
+        );
+
+        let mut pcm_bins = VecDeque::from([1, 1]);
+        assert_eq!(
+            decode_p_macroblock_type_with(|request| match request {
+                CabacBinRequest::Decision(_) => Ok(pcm_bins.pop_front().unwrap()),
+                CabacBinRequest::Terminate => Ok(1),
+            })
+            .unwrap(),
+            CabacPMacroblockType::Intra(25)
+        );
+    }
+
+    #[test]
+    fn decodes_every_p_sub_macroblock_shape() {
+        let cases: &[(&[u8], PSubMacroblockType)] = &[
+            (&[1], PSubMacroblockType::L0_8x8),
+            (&[0, 0], PSubMacroblockType::L0_8x4),
+            (&[0, 1, 1], PSubMacroblockType::L0_4x8),
+            (&[0, 1, 0], PSubMacroblockType::L0_4x4),
+        ];
+        for &(bins, expected) in cases {
+            let mut bins: VecDeque<_> = bins.iter().copied().collect();
+            assert_eq!(
+                decode_p_sub_macroblock_type_with(|_| Ok(bins.pop_front().unwrap())).unwrap(),
+                expected
+            );
+            assert!(bins.is_empty());
         }
     }
 

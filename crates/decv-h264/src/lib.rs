@@ -52,8 +52,8 @@ pub use cabac_residual::{
     decode_cabac_significance_map,
 };
 pub use cabac_syntax::{
-    CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary, CabacSliceDecoder,
-    CabacSyntaxDecoder,
+    CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary, CabacPMacroblockType,
+    CabacSliceDecoder, CabacSyntaxDecoder,
 };
 pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
