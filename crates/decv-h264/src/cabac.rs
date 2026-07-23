@@ -442,9 +442,11 @@ impl<'data> CabacDecoder<'data> {
 
 #[inline]
 fn renormalize(reader: &mut BitReader<'_>, range: &mut u16, offset: &mut u16) -> Result<()> {
-    while *range < 256 {
-        *range <<= 1;
-        *offset = (*offset << 1) | u16::from(reader.read_bit().ok_or(H264Error::UnexpectedEof)?);
+    if *range < 256 {
+        let shift = range.leading_zeros() - 7;
+        let bits = reader.read_bits(shift).ok_or(H264Error::UnexpectedEof)? as u16;
+        *range <<= shift;
+        *offset = (*offset << shift) | bits;
     }
     debug_assert!((256..=510).contains(range));
     debug_assert!(*offset < *range);
