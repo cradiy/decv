@@ -2,7 +2,9 @@
 
 use std::sync::Arc;
 
-use crate::{H264Error, ReferenceListModification, Result, Yuv420Picture};
+use crate::{
+    H264Error, MemoryManagementOperation, ReferenceListModification, Result, Yuv420Picture,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceKind {
@@ -27,6 +29,7 @@ pub struct DpbReference {
 pub struct DecodedPictureBuffer {
     max_num_ref_frames: usize,
     max_frame_num: u32,
+    max_long_term_frame_idx: Option<u32>,
     references: Vec<DpbReference>,
 }
 
@@ -42,7 +45,8 @@ impl DecodedPictureBuffer {
         Ok(Self {
             max_num_ref_frames,
             max_frame_num: 1u32 << log2_max_frame_num,
-            references: Vec::with_capacity(max_num_ref_frames),
+            max_long_term_frame_idx: None,
+            references: Vec::with_capacity(max_num_ref_frames.max(1)),
         })
     }
 
@@ -58,6 +62,7 @@ impl DecodedPictureBuffer {
 
     pub fn clear(&mut self) {
         self.references.clear();
+        self.max_long_term_frame_idx = None;
     }
 
     /// Builds the default reference picture List 0 for a progressive P slice:
@@ -155,14 +160,11 @@ impl DecodedPictureBuffer {
         picture: Arc<Yuv420Picture>,
         long_term_reference: bool,
     ) -> Result<()> {
-        if self.max_num_ref_frames == 0 {
-            return Err(H264Error::InvalidSyntax(
-                "SPS does not permit storing reference frames",
-            ));
-        }
         let kind = if long_term_reference {
+            self.max_long_term_frame_idx = Some(0);
             ReferenceKind::LongTerm { frame_index: 0 }
         } else {
+            self.max_long_term_frame_idx = None;
             ReferenceKind::ShortTerm
         };
         self.references.clear();
@@ -192,7 +194,7 @@ impl DecodedPictureBuffer {
                 "DPB already contains this short-term frame_num",
             ));
         }
-        if self.references.len() == self.max_num_ref_frames {
+        if self.references.len() == self.reference_limit() {
             let oldest = self
                 .references
                 .iter()
@@ -213,6 +215,112 @@ impl DecodedPictureBuffer {
             kind: ReferenceKind::ShortTerm,
             picture,
         });
+        Ok(())
+    }
+
+    /// Applies progressive-frame MMCO 1 through 6 and stores the current
+    /// decoded reference picture. The complete command sequence is atomic.
+    pub fn store_adaptive(
+        &mut self,
+        frame_num: u32,
+        picture_order_count: i32,
+        picture: Arc<Yuv420Picture>,
+        operations: &[MemoryManagementOperation],
+    ) -> Result<()> {
+        self.ensure_frame_num(frame_num)?;
+        self.ensure_can_store(&picture)?;
+        let mut references = self.references.clone();
+        let mut max_long_term_frame_idx = self.max_long_term_frame_idx;
+        let mut current_kind = ReferenceKind::ShortTerm;
+
+        for operation in operations {
+            match *operation {
+                MemoryManagementOperation::ForgetShortTerm {
+                    difference_of_pic_nums,
+                } => {
+                    let index = short_term_operation_index(
+                        &references,
+                        frame_num,
+                        self.max_frame_num,
+                        difference_of_pic_nums,
+                    )?;
+                    references.remove(index);
+                }
+                MemoryManagementOperation::ForgetLongTerm { long_term_pic_num } => {
+                    let index = long_term_index(&references, long_term_pic_num).ok_or(
+                        H264Error::InvalidSyntax("MMCO 2 names a missing long-term reference"),
+                    )?;
+                    references.remove(index);
+                }
+                MemoryManagementOperation::AssignLongTerm {
+                    difference_of_pic_nums,
+                    long_term_frame_idx,
+                } => {
+                    ensure_long_term_index(max_long_term_frame_idx, long_term_frame_idx)?;
+                    if let Some(index) = long_term_index(&references, long_term_frame_idx) {
+                        references.remove(index);
+                    }
+                    let index = short_term_operation_index(
+                        &references,
+                        frame_num,
+                        self.max_frame_num,
+                        difference_of_pic_nums,
+                    )?;
+                    references[index].kind = ReferenceKind::LongTerm {
+                        frame_index: long_term_frame_idx,
+                    };
+                }
+                MemoryManagementOperation::LimitLongTerm {
+                    max_long_term_frame_idx_plus1,
+                } => {
+                    references.retain(|reference| match reference.kind {
+                        ReferenceKind::ShortTerm => true,
+                        ReferenceKind::LongTerm { frame_index } => {
+                            frame_index < max_long_term_frame_idx_plus1
+                        }
+                    });
+                    max_long_term_frame_idx = max_long_term_frame_idx_plus1.checked_sub(1);
+                }
+                MemoryManagementOperation::ForgetAll => {
+                    references.clear();
+                    max_long_term_frame_idx = None;
+                }
+                MemoryManagementOperation::MarkCurrentLongTerm {
+                    long_term_frame_idx,
+                } => {
+                    ensure_long_term_index(max_long_term_frame_idx, long_term_frame_idx)?;
+                    if let Some(index) = long_term_index(&references, long_term_frame_idx) {
+                        references.remove(index);
+                    }
+                    current_kind = ReferenceKind::LongTerm {
+                        frame_index: long_term_frame_idx,
+                    };
+                }
+            }
+        }
+
+        if current_kind == ReferenceKind::ShortTerm
+            && references.iter().any(|reference| {
+                reference.kind == ReferenceKind::ShortTerm && reference.frame_num == frame_num
+            })
+        {
+            return Err(H264Error::InvalidSyntax(
+                "adaptive DPB already contains current short-term frame_num",
+            ));
+        }
+        if references.len() >= self.reference_limit() {
+            return Err(H264Error::InvalidSyntax(
+                "adaptive memory control exceeds max_num_ref_frames",
+            ));
+        }
+        references.push(DpbReference {
+            frame_num,
+            picture_order_count,
+            kind: current_kind,
+            picture,
+        });
+        self.references = references;
+        self.max_long_term_frame_idx = max_long_term_frame_idx;
         Ok(())
     }
 
@@ -272,11 +380,6 @@ impl DecodedPictureBuffer {
     }
 
     fn ensure_can_store(&self, picture: &Yuv420Picture) -> Result<()> {
-        if self.max_num_ref_frames == 0 {
-            return Err(H264Error::InvalidSyntax(
-                "SPS does not permit storing reference frames",
-            ));
-        }
         if self
             .references
             .first()
@@ -288,6 +391,50 @@ impl DecodedPictureBuffer {
         }
         Ok(())
     }
+
+    #[inline]
+    fn reference_limit(&self) -> usize {
+        self.max_num_ref_frames.max(1)
+    }
+}
+
+fn short_term_operation_index(
+    references: &[DpbReference],
+    current_frame_num: u32,
+    max_frame_num: u32,
+    difference_of_pic_nums: u32,
+) -> Result<usize> {
+    if difference_of_pic_nums == 0 {
+        return Err(H264Error::InvalidSyntax(
+            "MMCO short-term picture difference must be non-zero",
+        ));
+    }
+    let target_pic_num = i64::from(current_frame_num) - i64::from(difference_of_pic_nums);
+    references
+        .iter()
+        .position(|reference| {
+            reference.kind == ReferenceKind::ShortTerm
+                && frame_num_wrap(reference.frame_num, current_frame_num, max_frame_num)
+                    == target_pic_num
+        })
+        .ok_or(H264Error::InvalidSyntax(
+            "MMCO names a missing short-term reference",
+        ))
+}
+
+fn long_term_index(references: &[DpbReference], frame_index: u32) -> Option<usize> {
+    references
+        .iter()
+        .position(|reference| reference.kind == ReferenceKind::LongTerm { frame_index })
+}
+
+fn ensure_long_term_index(maximum: Option<u32>, frame_index: u32) -> Result<()> {
+    if maximum.is_none_or(|maximum| frame_index > maximum) {
+        return Err(H264Error::InvalidSyntax(
+            "MMCO long-term frame index exceeds MaxLongTermFrameIdx",
+        ));
+    }
+    Ok(())
 }
 
 #[inline]
@@ -425,5 +572,75 @@ mod tests {
             ),
             Err(H264Error::InvalidSyntax(_))
         ));
+    }
+
+    #[test]
+    fn applies_adaptive_memory_control_atomically() {
+        let mut dpb = DecodedPictureBuffer::new(4, 4).unwrap();
+        dpb.store_short_term(0, 0, picture(10)).unwrap();
+        dpb.store_short_term(1, 1, picture(11)).unwrap();
+        dpb.store_short_term(2, 2, picture(12)).unwrap();
+        dpb.store_adaptive(
+            3,
+            3,
+            picture(13),
+            &[
+                MemoryManagementOperation::LimitLongTerm {
+                    max_long_term_frame_idx_plus1: 2,
+                },
+                MemoryManagementOperation::AssignLongTerm {
+                    difference_of_pic_nums: 2,
+                    long_term_frame_idx: 1,
+                },
+                MemoryManagementOperation::ForgetShortTerm {
+                    difference_of_pic_nums: 1,
+                },
+                MemoryManagementOperation::MarkCurrentLongTerm {
+                    long_term_frame_idx: 0,
+                },
+            ],
+        )
+        .unwrap();
+        let list = dpb.default_p_list0(4).unwrap();
+        assert_eq!(
+            list.iter()
+                .map(|picture| luma_value(picture))
+                .collect::<Vec<_>>(),
+            [10, 13, 11]
+        );
+    }
+
+    #[test]
+    fn failed_adaptive_sequence_preserves_existing_references() {
+        let mut dpb = DecodedPictureBuffer::new(2, 4).unwrap();
+        dpb.store_short_term(0, 0, picture(10)).unwrap();
+        let before = dpb.default_p_list0(1).unwrap();
+        assert!(matches!(
+            dpb.store_adaptive(
+                1,
+                1,
+                picture(11),
+                &[
+                    MemoryManagementOperation::ForgetAll,
+                    MemoryManagementOperation::MarkCurrentLongTerm {
+                        long_term_frame_idx: 0
+                    }
+                ]
+            ),
+            Err(H264Error::InvalidSyntax(_))
+        ));
+        let after = dpb.default_p_list0(1).unwrap();
+        assert_eq!(luma_value(&before[0]), luma_value(&after[0]));
+        assert_eq!(dpb.len(), 1);
+    }
+
+    #[test]
+    fn max_num_ref_frames_zero_still_allows_one_reference() {
+        let mut dpb = DecodedPictureBuffer::new(0, 4).unwrap();
+        dpb.store_idr(0, picture(5), false).unwrap();
+        assert_eq!(dpb.len(), 1);
+        dpb.store_short_term(1, 1, picture(6)).unwrap();
+        assert_eq!(dpb.len(), 1);
+        assert_eq!(luma_value(&dpb.default_p_list0(2).unwrap()[0]), 6);
     }
 }

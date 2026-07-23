@@ -669,6 +669,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - P List-0 modification for subtract/add PicNum and long-term targets,
   including ordered insertion, duplicate removal, and explicit missing
   active-list entries;
+- transactional progressive-frame MMCO 1 through 6, including short/long-term
+  removal, reassignment, MaxLongTermFrameIdx limits, MMCO 5 reset, current
+  long-term marking, and final DPB-capacity validation;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
@@ -714,8 +717,7 @@ still rejects or has not yet connected:
 The next dependency chain is:
 
 ```text
-adaptive memory-control operations
-    -> connect P macroblocks to the slice and access-unit decoder
+connect P macroblocks to the slice and access-unit decoder
     -> DPB reference marking and POC-based output
     -> CABAC
 ```
