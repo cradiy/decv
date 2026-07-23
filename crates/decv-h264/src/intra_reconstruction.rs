@@ -149,6 +149,21 @@ struct PendingBInterMacroblock {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct DeblockReferenceList {
+    ids: [u8; 32],
+    len: u8,
+}
+
+impl DeblockReferenceList {
+    #[inline]
+    fn get(&self, reference_index: u8) -> Option<u8> {
+        (reference_index < self.len)
+            .then(|| self.ids[usize::from(reference_index)])
+            .filter(|id| *id != 0)
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ReconstructionReferenceList<'a> {
     pictures: &'a [Option<&'a Yuv420Picture>],
     reference_ids: Option<&'a [Option<ReferenceId>]>,
@@ -206,6 +221,10 @@ pub struct IntraPictureReconstructor {
     reference_motion: MotionFieldBuilder,
     completed: Vec<bool>,
     deblock: Vec<MacroblockDeblockInfo>,
+    // Stable picture-local tokens preserve reference identity across slices
+    // without storing pointer-sized addresses in every deblocking grid cell.
+    deblock_reference_addresses: [usize; 32],
+    deblock_reference_count: u8,
     scaling_lists: ResolvedScalingLists4x4,
     scaling_lists_8x8: ResolvedScalingLists8x8,
     scan_mode: ScanMode,
@@ -269,6 +288,8 @@ impl IntraPictureReconstructor {
             reference_motion: MotionFieldBuilder::new(coded_size)?,
             completed: vec![false; macroblock_count],
             deblock: vec![MacroblockDeblockInfo::default(); macroblock_count],
+            deblock_reference_addresses: [0; 32],
+            deblock_reference_count: 0,
             scaling_lists,
             scaling_lists_8x8,
             scan_mode: ScanMode::Frame,
@@ -997,6 +1018,7 @@ impl IntraPictureReconstructor {
             derive_chroma_qp(0, config.chroma_cr_offset),
         ];
         let reference_ids_l0 = references_l0.reference_ids;
+        let deblock_references_l0 = self.deblock_reference_list(references_l0.pictures)?;
         let references_l0 = references_l0.pictures;
         let mut macroblock_address = config.first_macroblock;
         let mut decoded_count = 0usize;
@@ -1064,7 +1086,7 @@ impl IntraPictureReconstructor {
                                 config.deblocking_filter,
                                 &motion,
                                 None,
-                                references_l0,
+                                &deblock_references_l0,
                             )?,
                         );
                         Ok(())
@@ -1128,7 +1150,7 @@ impl IntraPictureReconstructor {
                                     config.deblocking_filter,
                                     &motion,
                                     Some(residual),
-                                    references_l0,
+                                    &deblock_references_l0,
                                 )?,
                             );
                             Ok(())
@@ -1173,6 +1195,7 @@ impl IntraPictureReconstructor {
         prediction_weights: Option<&PredictionWeightTable>,
     ) -> Result<usize> {
         let reference_ids_l0 = references_l0.reference_ids;
+        let deblock_references_l0 = self.deblock_reference_list(references_l0.pictures)?;
         let references_l0 = references_l0.pictures;
         let mut reader = BitReader::new(rbsp);
         if !reader.skip_bits(config.header_bit_size) {
@@ -1267,7 +1290,7 @@ impl IntraPictureReconstructor {
                         config.deblocking_filter,
                         &motion,
                         None,
-                        references_l0,
+                        &deblock_references_l0,
                     )?,
                 );
                 macroblock_address += 1;
@@ -1356,7 +1379,7 @@ impl IntraPictureReconstructor {
                             config.deblocking_filter,
                             &motion,
                             Some(residual),
-                            references_l0,
+                            &deblock_references_l0,
                         )?,
                     );
                     Ok(())
@@ -1399,6 +1422,8 @@ impl IntraPictureReconstructor {
     ) -> Result<usize> {
         let reference_ids_l0 = references_l0.reference_ids;
         let reference_ids_l1 = references_l1.reference_ids;
+        let deblock_references_l0 = self.deblock_reference_list(references_l0.pictures)?;
+        let deblock_references_l1 = self.deblock_reference_list(references_l1.pictures)?;
         let references_l0 = references_l0.pictures;
         let references_l1 = references_l1.pictures;
         self.next_slice_id = self
@@ -1468,8 +1493,8 @@ impl IntraPictureReconstructor {
                             config.deblocking_filter,
                             &motion,
                             None,
-                            references_l0,
-                            references_l1,
+                            &deblock_references_l0,
+                            &deblock_references_l1,
                         ) {
                             Ok(deblock) => deblock,
                             Err(error) => {
@@ -1535,8 +1560,8 @@ impl IntraPictureReconstructor {
                                 config.deblocking_filter,
                                 &motion,
                                 Some(residual),
-                                references_l0,
-                                references_l1,
+                                &deblock_references_l0,
+                                &deblock_references_l1,
                             ) {
                                 Ok(deblock) => deblock,
                                 Err(error) => {
@@ -1621,6 +1646,8 @@ impl IntraPictureReconstructor {
     ) -> Result<usize> {
         let reference_ids_l0 = references_l0.reference_ids;
         let reference_ids_l1 = references_l1.reference_ids;
+        let deblock_references_l0 = self.deblock_reference_list(references_l0.pictures)?;
+        let deblock_references_l1 = self.deblock_reference_list(references_l1.pictures)?;
         let references_l0 = references_l0.pictures;
         let references_l1 = references_l1.pictures;
         let mut reader = BitReader::new(rbsp);
@@ -1687,8 +1714,8 @@ impl IntraPictureReconstructor {
                     config.deblocking_filter,
                     &motion,
                     None,
-                    references_l0,
-                    references_l1,
+                    &deblock_references_l0,
+                    &deblock_references_l1,
                 ) {
                     Ok(deblock) => deblock,
                     Err(error) => {
@@ -1792,8 +1819,8 @@ impl IntraPictureReconstructor {
                         config.deblocking_filter,
                         &motion,
                         Some(residual),
-                        references_l0,
-                        references_l1,
+                        &deblock_references_l0,
+                        &deblock_references_l1,
                     ) {
                         Ok(deblock) => deblock,
                         Err(error) => {
@@ -1858,6 +1885,45 @@ impl IntraPictureReconstructor {
 
     fn macroblock_coordinates(&self, address: usize) -> Result<(usize, usize)> {
         self.validate_new_macroblock(address)
+    }
+
+    fn deblock_reference_list(
+        &mut self,
+        references: &[Option<&Yuv420Picture>],
+    ) -> Result<DeblockReferenceList> {
+        if references.len() > 32 {
+            return Err(H264Error::InvalidSyntax(
+                "deblocking reference list exceeds the AVC limit",
+            ));
+        }
+        let len = references.len() as u8;
+
+        let mut ids = [0u8; 32];
+        for (index, reference) in references.iter().enumerate() {
+            let Some(reference) = reference else {
+                continue;
+            };
+            let address = std::ptr::from_ref(*reference).addr();
+            let count = usize::from(self.deblock_reference_count);
+            let token_index = self.deblock_reference_addresses[..count]
+                .iter()
+                .position(|candidate| *candidate == address)
+                .unwrap_or(count);
+            if token_index == count {
+                if count == self.deblock_reference_addresses.len() {
+                    return Err(H264Error::InvalidSyntax(
+                        "picture uses too many distinct deblocking references",
+                    ));
+                }
+                self.deblock_reference_addresses[count] = address;
+                self.deblock_reference_count = self
+                    .deblock_reference_count
+                    .checked_add(1)
+                    .ok_or(H264Error::IntegerOverflow)?;
+            }
+            ids[index] = u8::try_from(token_index + 1).map_err(|_| H264Error::IntegerOverflow)?;
+        }
+        Ok(DeblockReferenceList { ids, len })
     }
 
     fn complete_inter_macroblock(
@@ -2628,18 +2694,16 @@ fn inter_deblock_info(
     filter: DeblockingFilter,
     resolved: &ResolvedPMacroblock,
     residual: Option<&InterResidual>,
-    references_l0: &[Option<&Yuv420Picture>],
+    references_l0: &DeblockReferenceList,
 ) -> Result<MacroblockDeblockInfo> {
     let mut motion = [DeblockMotion::default(); 16];
     for partition in &resolved.partitions {
-        let reference = references_l0
-            .get(usize::from(partition.reference_index))
-            .copied()
-            .flatten()
-            .ok_or(H264Error::InvalidSyntax(
-                "P macroblock selects a missing List-0 reference picture",
-            ))?;
-        let reference_id = std::ptr::from_ref(reference).addr();
+        let reference_id =
+            references_l0
+                .get(partition.reference_index)
+                .ok_or(H264Error::InvalidSyntax(
+                    "P macroblock selects a missing List-0 reference picture",
+                ))?;
         let start_x = usize::from(partition.x) / 4;
         let start_y = usize::from(partition.y) / 4;
         let end_x = usize::from(partition.x + partition.width) / 4;
@@ -2689,8 +2753,8 @@ fn b_inter_deblock_info(
     filter: DeblockingFilter,
     resolved: &ResolvedBMacroblock,
     residual: Option<&InterResidual>,
-    references_l0: &[Option<&Yuv420Picture>],
-    references_l1: &[Option<&Yuv420Picture>],
+    references_l0: &DeblockReferenceList,
+    references_l1: &DeblockReferenceList,
 ) -> Result<MacroblockDeblockInfo> {
     let mut motion = [DeblockMotion::default(); 16];
     for partition in &resolved.partitions {
@@ -2732,16 +2796,14 @@ fn b_inter_deblock_info(
 
 fn b_deblock_list_motion(
     motion: Option<ResolvedBListMotion>,
-    references: &[Option<&Yuv420Picture>],
+    references: &DeblockReferenceList,
     list_name: &'static str,
 ) -> Result<DeblockListMotion> {
     let Some(motion) = motion else {
         return Ok(DeblockListMotion::default());
     };
-    let reference = references
-        .get(usize::from(motion.reference_index))
-        .copied()
-        .flatten()
+    let reference_id = references
+        .get(motion.reference_index)
         .ok_or(match list_name {
             "List 0" => {
                 H264Error::InvalidSyntax("B macroblock selects a missing List-0 reference picture")
@@ -2751,7 +2813,7 @@ fn b_deblock_list_motion(
             }
         })?;
     Ok(DeblockListMotion {
-        reference_id: std::ptr::from_ref(reference).addr(),
+        reference_id,
         vector: motion.motion_vector,
     })
 }
@@ -2966,6 +3028,30 @@ mod tests {
         cb.fill(value + 1);
         cr.fill(value + 2);
         picture
+    }
+
+    #[test]
+    fn deblock_reference_tokens_preserve_identity_across_reordered_lists() {
+        let first = constant_picture(16);
+        let second = constant_picture(32);
+        let mut reconstructor = reconstructor(Size::new(16, 16));
+
+        let initial = reconstructor
+            .deblock_reference_list(&[Some(&first), None, Some(&second), Some(&first)])
+            .unwrap();
+        let first_id = initial.get(0).unwrap();
+        let second_id = initial.get(2).unwrap();
+        assert_ne!(first_id, second_id);
+        assert_eq!(initial.get(1), None);
+        assert_eq!(initial.get(3), Some(first_id));
+        assert_eq!(initial.get(4), None);
+
+        let reordered = reconstructor
+            .deblock_reference_list(&[Some(&second), Some(&first)])
+            .unwrap();
+        assert_eq!(reordered.get(0), Some(second_id));
+        assert_eq!(reordered.get(1), Some(first_id));
+        assert_eq!(reconstructor.deblock_reference_count, 2);
     }
 
     fn bit_string(bits: &str) -> Vec<u8> {

@@ -67,14 +67,14 @@ pub(crate) struct MacroblockDeblockInfo {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeblockMotion {
-    reference_ids: [usize; 2],
+    reference_ids: [u8; 2],
     vectors: [MotionVector; 2],
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeblockListMotion {
-    /// Stable for the lifetime of the active reference list. Zero means absent.
-    pub reference_id: usize,
+    /// Stable for the lifetime of the reconstructed picture. Zero means absent.
+    pub reference_id: u8,
     pub vector: MotionVector,
 }
 
@@ -1026,7 +1026,7 @@ mod tests {
         }
     }
 
-    fn inter_macroblock(reference_id: usize, vector: MotionVector) -> MacroblockDeblockInfo {
+    fn inter_macroblock(reference_id: u8, vector: MotionVector) -> MacroblockDeblockInfo {
         MacroblockDeblockInfo {
             is_intra: false,
             motion: [DeblockMotion::new(
@@ -1056,7 +1056,7 @@ mod tests {
     fn motion_cells_do_not_pad_each_reference_list() {
         assert_eq!(
             std::mem::size_of::<DeblockMotion>(),
-            2 * std::mem::size_of::<usize>() + 2 * std::mem::size_of::<MotionVector>()
+            2 * std::mem::size_of::<u8>() + 2 * std::mem::size_of::<MotionVector>()
         );
     }
 
