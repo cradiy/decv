@@ -37,7 +37,7 @@ pub struct Yuv420Picture {
     coded_size: Size,
     width: usize,
     height: usize,
-    luma: Vec<u8>,
+    luma: Arc<[u8]>,
     cb: Vec<u8>,
     cr: Vec<u8>,
 }
@@ -100,7 +100,7 @@ impl Yuv420Picture {
             coded_size,
             width,
             height,
-            luma: vec![0; luma_len],
+            luma: vec![0; luma_len].into(),
             cb: vec![0; chroma_len],
             cr: vec![0; chroma_len],
         })
@@ -118,7 +118,7 @@ impl Yuv420Picture {
 
     #[inline]
     pub(crate) fn planes_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
-        (&mut self.luma, &mut self.cb, &mut self.cr)
+        (Arc::make_mut(&mut self.luma), &mut self.cb, &mut self.cr)
     }
 
     #[inline]
@@ -280,7 +280,14 @@ impl Yuv420Picture {
         residual: &Block4x4,
     ) -> Result<()> {
         self.validate_luma_block(x, y, 4)?;
-        add_block(&mut self.luma, self.width, x, y, prediction, residual);
+        add_block(
+            Arc::make_mut(&mut self.luma),
+            self.width,
+            x,
+            y,
+            prediction,
+            residual,
+        );
         Ok(())
     }
 
@@ -292,7 +299,14 @@ impl Yuv420Picture {
         residual: &[[i32; 8]; 8],
     ) -> Result<()> {
         self.validate_luma_block(x, y, 8)?;
-        add_block(&mut self.luma, self.width, x, y, prediction, residual);
+        add_block(
+            Arc::make_mut(&mut self.luma),
+            self.width,
+            x,
+            y,
+            prediction,
+            residual,
+        );
         Ok(())
     }
 
@@ -310,7 +324,14 @@ impl Yuv420Picture {
             .checked_mul(16)
             .ok_or(H264Error::IntegerOverflow)?;
         self.validate_luma_block(x, y, 16)?;
-        add_block(&mut self.luma, self.width, x, y, prediction, residual);
+        add_block(
+            Arc::make_mut(&mut self.luma),
+            self.width,
+            x,
+            y,
+            prediction,
+            residual,
+        );
         Ok(())
     }
 
@@ -348,7 +369,7 @@ impl Yuv420Picture {
             .ok_or(H264Error::IntegerOverflow)?;
         self.validate_luma_block(luma_x, luma_y, 16)?;
         copy_block(
-            &mut self.luma,
+            Arc::make_mut(&mut self.luma),
             self.width,
             luma_x,
             luma_y,
@@ -414,7 +435,7 @@ impl Yuv420Picture {
         snapshot: &MacroblockPixels,
     ) {
         write_block(
-            &mut self.luma,
+            Arc::make_mut(&mut self.luma),
             self.width,
             macroblock_x * 16,
             macroblock_y * 16,
@@ -480,8 +501,9 @@ impl Yuv420Picture {
         self.to_nv12_frame(id, pts, duration, format)
     }
 
-    /// Packages an NV12 output copy while retaining the planar picture for
-    /// future inter prediction in the decoded-picture buffer.
+    /// Packages NV12 output while retaining the planar picture for future
+    /// inter prediction. The immutable luma plane is shared with the output;
+    /// only Cb and Cr are interleaved into a new chroma plane.
     pub fn to_nv12_frame(
         &self,
         id: u64,
@@ -501,22 +523,17 @@ impl Yuv420Picture {
         }
         format.validate()?;
 
-        let luma_len = self.luma.len();
-        let allocation_len = luma_len
-            .checked_add(
-                self.cb
-                    .len()
-                    .checked_mul(2)
-                    .ok_or(H264Error::IntegerOverflow)?,
-            )
-            .ok_or(H264Error::IntegerOverflow)?;
-        let mut allocation = Vec::with_capacity(allocation_len);
-        allocation.extend_from_slice(&self.luma);
+        let mut chroma = Vec::with_capacity(
+            self.cb
+                .len()
+                .checked_mul(2)
+                .ok_or(H264Error::IntegerOverflow)?,
+        );
         for (&cb, &cr) in self.cb.iter().zip(&self.cr) {
-            allocation.push(cb);
-            allocation.push(cr);
+            chroma.push(cb);
+            chroma.push(cr);
         }
-        let allocation: Arc<[u8]> = allocation.into();
+        let chroma: Arc<[u8]> = chroma.into();
         let frame = DecodedVideoFrame {
             id,
             pts,
@@ -525,14 +542,14 @@ impl Yuv420Picture {
             storage: FrameStorage::Cpu(CpuFrame {
                 planes: vec![
                     CpuPlane {
-                        bytes: allocation.clone(),
+                        bytes: self.luma.clone(),
                         offset: 0,
                         stride: self.width,
                         rows: self.height,
                     },
                     CpuPlane {
-                        bytes: allocation,
-                        offset: luma_len,
+                        bytes: chroma,
+                        offset: 0,
                         stride: self.width,
                         rows: self.height / 2,
                     },
@@ -742,13 +759,16 @@ mod tests {
     #[test]
     fn gathers_macroblock_luma_and_chroma_references() {
         let mut picture = Yuv420Picture::new(Size::new(32, 32)).unwrap();
-        for column in 0..16 {
-            picture.luma[15 * 32 + 16 + column] = 10 + column as u8;
+        {
+            let luma = Arc::make_mut(&mut picture.luma);
+            for column in 0..16 {
+                luma[15 * 32 + 16 + column] = 10 + column as u8;
+            }
+            for row in 0..16 {
+                luma[(16 + row) * 32 + 15] = 40 + row as u8;
+            }
+            luma[15 * 32 + 15] = 99;
         }
-        for row in 0..16 {
-            picture.luma[(16 + row) * 32 + 15] = 40 + row as u8;
-        }
-        picture.luma[15 * 32 + 15] = 99;
 
         let references = picture.intra16x16_references(1, 1, ALL_REFERENCES).unwrap();
         assert_eq!(
@@ -779,8 +799,9 @@ mod tests {
     #[test]
     fn substitutes_unavailable_top_right_samples() {
         let mut picture = Yuv420Picture::new(Size::new(32, 32)).unwrap();
+        let luma = Arc::make_mut(&mut picture.luma);
         for column in 0..16 {
-            picture.luma[7 * 32 + 8 + column] = 20 + column as u8;
+            luma[7 * 32 + 8 + column] = 20 + column as u8;
         }
         let availability = IntraReferenceAvailability {
             top: true,
@@ -880,7 +901,7 @@ mod tests {
     }
 
     #[test]
-    fn writes_pcm_and_packages_shared_nv12_storage() {
+    fn writes_pcm_and_packages_independent_nv12_planes() {
         let mut picture = Yuv420Picture::new(Size::new(16, 16)).unwrap();
         let pcm = PcmMacroblock {
             luma: Box::new(std::array::from_fn(|index| index as u8)),
@@ -914,13 +935,11 @@ mod tests {
             _ => panic!("expected CPU frame"),
         };
         assert_eq!(cpu.planes.len(), 2);
-        assert_eq!(cpu.planes[0].bytes.len(), 384);
-        assert!(Arc::ptr_eq(&cpu.planes[0].bytes, &cpu.planes[1].bytes));
+        assert_eq!(cpu.planes[0].bytes.len(), 256);
+        assert_eq!(cpu.planes[1].bytes.len(), 128);
+        assert!(!Arc::ptr_eq(&cpu.planes[0].bytes, &cpu.planes[1].bytes));
         assert_eq!(&cpu.planes[0].bytes[..4], &[0, 1, 2, 3]);
-        assert_eq!(cpu.planes[1].offset, 256);
-        assert_eq!(
-            &cpu.planes[1].bytes[256..264],
-            &[10, 20, 10, 20, 10, 20, 10, 20]
-        );
+        assert_eq!(cpu.planes[1].offset, 0);
+        assert_eq!(&cpu.planes[1].bytes[..8], &[10, 20, 10, 20, 10, 20, 10, 20]);
     }
 }

@@ -3399,6 +3399,6 @@ mod tests {
             _ => panic!("expected CPU frame"),
         };
         assert!(cpu.planes[0].bytes[..256].iter().all(|&sample| sample == 5));
-        assert_eq!(&cpu.planes[1].bytes[256..260], &[10, 20, 10, 20]);
+        assert_eq!(&cpu.planes[1].bytes[..4], &[10, 20, 10, 20]);
     }
 }

@@ -865,9 +865,9 @@ mod tests {
     use std::num::NonZeroUsize;
 
     use decv_core::{
-        BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, DecodeInputStatus,
-        DecodeOutput, EncodedVideoPacket, FrameStorage, MediaTime, PixelFormat, Rect, Size,
-        TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+        BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, CpuFrame,
+        DecodeInputStatus, DecodeOutput, EncodedVideoPacket, FrameStorage, MediaTime, PixelFormat,
+        Rect, Size, TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
     };
 
     use super::{H264Decoder, H264StreamParser, ParserEvent, PictureIdentity};
@@ -893,6 +893,17 @@ mod tests {
                 Ok(DecodeOutput::NeedInput | DecodeOutput::EndOfStream) | Err(_) => break,
             }
         }
+    }
+
+    fn tightly_packed_cpu_bytes(frame: &CpuFrame) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for plane in &frame.planes {
+            for row in 0..plane.rows {
+                let start = plane.offset + row * plane.stride;
+                bytes.extend_from_slice(&plane.bytes[start..start + plane.stride]);
+            }
+        }
+        bytes
     }
 
     #[test]
@@ -1019,8 +1030,9 @@ mod tests {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU frame"),
         };
-        assert_eq!(cpu.planes[0].bytes.len(), 384);
-        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        let bytes = tightly_packed_cpu_bytes(&cpu);
+        assert_eq!(bytes.len(), 384);
+        assert!(bytes.iter().all(|&sample| sample == 128));
     }
 
     #[test]
@@ -1066,8 +1078,9 @@ mod tests {
         let FrameStorage::Cpu(cpu) = frame.storage else {
             panic!("expected CPU frame");
         };
-        assert_eq!(cpu.planes[0].bytes.len(), 384);
-        assert_eq!(crc32(cpu.planes[0].bytes.as_ref()), 2_320_103_694);
+        let bytes = tightly_packed_cpu_bytes(&cpu);
+        assert_eq!(bytes.len(), 384);
+        assert_eq!(crc32(&bytes), 2_320_103_694);
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::EndOfStream
@@ -1111,8 +1124,9 @@ mod tests {
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");
             };
-            assert_eq!(cpu.planes[0].bytes.len(), 768);
-            assert_eq!(crc32(cpu.planes[0].bytes.as_ref()), expected_crc);
+            let bytes = tightly_packed_cpu_bytes(&cpu);
+            assert_eq!(bytes.len(), 768);
+            assert_eq!(crc32(&bytes), expected_crc);
         }
         assert!(matches!(
             decoder.receive_frame().unwrap(),
@@ -1168,7 +1182,7 @@ mod tests {
                         let FrameStorage::Cpu(cpu) = frame.storage else {
                             panic!("expected CPU frame");
                         };
-                        frames.push(cpu.planes[0].bytes.to_vec());
+                        frames.push(tightly_packed_cpu_bytes(&cpu));
                     }
                     DecodeOutput::EndOfStream => break,
                     output => panic!("expected CABAC B frame, got {output:?}"),
@@ -1812,7 +1826,7 @@ mod tests {
                 .all(|&sample| sample == 187)
         );
         assert!(
-            cpu.planes[1].bytes[256..]
+            cpu.planes[1].bytes[..]
                 .chunks_exact(2)
                 .all(|samples| samples == [118, 84])
         );
