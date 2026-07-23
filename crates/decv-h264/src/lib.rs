@@ -11,6 +11,7 @@ mod deblock;
 mod decoder;
 mod dpb;
 mod error;
+mod intra_modes;
 mod macroblock;
 mod nal;
 mod parameter_sets;
@@ -31,6 +32,7 @@ pub use cavlc::{
 pub use cavlc_context::CavlcNeighborState;
 pub use decoder::{H264StreamParser, ParserEvent};
 pub use error::{H264Error, Result};
+pub use intra_modes::IntraModeState;
 pub use macroblock::{
     CodedBlockPattern, DecodedIntraMacroblock, IntraLumaPrediction, IntraMacroblock,
     IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, PcmMacroblock,
