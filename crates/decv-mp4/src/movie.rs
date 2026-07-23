@@ -3,6 +3,7 @@ use std::{num::NonZeroU32, sync::Arc};
 use crate::{
     BoxHeader, FourCc, Mp4Error, Mp4File, Result,
     reader::{BoundedReader, read_full_box},
+    sample_table::{Sample, parse_sample_table},
 };
 
 const MOOV: FourCc = FourCc::new(*b"moov");
@@ -99,6 +100,7 @@ pub struct Track {
     display_width_16_16: u32,
     display_height_16_16: u32,
     sample_descriptions: Vec<SampleDescription>,
+    samples: Vec<Sample>,
 }
 
 impl Track {
@@ -139,13 +141,13 @@ impl Track {
             file,
             handler_box.ok_or(Mp4Error::InvalidData("mdia has no hdlr box"))?,
         )?;
-        let sample_descriptions = if handler == VIDE {
-            parse_video_sample_descriptions(
+        let (sample_descriptions, samples) = if handler == VIDE {
+            parse_video_sample_table(
                 file,
                 media_information.ok_or(Mp4Error::InvalidData("video track has no minf box"))?,
             )?
         } else {
-            Vec::new()
+            (Vec::new(), Vec::new())
         };
 
         Ok(Self {
@@ -157,6 +159,7 @@ impl Track {
             display_width_16_16,
             display_height_16_16,
             sample_descriptions,
+            samples,
         })
     }
 
@@ -198,6 +201,11 @@ impl Track {
     #[inline]
     pub fn sample_descriptions(&self) -> &[SampleDescription] {
         &self.sample_descriptions
+    }
+
+    #[inline]
+    pub fn samples(&self) -> &[Sample] {
+        &self.samples
     }
 }
 
@@ -325,10 +333,10 @@ fn parse_handler(file: Mp4File<'_>, header: BoxHeader) -> Result<FourCc> {
     reader.read_fourcc()
 }
 
-fn parse_video_sample_descriptions(
+fn parse_video_sample_table(
     file: Mp4File<'_>,
     media_information: BoxHeader,
-) -> Result<Vec<SampleDescription>> {
+) -> Result<(Vec<SampleDescription>, Vec<Sample>)> {
     let mut sample_table = None;
     for child in file.children(media_information)? {
         let child = child?;
@@ -346,7 +354,9 @@ fn parse_video_sample_descriptions(
     }
     let description_box =
         description_box.ok_or(Mp4Error::InvalidData("video stbl has no stsd box"))?;
-    parse_sample_description_box(file, description_box)
+    let descriptions = parse_sample_description_box(file, description_box)?;
+    let samples = parse_sample_table(file, sample_table, descriptions.len())?;
+    Ok((descriptions, samples))
 }
 
 fn parse_sample_description_box(
@@ -514,7 +524,28 @@ mod tests {
 
         let mut stsd = full(0, 0, &1u32.to_be_bytes());
         stsd.extend_from_slice(&avc1);
-        let stbl = boxed(*b"stbl", &boxed(*b"stsd", &stsd));
+        let stts = boxed(
+            *b"stts",
+            &full(0, 0, &[1u32, 1, 3_000].map(u32::to_be_bytes).concat()),
+        );
+        let stsc = boxed(
+            *b"stsc",
+            &full(0, 0, &[1u32, 1, 1, 1].map(u32::to_be_bytes).concat()),
+        );
+        let stsz = boxed(
+            *b"stsz",
+            &full(0, 0, &[1u32, 1].map(u32::to_be_bytes).concat()),
+        );
+        let stco = boxed(
+            *b"stco",
+            &full(0, 0, &[1u32, 0].map(u32::to_be_bytes).concat()),
+        );
+        let mut stbl_payload = boxed(*b"stsd", &stsd);
+        stbl_payload.extend_from_slice(&stts);
+        stbl_payload.extend_from_slice(&stsc);
+        stbl_payload.extend_from_slice(&stsz);
+        stbl_payload.extend_from_slice(&stco);
+        let stbl = boxed(*b"stbl", &stbl_payload);
         let minf = boxed(*b"minf", &stbl);
 
         let mut mdia = boxed(*b"mdhd", &full(0, 0, &mdhd));

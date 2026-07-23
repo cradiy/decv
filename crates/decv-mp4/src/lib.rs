@@ -9,8 +9,10 @@ mod error;
 mod fourcc;
 mod movie;
 mod reader;
+mod sample_table;
 
 pub use boxes::{BoxHeader, BoxIter, Mp4File};
 pub use error::{Mp4Error, Result};
 pub use fourcc::FourCc;
 pub use movie::{AvcSampleEntry, Movie, SampleDescription, Track};
+pub use sample_table::Sample;
