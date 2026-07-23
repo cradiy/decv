@@ -1102,36 +1102,45 @@ mod tests {
             0x01, 0x41, 0x9a, 0x22, 0x11, 0xff, 0x73, 0x44, 0xc3, 0x02, 0x47, 0x78, 0x2d, 0xff,
             0x91, 0xe9, 0x6b, 0xed, 0x82, 0xfe, 0xc0,
         ];
-        let mut decoder = H264Decoder::new();
-        decoder.configure(byte_stream_config()).unwrap();
-        assert!(matches!(
-            decoder
-                .send_packet(EncodedVideoPacket::new(stream))
-                .unwrap(),
-            DecodeInputStatus::Accepted
-        ));
-        decoder.drain().unwrap();
-        assert!(matches!(
-            decoder.receive_frame().unwrap(),
-            DecodeOutput::FormatChanged(_)
-        ));
+        let decode = |parallelism| {
+            let mut decoder = H264Decoder::new();
+            decoder.set_parallelism(parallelism).unwrap();
+            decoder.configure(byte_stream_config()).unwrap();
+            assert!(matches!(
+                decoder
+                    .send_packet(EncodedVideoPacket::new(stream.to_vec()))
+                    .unwrap(),
+                DecodeInputStatus::Accepted
+            ));
+            decoder.drain().unwrap();
+            assert!(matches!(
+                decoder.receive_frame().unwrap(),
+                DecodeOutput::FormatChanged(_)
+            ));
 
-        for expected_crc in [3_812_764_094, 1_790_393_901] {
-            let frame = match decoder.receive_frame().unwrap() {
-                DecodeOutput::Frame(frame) => frame,
-                output => panic!("expected CABAC P frame, got {output:?}"),
-            };
-            let FrameStorage::Cpu(cpu) = frame.storage else {
-                panic!("expected CPU frame");
-            };
-            let bytes = tightly_packed_cpu_bytes(&cpu);
-            assert_eq!(bytes.len(), 768);
-            assert_eq!(crc32(&bytes), expected_crc);
+            let mut frames = Vec::new();
+            loop {
+                match decoder.receive_frame().unwrap() {
+                    DecodeOutput::Frame(frame) => {
+                        let FrameStorage::Cpu(cpu) = frame.storage else {
+                            panic!("expected CPU frame");
+                        };
+                        frames.push(tightly_packed_cpu_bytes(&cpu));
+                    }
+                    DecodeOutput::EndOfStream => break,
+                    output => panic!("expected CABAC P frame, got {output:?}"),
+                }
+            }
+            frames
+        };
+
+        let serial_frames = decode(H264Parallelism::Serial);
+        let parallel_frames = decode(H264Parallelism::Threads(NonZeroUsize::new(2).unwrap()));
+        assert_eq!(parallel_frames, serial_frames);
+        for (frame, expected_crc) in serial_frames.iter().zip([3_812_764_094, 1_790_393_901]) {
+            assert_eq!(frame.len(), 768);
+            assert_eq!(crc32(frame), expected_crc);
         }
-        assert!(matches!(
-            decoder.receive_frame().unwrap(),
-            DecodeOutput::EndOfStream
-        ));
     }
 
     #[test]

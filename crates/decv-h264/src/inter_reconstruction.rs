@@ -722,6 +722,120 @@ fn reconstruct_p_macroblock_from_list_inner(
     Ok(())
 }
 
+/// Reconstructs one resolved P macroblock without mutating decoder-visible
+/// picture state.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_p_macroblock_pixels_from_list_with_scratch(
+    current_size: Size,
+    references_l0: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedPMacroblock,
+    residual: Option<&ReconstructedInterResidual>,
+    weights: Option<&PredictionWeightTable>,
+    prediction: &mut InterPrediction420,
+) -> Result<MacroblockPixels> {
+    let luma_x = macroblock_x
+        .checked_mul(16)
+        .ok_or(H264Error::IntegerOverflow)?;
+    let luma_y = macroblock_y
+        .checked_mul(16)
+        .ok_or(H264Error::IntegerOverflow)?;
+    let width = usize::try_from(current_size.width).map_err(|_| H264Error::IntegerOverflow)?;
+    let height = usize::try_from(current_size.height).map_err(|_| H264Error::IntegerOverflow)?;
+    if luma_x.checked_add(16).is_none_or(|right| right > width)
+        || luma_y.checked_add(16).is_none_or(|bottom| bottom > height)
+    {
+        return Err(H264Error::InvalidSyntax(
+            "P macroblock lies outside the current picture",
+        ));
+    }
+
+    let mut predicted_luma = [[0u8; 16]; 16];
+    let mut predicted_cb = [[0u8; 8]; 8];
+    let mut predicted_cr = [[0u8; 8]; 8];
+    let mut covered = [[false; 4]; 4];
+    for partition in &motion.partitions {
+        let reference = references_l0
+            .get(usize::from(partition.reference_index))
+            .copied()
+            .flatten()
+            .ok_or(H264Error::InvalidSyntax(
+                "P partition selects no reference picture in List 0",
+            ))?;
+        if reference.coded_size() != current_size {
+            return Err(H264Error::InvalidSyntax(
+                "P reference picture coded size does not match",
+            ));
+        }
+        reference.predict_inter_420_into(macroblock_x, macroblock_y, *partition, prediction)?;
+        if let Some(weights) = weights {
+            apply_prediction_weights(prediction, partition.reference_index, weights)?;
+        }
+        for y in 0..usize::from(partition.height) {
+            let destination_y = usize::from(partition.y) + y;
+            // SAFETY: P-partition validation guarantees a 4/8/16-byte luma
+            // region within both fixed rows.
+            unsafe {
+                copy_fixed_row(
+                    predicted_luma[destination_y]
+                        .as_mut_ptr()
+                        .add(usize::from(partition.x)),
+                    prediction.luma[y].as_ptr(),
+                    usize::from(partition.width),
+                );
+            }
+        }
+        for y in 0..usize::from(partition.height / 2) {
+            let start = usize::from(partition.x / 2);
+            let destination_y = usize::from(partition.y / 2) + y;
+            let width = usize::from(partition.width / 2);
+            // SAFETY: P-partition validation guarantees a 2/4/8-byte chroma
+            // region within both fixed rows.
+            unsafe {
+                copy_fixed_row(
+                    predicted_cb[destination_y].as_mut_ptr().add(start),
+                    prediction.cb[y].as_ptr(),
+                    width,
+                );
+                copy_fixed_row(
+                    predicted_cr[destination_y].as_mut_ptr().add(start),
+                    prediction.cr[y].as_ptr(),
+                    width,
+                );
+            }
+        }
+        for y in (partition.y..partition.y + partition.height).step_by(4) {
+            for x in (partition.x..partition.x + partition.width).step_by(4) {
+                let cell = &mut covered[usize::from(y / 4)][usize::from(x / 4)];
+                if *cell {
+                    return Err(H264Error::InvalidSyntax("P prediction partitions overlap"));
+                }
+                *cell = true;
+            }
+        }
+    }
+    if covered.iter().flatten().any(|covered| !covered) {
+        return Err(H264Error::InvalidSyntax(
+            "P prediction partitions do not cover the macroblock",
+        ));
+    }
+
+    if let Some(residual) = residual {
+        add_inter_residual_to_prediction(
+            &mut predicted_luma,
+            &mut predicted_cb,
+            &mut predicted_cr,
+            residual,
+        );
+    }
+    Ok(MacroblockPixels::new(
+        predicted_luma,
+        predicted_cb,
+        predicted_cr,
+    ))
+}
+
 fn assemble_residual(residual: &ReconstructedInterResidual) -> MacroblockResidualSamples {
     let mut residual_luma = [[0i32; 16]; 16];
     let mut residual_cb = [[0i32; 8]; 8];
