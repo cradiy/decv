@@ -81,7 +81,7 @@ pub use quantization::{MacroblockQuantizer, MacroblockQuantizerState, derive_chr
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};
 pub use reconstruction::{
     ReconstructedInterResidual, ReconstructedIntraResidual, ReconstructedLumaResidual,
-    reconstruct_inter_residual, reconstruct_intra_residual,
+    reconstruct_b_inter_residual, reconstruct_inter_residual, reconstruct_intra_residual,
 };
 pub use slice::{
     DeblockingFilter, MemoryManagementOperation, ParsedSliceHeader, PredictionWeight,

@@ -703,6 +703,7 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - SPS/PPS 4x4 and 8x8 scaling-list fallback resolution;
 - transactional macroblock QP derivation with independent Cb and Cr offsets;
 - all 8-bit Intra4x4, Intra8x8, Intra16x16, and 4:2:0 chroma prediction modes;
+- shared P/B inter inverse-quantization and 4x4/8x8 inverse-transform paths;
 - the normative Intra8x8 reference-sample filter;
 - stateful Intra4x4/Intra8x8 mode derivation across block and slice boundaries;
 - a mutable planar 4:2:0 reconstruction picture surface;
