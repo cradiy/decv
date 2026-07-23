@@ -727,8 +727,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   identity, and motion-vector differences; chroma-to-luma boundary mapping;
   slice-controlled offsets; and cross-slice edge suppression;
 - deblocking fast rejection before pixel loads for zero-strength and
-  zero-threshold edges, with validation and invariant `alpha`/`beta`/`tc0`
-  preparation performed once per edge segment instead of once per sample;
+  zero-threshold edges; each macroblock caches the QP-derived `alpha`, `beta`,
+  and `index_a` values per component and neighbor direction, while each edge
+  segment only selects the boundary-strength-dependent `tc0`;
 - each macroblock derives its 32 luma-grid boundary strengths once and reuses
   them for Y, Cb, and Cr filtering, avoiding repeated reference-identity and
   motion-vector comparisons for the two chroma planes;

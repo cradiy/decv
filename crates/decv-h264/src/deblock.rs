@@ -276,10 +276,35 @@ pub(crate) fn filter_420_picture(
             }
         }
 
+        let internal_thresholds = [
+            edge_thresholds(current, current, 0)?,
+            edge_thresholds(current, current, 1)?,
+            edge_thresholds(current, current, 2)?,
+        ];
+        let left_thresholds = if filter_left {
+            let previous = left.expect("filter_left requires a neighbor");
+            [
+                edge_thresholds(previous, current, 0)?,
+                edge_thresholds(previous, current, 1)?,
+                edge_thresholds(previous, current, 2)?,
+            ]
+        } else {
+            [None; 3]
+        };
+        let top_thresholds = if filter_top {
+            let previous = top.expect("filter_top requires a neighbor");
+            [
+                edge_thresholds(previous, current, 0)?,
+                edge_thresholds(previous, current, 1)?,
+                edge_thresholds(previous, current, 2)?,
+            ]
+        } else {
+            [None; 3]
+        };
+
         let luma_x = macroblock_x * 16;
         let luma_y = macroblock_y * 16;
         if filter_left {
-            let previous = left.expect("filter_left requires a neighbor");
             for block_row in 0..4 {
                 filter_vertical_edge(
                     luma,
@@ -287,8 +312,9 @@ pub(crate) fn filter_420_picture(
                     luma_x,
                     luma_y + block_row * 4,
                     4,
-                    edge_parameters(previous, current, vertical_strengths[0][block_row], 0),
-                )?;
+                    vertical_strengths[0][block_row],
+                    left_thresholds[0],
+                );
             }
         }
         for block_column in 1..4 {
@@ -300,18 +326,13 @@ pub(crate) fn filter_420_picture(
                         luma_x + block_column * 4,
                         luma_y + block_row * 4,
                         4,
-                        edge_parameters(
-                            current,
-                            current,
-                            vertical_strengths[block_column][block_row],
-                            0,
-                        ),
-                    )?;
+                        vertical_strengths[block_column][block_row],
+                        internal_thresholds[0],
+                    );
                 }
             }
         }
         if filter_top {
-            let previous = top.expect("filter_top requires a neighbor");
             for block_column in 0..4 {
                 filter_horizontal_edge(
                     luma,
@@ -319,8 +340,9 @@ pub(crate) fn filter_420_picture(
                     luma_x + block_column * 4,
                     luma_y,
                     4,
-                    edge_parameters(previous, current, horizontal_strengths[0][block_column], 0),
-                )?;
+                    horizontal_strengths[0][block_column],
+                    top_thresholds[0],
+                );
             }
         }
         for block_row in 1..4 {
@@ -332,22 +354,17 @@ pub(crate) fn filter_420_picture(
                         luma_x + block_column * 4,
                         luma_y + block_row * 4,
                         4,
-                        edge_parameters(
-                            current,
-                            current,
-                            horizontal_strengths[block_row][block_column],
-                            0,
-                        ),
-                    )?;
+                        horizontal_strengths[block_row][block_column],
+                        internal_thresholds[0],
+                    );
                 }
             }
         }
 
         let chroma_x = macroblock_x * 8;
         let chroma_y = macroblock_y * 8;
-        for (plane, component) in [(&mut *cb, 1), (&mut *cr, 2)] {
+        for (plane, component) in [(&mut *cb, 1usize), (&mut *cr, 2usize)] {
             if filter_left {
-                let previous = left.expect("filter_left requires a neighbor");
                 for block_row in 0..4 {
                     filter_vertical_edge(
                         plane,
@@ -355,13 +372,9 @@ pub(crate) fn filter_420_picture(
                         chroma_x,
                         chroma_y + block_row * 2,
                         2,
-                        edge_parameters(
-                            previous,
-                            current,
-                            vertical_strengths[0][block_row],
-                            component,
-                        ),
-                    )?;
+                        vertical_strengths[0][block_row],
+                        left_thresholds[component],
+                    );
                 }
             }
             for block_row in 0..4 {
@@ -371,16 +384,11 @@ pub(crate) fn filter_420_picture(
                     chroma_x + 4,
                     chroma_y + block_row * 2,
                     2,
-                    edge_parameters(
-                        current,
-                        current,
-                        vertical_strengths[2][block_row],
-                        component,
-                    ),
-                )?;
+                    vertical_strengths[2][block_row],
+                    internal_thresholds[component],
+                );
             }
             if filter_top {
-                let previous = top.expect("filter_top requires a neighbor");
                 for block_column in 0..4 {
                     filter_horizontal_edge(
                         plane,
@@ -388,13 +396,9 @@ pub(crate) fn filter_420_picture(
                         chroma_x + block_column * 2,
                         chroma_y,
                         2,
-                        edge_parameters(
-                            previous,
-                            current,
-                            horizontal_strengths[0][block_column],
-                            component,
-                        ),
-                    )?;
+                        horizontal_strengths[0][block_column],
+                        top_thresholds[component],
+                    );
                 }
             }
             for block_column in 0..4 {
@@ -404,13 +408,9 @@ pub(crate) fn filter_420_picture(
                     chroma_x + block_column * 2,
                     chroma_y + 4,
                     2,
-                    edge_parameters(
-                        current,
-                        current,
-                        horizontal_strengths[2][block_column],
-                        component,
-                    ),
-                )?;
+                    horizontal_strengths[2][block_column],
+                    internal_thresholds[component],
+                );
             }
         }
     }
@@ -428,6 +428,15 @@ struct EdgeParameters {
 }
 
 #[derive(Debug, Clone, Copy)]
+struct EdgeThresholds {
+    alpha: i16,
+    beta: i16,
+    index_a: usize,
+    strong_threshold: i16,
+    chroma_style: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct PreparedEdgeParameters {
     boundary_strength: u8,
     alpha: i16,
@@ -439,52 +448,89 @@ struct PreparedEdgeParameters {
 
 fn prepare_edge_parameters(parameters: EdgeParameters) -> Result<Option<PreparedEdgeParameters>> {
     validate_edge_parameters(parameters)?;
-    if parameters.boundary_strength == 0 {
-        return Ok(None);
-    }
+    let thresholds = prepare_edge_thresholds_unchecked(
+        parameters.qp_p,
+        parameters.qp_q,
+        parameters.alpha_offset_div2,
+        parameters.beta_offset_div2,
+        parameters.chroma_style,
+    );
+    Ok(prepare_edge_strength(
+        parameters.boundary_strength,
+        thresholds,
+    ))
+}
 
-    let qp_average = (i16::from(parameters.qp_p) + i16::from(parameters.qp_q) + 1) >> 1;
-    let index_a = (qp_average + i16::from(parameters.alpha_offset_div2) * 2).clamp(0, 51) as usize;
-    let index_b = (qp_average + i16::from(parameters.beta_offset_div2) * 2).clamp(0, 51) as usize;
+fn prepare_edge_thresholds_unchecked(
+    qp_p: u8,
+    qp_q: u8,
+    alpha_offset_div2: i8,
+    beta_offset_div2: i8,
+    chroma_style: bool,
+) -> Option<EdgeThresholds> {
+    let qp_average = (i16::from(qp_p) + i16::from(qp_q) + 1) >> 1;
+    let index_a = (qp_average + i16::from(alpha_offset_div2) * 2).clamp(0, 51) as usize;
+    let index_b = (qp_average + i16::from(beta_offset_div2) * 2).clamp(0, 51) as usize;
     let alpha = i16::from(ALPHA[index_a]);
     let beta = i16::from(BETA[index_b]);
     if alpha == 0 || beta == 0 {
-        return Ok(None);
+        return None;
     }
 
-    Ok(Some(PreparedEdgeParameters {
-        boundary_strength: parameters.boundary_strength,
+    Some(EdgeThresholds {
         alpha,
         beta,
-        tc0: if parameters.boundary_strength < 4 {
-            i16::from(TC0[usize::from(parameters.boundary_strength - 1)][index_a])
+        index_a,
+        strong_threshold: (alpha >> 2) + 2,
+        chroma_style,
+    })
+}
+
+#[inline]
+fn prepare_edge_strength(
+    boundary_strength: u8,
+    thresholds: Option<EdgeThresholds>,
+) -> Option<PreparedEdgeParameters> {
+    if boundary_strength == 0 {
+        return None;
+    }
+    let thresholds = thresholds?;
+    Some(PreparedEdgeParameters {
+        boundary_strength,
+        alpha: thresholds.alpha,
+        beta: thresholds.beta,
+        tc0: if boundary_strength < 4 {
+            i16::from(TC0[usize::from(boundary_strength - 1)][thresholds.index_a])
         } else {
             0
         },
-        strong_threshold: (alpha >> 2) + 2,
-        chroma_style: parameters.chroma_style,
-    }))
+        strong_threshold: thresholds.strong_threshold,
+        chroma_style: thresholds.chroma_style,
+    })
 }
 
-fn edge_parameters(
+fn edge_thresholds(
     previous: MacroblockDeblockInfo,
     current: MacroblockDeblockInfo,
-    boundary_strength: u8,
     component: u8,
-) -> EdgeParameters {
+) -> Result<Option<EdgeThresholds>> {
     let qp = |macroblock: MacroblockDeblockInfo| match component {
         0 => macroblock.luma_qp,
         1 => macroblock.cb_qp,
         _ => macroblock.cr_qp,
     };
-    EdgeParameters {
-        boundary_strength,
-        qp_p: qp(previous),
-        qp_q: qp(current),
-        alpha_offset_div2: current.filter.alpha_c0_offset_div2,
-        beta_offset_div2: current.filter.beta_offset_div2,
-        chroma_style: component != 0,
-    }
+    let qp_p = qp(previous);
+    let qp_q = qp(current);
+    let alpha_offset_div2 = current.filter.alpha_c0_offset_div2;
+    let beta_offset_div2 = current.filter.beta_offset_div2;
+    validate_threshold_inputs(qp_p, qp_q, alpha_offset_div2, beta_offset_div2)?;
+    Ok(prepare_edge_thresholds_unchecked(
+        qp_p,
+        qp_q,
+        alpha_offset_div2,
+        beta_offset_div2,
+        component != 0,
+    ))
 }
 
 fn boundary_strength(
@@ -537,10 +583,11 @@ fn filter_vertical_edge(
     x: usize,
     y: usize,
     length: usize,
-    parameters: EdgeParameters,
-) -> Result<()> {
-    let Some(parameters) = prepare_edge_parameters(parameters)? else {
-        return Ok(());
+    boundary_strength: u8,
+    thresholds: Option<EdgeThresholds>,
+) {
+    let Some(parameters) = prepare_edge_strength(boundary_strength, thresholds) else {
+        return;
     };
     for offset in 0..length {
         let q0 = (y + offset) * stride + x;
@@ -554,7 +601,6 @@ fn filter_vertical_edge(
             plane[q0 + index] = filtered.q[index];
         }
     }
-    Ok(())
 }
 
 fn filter_horizontal_edge(
@@ -563,10 +609,11 @@ fn filter_horizontal_edge(
     x: usize,
     y: usize,
     length: usize,
-    parameters: EdgeParameters,
-) -> Result<()> {
-    let Some(parameters) = prepare_edge_parameters(parameters)? else {
-        return Ok(());
+    boundary_strength: u8,
+    thresholds: Option<EdgeThresholds>,
+) {
+    let Some(parameters) = prepare_edge_strength(boundary_strength, thresholds) else {
+        return;
     };
     for offset in 0..length {
         let q0 = y * stride + x + offset;
@@ -580,7 +627,6 @@ fn filter_horizontal_edge(
             plane[q0 + index * stride] = filtered.q[index];
         }
     }
-    Ok(())
 }
 
 fn apply_parameters(
@@ -612,6 +658,15 @@ fn validate_inputs(
             "deblocking boundary strength exceeds 4",
         ));
     }
+    validate_threshold_inputs(qp_p, qp_q, alpha_offset_div2, beta_offset_div2)
+}
+
+fn validate_threshold_inputs(
+    qp_p: u8,
+    qp_q: u8,
+    alpha_offset_div2: i8,
+    beta_offset_div2: i8,
+) -> Result<()> {
     if qp_p > 51 || qp_q > 51 {
         return Err(H264Error::InvalidSyntax("deblocking QP exceeds 51"));
     }
