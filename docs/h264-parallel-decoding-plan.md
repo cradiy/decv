@@ -6,8 +6,8 @@ kind of parallelism.
 
 ## Why SIMD Is Not Enough
 
-The current 1920x1080 High Profile benchmark decodes 180 frames in about 2.05
-seconds in Serial mode. That is roughly 87.8 frames per second. The decoder has
+The current 1920x1080 High Profile benchmark decodes 180 frames in about 2.00
+seconds in Serial mode. That is roughly 90.0 frames per second. The decoder has
 therefore crossed the 1080p60 line on this machine, but it remains far from the
 4K120 stretch goal and from FFmpeg's single-thread throughput. No single
 remaining kernel can provide that speedup alone.
