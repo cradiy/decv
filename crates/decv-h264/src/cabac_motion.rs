@@ -77,7 +77,7 @@ impl CabacMotionSyntaxState {
         )?;
         let reference_index =
             decode_reference_index_with(context_increment, active_reference_count, |index| {
-                syntax.decision(index)
+                syntax.decision_known(index)
             })?;
         self.fill_partition(
             macroblock_address,
@@ -380,7 +380,7 @@ enum MvdBinRequest {
 
 fn decode_request(syntax: &mut CabacSyntaxDecoder<'_, '_>, request: MvdBinRequest) -> Result<u8> {
     match request {
-        MvdBinRequest::Decision(context_index) => syntax.decision(context_index),
+        MvdBinRequest::Decision(context_index) => syntax.decision_known(context_index),
         MvdBinRequest::Bypass => syntax.bypass(),
     }
 }

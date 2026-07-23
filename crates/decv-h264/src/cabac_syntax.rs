@@ -87,7 +87,7 @@ impl CabacMacroblockState {
     ) -> Result<bool> {
         let context_index =
             self.skip_flag_context_index(macroblock_address, slice_id, slice_type)?;
-        Ok(syntax.decision(context_index)? != 0)
+        Ok(syntax.decision_known(context_index)? != 0)
     }
 
     /// Decodes an I/SI-slice `mb_type` value in the range 0..=25.
@@ -109,19 +109,19 @@ impl CabacMacroblockState {
                 context_index += 1;
             }
         }
-        if syntax.decision(context_index)? == 0 {
+        if syntax.decision_known(context_index)? == 0 {
             return Ok(0);
         }
         if syntax.terminate()? != 0 {
             return Ok(25);
         }
         let mut macroblock_type = 1;
-        macroblock_type += 12 * syntax.decision(6)?;
-        if syntax.decision(7)? != 0 {
-            macroblock_type += 4 + 4 * syntax.decision(8)?;
+        macroblock_type += 12 * syntax.decision_known(6)?;
+        if syntax.decision_known(7)? != 0 {
+            macroblock_type += 4 + 4 * syntax.decision_known(8)?;
         }
-        macroblock_type += 2 * syntax.decision(9)?;
-        macroblock_type += syntax.decision(10)?;
+        macroblock_type += 2 * syntax.decision_known(9)?;
+        macroblock_type += syntax.decision_known(10)?;
         Ok(macroblock_type)
     }
 
@@ -131,7 +131,7 @@ impl CabacMacroblockState {
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
     ) -> Result<CabacPMacroblockType> {
         decode_p_macroblock_type_with(|request| match request {
-            CabacBinRequest::Decision(context_index) => syntax.decision(context_index),
+            CabacBinRequest::Decision(context_index) => syntax.decision_known(context_index),
             CabacBinRequest::Terminate => syntax.terminate(),
         })
     }
@@ -141,7 +141,7 @@ impl CabacMacroblockState {
         &self,
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
     ) -> Result<PSubMacroblockType> {
-        decode_p_sub_macroblock_type_with(|context_index| syntax.decision(context_index))
+        decode_p_sub_macroblock_type_with(|context_index| syntax.decision_known(context_index))
     }
 
     /// Decodes one non-skipped progressive B-slice `mb_type`.
@@ -154,7 +154,7 @@ impl CabacMacroblockState {
         let context_increment =
             self.b_macroblock_type_context_increment(macroblock_address, slice_id)?;
         decode_b_macroblock_type_with(context_increment, |request| match request {
-            CabacBinRequest::Decision(context_index) => syntax.decision(context_index),
+            CabacBinRequest::Decision(context_index) => syntax.decision_known(context_index),
             CabacBinRequest::Terminate => syntax.terminate(),
         })
     }
@@ -164,7 +164,7 @@ impl CabacMacroblockState {
         &self,
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
     ) -> Result<BSubMacroblockType> {
-        decode_b_sub_macroblock_type_with(|context_index| syntax.decision(context_index))
+        decode_b_sub_macroblock_type_with(|context_index| syntax.decision_known(context_index))
     }
 
     /// Decodes the complete prediction/header syntax of one I macroblock.
@@ -275,7 +275,7 @@ impl CabacMacroblockState {
             })
             .count();
         decode_intra_chroma_prediction_mode(64 + context_increment, |context_index| {
-            syntax.decision(context_index)
+            syntax.decision_known(context_index)
         })
     }
 
@@ -289,11 +289,11 @@ impl CabacMacroblockState {
         let left_pattern = left.map(|macroblock| macroblock.summary.coded_block_pattern);
         let top_pattern = top.map(|macroblock| macroblock.summary.coded_block_pattern);
         let luma = decode_luma_coded_block_pattern(left_pattern, top_pattern, |context_index| {
-            syntax.decision(context_index)
+            syntax.decision_known(context_index)
         })?;
         let chroma =
             decode_chroma_coded_block_pattern(left_pattern, top_pattern, |context_index| {
-                syntax.decision(context_index)
+                syntax.decision_known(context_index)
             })?;
         Ok(CodedBlockPattern { luma, chroma })
     }
@@ -311,7 +311,7 @@ impl CabacMacroblockState {
                 neighbour.is_some_and(|macroblock| macroblock.summary.transform_size_8x8)
             })
             .count();
-        Ok(syntax.decision(399 + context_increment)? != 0)
+        Ok(syntax.decision_known(399 + context_increment)? != 0)
     }
 
     /// Records the properties needed by later macroblocks in the same slice.
@@ -505,6 +505,16 @@ impl<'syntax, 'data> CabacSyntaxDecoder<'syntax, 'data> {
             .decode_decision(self.contexts.get_mut(context_index)?)
     }
 
+    /// Fast path for context indices derived from bounded H.264 syntax.
+    #[inline]
+    pub(crate) fn decision_known(&mut self, context_index: usize) -> Result<u8> {
+        // SAFETY: Every internal call site derives its index from normative
+        // context bases plus a syntax increment whose range is validated by
+        // the owning decoder state.
+        let context = unsafe { self.contexts.get_mut_unchecked(context_index) };
+        self.arithmetic.decode_decision(context)
+    }
+
     /// Decodes one bypass bin.
     #[inline]
     pub fn bypass(&mut self) -> Result<u8> {
@@ -518,12 +528,12 @@ impl<'syntax, 'data> CabacSyntaxDecoder<'syntax, 'data> {
     }
 
     pub fn intra_prediction_mode(&mut self) -> Result<IntraPredictionModeSyntax> {
-        decode_intra_prediction_mode(|context_index| self.decision(context_index))
+        decode_intra_prediction_mode(|context_index| self.decision_known(context_index))
     }
 
     pub fn macroblock_qp_delta(&mut self, previous_delta_nonzero: bool) -> Result<i8> {
         decode_macroblock_qp_delta(previous_delta_nonzero, |context_index| {
-            self.decision(context_index)
+            self.decision_known(context_index)
         })
     }
 
@@ -544,7 +554,7 @@ impl<'syntax, 'data> CabacSyntaxDecoder<'syntax, 'data> {
         maximum_value: u32,
     ) -> Result<u32> {
         decode_truncated_unary(context_indices, maximum_value, |context_index| {
-            self.decision(context_index)
+            self.decision_known(context_index)
         })
     }
 
@@ -554,7 +564,7 @@ impl<'syntax, 'data> CabacSyntaxDecoder<'syntax, 'data> {
     /// terminating zero-bin. A longer run of one-bins is rejected.
     pub fn unary(&mut self, context_indices: &[usize], maximum_value: u32) -> Result<u32> {
         decode_unary(context_indices, maximum_value, |context_index| {
-            self.decision(context_index)
+            self.decision_known(context_index)
         })
     }
 }

@@ -217,6 +217,22 @@ impl CabacContextSet {
             ))
     }
 
+    /// Returns a context selected by codec-internal, spec-bounded syntax.
+    ///
+    /// # Safety
+    ///
+    /// `context_index` must be smaller than the normative 8-bit 4:2:0 context
+    /// count. Public callers must use [`Self::get_mut`] instead.
+    #[inline]
+    pub(crate) unsafe fn get_mut_unchecked(
+        &mut self,
+        context_index: usize,
+    ) -> &mut CabacContextState {
+        debug_assert!(context_index < CABAC_CONTEXT_COUNT);
+        // SAFETY: The caller guarantees the documented context-index bound.
+        unsafe { self.states.get_unchecked_mut(context_index) }
+    }
+
     #[inline]
     pub const fn len(&self) -> usize {
         self.states.len()

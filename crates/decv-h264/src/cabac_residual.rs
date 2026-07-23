@@ -186,7 +186,9 @@ pub fn decode_cabac_significance_map(
     syntax: &mut CabacSyntaxDecoder<'_, '_>,
     category: CabacResidualCategory,
 ) -> Result<CabacSignificanceMap> {
-    decode_significance_map_with(category, |context_index| syntax.decision(context_index))
+    decode_significance_map_with(category, |context_index| {
+        syntax.decision_known(context_index)
+    })
 }
 
 fn decode_significance_map_with(
@@ -236,7 +238,7 @@ pub fn decode_cabac_coefficient_levels(
 ) -> Result<CabacCoefficientBlock> {
     decode_coefficient_levels_with(category, significance_map, |context_index| {
         if let Some(context_index) = context_index {
-            syntax.decision(context_index)
+            syntax.decision_known(context_index)
         } else {
             syntax.bypass()
         }
@@ -788,7 +790,7 @@ impl CabacResidualState {
             current_is_intra,
             block,
         )? {
-            Some(context_index) => syntax.decision(context_index)? != 0,
+            Some(context_index) => syntax.decision_known(context_index)? != 0,
             None => true,
         };
         if !coded {
