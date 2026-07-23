@@ -73,6 +73,14 @@ ffmpeg -hide_banner -loglevel error \
 verify_stream cabac-b
 
 ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=128x72:rate=24" \
+    -frames:v 24 -pix_fmt yuv420p -c:v libx264 -profile:v high \
+    -x264-params \
+    "cabac=1:bframes=3:ref=3:weightp=2:weightb=1:8x8dct=1:direct=auto" \
+    -f h264 -y "$work_dir/cabac-realistic.h264"
+verify_stream cabac-realistic
+
+ffmpeg -hide_banner -loglevel error \
     -f lavfi -i "testsrc2=size=64x48:rate=24" \
     -frames:v 16 -pix_fmt yuv420p -c:v libx264 -profile:v main \
     -x264-params \

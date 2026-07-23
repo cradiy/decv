@@ -7,7 +7,7 @@ use std::{
 
 use decv_core::{
     BitstreamFormat, DecodeInputStatus, DecodeOutput, EncodedVideoPacket, FrameStorage,
-    PixelFormat, VideoCodec, VideoDecoder, VideoDecoderConfig,
+    PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
 };
 use decv_h264::H264Decoder;
 
@@ -52,22 +52,24 @@ fn main() -> Result<(), Box<dyn Error>> {
                     FrameStorage::Cpu(cpu) => {
                         let mut visible_bytes = 0usize;
                         for (plane_index, plane) in cpu.planes.iter().enumerate() {
-                            let row_bytes = visible_plane_row_bytes(
+                            let (first_row, byte_offset, row_bytes, rows) = visible_plane_layout(
                                 frame.format.pixel_format,
-                                frame.format.coded_size.width,
+                                frame.format.visible_rect,
                                 plane_index,
                             )
                             .ok_or("unsupported CPU plane layout")?;
                             visible_bytes = visible_bytes
                                 .checked_add(
                                     row_bytes
-                                        .checked_mul(plane.rows)
+                                        .checked_mul(rows)
                                         .ok_or("frame byte count overflow")?,
                                 )
                                 .ok_or("frame byte count overflow")?;
                             if let Some(output) = raw_output.as_mut() {
-                                for row in 0..plane.rows {
-                                    let start = plane.offset + row * plane.stride;
+                                for row in 0..rows {
+                                    let start = plane.offset
+                                        + (first_row + row) * plane.stride
+                                        + byte_offset;
                                     output.write_all(&plane.bytes[start..start + row_bytes])?;
                                 }
                             }
@@ -91,37 +93,67 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn visible_plane_row_bytes(
+fn visible_plane_layout(
     pixel_format: PixelFormat,
-    coded_width: u32,
+    visible_rect: Rect,
     plane_index: usize,
-) -> Option<usize> {
-    let width = usize::try_from(coded_width).ok()?;
+) -> Option<(usize, usize, usize, usize)> {
+    let x = usize::try_from(visible_rect.x).ok()?;
+    let y = usize::try_from(visible_rect.y).ok()?;
+    let width = usize::try_from(visible_rect.width).ok()?;
+    let height = usize::try_from(visible_rect.height).ok()?;
     match (pixel_format, plane_index) {
-        (PixelFormat::Nv12, 0 | 1) => Some(width),
-        (PixelFormat::I420, 0) => Some(width),
-        (PixelFormat::I420, 1 | 2) => Some(width / 2),
-        (PixelFormat::P010, 0 | 1) => width.checked_mul(2),
-        (PixelFormat::Bgra8 | PixelFormat::Rgba8, 0) => width.checked_mul(4),
+        (PixelFormat::Nv12, 0) => Some((y, x, width, height)),
+        (PixelFormat::Nv12, 1) if (x | y | width | height) & 1 == 0 => {
+            Some((y / 2, x, width, height / 2))
+        }
+        (PixelFormat::I420, 0) => Some((y, x, width, height)),
+        (PixelFormat::I420, 1 | 2) if (x | y | width | height) & 1 == 0 => {
+            Some((y / 2, x / 2, width / 2, height / 2))
+        }
+        (PixelFormat::P010, 0) => Some((y, x.checked_mul(2)?, width.checked_mul(2)?, height)),
+        (PixelFormat::P010, 1) if (x | y | width | height) & 1 == 0 => {
+            Some((y / 2, x.checked_mul(2)?, width.checked_mul(2)?, height / 2))
+        }
+        (PixelFormat::Bgra8 | PixelFormat::Rgba8, 0) => {
+            Some((y, x.checked_mul(4)?, width.checked_mul(4)?, height))
+        }
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::visible_plane_row_bytes;
-    use decv_core::PixelFormat;
+    use super::visible_plane_layout;
+    use decv_core::{PixelFormat, Rect};
 
     #[test]
-    fn derives_tightly_packed_row_widths() {
-        assert_eq!(visible_plane_row_bytes(PixelFormat::Nv12, 64, 0), Some(64));
-        assert_eq!(visible_plane_row_bytes(PixelFormat::Nv12, 64, 1), Some(64));
-        assert_eq!(visible_plane_row_bytes(PixelFormat::I420, 64, 2), Some(32));
-        assert_eq!(visible_plane_row_bytes(PixelFormat::P010, 64, 1), Some(128));
+    fn derives_cropped_plane_layouts() {
+        let rect = Rect::new(4, 2, 64, 32);
         assert_eq!(
-            visible_plane_row_bytes(PixelFormat::Bgra8, 64, 0),
-            Some(256)
+            visible_plane_layout(PixelFormat::Nv12, rect, 0),
+            Some((2, 4, 64, 32))
         );
-        assert_eq!(visible_plane_row_bytes(PixelFormat::Nv12, 64, 2), None);
+        assert_eq!(
+            visible_plane_layout(PixelFormat::Nv12, rect, 1),
+            Some((1, 4, 64, 16))
+        );
+        assert_eq!(
+            visible_plane_layout(PixelFormat::I420, rect, 2),
+            Some((1, 2, 32, 16))
+        );
+        assert_eq!(
+            visible_plane_layout(PixelFormat::P010, rect, 1),
+            Some((1, 8, 128, 16))
+        );
+        assert_eq!(
+            visible_plane_layout(PixelFormat::Bgra8, rect, 0),
+            Some((2, 16, 256, 32))
+        );
+        assert_eq!(visible_plane_layout(PixelFormat::Nv12, rect, 2), None);
+        assert_eq!(
+            visible_plane_layout(PixelFormat::Nv12, Rect::new(1, 0, 64, 32), 1),
+            None
+        );
     }
 }
