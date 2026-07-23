@@ -226,15 +226,15 @@ pub(crate) fn filter_420_picture(
 
     let chroma_stride = width / 2;
     let (luma, cb, cr) = picture.planes_mut();
-    for (address, &current) in macroblocks.iter().enumerate() {
+    for (address, current) in macroblocks.iter().enumerate() {
         let macroblock_x = address % width_in_macroblocks;
         let macroblock_y = address / width_in_macroblocks;
         if current.filter.idc == 1 {
             continue;
         }
 
-        let left = (macroblock_x > 0).then(|| macroblocks[address - 1]);
-        let top = (macroblock_y > 0).then(|| macroblocks[address - width_in_macroblocks]);
+        let left = (macroblock_x > 0).then(|| &macroblocks[address - 1]);
+        let top = (macroblock_y > 0).then(|| &macroblocks[address - width_in_macroblocks]);
         let filter_left = left.is_some_and(|neighbor| {
             current.filter.idc != 2 || neighbor.slice_id == current.slice_id
         });
@@ -510,11 +510,11 @@ fn prepare_edge_strength(
 }
 
 fn edge_thresholds(
-    previous: MacroblockDeblockInfo,
-    current: MacroblockDeblockInfo,
+    previous: &MacroblockDeblockInfo,
+    current: &MacroblockDeblockInfo,
     component: u8,
 ) -> Result<Option<EdgeThresholds>> {
-    let qp = |macroblock: MacroblockDeblockInfo| match component {
+    let qp = |macroblock: &MacroblockDeblockInfo| match component {
         0 => macroblock.luma_qp,
         1 => macroblock.cb_qp,
         _ => macroblock.cr_qp,
@@ -534,9 +534,9 @@ fn edge_thresholds(
 }
 
 fn boundary_strength(
-    previous: MacroblockDeblockInfo,
+    previous: &MacroblockDeblockInfo,
     previous_cell: usize,
-    current: MacroblockDeblockInfo,
+    current: &MacroblockDeblockInfo,
     current_cell: usize,
     external: bool,
 ) -> u8 {
@@ -1212,19 +1212,22 @@ mod tests {
     #[test]
     fn derives_progressive_p_boundary_strengths() {
         let same = inter_macroblock(7, MotionVector { x: 3, y: -2 });
-        assert_eq!(boundary_strength(same, 3, same, 0, true), 0);
+        assert_eq!(boundary_strength(&same, 3, &same, 0, true), 0);
 
         let different_reference = inter_macroblock(8, same.motion[0].list0.vector);
-        assert_eq!(boundary_strength(same, 3, different_reference, 0, true), 1);
+        assert_eq!(
+            boundary_strength(&same, 3, &different_reference, 0, true),
+            1
+        );
 
         let different_vector = inter_macroblock(7, MotionVector { x: 7, y: -2 });
-        assert_eq!(boundary_strength(same, 3, different_vector, 0, true), 1);
+        assert_eq!(boundary_strength(&same, 3, &different_vector, 0, true), 1);
 
         let mut residual = same;
         residual.luma_nonzero[3] = true;
-        assert_eq!(boundary_strength(residual, 3, same, 0, true), 2);
-        assert_eq!(boundary_strength(macroblock(1, 0), 3, same, 0, true), 4);
-        assert_eq!(boundary_strength(macroblock(1, 0), 3, same, 0, false), 3);
+        assert_eq!(boundary_strength(&residual, 3, &same, 0, true), 2);
+        assert_eq!(boundary_strength(&macroblock(1, 0), 3, &same, 0, true), 4);
+        assert_eq!(boundary_strength(&macroblock(1, 0), 3, &same, 0, false), 3);
     }
 
     #[test]
@@ -1241,15 +1244,18 @@ mod tests {
 
         let previous = bidirectional(list(7, 2), list(8, 9));
         let swapped = bidirectional(list(8, 9), list(7, 2));
-        assert_eq!(boundary_strength(previous, 3, swapped, 0, true), 0);
+        assert_eq!(boundary_strength(&previous, 3, &swapped, 0, true), 0);
 
         let crossed_difference = bidirectional(list(8, 13), list(7, 2));
         assert_eq!(
-            boundary_strength(previous, 3, crossed_difference, 0, true),
+            boundary_strength(&previous, 3, &crossed_difference, 0, true),
             1
         );
 
         let mismatched_pair = bidirectional(list(7, 2), list(9, 9));
-        assert_eq!(boundary_strength(previous, 3, mismatched_pair, 0, true), 1);
+        assert_eq!(
+            boundary_strength(&previous, 3, &mismatched_pair, 0, true),
+            1
+        );
     }
 }
