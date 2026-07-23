@@ -17,6 +17,7 @@ mod parameter_sets;
 mod picture;
 mod pps;
 mod prediction;
+mod quantization;
 mod rbsp;
 mod slice;
 mod sps;
@@ -41,6 +42,7 @@ pub use pps::{
     EntropyCodingMode, PictureParameterSet, SliceGroupMap, SliceGroupRectangle,
     WeightedBiprediction,
 };
+pub use quantization::{MacroblockQuantizer, MacroblockQuantizerState, derive_chroma_qp};
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};
 pub use slice::{
     DeblockingFilter, MemoryManagementOperation, ParsedSliceHeader, PredictionWeight,
