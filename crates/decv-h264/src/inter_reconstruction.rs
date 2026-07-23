@@ -2,6 +2,7 @@
 
 use decv_core::Size;
 
+use crate::inter_prediction::copy_fixed_row;
 use crate::picture_surface::{MacroblockPixels, StagedMacroblockPixels};
 use crate::{
     H264Error, InterPrediction420, PredictionWeight, PredictionWeightTable,
@@ -360,17 +361,37 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
             weight_mode,
         )?;
         for y in 0..usize::from(partition.height) {
-            let destination = &mut predicted_luma[usize::from(partition.y) + y]
-                [usize::from(partition.x)..usize::from(partition.x + partition.width)];
-            destination.copy_from_slice(&prediction.luma[y][..usize::from(partition.width)]);
+            let destination_y = usize::from(partition.y) + y;
+            // SAFETY: prediction validation guarantees a 4/8/16-byte luma
+            // partition within this macroblock and both fixed rows.
+            unsafe {
+                copy_fixed_row(
+                    predicted_luma[destination_y]
+                        .as_mut_ptr()
+                        .add(usize::from(partition.x)),
+                    prediction.luma[y].as_ptr(),
+                    usize::from(partition.width),
+                );
+            }
         }
         for y in 0..usize::from(partition.height / 2) {
             let start = usize::from(partition.x / 2);
-            let end = usize::from((partition.x + partition.width) / 2);
-            predicted_cb[usize::from(partition.y / 2) + y][start..end]
-                .copy_from_slice(&prediction.cb[y][..usize::from(partition.width / 2)]);
-            predicted_cr[usize::from(partition.y / 2) + y][start..end]
-                .copy_from_slice(&prediction.cr[y][..usize::from(partition.width / 2)]);
+            let destination_y = usize::from(partition.y / 2) + y;
+            let width = usize::from(partition.width / 2);
+            // SAFETY: prediction validation guarantees a 2/4/8-byte chroma
+            // partition within these fixed eight-byte rows.
+            unsafe {
+                copy_fixed_row(
+                    predicted_cb[destination_y].as_mut_ptr().add(start),
+                    prediction.cb[y].as_ptr(),
+                    width,
+                );
+                copy_fixed_row(
+                    predicted_cr[destination_y].as_mut_ptr().add(start),
+                    prediction.cr[y].as_ptr(),
+                    width,
+                );
+            }
         }
         for y in (partition.y..partition.y + partition.height).step_by(4) {
             for x in (partition.x..partition.x + partition.width).step_by(4) {

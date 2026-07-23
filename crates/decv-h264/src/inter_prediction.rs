@@ -468,7 +468,7 @@ fn predict_chroma<const CLIP: bool>(
 }
 
 #[inline(always)]
-unsafe fn copy_fixed_row(destination: *mut u8, source: *const u8, width: usize) {
+pub(crate) unsafe fn copy_fixed_row(destination: *mut u8, source: *const u8, width: usize) {
     use std::ptr::{read_unaligned, write_unaligned};
 
     match width {
