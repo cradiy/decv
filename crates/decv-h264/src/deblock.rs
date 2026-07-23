@@ -566,6 +566,7 @@ fn edge_thresholds(
     ))
 }
 
+#[inline(always)]
 fn boundary_strength(
     previous: &MacroblockDeblockInfo,
     previous_cell: usize,
