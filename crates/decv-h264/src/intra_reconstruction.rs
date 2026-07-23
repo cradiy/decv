@@ -14,10 +14,10 @@ use crate::inter_reconstruction::{
 use crate::motion_field::MotionFieldBuilder;
 use crate::rbsp::more_rbsp_data;
 use crate::{
-    ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, CavlcNeighborState,
-    ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock, DecodedIntraMacroblock,
-    DecodedPSliceMacroblock, DirectReference, EntropyCodingMode, H264Error, InterResidual,
-    IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraModeState,
+    ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, BSubMacroblockType,
+    CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock,
+    DecodedIntraMacroblock, DecodedPSliceMacroblock, DirectReference, EntropyCodingMode, H264Error,
+    InterResidual, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraModeState,
     IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
     MacroblockQuantizerState, PMacroblockContext, PMotionState, ParsedSliceHeader,
     PredictionWeightTable, ReconstructedInterResidual, ReconstructedIntraResidual,
@@ -914,7 +914,7 @@ impl IntraPictureReconstructor {
                         &self.scaling_lists_8x8,
                         self.scan_mode,
                     )?;
-                    let motion = if header.partition_mode == BPartitionMode::Direct16x16 {
+                    let motion = if is_fully_direct_b_macroblock(header) {
                         modes
                             .direct
                             .resolve(&mut self.b_motion, macroblock_address, slice_id)?
@@ -1671,6 +1671,18 @@ fn reconstruct_b_prediction(
             list0,
             list1,
         ),
+    }
+}
+
+fn is_fully_direct_b_macroblock(header: &crate::BInterMacroblockHeader) -> bool {
+    match &header.partition_mode {
+        BPartitionMode::Direct16x16 => true,
+        BPartitionMode::EightByEight { sub_macroblocks } => sub_macroblocks
+            .iter()
+            .all(|sub_type| *sub_type == BSubMacroblockType::Direct8x8),
+        BPartitionMode::SixteenBySixteen
+        | BPartitionMode::SixteenByEight
+        | BPartitionMode::EightBySixteen => false,
     }
 }
 

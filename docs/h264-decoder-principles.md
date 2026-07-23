@@ -734,6 +734,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   per-8x8 co-located zero-motion handling, and transactional state updates;
 - temporal Direct stable-ID mapping from co-located motion into current List 0,
   POC-distance MV scaling, complementary List-1 vectors, and B_Skip dispatch;
+- all-Direct `B_8x8` macroblocks using the SPS-selected 8x8 or 4x4 Direct
+  inference granularity;
 - explicit weighted B prediction for single-list and bidirectional partitions,
   including independent luma and chroma weights and offsets;
 - implicit weighted B prediction derived per active reference pair from current
@@ -764,7 +766,7 @@ This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
 - CABAC slice data;
-- Direct8x8 sub-macroblocks, SP, and SI reconstruction;
+- mixed Direct/explicit `B_8x8`, SP, and SI reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;
