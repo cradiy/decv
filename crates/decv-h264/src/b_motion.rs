@@ -753,17 +753,25 @@ impl BMotionState {
 }
 
 fn neighbour_motions(cells: [Option<MotionCell>; 4], list1: bool) -> [NeighbourMotion; 4] {
-    cells.map(|cell| {
-        let Some(cell) = cell else {
-            return NeighbourMotion::UNAVAILABLE;
-        };
-        let motion = if list1 { cell.list1 } else { cell.list0 };
-        NeighbourMotion {
-            available: true,
-            reference_index: motion.map_or(-1, |motion| motion.reference_index as i8),
-            vector: motion.map_or_else(MotionVector::default, |motion| motion.motion_vector),
-        }
-    })
+    [
+        neighbour_motion(cells[0], list1),
+        neighbour_motion(cells[1], list1),
+        neighbour_motion(cells[2], list1),
+        neighbour_motion(cells[3], list1),
+    ]
+}
+
+#[inline(always)]
+fn neighbour_motion(cell: Option<MotionCell>, list1: bool) -> NeighbourMotion {
+    let Some(cell) = cell else {
+        return NeighbourMotion::UNAVAILABLE;
+    };
+    let motion = if list1 { cell.list1 } else { cell.list0 };
+    NeighbourMotion {
+        available: true,
+        reference_index: motion.map_or(-1, |motion| motion.reference_index as i8),
+        vector: motion.map_or_else(MotionVector::default, |motion| motion.motion_vector),
+    }
 }
 
 fn spatial_direct_reference_index_from([a, b, mut c, d]: [NeighbourMotion; 4]) -> Option<u8> {
