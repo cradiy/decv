@@ -661,6 +661,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - slice-aware frame-coded P motion-vector prediction at 4x4 granularity,
   including A/B/C/D lookup, C-to-D fallback, directional 16x8/8x16 rules,
   median prediction, P_Skip inference, and transactional state updates;
+- transactional two-list spatial motion prediction for explicit B partitions,
+  including all non-Direct macroblock/sub-macroblock geometries, independent
+  List-0/List-1 neighbours, directional rules, and per-slice availability;
 - allocation-free progressive 8-bit 4:2:0 inter prediction blocks with
   normative quarter-sample luma six-tap filtering, eighth-sample chroma
   bilinear filtering, negative-vector decomposition, and edge extension;

@@ -5,6 +5,7 @@
 //! finally reconstructed pictures.
 
 mod annex_b;
+mod b_motion;
 mod cavlc;
 mod cavlc_context;
 pub mod deblock;
@@ -31,6 +32,7 @@ mod sps;
 mod transform;
 
 pub use annex_b::{AnnexBNalUnit, AnnexBReader};
+pub use b_motion::BMotionState;
 pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
 };
