@@ -40,18 +40,18 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 2.10 s | 2.02 s | 80,100 KiB | 85.7 FPS |
-| decv Auto (2 workers) | NV12 | 2.23 s | 2.40 s | 79,536 KiB | 80.7 FPS |
-| FFmpeg 1 thread | NV12 | 0.63 s | 0.72 s | 152,084 KiB | 285.7 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.47 s | 281,268 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.58 s | 0.56 s | 95,824 KiB | 310.3 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.98 s | 192,384 KiB | 782.6 FPS |
+| decv Serial | NV12 | 2.05 s | 1.96 s | 80,172 KiB | 87.8 FPS |
+| decv Auto (2 workers) | NV12 | 2.24 s | 2.41 s | 79,388 KiB | 80.4 FPS |
+| FFmpeg 1 thread | NV12 | 0.62 s | 0.71 s | 152,192 KiB | 290.3 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.47 s | 287,132 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.58 s | 0.56 s | 95,680 KiB | 310.3 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 0.99 s | 192,288 KiB | 782.6 FPS |
 
 On this workload:
 
 - decv Serial takes about **3.3x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **8.2x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **8.6x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.6x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 42.8% throughput headroom over that
-line, and the measured two-worker Auto result has about 34.5%. The ordering
+seconds. The current Serial result has about 46.3% throughput headroom over that
+line, and the measured two-worker Auto result has about 34.0%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -236,6 +236,15 @@ function body from roughly 8 KiB to 4.9 KiB, but did not reduce whole-decoder
 instructions and increased sampled cache misses by about 1.2%. Six alternating
 pinned runs were about 0.8% slower at the median, so the layout change was
 rejected.
+
+CABAC luma coded-block-pattern bits cover four 4x4 blocks, and a zero chroma
+pattern infers ten DC/AC block states at once. Recording those normative
+inferred-zero groups directly avoids repeating block-enum dispatch, macroblock
+coordinate division, and pattern checks for every member. On the pinned
+300-frame CABAC stream, instructions fell about 3.3%, branches 3.6%, cycles
+1.7%, and the six-run Serial median improved about 1.8%. CAVLC is unaffected.
+The fixed Serial benchmark is now 2.05 seconds; Auto remains scheduling-noisy
+at 2.24 seconds.
 
 ## BitReader Checkpoint
 
