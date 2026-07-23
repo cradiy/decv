@@ -3,9 +3,9 @@
 use bit_readers::BitReader;
 
 use crate::{
-    CoeffTokenContext, DecodedIntraMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
-    IntraMacroblockHeader, IntraResidual, ResidualBlock, Result, decode_residual_block,
-    parse_cavlc_intra_macroblock,
+    CoeffTokenContext, DecodedIntraMacroblock, H264Error, InterResidual, IntraLumaPrediction,
+    IntraMacroblock, IntraMacroblockHeader, IntraResidual, PInterMacroblockHeader, ResidualBlock,
+    Result, decode_residual_block, parse_cavlc_intra_macroblock,
 };
 
 const DECODED_BIT: u32 = 1 << 5;
@@ -279,6 +279,35 @@ impl CavlcNeighborState {
         }
     }
 
+    /// Decodes all residual blocks of one frame-coded 4:2:0 inter
+    /// macroblock, committing reader position and neighbour totals together.
+    pub fn decode_inter_residual(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        header: &PInterMacroblockHeader,
+    ) -> Result<InterResidual> {
+        self.ensure_slice_started()?;
+        if header.coded_block_pattern.luma > 15 || header.coded_block_pattern.chroma > 2 {
+            return Err(H264Error::InvalidSyntax(
+                "coded block pattern exceeds 4:2:0 macroblock bounds",
+            ));
+        }
+        let snapshot = self.snapshot_macroblock(mb_x, mb_y)?;
+        let mut probe = *reader;
+        match self.decode_inter_residual_inner(&mut probe, mb_x, mb_y, header) {
+            Ok(residual) => {
+                *reader = probe;
+                Ok(residual)
+            }
+            Err(error) => {
+                self.restore_macroblock(mb_x, mb_y, snapshot);
+                Err(error)
+            }
+        }
+    }
+
     #[inline]
     pub fn chroma_cb_context(
         &self,
@@ -416,6 +445,55 @@ impl CavlcNeighborState {
 
         Ok(IntraResidual {
             luma_dc,
+            luma,
+            chroma_dc,
+            chroma_ac,
+        })
+    }
+
+    fn decode_inter_residual_inner(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        header: &PInterMacroblockHeader,
+    ) -> Result<InterResidual> {
+        let mut luma = [ResidualBlock::empty(16); 16];
+        for block_index in 0..16u8 {
+            let region_8x8 = block_index / 4;
+            if header.coded_block_pattern.luma & (1 << region_8x8) != 0 {
+                luma[usize::from(block_index)] =
+                    self.decode_luma_block(reader, mb_x, mb_y, block_index, 16)?;
+            } else {
+                self.record_luma(mb_x, mb_y, block_index, 0)?;
+            }
+        }
+
+        let mut chroma_dc = [ResidualBlock::empty(4); 2];
+        if header.coded_block_pattern.chroma != 0 {
+            for block in &mut chroma_dc {
+                *block = decode_residual_block(reader, CoeffTokenContext::ChromaDc420, 4)?;
+            }
+        }
+
+        let mut chroma_ac = [[ResidualBlock::empty(15); 4]; 2];
+        if header.coded_block_pattern.chroma == 2 {
+            for block_index in 0..4u8 {
+                chroma_ac[0][usize::from(block_index)] =
+                    self.decode_chroma_cb_ac(reader, mb_x, mb_y, block_index)?;
+            }
+            for block_index in 0..4u8 {
+                chroma_ac[1][usize::from(block_index)] =
+                    self.decode_chroma_cr_ac(reader, mb_x, mb_y, block_index)?;
+            }
+        } else {
+            for block_index in 0..4u8 {
+                self.record_chroma_cb(mb_x, mb_y, block_index, 0)?;
+                self.record_chroma_cr(mb_x, mb_y, block_index, 0)?;
+            }
+        }
+
+        Ok(InterResidual {
             luma,
             chroma_dc,
             chroma_ac,
@@ -578,7 +656,8 @@ mod tests {
     use super::CavlcNeighborState;
     use crate::{
         CodedBlockPattern, CoeffTokenContext, H264Error, IntraLumaPrediction, IntraMacroblock,
-        IntraMacroblockHeader, IntraPredictionModeSyntax,
+        IntraMacroblockHeader, IntraPredictionModeSyntax, PInterMacroblockHeader, PPartitionMode,
+        PPartitionMotion,
     };
 
     #[test]
@@ -797,6 +876,33 @@ mod tests {
     }
 
     #[test]
+    fn decodes_inter_residual_and_rolls_back_atomically() {
+        let mut state = CavlcNeighborState::new(2, 1).unwrap();
+        state.begin_slice();
+        let data = bit_string("1111");
+        let mut reader = BitReader::new(&data);
+        let residual = state
+            .decode_inter_residual(&mut reader, 0, 0, &inter_header(1, 0, false))
+            .unwrap();
+        assert!(residual.luma.iter().all(|block| block.total_coeff == 0));
+        assert!(residual.luma.iter().all(|block| block.max_num_coeff == 16));
+        assert_eq!(reader.bit_position(), 4);
+
+        state.record_luma(1, 0, 0, 6).unwrap();
+        let mut truncated = BitReader::new(&[0b1000_0000]);
+        assert!(
+            state
+                .decode_inter_residual(&mut truncated, 1, 0, &inter_header(1, 0, false))
+                .is_err()
+        );
+        assert_eq!(truncated.bit_position(), 0);
+        assert_eq!(
+            state.luma_context(1, 0, 1),
+            Ok(CoeffTokenContext::NeighborTotal(6))
+        );
+    }
+
+    #[test]
     fn parses_and_decodes_complete_intra_macroblocks_transactionally() {
         let bits = format!("1{}100100", "1".repeat(16));
         let data = bit_string(&bits);
@@ -871,6 +977,19 @@ mod tests {
             luma_prediction: IntraLumaPrediction::SixteenBySixteen { mode: 0 },
             chroma_prediction_mode: 0,
             coded_block_pattern: CodedBlockPattern { luma, chroma },
+            qp_delta: 0,
+        }
+    }
+
+    fn inter_header(luma: u8, chroma: u8, transform_size_8x8: bool) -> PInterMacroblockHeader {
+        PInterMacroblockHeader {
+            partition_mode: PPartitionMode::L0_16x16,
+            partitions: vec![PPartitionMotion {
+                reference_index: 0,
+                differences: Vec::new(),
+            }],
+            coded_block_pattern: CodedBlockPattern { luma, chroma },
+            transform_size_8x8,
             qp_delta: 0,
         }
     }

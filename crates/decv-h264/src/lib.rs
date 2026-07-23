@@ -40,7 +40,7 @@ pub use inter_prediction::InterPrediction420;
 pub use intra_modes::IntraModeState;
 pub use intra_reconstruction::IntraPictureReconstructor;
 pub use macroblock::{
-    CodedBlockPattern, DecodedIntraMacroblock, IntraLumaPrediction, IntraMacroblock,
+    CodedBlockPattern, DecodedIntraMacroblock, InterResidual, IntraLumaPrediction, IntraMacroblock,
     IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MotionVectorDifference,
     PInterMacroblockHeader, PMacroblockContext, PPartitionMode, PPartitionMotion, PSliceMacroblock,
     PSubMacroblockType, PcmMacroblock, parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run,
@@ -63,7 +63,8 @@ pub use prediction::{
 pub use quantization::{MacroblockQuantizer, MacroblockQuantizerState, derive_chroma_qp};
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};
 pub use reconstruction::{
-    ReconstructedIntraResidual, ReconstructedLumaResidual, reconstruct_intra_residual,
+    ReconstructedInterResidual, ReconstructedIntraResidual, ReconstructedLumaResidual,
+    reconstruct_inter_residual, reconstruct_intra_residual,
 };
 pub use slice::{
     DeblockingFilter, MemoryManagementOperation, ParsedSliceHeader, PredictionWeight,

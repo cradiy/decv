@@ -658,6 +658,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - allocation-free progressive 8-bit 4:2:0 inter prediction blocks with
   normative quarter-sample luma six-tap filtering, eighth-sample chroma
   bilinear filtering, negative-vector decomposition, and edge extension;
+- transactional CAVLC inter residual decoding plus 4x4/8x8 inverse transform
+  paths using the Inter scaling lists;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
@@ -703,7 +705,7 @@ still rejects or has not yet connected:
 The next dependency chain is:
 
 ```text
-inter residual decoding and reference-picture storage
+reference-picture list and storage management
     -> connect fractional-sample prediction to P-picture reconstruction
     -> DPB reference marking and POC-based output
     -> CABAC

@@ -84,6 +84,13 @@ pub struct IntraResidual {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InterResidual {
+    pub luma: [ResidualBlock; 16],
+    pub chroma_dc: [ResidualBlock; 2],
+    pub chroma_ac: [[ResidualBlock; 4]; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedIntraMacroblock {
     pub macroblock: IntraMacroblock,
     /// Present for predicted macroblocks and absent for I_PCM.
