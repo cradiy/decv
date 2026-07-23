@@ -667,6 +667,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - allocation-free progressive 8-bit 4:2:0 inter prediction blocks with
   normative quarter-sample luma six-tap filtering, eighth-sample chroma
   bilinear filtering, negative-vector decomposition, and edge extension;
+- block-level interpolation-footprint classification: ordinary interior
+  motion compensation uses a bounds-check-free specialization, while the
+  clipped edge path preserves normative sample replication;
 - transactional CAVLC inter residual decoding plus 4x4/8x8 inverse transform
   paths using the Inter scaling lists;
 - a transactional complete non-skipped CAVLC P-macroblock entry point that

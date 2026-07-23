@@ -13,3 +13,7 @@ criterion = "0.8.2"
 [[bench]]
 name = "cavlc"
 harness = false
+
+[[bench]]
+name = "inter_prediction"
+harness = false

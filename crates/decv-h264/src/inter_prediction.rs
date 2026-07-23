@@ -61,20 +61,40 @@ impl Yuv420Picture {
             cr: [[0; 8]; 8],
         };
 
-        for y in 0..usize::from(partition.height) {
-            for x in 0..usize::from(partition.width) {
-                let reference_x = usize_to_i32(current_x + x)? + integer_motion_x;
-                let reference_y = usize_to_i32(current_y + y)? + integer_motion_y;
-                prediction.luma[y][x] = interpolate_luma(
-                    luma,
-                    picture_width,
-                    picture_height,
-                    reference_x,
-                    reference_y,
-                    fractional_motion_x,
-                    fractional_motion_y,
-                );
-            }
+        let reference_luma_x = usize_to_i32(current_x)? + integer_motion_x;
+        let reference_luma_y = usize_to_i32(current_y)? + integer_motion_y;
+        let luma_is_interior = interpolation_window_is_inside(
+            reference_luma_x,
+            reference_luma_y,
+            usize::from(partition.width),
+            usize::from(partition.height),
+            picture_width,
+            picture_height,
+            2,
+            3,
+        );
+        if luma_is_interior {
+            predict_luma::<false>(
+                &mut prediction,
+                luma,
+                picture_width,
+                picture_height,
+                reference_luma_x,
+                reference_luma_y,
+                fractional_motion_x,
+                fractional_motion_y,
+            );
+        } else {
+            predict_luma::<true>(
+                &mut prediction,
+                luma,
+                picture_width,
+                picture_height,
+                reference_luma_x,
+                reference_luma_y,
+                fractional_motion_x,
+                fractional_motion_y,
+            );
         }
 
         let chroma_width = picture_width / 2;
@@ -85,29 +105,42 @@ impl Yuv420Picture {
         let integer_chroma_y = i32::from(motion.y).div_euclid(8);
         let fractional_chroma_x = i32::from(motion.x).rem_euclid(8) as u8;
         let fractional_chroma_y = i32::from(motion.y).rem_euclid(8) as u8;
-        for y in 0..usize::from(partition.height / 2) {
-            for x in 0..usize::from(partition.width / 2) {
-                let reference_x = usize_to_i32(current_chroma_x + x)? + integer_chroma_x;
-                let reference_y = usize_to_i32(current_chroma_y + y)? + integer_chroma_y;
-                prediction.cb[y][x] = interpolate_chroma(
-                    cb,
-                    chroma_width,
-                    chroma_height,
-                    reference_x,
-                    reference_y,
-                    fractional_chroma_x,
-                    fractional_chroma_y,
-                );
-                prediction.cr[y][x] = interpolate_chroma(
-                    cr,
-                    chroma_width,
-                    chroma_height,
-                    reference_x,
-                    reference_y,
-                    fractional_chroma_x,
-                    fractional_chroma_y,
-                );
-            }
+        let reference_chroma_x = usize_to_i32(current_chroma_x)? + integer_chroma_x;
+        let reference_chroma_y = usize_to_i32(current_chroma_y)? + integer_chroma_y;
+        let chroma_is_interior = interpolation_window_is_inside(
+            reference_chroma_x,
+            reference_chroma_y,
+            usize::from(partition.width / 2),
+            usize::from(partition.height / 2),
+            chroma_width,
+            chroma_height,
+            0,
+            1,
+        );
+        if chroma_is_interior {
+            predict_chroma::<false>(
+                &mut prediction,
+                cb,
+                cr,
+                chroma_width,
+                chroma_height,
+                reference_chroma_x,
+                reference_chroma_y,
+                fractional_chroma_x,
+                fractional_chroma_y,
+            );
+        } else {
+            predict_chroma::<true>(
+                &mut prediction,
+                cb,
+                cr,
+                chroma_width,
+                chroma_height,
+                reference_chroma_x,
+                reference_chroma_y,
+                fractional_chroma_x,
+                fractional_chroma_y,
+            );
         }
         Ok(prediction)
     }
@@ -143,6 +176,88 @@ fn usize_to_i32(value: usize) -> Result<i32> {
     i32::try_from(value).map_err(|_| H264Error::IntegerOverflow)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn interpolation_window_is_inside(
+    x: i32,
+    y: i32,
+    width: usize,
+    height: usize,
+    plane_width: usize,
+    plane_height: usize,
+    margin_before: i32,
+    margin_after: i32,
+) -> bool {
+    let Ok(width) = i32::try_from(width) else {
+        return false;
+    };
+    let Ok(height) = i32::try_from(height) else {
+        return false;
+    };
+    let Ok(plane_width) = i32::try_from(plane_width) else {
+        return false;
+    };
+    let Ok(plane_height) = i32::try_from(plane_height) else {
+        return false;
+    };
+    x >= margin_before
+        && y >= margin_before
+        && x.checked_add(width - 1 + margin_after)
+            .is_some_and(|right| right < plane_width)
+        && y.checked_add(height - 1 + margin_after)
+            .is_some_and(|bottom| bottom < plane_height)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_luma<const CLIP: bool>(
+    prediction: &mut InterPrediction420,
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    reference_x: i32,
+    reference_y: i32,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    for y in 0..usize::from(prediction.height) {
+        for x in 0..usize::from(prediction.width) {
+            prediction.luma[y][x] = interpolate_luma_inner::<CLIP>(
+                plane,
+                width,
+                height,
+                reference_x + x as i32,
+                reference_y + y as i32,
+                x_fraction,
+                y_fraction,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_chroma<const CLIP: bool>(
+    prediction: &mut InterPrediction420,
+    cb: &[u8],
+    cr: &[u8],
+    width: usize,
+    height: usize,
+    reference_x: i32,
+    reference_y: i32,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    for output_y in 0..usize::from(prediction.height / 2) {
+        for output_x in 0..usize::from(prediction.width / 2) {
+            let x = reference_x + output_x as i32;
+            let y = reference_y + output_y as i32;
+            prediction.cb[output_y][output_x] =
+                interpolate_chroma_inner::<CLIP>(cb, width, height, x, y, x_fraction, y_fraction);
+            prediction.cr[output_y][output_x] =
+                interpolate_chroma_inner::<CLIP>(cr, width, height, x, y, x_fraction, y_fraction);
+        }
+    }
+}
+
+#[cfg(test)]
 fn interpolate_luma(
     plane: &[u8],
     width: usize,
@@ -152,100 +267,137 @@ fn interpolate_luma(
     x_fraction: u8,
     y_fraction: u8,
 ) -> u8 {
+    interpolate_luma_inner::<true>(plane, width, height, x, y, x_fraction, y_fraction)
+}
+
+fn interpolate_luma_inner<const CLIP: bool>(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    x_fraction: u8,
+    y_fraction: u8,
+) -> u8 {
     debug_assert!(x_fraction < 4 && y_fraction < 4);
-    let integer = sample_clipped(plane, width, height, x, y);
+    let integer = sample::<CLIP>(plane, width, height, x, y);
     if x_fraction == 0 && y_fraction == 0 {
         return integer;
     }
 
     match (x_fraction, y_fraction) {
-        (0, 1) => rounded_average(integer, half_vertical(plane, width, height, x, y)),
-        (0, 2) => half_vertical(plane, width, height, x, y),
+        (0, 1) => rounded_average(integer, half_vertical::<CLIP>(plane, width, height, x, y)),
+        (0, 2) => half_vertical::<CLIP>(plane, width, height, x, y),
         (0, 3) => rounded_average(
-            sample_clipped(plane, width, height, x, y + 1),
-            half_vertical(plane, width, height, x, y),
+            sample::<CLIP>(plane, width, height, x, y + 1),
+            half_vertical::<CLIP>(plane, width, height, x, y),
         ),
-        (1, 0) => rounded_average(integer, half_horizontal(plane, width, height, x, y)),
+        (1, 0) => rounded_average(integer, half_horizontal::<CLIP>(plane, width, height, x, y)),
         (1, 1) => rounded_average(
-            half_horizontal(plane, width, height, x, y),
-            half_vertical(plane, width, height, x, y),
+            half_horizontal::<CLIP>(plane, width, height, x, y),
+            half_vertical::<CLIP>(plane, width, height, x, y),
         ),
         (1, 2) => rounded_average(
-            half_vertical(plane, width, height, x, y),
-            half_diagonal(plane, width, height, x, y),
+            half_vertical::<CLIP>(plane, width, height, x, y),
+            half_diagonal::<CLIP>(plane, width, height, x, y),
         ),
         (1, 3) => rounded_average(
-            half_vertical(plane, width, height, x, y),
-            half_horizontal(plane, width, height, x, y + 1),
+            half_vertical::<CLIP>(plane, width, height, x, y),
+            half_horizontal::<CLIP>(plane, width, height, x, y + 1),
         ),
-        (2, 0) => half_horizontal(plane, width, height, x, y),
+        (2, 0) => half_horizontal::<CLIP>(plane, width, height, x, y),
         (2, 1) => rounded_average(
-            half_horizontal(plane, width, height, x, y),
-            half_diagonal(plane, width, height, x, y),
+            half_horizontal::<CLIP>(plane, width, height, x, y),
+            half_diagonal::<CLIP>(plane, width, height, x, y),
         ),
-        (2, 2) => half_diagonal(plane, width, height, x, y),
+        (2, 2) => half_diagonal::<CLIP>(plane, width, height, x, y),
         (2, 3) => rounded_average(
-            half_diagonal(plane, width, height, x, y),
-            half_horizontal(plane, width, height, x, y + 1),
+            half_diagonal::<CLIP>(plane, width, height, x, y),
+            half_horizontal::<CLIP>(plane, width, height, x, y + 1),
         ),
         (3, 0) => rounded_average(
-            sample_clipped(plane, width, height, x + 1, y),
-            half_horizontal(plane, width, height, x, y),
+            sample::<CLIP>(plane, width, height, x + 1, y),
+            half_horizontal::<CLIP>(plane, width, height, x, y),
         ),
         (3, 1) => rounded_average(
-            half_horizontal(plane, width, height, x, y),
-            half_vertical(plane, width, height, x + 1, y),
+            half_horizontal::<CLIP>(plane, width, height, x, y),
+            half_vertical::<CLIP>(plane, width, height, x + 1, y),
         ),
         (3, 2) => rounded_average(
-            half_diagonal(plane, width, height, x, y),
-            half_vertical(plane, width, height, x + 1, y),
+            half_diagonal::<CLIP>(plane, width, height, x, y),
+            half_vertical::<CLIP>(plane, width, height, x + 1, y),
         ),
         (3, 3) => rounded_average(
-            half_vertical(plane, width, height, x + 1, y),
-            half_horizontal(plane, width, height, x, y + 1),
+            half_vertical::<CLIP>(plane, width, height, x + 1, y),
+            half_horizontal::<CLIP>(plane, width, height, x, y + 1),
         ),
         _ => unreachable!("fractional luma positions are in 0..=3"),
     }
 }
 
 #[inline]
-fn half_horizontal(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
-    ((horizontal_six_tap(plane, width, height, x, y) + 16) >> 5).clamp(0, 255) as u8
+fn half_horizontal<const CLIP: bool>(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+) -> u8 {
+    ((horizontal_six_tap::<CLIP>(plane, width, height, x, y) + 16) >> 5).clamp(0, 255) as u8
 }
 
 #[inline]
-fn half_vertical(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
-    let value = sample_clipped(plane, width, height, x, y - 2) as i32
-        - 5 * sample_clipped(plane, width, height, x, y - 1) as i32
-        + 20 * sample_clipped(plane, width, height, x, y) as i32
-        + 20 * sample_clipped(plane, width, height, x, y + 1) as i32
-        - 5 * sample_clipped(plane, width, height, x, y + 2) as i32
-        + sample_clipped(plane, width, height, x, y + 3) as i32;
+fn half_vertical<const CLIP: bool>(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+) -> u8 {
+    let value = sample::<CLIP>(plane, width, height, x, y - 2) as i32
+        - 5 * sample::<CLIP>(plane, width, height, x, y - 1) as i32
+        + 20 * sample::<CLIP>(plane, width, height, x, y) as i32
+        + 20 * sample::<CLIP>(plane, width, height, x, y + 1) as i32
+        - 5 * sample::<CLIP>(plane, width, height, x, y + 2) as i32
+        + sample::<CLIP>(plane, width, height, x, y + 3) as i32;
     ((value + 16) >> 5).clamp(0, 255) as u8
 }
 
 #[inline]
-fn half_diagonal(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
-    let value = horizontal_six_tap(plane, width, height, x, y - 2)
-        - 5 * horizontal_six_tap(plane, width, height, x, y - 1)
-        + 20 * horizontal_six_tap(plane, width, height, x, y)
-        + 20 * horizontal_six_tap(plane, width, height, x, y + 1)
-        - 5 * horizontal_six_tap(plane, width, height, x, y + 2)
-        + horizontal_six_tap(plane, width, height, x, y + 3);
+fn half_diagonal<const CLIP: bool>(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+) -> u8 {
+    let value = horizontal_six_tap::<CLIP>(plane, width, height, x, y - 2)
+        - 5 * horizontal_six_tap::<CLIP>(plane, width, height, x, y - 1)
+        + 20 * horizontal_six_tap::<CLIP>(plane, width, height, x, y)
+        + 20 * horizontal_six_tap::<CLIP>(plane, width, height, x, y + 1)
+        - 5 * horizontal_six_tap::<CLIP>(plane, width, height, x, y + 2)
+        + horizontal_six_tap::<CLIP>(plane, width, height, x, y + 3);
     ((value + 512) >> 10).clamp(0, 255) as u8
 }
 
 #[inline]
-fn horizontal_six_tap(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> i32 {
-    sample_clipped(plane, width, height, x - 2, y) as i32
-        - 5 * sample_clipped(plane, width, height, x - 1, y) as i32
-        + 20 * sample_clipped(plane, width, height, x, y) as i32
-        + 20 * sample_clipped(plane, width, height, x + 1, y) as i32
-        - 5 * sample_clipped(plane, width, height, x + 2, y) as i32
-        + sample_clipped(plane, width, height, x + 3, y) as i32
+fn horizontal_six_tap<const CLIP: bool>(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+) -> i32 {
+    sample::<CLIP>(plane, width, height, x - 2, y) as i32
+        - 5 * sample::<CLIP>(plane, width, height, x - 1, y) as i32
+        + 20 * sample::<CLIP>(plane, width, height, x, y) as i32
+        + 20 * sample::<CLIP>(plane, width, height, x + 1, y) as i32
+        - 5 * sample::<CLIP>(plane, width, height, x + 2, y) as i32
+        + sample::<CLIP>(plane, width, height, x + 3, y) as i32
 }
 
 #[inline]
+#[cfg(test)]
 fn interpolate_chroma(
     plane: &[u8],
     width: usize,
@@ -255,13 +407,25 @@ fn interpolate_chroma(
     x_fraction: u8,
     y_fraction: u8,
 ) -> u8 {
+    interpolate_chroma_inner::<true>(plane, width, height, x, y, x_fraction, y_fraction)
+}
+
+fn interpolate_chroma_inner<const CLIP: bool>(
+    plane: &[u8],
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+    x_fraction: u8,
+    y_fraction: u8,
+) -> u8 {
     debug_assert!(x_fraction < 8 && y_fraction < 8);
-    let a = u32::from(sample_clipped(plane, width, height, x, y));
+    let a = u32::from(sample::<CLIP>(plane, width, height, x, y));
     if x_fraction == 0 && y_fraction == 0 {
         return a as u8;
     }
-    let b = u32::from(sample_clipped(plane, width, height, x + 1, y));
-    let c = u32::from(sample_clipped(plane, width, height, x, y + 1));
+    let b = u32::from(sample::<CLIP>(plane, width, height, x + 1, y));
+    let c = u32::from(sample::<CLIP>(plane, width, height, x, y + 1));
     let x_fraction = u32::from(x_fraction);
     let y_fraction = u32::from(y_fraction);
     if y_fraction == 0 {
@@ -270,13 +434,27 @@ fn interpolate_chroma(
     if x_fraction == 0 {
         return (((8 - y_fraction) * a + y_fraction * c + 4) >> 3) as u8;
     }
-    let d = u32::from(sample_clipped(plane, width, height, x + 1, y + 1));
+    let d = u32::from(sample::<CLIP>(plane, width, height, x + 1, y + 1));
     (((8 - x_fraction) * (8 - y_fraction) * a
         + x_fraction * (8 - y_fraction) * b
         + (8 - x_fraction) * y_fraction * c
         + x_fraction * y_fraction * d
         + 32)
         >> 6) as u8
+}
+
+#[inline(always)]
+fn sample<const CLIP: bool>(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
+    if CLIP {
+        return sample_clipped(plane, width, height, x, y);
+    }
+
+    debug_assert!(x >= 0 && x < width as i32);
+    debug_assert!(y >= 0 && y < height as i32);
+    let index = y as usize * width + x as usize;
+    // SAFETY: the caller selects this specialization only after validating
+    // the complete interpolation footprint against the plane dimensions.
+    unsafe { *plane.get_unchecked(index) }
 }
 
 #[inline]
