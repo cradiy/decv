@@ -143,6 +143,10 @@ impl IntraModeState {
         self.fill_macroblock(macroblock_address, ModeCell::Inter { slice_id }, true)
     }
 
+    pub(crate) fn clear_macroblock(&mut self, macroblock_address: usize) -> Result<()> {
+        self.fill_macroblock(macroblock_address, ModeCell::Unavailable, false)
+    }
+
     fn predicted_mode(
         &self,
         macroblock: (usize, usize),

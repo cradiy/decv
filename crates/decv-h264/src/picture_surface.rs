@@ -41,6 +41,13 @@ pub struct Yuv420Picture {
     cr: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct MacroblockPixels {
+    luma: [[u8; 16]; 16],
+    cb: [[u8; 8]; 8],
+    cr: [[u8; 8]; 8],
+}
+
 impl Yuv420Picture {
     pub fn new(coded_size: Size) -> Result<Self> {
         if coded_size.width == 0 || coded_size.height == 0 {
@@ -333,6 +340,61 @@ impl Yuv420Picture {
         Ok(())
     }
 
+    pub(crate) fn snapshot_macroblock(
+        &self,
+        macroblock_x: usize,
+        macroblock_y: usize,
+    ) -> Result<MacroblockPixels> {
+        let luma_x = macroblock_x
+            .checked_mul(16)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let luma_y = macroblock_y
+            .checked_mul(16)
+            .ok_or(H264Error::IntegerOverflow)?;
+        self.validate_luma_block(luma_x, luma_y, 16)?;
+        let chroma_x = macroblock_x
+            .checked_mul(8)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let chroma_y = macroblock_y
+            .checked_mul(8)
+            .ok_or(H264Error::IntegerOverflow)?;
+        Ok(MacroblockPixels {
+            luma: read_block(&self.luma, self.width, luma_x, luma_y),
+            cb: read_block(&self.cb, self.width / 2, chroma_x, chroma_y),
+            cr: read_block(&self.cr, self.width / 2, chroma_x, chroma_y),
+        })
+    }
+
+    pub(crate) fn restore_macroblock(
+        &mut self,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        snapshot: &MacroblockPixels,
+    ) {
+        write_block(
+            &mut self.luma,
+            self.width,
+            macroblock_x * 16,
+            macroblock_y * 16,
+            &snapshot.luma,
+        );
+        let chroma_stride = self.width / 2;
+        write_block(
+            &mut self.cb,
+            chroma_stride,
+            macroblock_x * 8,
+            macroblock_y * 8,
+            &snapshot.cb,
+        );
+        write_block(
+            &mut self.cr,
+            chroma_stride,
+            macroblock_x * 8,
+            macroblock_y * 8,
+            &snapshot.cr,
+        );
+    }
+
     pub fn into_nv12_frame(
         self,
         id: u64,
@@ -524,6 +586,32 @@ fn copy_block(plane: &mut [u8], stride: usize, x: usize, y: usize, samples: &[u8
         let source = &samples[row * size..(row + 1) * size];
         let start = (y + row) * stride + x;
         plane[start..start + size].copy_from_slice(source);
+    }
+}
+
+fn read_block<const SIZE: usize>(
+    plane: &[u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+) -> [[u8; SIZE]; SIZE] {
+    std::array::from_fn(|row| {
+        plane[(y + row) * stride + x..(y + row) * stride + x + SIZE]
+            .try_into()
+            .expect("validated block bounds guarantee a complete row")
+    })
+}
+
+fn write_block<const SIZE: usize>(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    block: &[[u8; SIZE]; SIZE],
+) {
+    for (row, samples) in block.iter().enumerate() {
+        let start = (y + row) * stride + x;
+        plane[start..start + SIZE].copy_from_slice(samples);
     }
 }
 

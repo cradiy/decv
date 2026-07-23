@@ -4,10 +4,29 @@ use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 
 use crate::{
     ChromaPlane, DecodedIntraMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
-    IntraModeState, IntraReferenceAvailability, MacroblockQuantizer, ReconstructedIntraResidual,
-    ResolvedScalingLists4x4, Result, ScanMode, Yuv420Picture, predict_intra_16x16,
-    predict_intra_chroma_420, reconstruct_intra_residual,
+    IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
+    ReconstructedIntraResidual, ResolvedScalingLists4x4, Result, ScanMode, Yuv420Picture,
+    predict_intra_4x4, predict_intra_16x16, predict_intra_chroma_420, reconstruct_intra_residual,
 };
+
+const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (1, 1),
+    (2, 0),
+    (3, 0),
+    (2, 1),
+    (3, 1),
+    (0, 2),
+    (1, 2),
+    (0, 3),
+    (1, 3),
+    (2, 2),
+    (3, 2),
+    (2, 3),
+    (3, 3),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct CompletedMacroblock {
@@ -107,10 +126,24 @@ impl IntraPictureReconstructor {
                         self.modes
                             .record_other_intra(macroblock_address, slice_id)?;
                     }
-                    IntraLumaPrediction::FourByFour(_) => {
-                        return Err(H264Error::UnsupportedFeature(
-                            "Intra4x4 picture reconstruction",
-                        ));
+                    IntraLumaPrediction::FourByFour(syntax) => {
+                        let snapshot = self
+                            .picture
+                            .snapshot_macroblock(macroblock_x, macroblock_y)?;
+                        if let Err(error) = self.reconstruct_intra4x4(
+                            macroblock_address,
+                            macroblock_x,
+                            macroblock_y,
+                            slice_id,
+                            &syntax,
+                            header.chroma_prediction_mode,
+                            &reconstructed,
+                        ) {
+                            self.picture
+                                .restore_macroblock(macroblock_x, macroblock_y, &snapshot);
+                            self.modes.clear_macroblock(macroblock_address)?;
+                            return Err(error);
+                        }
                     }
                     IntraLumaPrediction::EightByEight(_) => {
                         return Err(H264Error::UnsupportedFeature(
@@ -125,6 +158,68 @@ impl IntraPictureReconstructor {
             is_intra: true,
         });
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_intra4x4(
+        &mut self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        slice_id: u32,
+        syntax: &[IntraPredictionModeSyntax; 16],
+        chroma_mode: u8,
+        residual: &ReconstructedIntraResidual,
+    ) -> Result<()> {
+        let macroblock_availability = self.macroblock_availability(macroblock_address, slice_id);
+        let cb_references = self.picture.intra_chroma_references(
+            ChromaPlane::Cb,
+            macroblock_x,
+            macroblock_y,
+            macroblock_availability,
+        )?;
+        let cr_references = self.picture.intra_chroma_references(
+            ChromaPlane::Cr,
+            macroblock_x,
+            macroblock_y,
+            macroblock_availability,
+        )?;
+        let cb_prediction = predict_intra_chroma_420(chroma_mode, &cb_references)?;
+        let cr_prediction = predict_intra_chroma_420(chroma_mode, &cr_references)?;
+        let modes = self.modes.derive_intra4x4(
+            macroblock_address,
+            slice_id,
+            syntax,
+            self.constrained_intra_prediction,
+        )?;
+
+        for (index, &(block_x, block_y)) in LUMA_4X4_COORDINATES.iter().enumerate() {
+            let availability =
+                self.intra4x4_availability(macroblock_address, slice_id, index, block_x, block_y);
+            let x = macroblock_x * 16 + block_x * 4;
+            let y = macroblock_y * 16 + block_y * 4;
+            let references = self.picture.intra4x4_references(x, y, availability)?;
+            let prediction = predict_intra_4x4(modes[index], &references)?;
+            self.picture
+                .write_luma_4x4(x, y, &prediction, &residual.luma[index])?;
+        }
+
+        let cb_residual = assemble_chroma_residual(&residual.chroma_cb);
+        let cr_residual = assemble_chroma_residual(&residual.chroma_cr);
+        self.picture.write_chroma_8x8(
+            ChromaPlane::Cb,
+            macroblock_x,
+            macroblock_y,
+            &cb_prediction,
+            &cb_residual,
+        )?;
+        self.picture.write_chroma_8x8(
+            ChromaPlane::Cr,
+            macroblock_x,
+            macroblock_y,
+            &cr_prediction,
+            &cr_residual,
+        )
     }
 
     pub fn into_nv12_frame(
@@ -217,6 +312,86 @@ impl IntraPictureReconstructor {
         }
     }
 
+    fn intra4x4_availability(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+        block_index: usize,
+        block_x: usize,
+        block_y: usize,
+    ) -> IntraReferenceAvailability {
+        let x = (block_x * 4) as isize;
+        let y = (block_y * 4) as isize;
+        IntraReferenceAvailability {
+            top: (0..4).all(|offset| {
+                self.luma_reference_sample_available(
+                    macroblock_address,
+                    slice_id,
+                    block_index,
+                    x + offset,
+                    y - 1,
+                )
+            }),
+            left: (0..4).all(|offset| {
+                self.luma_reference_sample_available(
+                    macroblock_address,
+                    slice_id,
+                    block_index,
+                    x - 1,
+                    y + offset,
+                )
+            }),
+            top_left: self.luma_reference_sample_available(
+                macroblock_address,
+                slice_id,
+                block_index,
+                x - 1,
+                y - 1,
+            ),
+            top_right: !matches!(block_index, 3 | 11)
+                && (4..8).all(|offset| {
+                    self.luma_reference_sample_available(
+                        macroblock_address,
+                        slice_id,
+                        block_index,
+                        x + offset,
+                        y - 1,
+                    )
+                }),
+        }
+    }
+
+    fn luma_reference_sample_available(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+        block_index: usize,
+        local_x: isize,
+        local_y: isize,
+    ) -> bool {
+        if (0..16).contains(&local_x) && (0..16).contains(&local_y) {
+            let cell_x = local_x as usize / 4;
+            let cell_y = local_y as usize / 4;
+            return luma4x4_index(cell_x, cell_y) < block_index;
+        }
+
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let global_x = macroblock_x as isize * 16 + local_x;
+        let global_y = macroblock_y as isize * 16 + local_y;
+        if global_x < 0
+            || global_y < 0
+            || global_x >= (self.width_in_macroblocks * 16) as isize
+            || global_y >= (self.completed.len() / self.width_in_macroblocks * 16) as isize
+        {
+            return false;
+        }
+        let neighbor_x = global_x as usize / 16;
+        let neighbor_y = global_y as usize / 16;
+        let neighbor_address = neighbor_y * self.width_in_macroblocks + neighbor_x;
+        self.is_available(neighbor_address, slice_id)
+    }
+
     fn is_available(&self, address: usize, slice_id: u32) -> bool {
         self.completed[address].is_some_and(|macroblock| {
             macroblock.slice_id == slice_id
@@ -240,6 +415,10 @@ impl IntraPictureReconstructor {
             address / self.width_in_macroblocks,
         ))
     }
+}
+
+fn luma4x4_index(cell_x: usize, cell_y: usize) -> usize {
+    8 * (cell_y / 2) + 4 * (cell_x / 2) + 2 * (cell_y % 2) + cell_x % 2
 }
 
 fn assemble_luma_residual(blocks: &[[[i32; 4]; 4]; 16]) -> [[i32; 16]; 16] {
@@ -289,8 +468,13 @@ mod tests {
     use super::IntraPictureReconstructor;
     use crate::{
         CodedBlockPattern, DecodedIntraMacroblock, IntraLumaPrediction, IntraMacroblock,
-        IntraMacroblockHeader, IntraResidual, MacroblockQuantizer, PcmMacroblock, ResidualBlock,
-        resolve_scaling_lists_4x4,
+        IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer,
+        PcmMacroblock, ResidualBlock, resolve_scaling_lists_4x4,
+    };
+
+    const PREDICTED_MODE: IntraPredictionModeSyntax = IntraPredictionModeSyntax {
+        use_predicted: true,
+        remaining_mode: None,
     };
 
     fn quantizer() -> MacroblockQuantizer {
@@ -331,6 +515,26 @@ mod tests {
         }
     }
 
+    fn predicted4x4(
+        modes: [IntraPredictionModeSyntax; 16],
+        chroma_mode: u8,
+    ) -> DecodedIntraMacroblock {
+        DecodedIntraMacroblock {
+            macroblock: IntraMacroblock::Predicted(IntraMacroblockHeader {
+                luma_prediction: IntraLumaPrediction::FourByFour(modes),
+                chroma_prediction_mode: chroma_mode,
+                coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
+                qp_delta: 0,
+            }),
+            residual: Some(IntraResidual {
+                luma_dc: None,
+                luma: [ResidualBlock::empty(16); 16],
+                chroma_dc: [ResidualBlock::empty(4); 2],
+                chroma_ac: [[ResidualBlock::empty(15); 4]; 2],
+            }),
+        }
+    }
+
     fn reconstructor(size: Size) -> IntraPictureReconstructor {
         IntraPictureReconstructor::new(size, resolve_scaling_lists_4x4(None, None).unwrap(), false)
             .unwrap()
@@ -361,6 +565,59 @@ mod tests {
             _ => panic!("expected CPU frame"),
         };
         assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+    }
+
+    #[test]
+    fn reconstructs_intra4_blocks_in_normative_scan_order() {
+        let size = Size::new(16, 16);
+        let mut reconstructor = reconstructor(size);
+        reconstructor
+            .reconstruct_macroblock(0, 1, &predicted4x4([PREDICTED_MODE; 16], 0), quantizer())
+            .unwrap();
+        let frame = reconstructor
+            .into_nv12_frame(1, None, None, format(size))
+            .unwrap();
+        let cpu = match frame.storage {
+            FrameStorage::Cpu(cpu) => cpu,
+            _ => panic!("expected CPU frame"),
+        };
+        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+    }
+
+    #[test]
+    fn reconstructs_intra4_from_a_completed_left_macroblock() {
+        let size = Size::new(32, 16);
+        let mut reconstructor = reconstructor(size);
+        reconstructor
+            .reconstruct_macroblock(0, 1, &predicted(2, 0), quantizer())
+            .unwrap();
+        let mut syntax = [PREDICTED_MODE; 16];
+        syntax[0] = IntraPredictionModeSyntax {
+            use_predicted: false,
+            remaining_mode: Some(1),
+        };
+        reconstructor
+            .reconstruct_macroblock(1, 1, &predicted4x4(syntax, 1), quantizer())
+            .unwrap();
+    }
+
+    #[test]
+    fn rolls_back_partial_intra4_picture_and_mode_state() {
+        let size = Size::new(16, 16);
+        let mut reconstructor = reconstructor(size);
+        let mut invalid = [PREDICTED_MODE; 16];
+        invalid[0] = IntraPredictionModeSyntax {
+            use_predicted: false,
+            remaining_mode: Some(0),
+        };
+        assert!(
+            reconstructor
+                .reconstruct_macroblock(0, 1, &predicted4x4(invalid, 0), quantizer())
+                .is_err()
+        );
+        reconstructor
+            .reconstruct_macroblock(0, 1, &predicted4x4([PREDICTED_MODE; 16], 0), quantizer())
+            .unwrap();
     }
 
     #[test]
