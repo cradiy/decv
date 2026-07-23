@@ -6,6 +6,7 @@
 
 mod annex_b;
 mod cavlc;
+mod cavlc_context;
 mod deblock;
 mod decoder;
 mod dpb;
@@ -25,6 +26,7 @@ pub use annex_b::{AnnexBNalUnit, AnnexBReader};
 pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
 };
+pub use cavlc_context::CavlcNeighborState;
 pub use decoder::{H264StreamParser, ParserEvent};
 pub use error::{H264Error, Result};
 pub use macroblock::{
