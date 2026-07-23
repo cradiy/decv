@@ -6,11 +6,11 @@ kind of parallelism.
 
 ## Why SIMD Is Not Enough
 
-The current 1920x1080 High Profile benchmark decodes 60 frames in about 1.56
-seconds on one core. That is roughly 38.5 frames per second. Skipping all
-deblocking reduces the same run by roughly 400 milliseconds, and skipping all
-motion compensation reduces it by roughly 290 milliseconds. Neither kernel can
-provide the remaining speedup alone.
+The current 1920x1080 High Profile benchmark decodes 180 frames in about 2.10
+seconds in Serial mode. That is roughly 85.7 frames per second. The decoder has
+therefore crossed the 1080p60 line on this machine, but it remains far from the
+4K120 stretch goal and from FFmpeg's single-thread throughput. No single
+remaining kernel can provide that speedup alone.
 
 The decoder therefore needs multiple independent work items in flight. It must
 not make CABAC, neighbour derivation, or reference-picture state concurrent
@@ -177,15 +177,17 @@ does not justify a thread-pool dependency.
 7. Design deblocking wavefront scheduling only if reconstruction parallelism
    still leaves 1080p60 below target.
 
-Current status: stages 1 through 4 are implemented for CABAC B inter
+Current status: stages 1 through 5 are implemented for CABAC B and P inter
 macroblocks. Syntax, QP, residual transform, Direct motion, and metadata
 derivation remain serial. Four macroblock rows of owned jobs are reconstructed
 on a decoder-owned persistent pool, results are collected in address order,
 and batch commit validates all addresses before touching the picture.
 Intra/PCM macroblocks flush the pending batch before using current-picture
-neighbours. `Serial`, conservative `Auto`, and explicit `Threads(n)` policies
-are available, and the embedded real CABAC B fixture must match byte for byte
-between serial and two-thread decoding.
+neighbours. The CAVLC P path retains direct in-place reconstruction because
+routing it through owned staging measured slower. `Serial`, conservative
+`Auto`, and explicit `Threads(n)` policies are available, and embedded real
+CABAC P and B fixtures must match byte for byte between serial and two-thread
+decoding.
 
 ## Acceptance Checks
 

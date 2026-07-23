@@ -40,30 +40,30 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 2.11 s | 2.03 s | 80,096 KiB | 85.3 FPS |
-| decv Auto (2 workers) | NV12 | 2.22 s | 2.33 s | 79,576 KiB | 81.1 FPS |
-| FFmpeg 1 thread | NV12 | 0.62 s | 0.70 s | 152,000 KiB | 290.3 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.50 s | 278,144 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.60 s | 0.58 s | 95,504 KiB | 300.0 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.99 s | 192,572 KiB | 782.6 FPS |
+| decv Serial | NV12 | 2.10 s | 2.02 s | 80,100 KiB | 85.7 FPS |
+| decv Auto (2 workers) | NV12 | 2.23 s | 2.40 s | 79,536 KiB | 80.7 FPS |
+| FFmpeg 1 thread | NV12 | 0.63 s | 0.72 s | 152,084 KiB | 285.7 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.47 s | 281,268 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.58 s | 0.56 s | 95,824 KiB | 310.3 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 0.98 s | 192,384 KiB | 782.6 FPS |
 
 On this workload:
 
-- decv Serial takes about **3.4x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **3.3x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
 - decv Auto takes about **8.2x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.6x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
-  **29%** of FFmpeg Auto NV12 peak RSS;
+  **28%** of FFmpeg Auto NV12 peak RSS;
 - prior measurements with 16 decv workers were slower than the two-worker
   `Auto` policy and consumed far more CPU, confirming that the current parallel
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 42.2% throughput headroom over that
-line, and the measured two-worker Auto result has about 35.1%. The ordering
+seconds. The current Serial result has about 42.8% throughput headroom over that
+line, and the measured two-worker Auto result has about 34.5%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -214,6 +214,15 @@ all pass. On pinned 300-frame runs, CABAC instructions fell about 6.0% and
 cycles 1.6%; CAVLC instructions fell about 7.0% and cycles 2.9%. The fixed
 benchmark is now 2.11 seconds in Serial mode and 2.22 seconds in Auto mode.
 
+CABAC P inter macroblocks now use the same four-row owned-job pipeline as
+CABAC B macroblocks. Pinned 300-frame A/B samples reduced Serial cycles by
+about 2.2% and wall time by about 1.7%. The two-worker Auto sample reduced wall
+time by about 5.3%, although total cycles, instructions, and cache misses rose
+because of worker and staging overhead. The fixed benchmark is now 2.10
+seconds in Serial mode and 2.23 seconds in Auto mode, effectively unchanged in
+Auto at this measurement resolution. The CAVLC path deliberately retains its
+direct reconstruction path and remains neutral against the pre-change binary.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
@@ -262,11 +271,11 @@ with exact A/B decoder binaries and both CABAC and CAVLC inputs.
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
-FFmpeg is already about 3.4x faster in the comparable NV12 case. FFmpeg then
+FFmpeg is already about 3.3x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
-parallelizes only owned CABAC B-macroblock pixel reconstruction. CABAC parsing,
-residual reconstruction, most P-picture reconstruction, output packaging, and
-deblocking remain serial.
+parallelizes owned CABAC P- and B-macroblock pixel reconstruction. CABAC
+parsing, residual reconstruction, output packaging, and deblocking remain
+serial.
 
 The immediate optimization priority should therefore remain single-thread hot
 loops and broader dependency-aware parallelism, not a larger Rayon pool.
