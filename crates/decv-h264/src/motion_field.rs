@@ -71,7 +71,8 @@ impl ReferenceMotionField {
 #[derive(Debug, Clone)]
 pub(crate) struct MotionFieldBuilder {
     width_in_macroblocks: usize,
-    cells: Vec<Option<MotionFieldCell>>,
+    cells: Vec<MotionFieldCell>,
+    completed: Vec<u8>,
 }
 
 impl MotionFieldBuilder {
@@ -82,7 +83,8 @@ impl MotionFieldBuilder {
             .ok_or(H264Error::IntegerOverflow)?;
         Ok(Self {
             width_in_macroblocks: width / 4,
-            cells: vec![None; count],
+            cells: vec![MotionFieldCell::INTRA; count],
+            completed: vec![0; count / 16],
         })
     }
 
@@ -164,21 +166,20 @@ impl MotionFieldBuilder {
     }
 
     pub(crate) fn clear_macroblock(&mut self, macroblock_address: usize) -> Result<()> {
-        let indices = self.macroblock_indices(macroblock_address)?;
-        for index in indices {
-            self.cells[index] = None;
-        }
+        self.macroblock_indices(macroblock_address)?;
+        // The old cells can remain in place: an incomplete macroblock is never
+        // exposed, and the next successful record overwrites all 16 cells.
+        self.completed[macroblock_address] = 0;
         Ok(())
     }
 
     pub(crate) fn finish(self) -> Result<ReferenceMotionField> {
-        let cells =
-            self.cells
-                .into_iter()
-                .collect::<Option<Vec<_>>>()
-                .ok_or(H264Error::InvalidSyntax(
-                    "reference motion field is incomplete",
-                ))?;
+        if self.completed.contains(&0) {
+            return Err(H264Error::InvalidSyntax(
+                "reference motion field is incomplete",
+            ));
+        }
+        let cells = self.cells;
         Ok(ReferenceMotionField {
             width_in_4x4_blocks: self.width_in_macroblocks * 4,
             height_in_4x4_blocks: cells.len() / (self.width_in_macroblocks * 4),
@@ -206,14 +207,15 @@ impl MotionFieldBuilder {
         local: [MotionFieldCell; 16],
     ) -> Result<()> {
         let indices = self.macroblock_indices(macroblock_address)?;
-        if indices.iter().any(|&index| self.cells[index].is_some()) {
+        if self.completed[macroblock_address] != 0 {
             return Err(H264Error::InvalidSyntax(
                 "reference motion-field macroblock was already recorded",
             ));
         }
         for (index, cell) in indices.into_iter().zip(local) {
-            self.cells[index] = Some(cell);
+            self.cells[index] = cell;
         }
+        self.completed[macroblock_address] = 1;
         Ok(())
     }
 
@@ -362,5 +364,40 @@ mod tests {
                 .is_err()
         );
         assert!(builder.finish().is_err());
+    }
+
+    #[test]
+    fn clearing_requires_a_complete_re_record() {
+        let mut incomplete = MotionFieldBuilder::new(Size::new(16, 16)).unwrap();
+        incomplete.record_intra(0).unwrap();
+        incomplete.clear_macroblock(0).unwrap();
+        assert!(incomplete.finish().is_err());
+
+        let mut builder = MotionFieldBuilder::new(Size::new(16, 16)).unwrap();
+        builder.record_intra(0).unwrap();
+        assert!(builder.record_intra(0).is_err());
+        builder.clear_macroblock(0).unwrap();
+        builder
+            .record_p(
+                0,
+                &ResolvedPMacroblock {
+                    skipped: false,
+                    partitions: vec![ResolvedPPartition {
+                        x: 0,
+                        y: 0,
+                        width: 16,
+                        height: 16,
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: 3, y: -2 },
+                    }],
+                },
+                Some(&[Some(ReferenceId(9))]),
+            )
+            .unwrap();
+
+        let cell = builder.finish().unwrap().cell(3, 3).unwrap();
+        assert!(!cell.intra);
+        assert_eq!(cell.list0.unwrap().reference_id, Some(ReferenceId(9)));
+        assert_eq!(cell.list0.unwrap().vector, MotionVector { x: 3, y: -2 });
     }
 }
