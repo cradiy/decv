@@ -338,6 +338,13 @@ and reference cycles about 2.8%. `MotionFieldBuilder::record_b` consequently
 disappeared from the greater-than-1% profile. The fixed benchmark now measures
 1.89 seconds in Serial mode and 2.10 seconds in Auto mode.
 
+The uniform writer subsequently stopped materializing a sixteen-element global
+index array and instead writes four contiguous cells on each of the four
+motion-field rows. CABAC instructions fell another 0.8%, branches 0.6%, and
+reference cycles about 2.3%; CAVLC instructions fell 0.9% with reference
+cycles down about 0.5%. This keeps the same per-row bounds established by the
+validated picture and macroblock address.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
