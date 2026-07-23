@@ -547,16 +547,12 @@ impl Yuv420Picture {
         }
         format.validate()?;
 
-        let mut chroma = Vec::with_capacity(
-            self.cb
-                .len()
-                .checked_mul(2)
-                .ok_or(H264Error::IntegerOverflow)?,
-        );
-        for (&cb, &cr) in self.cb.iter().zip(&self.cr) {
-            chroma.push(cb);
-            chroma.push(cr);
-        }
+        let chroma_len = self
+            .cb
+            .len()
+            .checked_mul(2)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let chroma = interleave_chroma(&self.cb, &self.cr, chroma_len);
         let chroma: Arc<[u8]> = chroma.into();
         let frame = DecodedVideoFrame {
             id,
@@ -675,6 +671,70 @@ impl Yuv420Picture {
     }
 }
 
+fn interleave_chroma(cb: &[u8], cr: &[u8], output_len: usize) -> Vec<u8> {
+    assert_eq!(cb.len(), cr.len());
+    assert_eq!(cb.len().checked_mul(2), Some(output_len));
+
+    let mut output = Vec::with_capacity(output_len);
+    // SAFETY: `output` has capacity for exactly two bytes per input sample.
+    // The selected implementation writes every byte before `set_len` exposes
+    // the initialized allocation.
+    unsafe {
+        interleave_chroma_into(cb.as_ptr(), cr.as_ptr(), output.as_mut_ptr(), cb.len());
+        output.set_len(output_len);
+    }
+    output
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn interleave_chroma_into(cb: *const u8, cr: *const u8, output: *mut u8, len: usize) {
+    use std::arch::x86_64::{
+        __m128i, _mm_loadu_si128, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+
+    let mut index = 0;
+    while index + 16 <= len {
+        // SAFETY: The loop bound leaves 16 readable input bytes and 32
+        // writable output bytes. Unaligned SIMD loads and stores are used.
+        unsafe {
+            let cb_samples = _mm_loadu_si128(cb.add(index).cast::<__m128i>());
+            let cr_samples = _mm_loadu_si128(cr.add(index).cast::<__m128i>());
+            _mm_storeu_si128(
+                output.add(index * 2).cast::<__m128i>(),
+                _mm_unpacklo_epi8(cb_samples, cr_samples),
+            );
+            _mm_storeu_si128(
+                output.add(index * 2 + 16).cast::<__m128i>(),
+                _mm_unpackhi_epi8(cb_samples, cr_samples),
+            );
+        }
+        index += 16;
+    }
+
+    while index < len {
+        // SAFETY: `index` is within both equal-length inputs and the output
+        // reserves two bytes for every input sample.
+        unsafe {
+            output.add(index * 2).write(*cb.add(index));
+            output.add(index * 2 + 1).write(*cr.add(index));
+        }
+        index += 1;
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn interleave_chroma_into(cb: *const u8, cr: *const u8, output: *mut u8, len: usize) {
+    for index in 0..len {
+        // SAFETY: `index` is within both equal-length inputs and the output
+        // reserves two bytes for every input sample.
+        unsafe {
+            output.add(index * 2).write(*cb.add(index));
+            output.add(index * 2 + 1).write(*cr.add(index));
+        }
+    }
+}
+
 fn validate_block_bounds(
     width: usize,
     height: usize,
@@ -751,7 +811,7 @@ mod tests {
 
     use super::{
         ChromaPlane, IntraReferenceAvailability, MacroblockPixels, StagedMacroblockPixels,
-        Yuv420Picture,
+        Yuv420Picture, interleave_chroma,
     };
     use crate::{H264Error, PcmMacroblock};
 
@@ -761,6 +821,18 @@ mod tests {
         top_left: true,
         top_right: true,
     };
+
+    #[test]
+    fn chroma_interleave_matches_scalar_for_vector_and_tail_lengths() {
+        for len in 0..=65 {
+            let cb: Vec<_> = (0..len).map(|index| index as u8).collect();
+            let cr: Vec<_> = (0..len)
+                .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+                .collect();
+            let expected: Vec<_> = cb.iter().zip(&cr).flat_map(|(&cb, &cr)| [cb, cr]).collect();
+            assert_eq!(interleave_chroma(&cb, &cr, len * 2), expected);
+        }
+    }
 
     #[test]
     fn validates_macroblock_aligned_picture_dimensions() {
