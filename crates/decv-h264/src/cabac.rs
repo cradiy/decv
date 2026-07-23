@@ -250,25 +250,25 @@ pub fn consume_cabac_alignment(reader: &mut BitReader<'_>) -> Result<()> {
 /// This layer deliberately knows nothing about H.264 syntax-element context
 /// selection. Callers supply the context state for decision bins and use the
 /// separate bypass and terminate operations where the syntax requires them.
-#[derive(Debug)]
-pub struct CabacDecoder<'reader, 'data> {
-    reader: &'reader mut BitReader<'data>,
+#[derive(Debug, Clone)]
+pub struct CabacDecoder<'data> {
+    reader: BitReader<'data>,
     range: u16,
     offset: u16,
 }
 
-impl<'reader, 'data> CabacDecoder<'reader, 'data> {
+impl<'data> CabacDecoder<'data> {
     /// Initializes `codIRange` and the nine-bit `codIOffset`.
     ///
     /// The input must already be byte-aligned after
     /// [`consume_cabac_alignment`].
-    pub fn new(reader: &'reader mut BitReader<'data>) -> Result<Self> {
+    pub fn new(mut reader: BitReader<'data>) -> Result<Self> {
         if reader.bit_offset() != 0 {
             return Err(H264Error::InvalidSyntax(
                 "CABAC arithmetic data is not byte-aligned",
             ));
         }
-        let mut probe = *reader;
+        let mut probe = reader;
         let offset = probe
             .read_bits_const::<9>()
             .ok_or(H264Error::UnexpectedEof)? as u16;
@@ -277,7 +277,7 @@ impl<'reader, 'data> CabacDecoder<'reader, 'data> {
                 "CABAC initial offset is not smaller than the initial range",
             ));
         }
-        *reader = probe;
+        reader = probe;
         Ok(Self {
             reader,
             range: INITIAL_RANGE,
@@ -291,7 +291,7 @@ impl<'reader, 'data> CabacDecoder<'reader, 'data> {
     /// only after any required renormalization bits are available.
     #[inline]
     pub fn decode_decision(&mut self, context: &mut CabacContextState) -> Result<u8> {
-        let mut reader = *self.reader;
+        let mut reader = self.reader;
         let mut range = self.range;
         let mut offset = self.offset;
         let mut next_context = *context;
@@ -317,7 +317,7 @@ impl<'reader, 'data> CabacDecoder<'reader, 'data> {
         };
 
         renormalize(&mut reader, &mut range, &mut offset)?;
-        *self.reader = reader;
+        self.reader = reader;
         self.range = range;
         self.offset = offset;
         *context = next_context;
@@ -340,7 +340,7 @@ impl<'reader, 'data> CabacDecoder<'reader, 'data> {
     /// Decodes `end_of_slice_flag` using the fixed termination probability.
     #[inline]
     pub fn decode_terminate(&mut self) -> Result<u8> {
-        let mut reader = *self.reader;
+        let mut reader = self.reader;
         let mut range = self.range - 2;
         let mut offset = self.offset;
         if offset >= range {
@@ -349,7 +349,7 @@ impl<'reader, 'data> CabacDecoder<'reader, 'data> {
         }
 
         renormalize(&mut reader, &mut range, &mut offset)?;
-        *self.reader = reader;
+        self.reader = reader;
         self.range = range;
         self.offset = offset;
         Ok(0)
@@ -363,6 +363,21 @@ impl<'reader, 'data> CabacDecoder<'reader, 'data> {
     #[inline]
     pub const fn offset(&self) -> u16 {
         self.offset
+    }
+
+    #[inline]
+    pub fn bit_position(&self) -> usize {
+        self.reader.bit_position()
+    }
+
+    #[inline]
+    pub const fn reader(&self) -> &BitReader<'data> {
+        &self.reader
+    }
+
+    #[inline]
+    pub fn into_reader(self) -> BitReader<'data> {
+        self.reader
     }
 }
 
@@ -400,19 +415,19 @@ mod tests {
 
     #[test]
     fn initializes_range_and_offset_from_nine_bits() {
-        let mut reader = BitReader::new(&[0b0011_0010, 0b1000_0000]);
-        let decoder = CabacDecoder::new(&mut reader).unwrap();
+        let reader = BitReader::new(&[0b0011_0010, 0b1000_0000]);
+        let decoder = CabacDecoder::new(reader).unwrap();
         assert_eq!(decoder.range(), 510);
         assert_eq!(decoder.offset(), 101);
-        assert_eq!(reader.bit_position(), 9);
+        assert_eq!(decoder.bit_position(), 9);
     }
 
     #[test]
     fn rejects_invalid_initial_offsets_without_consuming_input() {
         for bytes in [[0xff, 0x00], [0xff, 0x80]] {
-            let mut reader = BitReader::new(&bytes);
+            let reader = BitReader::new(&bytes);
             assert!(matches!(
-                CabacDecoder::new(&mut reader),
+                CabacDecoder::new(reader),
                 Err(H264Error::InvalidSyntax(_))
             ));
             assert_eq!(reader.bit_position(), 0);
@@ -421,16 +436,16 @@ mod tests {
 
     #[test]
     fn decodes_mps_and_lps_with_normative_state_transitions() {
-        let mut mps_reader = BitReader::new(&[0, 0]);
-        let mut mps_decoder = CabacDecoder::new(&mut mps_reader).unwrap();
+        let mps_reader = BitReader::new(&[0, 0]);
+        let mut mps_decoder = CabacDecoder::new(mps_reader).unwrap();
         let mut mps_context = CabacContextState::new(0, 0).unwrap();
         assert_eq!(mps_decoder.decode_decision(&mut mps_context).unwrap(), 0);
         assert_eq!(mps_context, CabacContextState::new(1, 0).unwrap());
         assert_eq!((mps_decoder.range(), mps_decoder.offset()), (270, 0));
 
         // Initial offset 400 followed by a one renormalization bit.
-        let mut lps_reader = BitReader::new(&[0b1100_1000, 0b0100_0000]);
-        let mut lps_decoder = CabacDecoder::new(&mut lps_reader).unwrap();
+        let lps_reader = BitReader::new(&[0b1100_1000, 0b0100_0000]);
+        let mut lps_decoder = CabacDecoder::new(lps_reader).unwrap();
         let mut lps_context = CabacContextState::new(0, 0).unwrap();
         assert_eq!(lps_decoder.decode_decision(&mut lps_context).unwrap(), 1);
         assert_eq!(lps_context, CabacContextState::new(0, 1).unwrap());
@@ -439,26 +454,26 @@ mod tests {
 
     #[test]
     fn decodes_bypass_and_termination_bins() {
-        let mut bypass_reader = BitReader::new(&[0b0011_0010, 0b1100_0000]);
-        let mut bypass = CabacDecoder::new(&mut bypass_reader).unwrap();
+        let bypass_reader = BitReader::new(&[0b0011_0010, 0b1100_0000]);
+        let mut bypass = CabacDecoder::new(bypass_reader).unwrap();
         assert_eq!(bypass.decode_bypass().unwrap(), 0);
         assert_eq!(bypass.offset(), 203);
 
-        let mut zero_reader = BitReader::new(&[0, 0]);
-        let mut zero = CabacDecoder::new(&mut zero_reader).unwrap();
+        let zero_reader = BitReader::new(&[0, 0]);
+        let mut zero = CabacDecoder::new(zero_reader).unwrap();
         assert_eq!(zero.decode_terminate().unwrap(), 0);
         assert_eq!((zero.range(), zero.offset()), (508, 0));
 
-        let mut one_reader = BitReader::new(&[0b1111_1110, 0b1000_0000]);
-        let mut one = CabacDecoder::new(&mut one_reader).unwrap();
+        let one_reader = BitReader::new(&[0b1111_1110, 0b1000_0000]);
+        let mut one = CabacDecoder::new(one_reader).unwrap();
         assert_eq!(one.decode_terminate().unwrap(), 1);
         assert_eq!((one.range(), one.offset()), (508, 509));
     }
 
     #[test]
     fn decision_failure_is_atomic() {
-        let mut reader = BitReader::new(&[0, 0]);
-        let mut decoder = CabacDecoder::new(&mut reader).unwrap();
+        let reader = BitReader::new(&[0, 0]);
+        let mut decoder = CabacDecoder::new(reader).unwrap();
         let mut context = CabacContextState::new(0, 0).unwrap();
 
         // Repeated MPS decisions eventually exhaust the seven bits left after

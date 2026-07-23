@@ -1,20 +1,72 @@
 //! Reusable CABAC binarization readers.
 
-use crate::{CabacContextSet, CabacDecoder, H264Error, Result};
+use bit_readers::BitReader;
+
+use crate::{
+    CabacContextSet, CabacDecoder, CabacInitializationTable, H264Error, Result, SliceType,
+    consume_cabac_alignment,
+};
+
+/// Long-lived arithmetic and probability state for one CABAC slice.
+#[derive(Debug, Clone)]
+pub struct CabacSliceDecoder<'data> {
+    arithmetic: CabacDecoder<'data>,
+    contexts: CabacContextSet,
+}
+
+impl<'data> CabacSliceDecoder<'data> {
+    pub fn new(
+        rbsp: &'data [u8],
+        header_bit_size: usize,
+        slice_type: SliceType,
+        cabac_init_idc: Option<u8>,
+        slice_qp_y: u8,
+    ) -> Result<Self> {
+        let mut reader = BitReader::new(rbsp);
+        if !reader.skip_bits(header_bit_size) {
+            return Err(H264Error::UnexpectedEof);
+        }
+        consume_cabac_alignment(&mut reader)?;
+        let table = CabacInitializationTable::for_slice(slice_type, cabac_init_idc)?;
+        Ok(Self {
+            arithmetic: CabacDecoder::new(reader)?,
+            contexts: CabacContextSet::new(table, slice_qp_y)?,
+        })
+    }
+
+    #[inline]
+    pub fn syntax(&mut self) -> CabacSyntaxDecoder<'_, 'data> {
+        CabacSyntaxDecoder::new(&mut self.arithmetic, &mut self.contexts)
+    }
+
+    #[inline]
+    pub fn bit_position(&self) -> usize {
+        self.arithmetic.bit_position()
+    }
+
+    #[inline]
+    pub const fn contexts(&self) -> &CabacContextSet {
+        &self.contexts
+    }
+
+    pub fn into_parts(self) -> (CabacDecoder<'data>, CabacContextSet) {
+        (self.arithmetic, self.contexts)
+    }
+}
 
 /// Couples the arithmetic engine with one slice's adaptive context models.
 ///
 /// Higher H.264 syntax layers use this type to decode bin strings without
 /// reaching into either object's storage representation.
 #[derive(Debug)]
-pub struct CabacSyntaxDecoder<'syntax, 'reader, 'data> {
-    arithmetic: &'syntax mut CabacDecoder<'reader, 'data>,
+pub struct CabacSyntaxDecoder<'syntax, 'data> {
+    arithmetic: &'syntax mut CabacDecoder<'data>,
     contexts: &'syntax mut CabacContextSet,
 }
 
-impl<'syntax, 'reader, 'data> CabacSyntaxDecoder<'syntax, 'reader, 'data> {
+impl<'syntax, 'data> CabacSyntaxDecoder<'syntax, 'data> {
     pub const fn new(
-        arithmetic: &'syntax mut CabacDecoder<'reader, 'data>,
+        arithmetic: &'syntax mut CabacDecoder<'data>,
         contexts: &'syntax mut CabacContextSet,
     ) -> Self {
         Self {
@@ -195,5 +247,32 @@ mod tests {
             Err(H264Error::InvalidSyntax(_))
         ));
         assert!(decode_unary(&[], 2, |_| Ok(0)).is_err());
+    }
+
+    #[test]
+    fn initializes_a_slice_session_after_header_alignment() {
+        let rbsp = [0b1011_1111, 0b0011_0010, 0b1000_0000];
+        let slice = CabacSliceDecoder::new(&rbsp, 3, SliceType::I, None, 0).unwrap();
+        assert_eq!(slice.bit_position(), 17);
+        assert_eq!(
+            slice.contexts().get(0).unwrap(),
+            crate::CabacContextState::new(62, 0).unwrap()
+        );
+        let (arithmetic, contexts) = slice.into_parts();
+        assert_eq!(arithmetic.offset(), 101);
+        assert_eq!(contexts.len(), 460);
+    }
+
+    #[test]
+    fn rejects_malformed_slice_alignment_and_header_bounds() {
+        let malformed = [0b1010_1111, 0, 0];
+        assert!(matches!(
+            CabacSliceDecoder::new(&malformed, 3, SliceType::I, None, 26),
+            Err(H264Error::InvalidSyntax(_))
+        ));
+        assert!(matches!(
+            CabacSliceDecoder::new(&[0], 9, SliceType::I, None, 26),
+            Err(H264Error::UnexpectedEof)
+        ));
     }
 }
