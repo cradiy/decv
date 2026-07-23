@@ -755,14 +755,13 @@ fn apply_prediction_weights_for_list(
         weight: luma_default,
         offset: 0,
     });
+    let luma_width = usize::from(prediction.width);
     for row in prediction
         .luma
         .iter_mut()
         .take(usize::from(prediction.height))
     {
-        for sample in row.iter_mut().take(usize::from(prediction.width)) {
-            *sample = weighted_sample(*sample, luma, table.luma_log2_weight_denom);
-        }
+        weighted_row(&mut row[..luma_width], luma, table.luma_log2_weight_denom);
     }
 
     let chroma_default = 1i32 << table.chroma_log2_weight_denom;
@@ -779,16 +778,142 @@ fn apply_prediction_weights_for_list(
     let chroma_height = usize::from(prediction.height / 2);
     let chroma_width = usize::from(prediction.width / 2);
     for row in prediction.cb.iter_mut().take(chroma_height) {
-        for sample in row.iter_mut().take(chroma_width) {
-            *sample = weighted_sample(*sample, chroma[0], table.chroma_log2_weight_denom);
-        }
+        weighted_row(
+            &mut row[..chroma_width],
+            chroma[0],
+            table.chroma_log2_weight_denom,
+        );
     }
     for row in prediction.cr.iter_mut().take(chroma_height) {
-        for sample in row.iter_mut().take(chroma_width) {
-            *sample = weighted_sample(*sample, chroma[1], table.chroma_log2_weight_denom);
-        }
+        weighted_row(
+            &mut row[..chroma_width],
+            chroma[1],
+            table.chroma_log2_weight_denom,
+        );
     }
     Ok(())
+}
+
+#[inline]
+fn weighted_row(samples: &mut [u8], weight: WeightOffset, denominator: u8) {
+    #[cfg(target_arch = "x86_64")]
+    let offset = if (-128..=128).contains(&weight.weight)
+        && (-128..=127).contains(&weight.offset)
+        && denominator <= 7
+    {
+        // SAFETY: SSE2 is part of the x86_64 baseline. The guarded H.264
+        // weight, offset, and denominator ranges keep every intermediate in
+        // i16, and the helper only loads and stores complete chunks.
+        unsafe {
+            weighted_row_sse2(
+                samples,
+                weight.weight,
+                weight.offset,
+                u32::from(denominator),
+            )
+        }
+    } else {
+        0
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let offset = 0;
+    for sample in &mut samples[offset..] {
+        *sample = weighted_sample(*sample, weight, denominator);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn weighted_row_sse2(
+    samples: &mut [u8],
+    weight: i32,
+    value_offset: i32,
+    denominator: u32,
+) -> usize {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_cvtsi32_si128, _mm_loadl_epi64, _mm_loadu_si128,
+        _mm_mullo_epi16, _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_sra_epi16,
+        _mm_storel_epi64, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn apply(
+        samples: __m128i,
+        weight: __m128i,
+        rounding: __m128i,
+        shift: __m128i,
+        value_offset: __m128i,
+    ) -> __m128i {
+        let weighted = _mm_add_epi16(_mm_mullo_epi16(samples, weight), rounding);
+        _mm_add_epi16(_mm_sra_epi16(weighted, shift), value_offset)
+    }
+
+    let zero = _mm_setzero_si128();
+    let weight = _mm_set1_epi16(weight as i16);
+    let rounding = _mm_set1_epi16(if denominator == 0 {
+        0
+    } else {
+        1i16 << (denominator - 1)
+    });
+    let shift = _mm_cvtsi32_si128(denominator as i32);
+    let value_offset = _mm_set1_epi16(value_offset as i16);
+    let mut offset = 0;
+    while samples.len() - offset >= 16 {
+        // SAFETY: The loop condition proves the 16-byte range is in-bounds.
+        let packed = unsafe { _mm_loadu_si128(samples.as_ptr().add(offset).cast::<__m128i>()) };
+        // SAFETY: This function and the helper are compiled with SSE2 enabled.
+        let low = unsafe {
+            apply(
+                _mm_unpacklo_epi8(packed, zero),
+                weight,
+                rounding,
+                shift,
+                value_offset,
+            )
+        };
+        // SAFETY: This function and the helper are compiled with SSE2 enabled.
+        let high = unsafe {
+            apply(
+                _mm_unpackhi_epi8(packed, zero),
+                weight,
+                rounding,
+                shift,
+                value_offset,
+            )
+        };
+        // SAFETY: The loop condition proves the destination is in-bounds.
+        unsafe {
+            _mm_storeu_si128(
+                samples.as_mut_ptr().add(offset).cast::<__m128i>(),
+                _mm_packus_epi16(low, high),
+            );
+        }
+        offset += 16;
+    }
+    if samples.len() - offset >= 8 {
+        // SAFETY: The branch proves the eight-byte range is in-bounds.
+        let packed = unsafe { _mm_loadl_epi64(samples.as_ptr().add(offset).cast::<__m128i>()) };
+        // SAFETY: This function and the helper are compiled with SSE2 enabled.
+        let low = unsafe {
+            apply(
+                _mm_unpacklo_epi8(packed, zero),
+                weight,
+                rounding,
+                shift,
+                value_offset,
+            )
+        };
+        // SAFETY: The branch proves the destination is in-bounds.
+        unsafe {
+            _mm_storel_epi64(
+                samples.as_mut_ptr().add(offset).cast::<__m128i>(),
+                _mm_packus_epi16(low, zero),
+            );
+        }
+        offset += 8;
+    }
+    offset
 }
 
 fn apply_explicit_bipred_weights(
@@ -1501,6 +1626,60 @@ mod tests {
             derive_implicit_bipred_weights(127, short(0), short(1)),
             (32, 32)
         );
+    }
+
+    #[test]
+    fn simd_single_prediction_weighting_matches_the_scalar_equation() {
+        let mut cases = Vec::new();
+        for denominator in [0, 1, 3, 7] {
+            for weight in [-128, -17, 0, 1, 127, 128] {
+                for offset in [-128, 0, 127] {
+                    cases.push((WeightOffset { weight, offset }, denominator));
+                }
+            }
+        }
+        // Exercise the scalar fallback outside the guarded H.264 SIMD range.
+        cases.extend([
+            (
+                WeightOffset {
+                    weight: 129,
+                    offset: 0,
+                },
+                7,
+            ),
+            (
+                WeightOffset {
+                    weight: 1,
+                    offset: 128,
+                },
+                7,
+            ),
+            (
+                WeightOffset {
+                    weight: 1,
+                    offset: 0,
+                },
+                8,
+            ),
+        ]);
+
+        for length in 0..=32 {
+            for &(weight, denominator) in &cases {
+                let mut actual = (0..length)
+                    .map(|index| (index * 73 + length * 19) as u8)
+                    .collect::<Vec<_>>();
+                let expected = actual
+                    .iter()
+                    .map(|&sample| weighted_sample(sample, weight, denominator))
+                    .collect::<Vec<_>>();
+
+                weighted_row(&mut actual, weight, denominator);
+                assert_eq!(
+                    actual, expected,
+                    "length={length} weight={weight:?} denominator={denominator}"
+                );
+            }
+        }
     }
 
     #[test]
