@@ -1438,11 +1438,11 @@ impl IntraPictureReconstructor {
         ];
         let mut macroblock_address = config.first_macroblock;
         let mut decoded_count = 0usize;
-        let mut pending_inter = Vec::new();
         let inter_batch_limit = self
             .width_in_macroblocks
             .checked_mul(4)
             .ok_or(H264Error::IntegerOverflow)?;
+        let mut pending_inter = Vec::with_capacity(inter_batch_limit);
 
         loop {
             let (macroblock_x, macroblock_y) = self.macroblock_coordinates(macroblock_address)?;
@@ -1922,16 +1922,19 @@ impl IntraPictureReconstructor {
             )
             .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
         };
-        let reconstructed: Vec<Result<StagedMacroblockPixels>> = if jobs.len() > 1
+        let staged = if jobs.len() > 1
             && let Some(pool) = self.reconstruction_executor.pool()
         {
-            pool.install(|| jobs.par_iter().map(&reconstruct).collect())
+            let reconstructed: Vec<Result<StagedMacroblockPixels>> =
+                pool.install(|| jobs.par_iter().map(&reconstruct).collect());
+            reconstructed
+                .into_iter()
+                .collect::<Result<Vec<StagedMacroblockPixels>>>()?
         } else {
-            jobs.iter().map(&reconstruct).collect()
+            jobs.iter()
+                .map(&reconstruct)
+                .collect::<Result<Vec<StagedMacroblockPixels>>>()?
         };
-        let staged = reconstructed
-            .into_iter()
-            .collect::<Result<Vec<StagedMacroblockPixels>>>()?;
 
         for (recorded_modes, job) in jobs.iter().enumerate() {
             if let Err(error) = self.modes.record_inter(job.address, slice_id) {

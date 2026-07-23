@@ -552,6 +552,7 @@ fn reconstruct_p_macroblock_from_list_inner(
     let mut predicted_cb = [[0u8; 8]; 8];
     let mut predicted_cr = [[0u8; 8]; 8];
     let mut covered = [[false; 4]; 4];
+    let mut prediction = InterPrediction420::empty();
     for partition in &motion.partitions {
         let reference = references_l0
             .get(usize::from(partition.reference_index))
@@ -565,7 +566,12 @@ fn reconstruct_p_macroblock_from_list_inner(
                 "P reference picture coded size does not match",
             ));
         }
-        let mut prediction = reference.predict_inter_420(macroblock_x, macroblock_y, *partition)?;
+        reference.predict_inter_420_into(
+            macroblock_x,
+            macroblock_y,
+            *partition,
+            &mut prediction,
+        )?;
         if let Some(weights) = weights {
             apply_prediction_weights(&mut prediction, partition.reference_index, weights)?;
         }
