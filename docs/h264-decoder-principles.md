@@ -856,11 +856,13 @@ cargo bench -p decv-h264 --bench cavlc
 ./scripts/benchmark_h264.sh 60
 ```
 
-The last command generates fresh Baseline, Main, and High Profile streams with
-libx264. Its cases cover CAVLC/CABAC I/P/B, CABAC neighbour-state transitions,
-weighted and Direct B prediction, multiple references, reordering, and a
-cropped realistic stream. It compares every visible NV12 byte with FFmpeg and
-uses a unique temporary directory so stale output cannot produce a false pass.
+The real-stream verifier generates fresh Baseline, Main, and High Profile
+streams with libx264. Its cases cover CAVLC/CABAC I/P/B, CABAC neighbour-state
+transitions, weighted and Direct B prediction, multiple references, reordering,
+and a cropped realistic stream. It also concatenates streams with different
+SPS dimensions, requires both `FormatChanged` events, and compares each
+variable-size NV12 segment with its matching FFmpeg decode. It uses a unique
+temporary directory so stale output cannot produce a false pass.
 The benchmark command generates a reproducible 1080p60 High Profile stream,
 drives the decoder incrementally one NAL at a time, and reports wall time, CPU
 time, and peak resident memory. It is a measurement tool rather than a

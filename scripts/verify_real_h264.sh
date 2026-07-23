@@ -95,3 +95,37 @@ ffmpeg -hide_banner -loglevel error \
     "cabac=0:bframes=3:b-adapt=0:keyint=48:min-keyint=48:scenecut=0:ref=2:weightp=2:weightb=1:8x8dct=1:direct=auto" \
     -f h264 -y "$work_dir/high-b.h264"
 verify_stream high-b
+
+ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=64x48:rate=4" \
+    -frames:v 4 -pix_fmt yuv420p -c:v libx264 -profile:v baseline \
+    -x264-params \
+    "cabac=0:bframes=0:keyint=4:min-keyint=4:scenecut=0" \
+    -f h264 -y "$work_dir/size-a.h264"
+ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=96x64:rate=4" \
+    -frames:v 4 -pix_fmt yuv420p -c:v libx264 -profile:v baseline \
+    -x264-params \
+    "cabac=0:bframes=0:keyint=4:min-keyint=4:scenecut=0" \
+    -f h264 -y "$work_dir/size-b.h264"
+ffmpeg -hide_banner -loglevel error -y \
+    -i "concat:$work_dir/size-a.h264|$work_dir/size-b.h264" \
+    -c copy -f h264 "$work_dir/size-change.h264"
+ffmpeg -hide_banner -loglevel error \
+    -i "$work_dir/size-a.h264" -pix_fmt nv12 -f rawvideo \
+    -y "$work_dir/size-a.ffmpeg.nv12"
+ffmpeg -hide_banner -loglevel error \
+    -i "$work_dir/size-b.h264" -pix_fmt nv12 -f rawvideo \
+    -y "$work_dir/size-b.ffmpeg.nv12"
+cargo run --quiet --manifest-path "$repo_dir/Cargo.toml" -p decv-cli -- \
+    "$work_dir/size-change.h264" "$work_dir/size-change.decv.nv12" \
+    >"$work_dir/size-change.log"
+
+first_size="$(wc -c <"$work_dir/size-a.ffmpeg.nv12")"
+dd if="$work_dir/size-change.decv.nv12" bs=1 count="$first_size" status=none \
+    | cmp - "$work_dir/size-a.ffmpeg.nv12"
+dd if="$work_dir/size-change.decv.nv12" bs=1 skip="$first_size" status=none \
+    | cmp - "$work_dir/size-b.ffmpeg.nv12"
+rg -q '^format 64x48 Nv12$' "$work_dir/size-change.log"
+rg -q '^format 96x64 Nv12$' "$work_dir/size-change.log"
+echo "size-change: both FormatChanged events and byte-exact NV12 segments match"
