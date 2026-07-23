@@ -1,5 +1,7 @@
 //! Spatial motion-vector prediction for explicit progressive B partitions.
 
+use smallvec::SmallVec;
+
 use crate::{
     BInterMacroblockHeader, BPartitionMode, BPartitionMotion, BPredictionMode, BSubMacroblockType,
     H264Error, MotionVector, MotionVectorDifference, ReferenceMotionField, ResolvedBListMotion,
@@ -147,7 +149,7 @@ impl BMotionState {
         self.ensure_macroblock_available_for_write(macroblock_address)?;
         let plans = partition_plans(header)?;
         let mut local = [None; 16];
-        let mut resolved = Vec::with_capacity(plans.len());
+        let mut resolved = SmallVec::with_capacity(plans.len());
         for plan in plans {
             let list0 = self.resolve_list(
                 macroblock_address,
@@ -246,7 +248,7 @@ impl BMotionState {
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let mut local = [None; 16];
-        let mut partitions = Vec::with_capacity((16 / partition_size) * (16 / partition_size));
+        let mut partitions = SmallVec::with_capacity((16 / partition_size) * (16 / partition_size));
         for y in (0..16).step_by(partition_size) {
             for x in (0..16).step_by(partition_size) {
                 let colocated = context
@@ -307,7 +309,7 @@ impl BMotionState {
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let mut local = [None; 16];
-        let mut partitions = Vec::with_capacity((16 / partition_size) * (16 / partition_size));
+        let mut partitions = SmallVec::with_capacity((16 / partition_size) * (16 / partition_size));
         for y in (0..16).step_by(partition_size) {
             for x in (0..16).step_by(partition_size) {
                 let colocated = context
@@ -356,7 +358,7 @@ impl BMotionState {
             ));
         }
         let mut local = [None; 16];
-        let mut resolved = Vec::new();
+        let mut resolved = SmallVec::new();
         for (index, (&sub_type, syntax)) in
             sub_macroblocks.iter().zip(&header.partitions).enumerate()
         {
@@ -499,7 +501,7 @@ impl BMotionState {
         base_x: u8,
         base_y: u8,
         context: DirectMotionContext<'_>,
-    ) -> Result<Vec<ResolvedBPartition>> {
+    ) -> Result<SmallVec<[ResolvedBPartition; 4]>> {
         let partition_size = match context {
             DirectMotionContext::Spatial(context) if context.direct_8x8_inference => 8,
             DirectMotionContext::Temporal(context) if context.direct_8x8_inference => 8,
@@ -507,7 +509,7 @@ impl BMotionState {
         };
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
-        let mut partitions = Vec::with_capacity((8 / partition_size) * (8 / partition_size));
+        let mut partitions = SmallVec::with_capacity((8 / partition_size) * (8 / partition_size));
 
         let spatial_prediction = if let DirectMotionContext::Spatial(context) = context {
             let geometry = PartitionGeometry {
@@ -1458,6 +1460,7 @@ mod tests {
             .unwrap();
         assert!(resolved.direct);
         assert_eq!(resolved.partitions.len(), 4);
+        assert!(!resolved.partitions.spilled());
         assert!(resolved.partitions.iter().all(|partition| {
             partition.list0
                 == Some(ResolvedBListMotion {

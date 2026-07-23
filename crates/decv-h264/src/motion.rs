@@ -4,6 +4,8 @@
 //! partitions. Storing the result at 4x4 granularity makes the A/B/C/D lookup
 //! rules work uniformly for macroblock and sub-macroblock partitions.
 
+use smallvec::SmallVec;
+
 use crate::{
     H264Error, MotionVectorDifference, PInterMacroblockHeader, PPartitionMode, PSubMacroblockType,
     Result,
@@ -55,7 +57,7 @@ pub struct ResolvedBPartition {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedBMacroblock {
     pub direct: bool,
-    pub partitions: Vec<ResolvedBPartition>,
+    pub partitions: SmallVec<[ResolvedBPartition; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

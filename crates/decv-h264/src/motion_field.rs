@@ -320,7 +320,8 @@ mod tests {
                                 motion_vector: MotionVector { x: -1, y: 4 },
                             }),
                         },
-                    ],
+                    ]
+                    .into(),
                 },
                 Some(&[Some(ReferenceId(7))]),
                 Some(&[Some(ReferenceId(8))]),

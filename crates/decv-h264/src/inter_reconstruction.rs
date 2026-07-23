@@ -1769,7 +1769,8 @@ mod tests {
                     b_partition(0, 0, 8, 8, Some(b_list(0)), None),
                     b_partition(8, 0, 8, 8, None, Some(b_list(0))),
                     b_partition(0, 8, 16, 8, Some(b_list(0)), Some(b_list(0))),
-                ],
+                ]
+                .into(),
             },
             &zero_residual(),
         )
@@ -1798,7 +1799,8 @@ mod tests {
                     b_partition(0, 0, 8, 8, Some(b_list(0)), None),
                     b_partition(8, 0, 8, 8, None, Some(b_list(0))),
                     b_partition(0, 8, 16, 8, Some(b_list(0)), Some(b_list(0))),
-                ],
+                ]
+                .into(),
             },
             &zero_residual(),
             &PredictionWeightTable {
@@ -2033,7 +2035,8 @@ mod tests {
                     b_partition(0, 0, 8, 8, Some(b_list(0)), None),
                     b_partition(8, 0, 8, 8, None, Some(b_list(0))),
                     b_partition(0, 8, 16, 8, Some(b_list(0)), Some(b_list(0))),
-                ],
+                ]
+                .into(),
             },
             &zero_residual(),
             2,
@@ -2071,7 +2074,8 @@ mod tests {
             0,
             &ResolvedBMacroblock {
                 direct: false,
-                partitions: vec![b_partition(0, 0, 16, 16, Some(b_list(0)), Some(b_list(0)))],
+                partitions: vec![b_partition(0, 0, 16, 16, Some(b_list(0)), Some(b_list(0)))]
+                    .into(),
             },
             &residual,
         )
@@ -2092,7 +2096,7 @@ mod tests {
             0,
             &ResolvedBMacroblock {
                 direct: false,
-                partitions: vec![b_partition(0, 0, 16, 16, None, None)],
+                partitions: vec![b_partition(0, 0, 16, 16, None, None)].into(),
             },
             &zero_residual(),
         );
