@@ -13,6 +13,7 @@ pub struct CabacMacroblockSummary {
     pub intra16_or_pcm: bool,
     pub intra_chroma_prediction: Option<u8>,
     pub coded_block_pattern: CodedBlockPattern,
+    pub transform_size_8x8: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +132,22 @@ impl CabacMacroblockState {
                 syntax.decision(context_index)
             })?;
         Ok(CodedBlockPattern { luma, chroma })
+    }
+
+    pub fn decode_transform_size_8x8_flag(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<bool> {
+        let context_increment = self
+            .left_and_top(macroblock_address, slice_id)?
+            .into_iter()
+            .filter(|neighbour| {
+                neighbour.is_some_and(|macroblock| macroblock.summary.transform_size_8x8)
+            })
+            .count();
+        Ok(syntax.decision(399 + context_increment)? != 0)
     }
 
     /// Records the properties needed by later macroblocks in the same slice.
@@ -301,6 +318,12 @@ impl<'syntax, 'data> CabacSyntaxDecoder<'syntax, 'data> {
 
     pub fn intra_prediction_mode(&mut self) -> Result<IntraPredictionModeSyntax> {
         decode_intra_prediction_mode(|context_index| self.decision(context_index))
+    }
+
+    pub fn macroblock_qp_delta(&mut self, previous_delta_nonzero: bool) -> Result<i8> {
+        decode_macroblock_qp_delta(previous_delta_nonzero, |context_index| {
+            self.decision(context_index)
+        })
     }
 
     /// Decodes a fixed-length bypass-coded bin string, MSB first.
@@ -489,6 +512,29 @@ fn decode_chroma_coded_block_pattern(
     Ok(1 + decision(77 + context)?)
 }
 
+fn decode_macroblock_qp_delta(
+    previous_delta_nonzero: bool,
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<i8> {
+    if decision(60 + usize::from(previous_delta_nonzero))? == 0 {
+        return Ok(0);
+    }
+    let mut code = 1u16;
+    let mut context_index = 62;
+    while decision(context_index)? != 0 {
+        context_index = 63;
+        code += 1;
+        if code > 102 {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC mb_qp_delta exceeds the 8-bit QP range",
+            ));
+        }
+    }
+    let magnitude = ((code + 1) >> 1) as i16;
+    let delta = if code & 1 != 0 { magnitude } else { -magnitude };
+    i8::try_from(delta).map_err(|_| H264Error::IntegerOverflow)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
@@ -507,6 +553,7 @@ mod tests {
             intra16_or_pcm,
             intra_chroma_prediction,
             coded_block_pattern: CodedBlockPattern { luma, chroma },
+            transform_size_8x8: false,
         }
     }
 
@@ -770,5 +817,38 @@ mod tests {
             2
         );
         assert_eq!(visited, [66, 67, 67]);
+    }
+
+    #[test]
+    fn decodes_macroblock_qp_delta_mapping_and_context_progression() {
+        let mut zero = VecDeque::from([0]);
+        assert_eq!(
+            decode_macroblock_qp_delta(false, |_| Ok(zero.pop_front().unwrap())).unwrap(),
+            0
+        );
+
+        let mut positive = VecDeque::from([1, 0]);
+        let mut visited = Vec::new();
+        assert_eq!(
+            decode_macroblock_qp_delta(false, |context_index| {
+                visited.push(context_index);
+                Ok(positive.pop_front().unwrap())
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(visited, [60, 62]);
+
+        let mut negative = VecDeque::from([1, 1, 0]);
+        let mut visited = Vec::new();
+        assert_eq!(
+            decode_macroblock_qp_delta(true, |context_index| {
+                visited.push(context_index);
+                Ok(negative.pop_front().unwrap())
+            })
+            .unwrap(),
+            -1
+        );
+        assert_eq!(visited, [61, 62, 63]);
     }
 }

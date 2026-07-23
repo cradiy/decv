@@ -756,7 +756,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   macroblocks; progressive-frame P/B `mb_skip_flag` and I/SI `mb_type` now
   derive their contexts from completed same-slice neighbours, followed by
   CABAC intra luma/chroma prediction modes and neighbour-dependent luma/chroma
-  coded-block-pattern decoding;
+  coded-block-pattern decoding, transform-size selection, and signed
+  `mb_qp_delta` mapping;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
