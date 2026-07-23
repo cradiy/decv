@@ -12,10 +12,11 @@ use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
 use crate::intra_reconstruction::ReconstructionReferenceList;
 use crate::reorder::PictureReorderBuffer;
 use crate::{
-    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, H264Error, IntraPictureReconstructor,
-    NalHeader, NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader, PictureOrderCount,
-    PictureParameterSet, Profile, ReferencePictureMarking, Result, SequenceParameterSet, SliceType,
-    consume_rbsp_trailing_bits, decode_rbsp,
+    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, H264Error, ImplicitWeightReference,
+    IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType, ParameterSetStore,
+    ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile, ReferenceKind,
+    ReferencePictureMarking, Result, SequenceParameterSet, SliceType, consume_rbsp_trailing_bits,
+    decode_rbsp,
 };
 
 #[derive(Debug)]
@@ -41,9 +42,9 @@ struct DpbConfiguration {
 /// Synchronous pure-Rust H.264 decoder implementing the codec-independent
 /// push/pull contract.
 ///
-/// The current reconstruction backend accepts progressive Annex-B CAVLC I and
-/// unweighted P pictures. Other H.264 coding tools return explicit
-/// [`H264Error::UnsupportedFeature`] errors.
+/// The current reconstruction backend accepts progressive CAVLC I, P, and
+/// explicit non-Direct B pictures. Unsupported H.264 coding tools return
+/// explicit [`H264Error::UnsupportedFeature`] errors.
 #[derive(Debug)]
 pub struct H264Decoder {
     configured: bool,
@@ -219,6 +220,30 @@ impl H264Decoder {
                             .iter()
                             .map(|reference| reference.as_ref().map(|reference| reference.id))
                             .collect::<Vec<_>>();
+                        let implicit_l0 = references_l0
+                            .iter()
+                            .map(|reference| {
+                                reference.as_ref().map(|reference| ImplicitWeightReference {
+                                    picture_order_count: reference.picture_order_count,
+                                    long_term: matches!(
+                                        reference.kind,
+                                        ReferenceKind::LongTerm { .. }
+                                    ),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        let implicit_l1 = references_l1
+                            .iter()
+                            .map(|reference| {
+                                reference.as_ref().map(|reference| ImplicitWeightReference {
+                                    picture_order_count: reference.picture_order_count,
+                                    long_term: matches!(
+                                        reference.kind,
+                                        ReferenceKind::LongTerm { .. }
+                                    ),
+                                })
+                            })
+                            .collect::<Vec<_>>();
                         self.current_picture
                             .as_mut()
                             .expect("the picture is initialized above")
@@ -226,14 +251,17 @@ impl H264Decoder {
                             .decode_cavlc_b_slice(
                                 rbsp.as_ref(),
                                 &parsed,
-                                ReconstructionReferenceList::with_ids(
+                                ReconstructionReferenceList::with_metadata(
                                     &borrowed_l0,
                                     &reference_ids_l0,
+                                    &implicit_l0,
                                 ),
-                                ReconstructionReferenceList::with_ids(
+                                ReconstructionReferenceList::with_metadata(
                                     &borrowed_l1,
                                     &reference_ids_l1,
+                                    &implicit_l1,
                                 ),
+                                current_poc,
                             )?;
                     }
                     SliceType::Sp | SliceType::Si => {
@@ -1024,6 +1052,56 @@ mod tests {
     }
 
     #[test]
+    fn decodes_an_implicitly_weighted_bidirectional_b_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_weighted_implicit_b_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_weighted_p_skip_at_poc_rbsp(4)),
+            (0x01, single_macroblock_explicit_b_at_poc_rbsp(1)),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
+                panic!("expected a decoded frame");
+            };
+            frames.push(frame);
+        }
+        assert_eq!(
+            frames.iter().map(|frame| frame.id).collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+        let FrameStorage::Cpu(weighted_b) = &frames[1].storage else {
+            panic!("expected CPU frame");
+        };
+        let luma = &weighted_b.planes[0];
+        let luma_bytes = &luma.bytes[luma.offset..luma.offset + luma.stride * luma.rows];
+        assert!(luma_bytes.iter().all(|&sample| sample == 143));
+        let chroma = &weighted_b.planes[1];
+        let chroma_bytes =
+            &chroma.bytes[chroma.offset..chroma.offset + chroma.stride * chroma.rows];
+        assert!(
+            chroma_bytes
+                .chunks_exact(2)
+                .all(|samples| samples == [126, 117])
+        );
+    }
+
+    #[test]
     fn decodes_explicitly_weighted_reference_p_picture() {
         let stream = annex_b_stream(&[
             (0x67, single_macroblock_sps_rbsp()),
@@ -1660,6 +1738,26 @@ mod tests {
         writer.finish_rbsp()
     }
 
+    fn single_macroblock_weighted_implicit_b_pps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_ue(0); // seq_parameter_set_id
+        writer.write_flag(false); // entropy_coding_mode_flag: CAVLC
+        writer.write_flag(false); // bottom_field_pic_order_in_frame_present_flag
+        writer.write_ue(0); // num_slice_groups_minus1
+        writer.write_ue(0); // num_ref_idx_l0_default_active_minus1
+        writer.write_ue(0); // num_ref_idx_l1_default_active_minus1
+        writer.write_flag(true); // weighted_pred_flag
+        writer.write_bits(2, 2); // implicit weighted_bipred_idc
+        writer.write_se(0); // pic_init_qp_minus26
+        writer.write_se(0); // pic_init_qs_minus26
+        writer.write_se(0); // chroma_qp_index_offset
+        writer.write_flag(false); // deblocking_filter_control_present_flag
+        writer.write_flag(false); // constrained_intra_pred_flag
+        writer.write_flag(false); // redundant_pic_cnt_present_flag
+        writer.finish_rbsp()
+    }
+
     fn single_macroblock_idr_rbsp() -> Vec<u8> {
         let mut writer = BitWriter::default();
         writer.write_ue(0); // first_mb_in_slice
@@ -1712,12 +1810,16 @@ mod tests {
     }
 
     fn single_macroblock_explicit_b_rbsp() -> Vec<u8> {
+        single_macroblock_explicit_b_at_poc_rbsp(2)
+    }
+
+    fn single_macroblock_explicit_b_at_poc_rbsp(poc_lsb: u64) -> Vec<u8> {
         let mut writer = BitWriter::default();
         writer.write_ue(0); // first_mb_in_slice
         writer.write_ue(1); // B slice
         writer.write_ue(0); // pic_parameter_set_id
         writer.write_bits(1, 4); // frame_num (non-reference pictures do not advance it)
-        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_bits(poc_lsb, 4); // pic_order_cnt_lsb
         writer.write_flag(true); // direct_spatial_mv_pred_flag
         writer.write_flag(false); // num_ref_idx_active_override_flag
         writer.write_flag(false); // ref_pic_list_modification_flag_l0
@@ -1769,12 +1871,16 @@ mod tests {
     }
 
     fn single_macroblock_weighted_p_skip_rbsp() -> Vec<u8> {
+        single_macroblock_weighted_p_skip_at_poc_rbsp(2)
+    }
+
+    fn single_macroblock_weighted_p_skip_at_poc_rbsp(poc_lsb: u64) -> Vec<u8> {
         let mut writer = BitWriter::default();
         writer.write_ue(0); // first_mb_in_slice
         writer.write_ue(0); // P slice
         writer.write_ue(0); // pic_parameter_set_id
         writer.write_bits(1, 4); // frame_num
-        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_bits(poc_lsb, 4); // pic_order_cnt_lsb
         writer.write_flag(false); // num_ref_idx_active_override_flag
         writer.write_flag(false); // ref_pic_list_modification_flag_l0
         writer.write_ue(1); // luma_log2_weight_denom

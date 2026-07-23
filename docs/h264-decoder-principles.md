@@ -730,6 +730,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   and bidirectional macroblocks, including residuals and in-loop deblocking;
 - explicit weighted B prediction for single-list and bidirectional partitions,
   including independent luma and chroma weights and offsets;
+- implicit weighted B prediction derived per active reference pair from current
+  and reference POCs, including long-term, zero-distance, and range fallbacks;
 - complete Annex-B SPS/PPS/IDR-to-NV12 and IDR-to-reference-P integration
   tests;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
@@ -756,7 +758,7 @@ This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
 - CABAC slice data;
-- Direct/Skip B, implicit weighted B, SP, and SI macroblock reconstruction;
+- Direct/Skip B, SP, and SI macroblock reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;

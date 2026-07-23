@@ -7,6 +7,23 @@ use crate::{
     WeightOffset, Yuv420Picture,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImplicitWeightReference {
+    pub picture_order_count: i32,
+    pub long_term: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum BPredictionWeightMode<'a> {
+    Default,
+    Explicit(&'a PredictionWeightTable),
+    Implicit {
+        current_picture_order_count: i32,
+        list0: &'a [Option<ImplicitWeightReference>],
+        list1: &'a [Option<ImplicitWeightReference>],
+    },
+}
+
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
     (0, 0),
     (1, 0),
@@ -159,7 +176,7 @@ pub fn reconstruct_b_macroblock_from_lists_420(
         macroblock_y,
         motion,
         residual,
-        None,
+        BPredictionWeightMode::Default,
     )
 }
 
@@ -184,7 +201,36 @@ pub fn reconstruct_weighted_b_macroblock_from_lists_420(
         macroblock_y,
         motion,
         residual,
-        Some(weights),
+        BPredictionWeightMode::Explicit(weights),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: &ReconstructedInterResidual,
+    current_picture_order_count: i32,
+    implicit_references_l0: &[Option<ImplicitWeightReference>],
+    implicit_references_l1: &[Option<ImplicitWeightReference>],
+) -> Result<()> {
+    reconstruct_b_macroblock_from_lists_inner(
+        current,
+        references_l0,
+        references_l1,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        BPredictionWeightMode::Implicit {
+            current_picture_order_count,
+            list0: implicit_references_l0,
+            list1: implicit_references_l1,
+        },
     )
 }
 
@@ -197,7 +243,7 @@ fn reconstruct_b_macroblock_from_lists_inner(
     macroblock_y: usize,
     motion: &ResolvedBMacroblock,
     residual: &ReconstructedInterResidual,
-    weights: Option<&PredictionWeightTable>,
+    weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<()> {
     let luma_x = macroblock_x
         .checked_mul(16)
@@ -242,7 +288,7 @@ fn reconstruct_b_macroblock_from_lists_inner(
             prediction_l1,
             partition.list0.map(|motion| motion.reference_index),
             partition.list1.map(|motion| motion.reference_index),
-            weights,
+            weight_mode,
         )?;
         for y in 0..usize::from(partition.height) {
             let destination = &mut predicted_luma[usize::from(partition.y) + y]
@@ -344,11 +390,11 @@ fn merge_b_predictions(
     list1: Option<InterPrediction420>,
     reference_index_l0: Option<u8>,
     reference_index_l1: Option<u8>,
-    weights: Option<&PredictionWeightTable>,
+    weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<InterPrediction420> {
     match (list0, list1) {
         (Some(mut prediction), None) => {
-            if let Some(weights) = weights {
+            if let BPredictionWeightMode::Explicit(weights) = weight_mode {
                 apply_prediction_weights_for_list(
                     &mut prediction,
                     reference_index_l0.ok_or(H264Error::InvalidSyntax(
@@ -361,7 +407,7 @@ fn merge_b_predictions(
             Ok(prediction)
         }
         (None, Some(mut prediction)) => {
-            if let Some(weights) = weights {
+            if let BPredictionWeightMode::Explicit(weights) = weight_mode {
                 apply_prediction_weights_for_list(
                     &mut prediction,
                     reference_index_l1.ok_or(H264Error::InvalidSyntax(
@@ -379,19 +425,42 @@ fn merge_b_predictions(
                     "bidirectional prediction dimensions do not match",
                 ));
             }
-            if let Some(weights) = weights {
-                apply_explicit_bipred_weights(
-                    &mut list0,
-                    &list1,
-                    reference_index_l0.ok_or(H264Error::InvalidSyntax(
-                        "bidirectional List-0 prediction is missing its reference index",
-                    ))?,
-                    reference_index_l1.ok_or(H264Error::InvalidSyntax(
-                        "bidirectional List-1 prediction is missing its reference index",
-                    ))?,
-                    weights,
-                )?;
-                return Ok(list0);
+            let reference_index_l0 = reference_index_l0.ok_or(H264Error::InvalidSyntax(
+                "bidirectional List-0 prediction is missing its reference index",
+            ))?;
+            let reference_index_l1 = reference_index_l1.ok_or(H264Error::InvalidSyntax(
+                "bidirectional List-1 prediction is missing its reference index",
+            ))?;
+            match weight_mode {
+                BPredictionWeightMode::Explicit(weights) => {
+                    apply_explicit_bipred_weights(
+                        &mut list0,
+                        &list1,
+                        reference_index_l0,
+                        reference_index_l1,
+                        weights,
+                    )?;
+                    return Ok(list0);
+                }
+                BPredictionWeightMode::Implicit {
+                    current_picture_order_count,
+                    list0: implicit_l0,
+                    list1: implicit_l1,
+                } => {
+                    let reference_l0 =
+                        implicit_weight_reference(implicit_l0, reference_index_l0, "List 0")?;
+                    let reference_l1 =
+                        implicit_weight_reference(implicit_l1, reference_index_l1, "List 1")?;
+                    apply_implicit_bipred_weights(
+                        &mut list0,
+                        &list1,
+                        current_picture_order_count,
+                        reference_l0,
+                        reference_l1,
+                    );
+                    return Ok(list0);
+                }
+                BPredictionWeightMode::Default => {}
             }
             for y in 0..usize::from(list0.height) {
                 for x in 0..usize::from(list0.width) {
@@ -672,6 +741,79 @@ fn apply_explicit_bipred_weights(
         }
     }
     Ok(())
+}
+
+fn implicit_weight_reference(
+    references: &[Option<ImplicitWeightReference>],
+    reference_index: u8,
+    list_name: &'static str,
+) -> Result<ImplicitWeightReference> {
+    references
+        .get(usize::from(reference_index))
+        .copied()
+        .flatten()
+        .ok_or(H264Error::InvalidSyntax(match list_name {
+            "List 0" => "implicit weighting List-0 index has no reference metadata",
+            _ => "implicit weighting List-1 index has no reference metadata",
+        }))
+}
+
+fn apply_implicit_bipred_weights(
+    list0: &mut InterPrediction420,
+    list1: &InterPrediction420,
+    current_picture_order_count: i32,
+    reference_l0: ImplicitWeightReference,
+    reference_l1: ImplicitWeightReference,
+) {
+    let (weight_l0, weight_l1) =
+        derive_implicit_bipred_weights(current_picture_order_count, reference_l0, reference_l1);
+    let weight_l0 = WeightOffset {
+        weight: weight_l0,
+        offset: 0,
+    };
+    let weight_l1 = WeightOffset {
+        weight: weight_l1,
+        offset: 0,
+    };
+    for y in 0..usize::from(list0.height) {
+        for x in 0..usize::from(list0.width) {
+            list0.luma[y][x] =
+                weighted_bipred_sample(list0.luma[y][x], list1.luma[y][x], weight_l0, weight_l1, 5);
+        }
+    }
+    for y in 0..usize::from(list0.height / 2) {
+        for x in 0..usize::from(list0.width / 2) {
+            list0.cb[y][x] =
+                weighted_bipred_sample(list0.cb[y][x], list1.cb[y][x], weight_l0, weight_l1, 5);
+            list0.cr[y][x] =
+                weighted_bipred_sample(list0.cr[y][x], list1.cr[y][x], weight_l0, weight_l1, 5);
+        }
+    }
+}
+
+pub fn derive_implicit_bipred_weights(
+    current_picture_order_count: i32,
+    reference_l0: ImplicitWeightReference,
+    reference_l1: ImplicitWeightReference,
+) -> (i32, i32) {
+    if reference_l0.long_term || reference_l1.long_term {
+        return (32, 32);
+    }
+    let td = (i64::from(reference_l1.picture_order_count)
+        - i64::from(reference_l0.picture_order_count))
+    .clamp(-128, 127);
+    if td == 0 {
+        return (32, 32);
+    }
+    let tb = (i64::from(current_picture_order_count) - i64::from(reference_l0.picture_order_count))
+        .clamp(-128, 127);
+    let tx = (16_384 + td.abs() / 2) / td;
+    let weight_l1 = (tb * tx + 32) >> 8;
+    if !(-64..=128).contains(&weight_l1) {
+        return (32, 32);
+    }
+    let weight_l1 = weight_l1 as i32;
+    (64 - weight_l1, weight_l1)
 }
 
 fn prediction_weight(
@@ -1011,6 +1153,78 @@ mod tests {
         assert_eq!((luma[0], luma[8], luma[8 * 16]), (30, 238, 134));
         assert_eq!((cb[0], cb[4], cb[4 * 8]), (26, 76, 51));
         assert_eq!((cr[0], cr[4], cr[4 * 8]), (27, 77, 52));
+    }
+
+    #[test]
+    fn derives_normative_implicit_biprediction_weights() {
+        let short = |picture_order_count| ImplicitWeightReference {
+            picture_order_count,
+            long_term: false,
+        };
+        assert_eq!(
+            derive_implicit_bipred_weights(2, short(0), short(8)),
+            (48, 16)
+        );
+        assert_eq!(
+            derive_implicit_bipred_weights(4, short(0), short(8)),
+            (32, 32)
+        );
+        assert_eq!(
+            derive_implicit_bipred_weights(2, short(0), short(0)),
+            (32, 32)
+        );
+        assert_eq!(
+            derive_implicit_bipred_weights(
+                2,
+                short(0),
+                ImplicitWeightReference {
+                    picture_order_count: 8,
+                    long_term: true,
+                },
+            ),
+            (32, 32)
+        );
+        assert_eq!(
+            derive_implicit_bipred_weights(127, short(0), short(1)),
+            (32, 32)
+        );
+    }
+
+    #[test]
+    fn applies_implicit_weights_only_to_bidirectional_partitions() {
+        let first = picture(20);
+        let second = picture(80);
+        let mut current = picture(0);
+        reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
+            &mut current,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions: vec![
+                    b_partition(0, 0, 8, 8, Some(b_list(0)), None),
+                    b_partition(8, 0, 8, 8, None, Some(b_list(0))),
+                    b_partition(0, 8, 16, 8, Some(b_list(0)), Some(b_list(0))),
+                ],
+            },
+            &zero_residual(),
+            2,
+            &[Some(ImplicitWeightReference {
+                picture_order_count: 0,
+                long_term: false,
+            })],
+            &[Some(ImplicitWeightReference {
+                picture_order_count: 8,
+                long_term: false,
+            })],
+        )
+        .unwrap();
+        let (luma, cb, cr) = current.planes();
+        assert_eq!((luma[0], luma[8], luma[8 * 16]), (20, 80, 35));
+        assert_eq!((cb[0], cb[4], cb[4 * 8]), (21, 81, 36));
+        assert_eq!(cr[4 * 8], 37);
     }
 
     #[test]

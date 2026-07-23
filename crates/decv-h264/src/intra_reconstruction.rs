@@ -5,8 +5,9 @@ use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 
 use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
-    reconstruct_b_macroblock_from_lists_420, reconstruct_p_skip_macroblock_from_list_420,
-    reconstruct_weighted_b_macroblock_from_lists_420,
+    ImplicitWeightReference, reconstruct_b_macroblock_from_lists_420,
+    reconstruct_implicitly_weighted_b_macroblock_from_lists_420,
+    reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_b_macroblock_from_lists_420,
     reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
 };
@@ -68,9 +69,21 @@ struct IntraSliceConfig {
 }
 
 #[derive(Debug, Clone, Copy)]
+enum BSlicePredictionWeights<'a> {
+    Default,
+    Explicit(&'a PredictionWeightTable),
+    Implicit {
+        current_picture_order_count: i32,
+        list0: &'a [Option<ImplicitWeightReference>],
+        list1: &'a [Option<ImplicitWeightReference>],
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
 pub struct ReconstructionReferenceList<'a> {
     pictures: &'a [Option<&'a Yuv420Picture>],
     reference_ids: Option<&'a [Option<ReferenceId>]>,
+    implicit_weights: Option<&'a [Option<ImplicitWeightReference>]>,
 }
 
 impl<'a> ReconstructionReferenceList<'a> {
@@ -78,6 +91,7 @@ impl<'a> ReconstructionReferenceList<'a> {
         Self {
             pictures,
             reference_ids: None,
+            implicit_weights: None,
         }
     }
 
@@ -88,6 +102,19 @@ impl<'a> ReconstructionReferenceList<'a> {
         Self {
             pictures,
             reference_ids: Some(reference_ids),
+            implicit_weights: None,
+        }
+    }
+
+    pub const fn with_metadata(
+        pictures: &'a [Option<&'a Yuv420Picture>],
+        reference_ids: &'a [Option<ReferenceId>],
+        implicit_weights: &'a [Option<ImplicitWeightReference>],
+    ) -> Self {
+        Self {
+            pictures,
+            reference_ids: Some(reference_ids),
+            implicit_weights: Some(implicit_weights),
         }
     }
 }
@@ -292,6 +319,7 @@ impl IntraPictureReconstructor {
         parsed: &ParsedSliceHeader,
         references_l0: ReconstructionReferenceList<'_>,
         references_l1: ReconstructionReferenceList<'_>,
+        current_picture_order_count: i32,
     ) -> Result<usize> {
         let header = &parsed.header;
         let sps = &parsed.parameter_sets.sequence;
@@ -311,15 +339,27 @@ impl IntraPictureReconstructor {
             ));
         }
         let prediction_weights = match pps.weighted_biprediction {
-            WeightedBiprediction::Default => None,
-            WeightedBiprediction::Explicit => Some(header.prediction_weights.as_ref().ok_or(
-                H264Error::InvalidSyntax("explicit weighted B slice is missing pred_weight_table"),
-            )?),
-            WeightedBiprediction::Implicit => {
-                return Err(H264Error::UnsupportedFeature(
-                    "implicit weighted B prediction reconstruction",
-                ));
+            WeightedBiprediction::Default => BSlicePredictionWeights::Default,
+            WeightedBiprediction::Explicit => {
+                BSlicePredictionWeights::Explicit(header.prediction_weights.as_ref().ok_or(
+                    H264Error::InvalidSyntax(
+                        "explicit weighted B slice is missing pred_weight_table",
+                    ),
+                )?)
             }
+            WeightedBiprediction::Implicit => BSlicePredictionWeights::Implicit {
+                current_picture_order_count,
+                list0: references_l0
+                    .implicit_weights
+                    .ok_or(H264Error::InvalidSyntax(
+                        "implicit weighted B List 0 is missing reference metadata",
+                    ))?,
+                list1: references_l1
+                    .implicit_weights
+                    .ok_or(H264Error::InvalidSyntax(
+                        "implicit weighted B List 1 is missing reference metadata",
+                    ))?,
+            },
         };
         if sps.coded_size != self.picture.coded_size()
             || pps.constrained_intra_prediction != self.constrained_intra_prediction
@@ -656,7 +696,7 @@ impl IntraPictureReconstructor {
         context: BMacroblockContext,
         references_l0: ReconstructionReferenceList<'_>,
         references_l1: ReconstructionReferenceList<'_>,
-        prediction_weights: Option<&PredictionWeightTable>,
+        prediction_weights: BSlicePredictionWeights<'_>,
     ) -> Result<usize> {
         let reference_ids_l0 = references_l0.reference_ids;
         let reference_ids_l1 = references_l1.reference_ids;
@@ -756,8 +796,35 @@ impl IntraPictureReconstructor {
                     let picture_snapshot = self
                         .picture
                         .snapshot_macroblock(macroblock_x, macroblock_y)?;
-                    let reconstruction = if let Some(weights) = prediction_weights {
-                        reconstruct_weighted_b_macroblock_from_lists_420(
+                    let reconstruction = match prediction_weights {
+                        BSlicePredictionWeights::Default => {
+                            reconstruct_b_macroblock_from_lists_420(
+                                &mut self.picture,
+                                references_l0,
+                                references_l1,
+                                macroblock_x,
+                                macroblock_y,
+                                &motion,
+                                &reconstructed,
+                            )
+                        }
+                        BSlicePredictionWeights::Explicit(weights) => {
+                            reconstruct_weighted_b_macroblock_from_lists_420(
+                                &mut self.picture,
+                                references_l0,
+                                references_l1,
+                                macroblock_x,
+                                macroblock_y,
+                                &motion,
+                                &reconstructed,
+                                weights,
+                            )
+                        }
+                        BSlicePredictionWeights::Implicit {
+                            current_picture_order_count,
+                            list0,
+                            list1,
+                        } => reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
                             &mut self.picture,
                             references_l0,
                             references_l1,
@@ -765,18 +832,10 @@ impl IntraPictureReconstructor {
                             macroblock_y,
                             &motion,
                             &reconstructed,
-                            weights,
-                        )
-                    } else {
-                        reconstruct_b_macroblock_from_lists_420(
-                            &mut self.picture,
-                            references_l0,
-                            references_l1,
-                            macroblock_x,
-                            macroblock_y,
-                            &motion,
-                            &reconstructed,
-                        )
+                            current_picture_order_count,
+                            list0,
+                            list1,
+                        ),
                     };
                     if let Err(error) = reconstruction
                         .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
@@ -1646,7 +1705,10 @@ fn assemble_chroma_residual(blocks: &[[[i32; 4]; 4]; 4]) -> [[i32; 8]; 8] {
 mod tests {
     use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
 
-    use super::{IntraPictureReconstructor, IntraSliceConfig, ReconstructionReferenceList};
+    use super::{
+        BSlicePredictionWeights, IntraPictureReconstructor, IntraSliceConfig,
+        ReconstructionReferenceList,
+    };
     use crate::{
         BMacroblockContext, CodedBlockPattern, DeblockingFilter, DecodedIntraMacroblock, H264Error,
         IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax,
@@ -1853,7 +1915,7 @@ mod tests {
                 b_macroblock_context(),
                 ReconstructionReferenceList::new(&references_l0),
                 ReconstructionReferenceList::new(&references_l1),
-                None,
+                BSlicePredictionWeights::Default,
             ),
             Ok(1)
         );
@@ -1871,7 +1933,7 @@ mod tests {
                 b_macroblock_context(),
                 ReconstructionReferenceList::new(&references_l0),
                 ReconstructionReferenceList::new(&references_l1),
-                None,
+                BSlicePredictionWeights::Default,
             ),
             Ok(1)
         );
@@ -1888,7 +1950,7 @@ mod tests {
                 b_macroblock_context(),
                 ReconstructionReferenceList::new(&references_l0),
                 ReconstructionReferenceList::new(&references_l1),
-                None,
+                BSlicePredictionWeights::Default,
             ),
             Err(H264Error::UnsupportedFeature(_))
         ));
