@@ -223,6 +223,20 @@ seconds in Serial mode and 2.23 seconds in Auto mode, effectively unchanged in
 Auto at this measurement resolution. The CAVLC path deliberately retains its
 direct reconstruction path and remains neutral against the pre-change binary.
 
+Worker-count scaling depends strongly on CPU placement. With the same
+300-frame stream pinned to four performance cores, the medians were 3.52
+seconds for Serial, 3.47 for two workers, 3.44 for three, and 3.31 for four.
+Without affinity, the corresponding Serial/two/four medians were 3.51, 3.63,
+and 3.59 seconds, while four workers used about 31% more user CPU than Serial.
+`Auto` therefore remains capped at two; callers that control affinity may
+explicitly request four workers.
+
+Outlining the co-located-zero branch of spatial Direct motion reduced its hot
+function body from roughly 8 KiB to 4.9 KiB, but did not reduce whole-decoder
+instructions and increased sampled cache misses by about 1.2%. Six alternating
+pinned runs were about 0.8% slower at the median, so the layout change was
+rejected.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

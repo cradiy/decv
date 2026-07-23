@@ -134,8 +134,10 @@ Rules:
 
 - `Serial` is the deterministic fallback and test oracle.
 - `Auto` currently caps the worker count at two instead of consuming every
-  logical CPU in a UI application. This is based on the 1080p benchmark and
-  can be retuned as more stages become parallel.
+  logical CPU in a UI application. Four workers improve the 1080p benchmark
+  when pinned to four performance cores, but unpinned runs still add CPU work
+  without reducing wall time. The cap can be retuned as more stages become
+  parallel.
 - `set_parallelism` must run before decoding begins. It is separate from the
   codec-independent `VideoDecoderConfig`.
 - a decoder owns a persistent pool; it must not create OS threads

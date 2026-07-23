@@ -11,9 +11,10 @@ pub enum H264Parallelism {
     Serial,
     /// Select a conservative worker count for the current implementation.
     ///
-    /// CABAC parsing remains serial. Measurements currently show that more
-    /// than two reconstruction workers add overhead, so `Auto` caps the pool
-    /// at two threads.
+    /// CABAC parsing remains serial. Four workers can help when they are pinned
+    /// to four performance cores, but unpinned measurements still add CPU work
+    /// without reducing wall time. `Auto` therefore caps the pool at two
+    /// threads for use inside an interactive application.
     #[default]
     Auto,
     /// Use exactly this many reconstruction threads.
