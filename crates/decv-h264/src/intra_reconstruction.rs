@@ -1979,9 +1979,11 @@ impl IntraPictureReconstructor {
                 .collect::<Result<Vec<StagedMacroblockPixels>>>()?
         } else {
             let mut scratch = InterPrediction420::empty();
-            jobs.iter()
-                .map(|job| reconstruct(job, &mut scratch))
-                .collect::<Result<Vec<StagedMacroblockPixels>>>()?
+            let mut staged = Vec::with_capacity(jobs.len());
+            for job in jobs.iter() {
+                staged.push(reconstruct(job, &mut scratch)?);
+            }
+            staged
         };
 
         for (recorded_modes, job) in jobs.iter().enumerate() {
@@ -2064,9 +2066,11 @@ impl IntraPictureReconstructor {
                 .collect::<Result<Vec<StagedMacroblockPixels>>>()?
         } else {
             let mut scratch = (InterPrediction420::empty(), InterPrediction420::empty());
-            jobs.iter()
-                .map(|job| reconstruct(job, &mut scratch))
-                .collect::<Result<Vec<StagedMacroblockPixels>>>()?
+            let mut staged = Vec::with_capacity(jobs.len());
+            for job in jobs.iter() {
+                staged.push(reconstruct(job, &mut scratch)?);
+            }
+            staged
         };
 
         for (recorded_modes, job) in jobs.iter().enumerate() {
