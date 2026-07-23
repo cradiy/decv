@@ -1,1 +1,483 @@
-//! Top-level NAL dispatch, picture assembly, and frame output.
+//! Top-level NAL dispatch, picture-boundary detection, and frame output.
+
+use std::{borrow::Cow, sync::Arc};
+
+use bit_readers::BitReader;
+
+use crate::{
+    AnnexBNalUnit, H264Error, NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader,
+    PictureParameterSet, Result, SequenceParameterSet, consume_rbsp_trailing_bits, decode_rbsp,
+};
+
+#[derive(Debug)]
+#[non_exhaustive]
+// Slice events dominate normal decoding. Keeping the parsed header inline
+// avoids an otherwise unconditional heap allocation for every slice NAL.
+#[allow(clippy::large_enum_variant)]
+pub enum ParserEvent<'a> {
+    SequenceParameterSet(Arc<SequenceParameterSet>),
+    PictureParameterSet(Arc<PictureParameterSet>),
+    Slice {
+        parsed: ParsedSliceHeader,
+        /// Unescaped payload retained for the following slice-data parser.
+        rbsp: Cow<'a, [u8]>,
+        starts_new_picture: bool,
+    },
+    AccessUnitDelimiter {
+        primary_pic_type: u8,
+    },
+    EndOfSequence,
+    EndOfStream,
+    Unhandled(NalUnitType),
+}
+
+#[derive(Debug, Default)]
+pub struct H264StreamParser {
+    parameter_sets: ParameterSetStore,
+    previous_vcl: Option<PictureIdentity>,
+}
+
+impl H264StreamParser {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn parameter_sets(&self) -> &ParameterSetStore {
+        &self.parameter_sets
+    }
+
+    pub fn push_annex_b<'a>(&mut self, unit: AnnexBNalUnit<'a>) -> Result<ParserEvent<'a>> {
+        self.push_nal(NalUnit::try_from(unit)?)
+    }
+
+    pub fn push_nal<'a>(&mut self, nal: NalUnit<'a>) -> Result<ParserEvent<'a>> {
+        match nal.header.unit_type {
+            NalUnitType::Sps => {
+                let rbsp = decode_rbsp(nal.ebsp)?;
+                let sps = self.parameter_sets.parse_sps(rbsp.as_ref())?;
+                Ok(ParserEvent::SequenceParameterSet(sps))
+            }
+            NalUnitType::Pps => {
+                let rbsp = decode_rbsp(nal.ebsp)?;
+                let pps = self.parameter_sets.parse_pps(rbsp.as_ref())?;
+                Ok(ParserEvent::PictureParameterSet(pps))
+            }
+            NalUnitType::NonIdrSlice | NalUnitType::IdrSlice => {
+                let rbsp = decode_rbsp(nal.ebsp)?;
+                let parsed =
+                    ParsedSliceHeader::parse(rbsp.as_ref(), nal.header, &self.parameter_sets)?;
+                let identity = PictureIdentity::from_slice(
+                    &parsed,
+                    nal.header.unit_type,
+                    nal.header.nal_ref_idc,
+                );
+                let starts_new_picture = self
+                    .previous_vcl
+                    .as_ref()
+                    .is_none_or(|previous| identity.starts_new_picture_after(previous));
+                self.previous_vcl = Some(identity);
+                Ok(ParserEvent::Slice {
+                    parsed,
+                    rbsp,
+                    starts_new_picture,
+                })
+            }
+            NalUnitType::AccessUnitDelimiter => {
+                let rbsp = decode_rbsp(nal.ebsp)?;
+                let primary_pic_type = parse_access_unit_delimiter(rbsp.as_ref())?;
+                self.previous_vcl = None;
+                Ok(ParserEvent::AccessUnitDelimiter { primary_pic_type })
+            }
+            NalUnitType::EndOfSequence => {
+                validate_empty_rbsp(nal.ebsp)?;
+                self.previous_vcl = None;
+                Ok(ParserEvent::EndOfSequence)
+            }
+            NalUnitType::EndOfStream => {
+                validate_empty_rbsp(nal.ebsp)?;
+                self.previous_vcl = None;
+                Ok(ParserEvent::EndOfStream)
+            }
+            unit_type if unit_type.is_vcl() => Err(H264Error::UnsupportedFeature(
+                "slice partitions and slice extensions are not supported",
+            )),
+            NalUnitType::SpsExtension | NalUnitType::SubsetSps => {
+                Err(H264Error::UnsupportedFeature(
+                    "SPS extensions and subset SPS NAL units are not supported",
+                ))
+            }
+            unit_type => Ok(ParserEvent::Unhandled(unit_type)),
+        }
+    }
+
+    /// Clears parameter sets and picture-boundary history.
+    pub fn reset(&mut self) {
+        self.parameter_sets.clear();
+        self.previous_vcl = None;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PictureIdentity {
+    frame_num: u32,
+    picture_parameter_set_id: u32,
+    field_picture: bool,
+    bottom_field: bool,
+    nal_ref_idc: u8,
+    is_idr: bool,
+    idr_pic_id: Option<u32>,
+    pic_order_cnt_lsb: Option<u32>,
+    delta_pic_order_bottom: Option<i32>,
+    delta_pic_order: [Option<i32>; 2],
+}
+
+impl PictureIdentity {
+    fn from_slice(parsed: &ParsedSliceHeader, unit_type: NalUnitType, nal_ref_idc: u8) -> Self {
+        let header = &parsed.header;
+        Self {
+            frame_num: header.frame_num,
+            picture_parameter_set_id: header.picture_parameter_set_id,
+            field_picture: header.field_picture,
+            bottom_field: header.bottom_field,
+            nal_ref_idc,
+            is_idr: unit_type == NalUnitType::IdrSlice,
+            idr_pic_id: header.idr_pic_id,
+            pic_order_cnt_lsb: header.picture_order.pic_order_cnt_lsb,
+            delta_pic_order_bottom: header.picture_order.delta_pic_order_bottom,
+            delta_pic_order: header.picture_order.delta_pic_order,
+        }
+    }
+
+    /// Implements the ordinary AVC first-VCL-NAL test from H.264 7.4.1.2.4.
+    fn starts_new_picture_after(&self, previous: &Self) -> bool {
+        self.frame_num != previous.frame_num
+            || self.picture_parameter_set_id != previous.picture_parameter_set_id
+            || self.field_picture != previous.field_picture
+            || (self.field_picture
+                && previous.field_picture
+                && self.bottom_field != previous.bottom_field)
+            || ((self.nal_ref_idc == 0) != (previous.nal_ref_idc == 0))
+            || self.pic_order_cnt_lsb != previous.pic_order_cnt_lsb
+            || self.delta_pic_order_bottom != previous.delta_pic_order_bottom
+            || self.delta_pic_order != previous.delta_pic_order
+            || self.is_idr != previous.is_idr
+            || (self.is_idr && previous.is_idr && self.idr_pic_id != previous.idr_pic_id)
+    }
+}
+
+fn parse_access_unit_delimiter(rbsp: &[u8]) -> Result<u8> {
+    let mut reader = BitReader::new(rbsp);
+    let primary_pic_type = reader
+        .read_bits_const::<3>()
+        .ok_or(H264Error::UnexpectedEof)? as u8;
+    consume_rbsp_trailing_bits(&mut reader)?;
+    Ok(primary_pic_type)
+}
+
+fn validate_empty_rbsp(ebsp: &[u8]) -> Result<()> {
+    let rbsp = decode_rbsp(ebsp)?;
+    if rbsp.is_empty() {
+        return Ok(());
+    }
+
+    let mut reader = BitReader::new(rbsp.as_ref());
+    consume_rbsp_trailing_bits(&mut reader)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{H264StreamParser, ParserEvent, PictureIdentity};
+    use crate::{AnnexBReader, H264Error, NalHeader, NalUnit};
+
+    #[test]
+    fn dispatches_an_annex_b_stream_and_detects_picture_boundaries() {
+        let nals = [
+            (0x67, sps_rbsp()),
+            (0x68, pps_rbsp()),
+            (0x01, i_slice_rbsp(0, 0, 0)),
+            (0x01, i_slice_rbsp(1, 0, 0)),
+            (0x01, i_slice_rbsp(0, 1, 2)),
+        ];
+        let stream = annex_b_stream(&nals);
+        let mut parser = H264StreamParser::new();
+        let mut boundaries = Vec::new();
+        let mut parameter_set_events = 0;
+
+        for unit in AnnexBReader::new(&stream) {
+            match parser.push_annex_b(unit.unwrap()).unwrap() {
+                ParserEvent::SequenceParameterSet(sps) => {
+                    assert_eq!(sps.coded_size.width, 64);
+                    parameter_set_events += 1;
+                }
+                ParserEvent::PictureParameterSet(pps) => {
+                    assert_eq!(pps.id, 0);
+                    parameter_set_events += 1;
+                }
+                ParserEvent::Slice {
+                    parsed,
+                    rbsp,
+                    starts_new_picture,
+                } => {
+                    assert!(parsed.header.bit_size <= rbsp.len() * 8);
+                    boundaries.push(starts_new_picture);
+                }
+                event => panic!("unexpected parser event: {event:?}"),
+            }
+        }
+
+        assert_eq!(parameter_set_events, 2);
+        assert_eq!(boundaries, [true, false, true]);
+    }
+
+    #[test]
+    fn access_unit_delimiters_reset_picture_history() {
+        let mut parser = configured_parser();
+        let slice = i_slice_rbsp(0, 0, 0);
+        let first = parser.push_nal(nal(0x01, slice.as_slice())).unwrap();
+        assert!(matches!(
+            first,
+            ParserEvent::Slice {
+                starts_new_picture: true,
+                ..
+            }
+        ));
+
+        assert!(matches!(
+            parser.push_nal(nal(0x09, &[0b1011_0000])).unwrap(),
+            ParserEvent::AccessUnitDelimiter {
+                primary_pic_type: 5
+            }
+        ));
+
+        let after_aud = parser.push_nal(nal(0x01, slice.as_slice())).unwrap();
+        assert!(matches!(
+            after_aud,
+            ParserEvent::Slice {
+                starts_new_picture: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_missing_parameter_sets_and_unsupported_vcl_units() {
+        let mut empty = H264StreamParser::new();
+        let slice = i_slice_rbsp(0, 0, 0);
+        assert!(matches!(
+            empty.push_nal(nal(0x01, slice.as_slice())),
+            Err(H264Error::MissingPps(0))
+        ));
+
+        let mut configured = configured_parser();
+        assert!(matches!(
+            configured.push_nal(nal(0x42, &[])),
+            Err(H264Error::UnsupportedFeature(_))
+        ));
+    }
+
+    #[test]
+    fn recognizes_every_ordinary_first_vcl_difference() {
+        let base = PictureIdentity {
+            frame_num: 1,
+            picture_parameter_set_id: 2,
+            field_picture: true,
+            bottom_field: false,
+            nal_ref_idc: 2,
+            is_idr: true,
+            idr_pic_id: Some(3),
+            pic_order_cnt_lsb: Some(4),
+            delta_pic_order_bottom: Some(5),
+            delta_pic_order: [Some(6), Some(7)],
+        };
+        assert!(!base.starts_new_picture_after(&base));
+
+        let variants = [
+            PictureIdentity {
+                frame_num: 2,
+                ..base.clone()
+            },
+            PictureIdentity {
+                picture_parameter_set_id: 3,
+                ..base.clone()
+            },
+            PictureIdentity {
+                field_picture: false,
+                ..base.clone()
+            },
+            PictureIdentity {
+                bottom_field: true,
+                ..base.clone()
+            },
+            PictureIdentity {
+                nal_ref_idc: 0,
+                ..base.clone()
+            },
+            PictureIdentity {
+                is_idr: false,
+                idr_pic_id: None,
+                ..base.clone()
+            },
+            PictureIdentity {
+                idr_pic_id: Some(4),
+                ..base.clone()
+            },
+            PictureIdentity {
+                pic_order_cnt_lsb: Some(8),
+                ..base.clone()
+            },
+            PictureIdentity {
+                delta_pic_order_bottom: Some(9),
+                ..base.clone()
+            },
+            PictureIdentity {
+                delta_pic_order: [Some(10), Some(7)],
+                ..base.clone()
+            },
+        ];
+        for variant in variants {
+            assert!(variant.starts_new_picture_after(&base));
+        }
+    }
+
+    fn configured_parser() -> H264StreamParser {
+        let mut parser = H264StreamParser::new();
+        let sps = sps_rbsp();
+        let pps = pps_rbsp();
+        parser.push_nal(nal(0x67, sps.as_slice())).unwrap();
+        parser.push_nal(nal(0x68, pps.as_slice())).unwrap();
+        parser
+    }
+
+    fn nal(header: u8, ebsp: &[u8]) -> NalUnit<'_> {
+        NalUnit {
+            header: NalHeader::parse(header).unwrap(),
+            ebsp,
+            stream_offset: 0,
+        }
+    }
+
+    fn annex_b_stream(nals: &[(u8, Vec<u8>)]) -> Vec<u8> {
+        let mut stream = Vec::new();
+        for (header, rbsp) in nals {
+            stream.extend_from_slice(&[0, 0, 1, *header]);
+            stream.extend_from_slice(&encode_ebsp(rbsp));
+        }
+        stream
+    }
+
+    fn encode_ebsp(rbsp: &[u8]) -> Vec<u8> {
+        let mut ebsp = Vec::with_capacity(rbsp.len());
+        let mut zero_count = 0;
+        for &byte in rbsp {
+            if zero_count == 2 && byte <= 3 {
+                ebsp.push(3);
+                zero_count = 0;
+            }
+            ebsp.push(byte);
+            zero_count = if byte == 0 { zero_count + 1 } else { 0 };
+        }
+        ebsp
+    }
+
+    fn sps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_bits(66, 8);
+        writer.write_bits(0, 8);
+        writer.write_bits(30, 8);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_ue(2);
+        writer.write_flag(false);
+        writer.write_ue(3);
+        writer.write_ue(2);
+        writer.write_flag(true);
+        writer.write_flag(true);
+        writer.write_flag(false);
+        writer.write_flag(false);
+        writer.finish_rbsp()
+    }
+
+    fn pps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_flag(false);
+        writer.write_flag(false);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_flag(false);
+        writer.write_bits(0, 2);
+        writer.write_se(0);
+        writer.write_se(0);
+        writer.write_se(0);
+        writer.write_flag(true);
+        writer.write_flag(false);
+        writer.write_flag(false);
+        writer.finish_rbsp()
+    }
+
+    fn i_slice_rbsp(first_mb: u32, frame_num: u64, pic_order_cnt_lsb: u64) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(first_mb);
+        writer.write_ue(2);
+        writer.write_ue(0);
+        writer.write_bits(frame_num, 4);
+        writer.write_bits(pic_order_cnt_lsb, 4);
+        writer.write_se(0);
+        writer.write_ue(1);
+        writer.finish_rbsp()
+    }
+
+    #[derive(Default)]
+    struct BitWriter {
+        bytes: Vec<u8>,
+        current: u8,
+        bits: u8,
+    }
+
+    impl BitWriter {
+        fn write_flag(&mut self, value: bool) {
+            self.write_bits(u64::from(value), 1);
+        }
+
+        fn write_bits(&mut self, value: u64, count: u8) {
+            for shift in (0..count).rev() {
+                self.current = (self.current << 1) | ((value >> shift) as u8 & 1);
+                self.bits += 1;
+                if self.bits == 8 {
+                    self.bytes.push(self.current);
+                    self.current = 0;
+                    self.bits = 0;
+                }
+            }
+        }
+
+        fn write_ue(&mut self, value: u32) {
+            let code_num = u64::from(value) + 1;
+            let width = 64 - code_num.leading_zeros() as u8;
+            self.write_bits(0, width - 1);
+            self.write_bits(code_num, width);
+        }
+
+        fn write_se(&mut self, value: i32) {
+            let code_num = if value <= 0 {
+                u32::try_from(-i64::from(value) * 2).unwrap()
+            } else {
+                u32::try_from(i64::from(value) * 2 - 1).unwrap()
+            };
+            self.write_ue(code_num);
+        }
+
+        fn finish_rbsp(mut self) -> Vec<u8> {
+            self.write_flag(true);
+            if self.bits != 0 {
+                self.current <<= 8 - self.bits;
+                self.bytes.push(self.current);
+            }
+            self.bytes
+        }
+    }
+}
