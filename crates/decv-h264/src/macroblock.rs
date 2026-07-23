@@ -185,6 +185,130 @@ pub struct PMacroblockContext {
     pub transform_8x8_mode_enabled: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BPredictionMode {
+    Direct,
+    List0,
+    List1,
+    Bi,
+}
+
+impl BPredictionMode {
+    #[inline]
+    pub const fn uses_list0(self) -> bool {
+        matches!(self, Self::List0 | Self::Bi)
+    }
+
+    #[inline]
+    pub const fn uses_list1(self) -> bool {
+        matches!(self, Self::List1 | Self::Bi)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BSubMacroblockType {
+    Direct8x8,
+    List0_8x8,
+    List1_8x8,
+    Bi8x8,
+    List0_8x4,
+    List0_4x8,
+    List1_8x4,
+    List1_4x8,
+    Bi8x4,
+    Bi4x8,
+    List0_4x4,
+    List1_4x4,
+    Bi4x4,
+}
+
+impl BSubMacroblockType {
+    #[inline]
+    pub const fn prediction(self) -> BPredictionMode {
+        match self {
+            Self::Direct8x8 => BPredictionMode::Direct,
+            Self::List0_8x8 | Self::List0_8x4 | Self::List0_4x8 | Self::List0_4x4 => {
+                BPredictionMode::List0
+            }
+            Self::List1_8x8 | Self::List1_8x4 | Self::List1_4x8 | Self::List1_4x4 => {
+                BPredictionMode::List1
+            }
+            Self::Bi8x8 | Self::Bi8x4 | Self::Bi4x8 | Self::Bi4x4 => BPredictionMode::Bi,
+        }
+    }
+
+    #[inline]
+    pub const fn partition_count(self) -> usize {
+        match self {
+            Self::Direct8x8 | Self::List0_8x8 | Self::List1_8x8 | Self::Bi8x8 => 1,
+            Self::List0_8x4
+            | Self::List0_4x8
+            | Self::List1_8x4
+            | Self::List1_4x8
+            | Self::Bi8x4
+            | Self::Bi4x8 => 2,
+            Self::List0_4x4 | Self::List1_4x4 | Self::Bi4x4 => 4,
+        }
+    }
+
+    #[inline]
+    pub const fn partition_size(self) -> (u8, u8) {
+        match self {
+            Self::Direct8x8 | Self::List0_8x8 | Self::List1_8x8 | Self::Bi8x8 => (8, 8),
+            Self::List0_8x4 | Self::List1_8x4 | Self::Bi8x4 => (8, 4),
+            Self::List0_4x8 | Self::List1_4x8 | Self::Bi4x8 => (4, 8),
+            Self::List0_4x4 | Self::List1_4x4 | Self::Bi4x4 => (4, 4),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BPartitionMode {
+    Direct16x16,
+    SixteenBySixteen,
+    SixteenByEight,
+    EightBySixteen,
+    EightByEight {
+        sub_macroblocks: [BSubMacroblockType; 4],
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BPartitionMotion {
+    pub prediction: BPredictionMode,
+    pub reference_index_l0: Option<u8>,
+    pub reference_index_l1: Option<u8>,
+    /// Empty for an unused list or Direct; otherwise one entry for an
+    /// ordinary macroblock partition or one per sub-macroblock partition.
+    pub differences_l0: Vec<MotionVectorDifference>,
+    pub differences_l1: Vec<MotionVectorDifference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BInterMacroblockHeader {
+    pub partition_mode: BPartitionMode,
+    pub partitions: Vec<BPartitionMotion>,
+    pub coded_block_pattern: CodedBlockPattern,
+    pub transform_size_8x8: bool,
+    /// Zero when `mb_qp_delta` is absent and inferred.
+    pub qp_delta: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BSliceMacroblock {
+    Inter(BInterMacroblockHeader),
+    Intra(IntraMacroblock),
+}
+
+/// Syntax context needed to decode a frame-coded CAVLC B macroblock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BMacroblockContext {
+    pub num_ref_idx_l0_active: u8,
+    pub num_ref_idx_l1_active: u8,
+    pub transform_8x8_mode_enabled: bool,
+    pub direct_8x8_inference: bool,
+}
+
 /// Parses the non-residual portion of one CAVLC I-slice macroblock.
 ///
 /// For predicted macroblocks the reader stops immediately before residual
@@ -229,6 +353,44 @@ pub fn parse_cavlc_p_macroblock(
         _ => {
             return Err(H264Error::InvalidSyntax(
                 "mb_type exceeds the P-slice macroblock table",
+            ));
+        }
+    };
+    *reader = probe;
+    Ok(macroblock)
+}
+
+/// Parses one non-skipped, frame-coded CAVLC B-slice macroblock up to the
+/// residual coefficient syntax.
+///
+/// B-slice mb_type values 23 through 48 are mapped to their I-slice
+/// counterparts. Any failure leaves the reader unchanged.
+pub fn parse_cavlc_b_macroblock(
+    reader: &mut BitReader<'_>,
+    context: BMacroblockContext,
+) -> Result<BSliceMacroblock> {
+    if context.num_ref_idx_l0_active == 0
+        || context.num_ref_idx_l0_active > 32
+        || context.num_ref_idx_l1_active == 0
+        || context.num_ref_idx_l1_active > 32
+    {
+        return Err(H264Error::InvalidSyntax(
+            "B macroblock active reference count is outside 1..=32",
+        ));
+    }
+
+    let mut probe = *reader;
+    let mb_type = probe.read_ue().ok_or(H264Error::UnexpectedEof)?;
+    let macroblock = match mb_type {
+        0..=22 => BSliceMacroblock::Inter(parse_b_inter_macroblock(&mut probe, mb_type, context)?),
+        23..=48 => BSliceMacroblock::Intra(parse_intra_macroblock_type(
+            &mut probe,
+            mb_type - 23,
+            context.transform_8x8_mode_enabled,
+        )?),
+        _ => {
+            return Err(H264Error::InvalidSyntax(
+                "mb_type exceeds the B-slice macroblock table",
             ));
         }
     };
@@ -406,6 +568,210 @@ fn parse_p_inter_macroblock(
     })
 }
 
+fn parse_b_inter_macroblock(
+    reader: &mut BitReader<'_>,
+    mb_type: u32,
+    context: BMacroblockContext,
+) -> Result<BInterMacroblockHeader> {
+    let (partition_mode, partitions, permits_transform_8x8) = match mb_type {
+        0 => (
+            BPartitionMode::Direct16x16,
+            vec![empty_b_partition(BPredictionMode::Direct)],
+            context.direct_8x8_inference,
+        ),
+        1..=3 => {
+            let prediction = match mb_type {
+                1 => BPredictionMode::List0,
+                2 => BPredictionMode::List1,
+                3 => BPredictionMode::Bi,
+                _ => unreachable!(),
+            };
+            (
+                BPartitionMode::SixteenBySixteen,
+                parse_b_partition_motion(reader, &[prediction], context)?,
+                true,
+            )
+        }
+        4..=21 => {
+            let partition_mode = if mb_type.is_multiple_of(2) {
+                BPartitionMode::SixteenByEight
+            } else {
+                BPartitionMode::EightBySixteen
+            };
+            let pair_index =
+                usize::try_from((mb_type - 4) / 2).map_err(|_| H264Error::IntegerOverflow)?;
+            let predictions = [
+                [BPredictionMode::List0, BPredictionMode::List0],
+                [BPredictionMode::List1, BPredictionMode::List1],
+                [BPredictionMode::List0, BPredictionMode::List1],
+                [BPredictionMode::List1, BPredictionMode::List0],
+                [BPredictionMode::List0, BPredictionMode::Bi],
+                [BPredictionMode::List1, BPredictionMode::Bi],
+                [BPredictionMode::Bi, BPredictionMode::List0],
+                [BPredictionMode::Bi, BPredictionMode::List1],
+                [BPredictionMode::Bi, BPredictionMode::Bi],
+            ][pair_index];
+            (
+                partition_mode,
+                parse_b_partition_motion(reader, &predictions, context)?,
+                true,
+            )
+        }
+        22 => parse_b_sub_macroblocks(reader, context)?,
+        _ => unreachable!("caller restricts B inter mb_type to 0..=22"),
+    };
+
+    let coded_block_pattern = parse_inter_coded_block_pattern(reader)?;
+    let transform_size_8x8 = coded_block_pattern.luma != 0
+        && context.transform_8x8_mode_enabled
+        && permits_transform_8x8
+        && read_flag(reader)?;
+    let qp_delta = if coded_block_pattern.has_residual() {
+        parse_qp_delta(reader)?
+    } else {
+        0
+    };
+    Ok(BInterMacroblockHeader {
+        partition_mode,
+        partitions,
+        coded_block_pattern,
+        transform_size_8x8,
+        qp_delta,
+    })
+}
+
+fn parse_b_partition_motion(
+    reader: &mut BitReader<'_>,
+    predictions: &[BPredictionMode],
+    context: BMacroblockContext,
+) -> Result<Vec<BPartitionMotion>> {
+    let mut partitions = predictions
+        .iter()
+        .copied()
+        .map(empty_b_partition)
+        .collect::<Vec<_>>();
+    for partition in &mut partitions {
+        if partition.prediction.uses_list0() {
+            partition.reference_index_l0 = Some(parse_reference_index(
+                reader,
+                context.num_ref_idx_l0_active,
+            )?);
+        }
+    }
+    for partition in &mut partitions {
+        if partition.prediction.uses_list1() {
+            partition.reference_index_l1 = Some(parse_reference_index(
+                reader,
+                context.num_ref_idx_l1_active,
+            )?);
+        }
+    }
+    for partition in &mut partitions {
+        if partition.prediction.uses_list0() {
+            partition
+                .differences_l0
+                .push(parse_motion_vector_difference(reader)?);
+        }
+    }
+    for partition in &mut partitions {
+        if partition.prediction.uses_list1() {
+            partition
+                .differences_l1
+                .push(parse_motion_vector_difference(reader)?);
+        }
+    }
+    Ok(partitions)
+}
+
+fn parse_b_sub_macroblocks(
+    reader: &mut BitReader<'_>,
+    context: BMacroblockContext,
+) -> Result<(BPartitionMode, Vec<BPartitionMotion>, bool)> {
+    let mut sub_macroblocks = [BSubMacroblockType::Direct8x8; 4];
+    for sub_type in &mut sub_macroblocks {
+        *sub_type = parse_b_sub_macroblock_type(reader)?;
+    }
+    let mut partitions = sub_macroblocks
+        .iter()
+        .map(|sub_type| empty_b_partition(sub_type.prediction()))
+        .collect::<Vec<_>>();
+    for partition in &mut partitions {
+        if partition.prediction.uses_list0() {
+            partition.reference_index_l0 = Some(parse_reference_index(
+                reader,
+                context.num_ref_idx_l0_active,
+            )?);
+        }
+    }
+    for partition in &mut partitions {
+        if partition.prediction.uses_list1() {
+            partition.reference_index_l1 = Some(parse_reference_index(
+                reader,
+                context.num_ref_idx_l1_active,
+            )?);
+        }
+    }
+    for (partition, sub_type) in partitions.iter_mut().zip(sub_macroblocks) {
+        if partition.prediction.uses_list0() {
+            for _ in 0..sub_type.partition_count() {
+                partition
+                    .differences_l0
+                    .push(parse_motion_vector_difference(reader)?);
+            }
+        }
+    }
+    for (partition, sub_type) in partitions.iter_mut().zip(sub_macroblocks) {
+        if partition.prediction.uses_list1() {
+            for _ in 0..sub_type.partition_count() {
+                partition
+                    .differences_l1
+                    .push(parse_motion_vector_difference(reader)?);
+            }
+        }
+    }
+    let permits_transform_8x8 = sub_macroblocks.iter().all(|sub_type| {
+        sub_type.partition_size() == (8, 8)
+            && (*sub_type != BSubMacroblockType::Direct8x8 || context.direct_8x8_inference)
+    });
+    Ok((
+        BPartitionMode::EightByEight { sub_macroblocks },
+        partitions,
+        permits_transform_8x8,
+    ))
+}
+
+#[inline]
+fn empty_b_partition(prediction: BPredictionMode) -> BPartitionMotion {
+    BPartitionMotion {
+        prediction,
+        reference_index_l0: None,
+        reference_index_l1: None,
+        differences_l0: Vec::new(),
+        differences_l1: Vec::new(),
+    }
+}
+
+fn parse_b_sub_macroblock_type(reader: &mut BitReader<'_>) -> Result<BSubMacroblockType> {
+    match reader.read_ue().ok_or(H264Error::UnexpectedEof)? {
+        0 => Ok(BSubMacroblockType::Direct8x8),
+        1 => Ok(BSubMacroblockType::List0_8x8),
+        2 => Ok(BSubMacroblockType::List1_8x8),
+        3 => Ok(BSubMacroblockType::Bi8x8),
+        4 => Ok(BSubMacroblockType::List0_8x4),
+        5 => Ok(BSubMacroblockType::List0_4x8),
+        6 => Ok(BSubMacroblockType::List1_8x4),
+        7 => Ok(BSubMacroblockType::List1_4x8),
+        8 => Ok(BSubMacroblockType::Bi8x4),
+        9 => Ok(BSubMacroblockType::Bi4x8),
+        10 => Ok(BSubMacroblockType::List0_4x4),
+        11 => Ok(BSubMacroblockType::List1_4x4),
+        12 => Ok(BSubMacroblockType::Bi4x4),
+        _ => Err(H264Error::InvalidSyntax(
+            "sub_mb_type exceeds the B-slice table",
+        )),
+    }
+}
+
 fn parse_macroblock_partition_motion(
     reader: &mut BitReader<'_>,
     partition_count: usize,
@@ -571,10 +937,12 @@ mod tests {
     use bit_readers::BitReader;
 
     use super::{
+        BMacroblockContext, BPartitionMode, BPredictionMode, BSliceMacroblock, BSubMacroblockType,
         CodedBlockPattern, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader,
         IntraPredictionModeSyntax, MotionVectorDifference, PInterMacroblockHeader,
         PMacroblockContext, PPartitionMode, PPartitionMotion, PSliceMacroblock, PSubMacroblockType,
-        parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run, parse_cavlc_p_macroblock,
+        parse_cavlc_b_macroblock, parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run,
+        parse_cavlc_p_macroblock,
     };
     use crate::H264Error;
 
@@ -885,6 +1253,219 @@ mod tests {
     }
 
     #[test]
+    fn maps_every_ordinary_b_inter_macroblock_type() {
+        let modes = [
+            (1, vec![BPredictionMode::List0]),
+            (2, vec![BPredictionMode::List1]),
+            (3, vec![BPredictionMode::Bi]),
+            (4, vec![BPredictionMode::List0, BPredictionMode::List0]),
+            (5, vec![BPredictionMode::List0, BPredictionMode::List0]),
+            (6, vec![BPredictionMode::List1, BPredictionMode::List1]),
+            (7, vec![BPredictionMode::List1, BPredictionMode::List1]),
+            (8, vec![BPredictionMode::List0, BPredictionMode::List1]),
+            (9, vec![BPredictionMode::List0, BPredictionMode::List1]),
+            (10, vec![BPredictionMode::List1, BPredictionMode::List0]),
+            (11, vec![BPredictionMode::List1, BPredictionMode::List0]),
+            (12, vec![BPredictionMode::List0, BPredictionMode::Bi]),
+            (13, vec![BPredictionMode::List0, BPredictionMode::Bi]),
+            (14, vec![BPredictionMode::List1, BPredictionMode::Bi]),
+            (15, vec![BPredictionMode::List1, BPredictionMode::Bi]),
+            (16, vec![BPredictionMode::Bi, BPredictionMode::List0]),
+            (17, vec![BPredictionMode::Bi, BPredictionMode::List0]),
+            (18, vec![BPredictionMode::Bi, BPredictionMode::List1]),
+            (19, vec![BPredictionMode::Bi, BPredictionMode::List1]),
+            (20, vec![BPredictionMode::Bi, BPredictionMode::Bi]),
+            (21, vec![BPredictionMode::Bi, BPredictionMode::Bi]),
+        ];
+        for (mb_type, predictions) in modes {
+            let mut writer = BitWriter::default();
+            writer.write_ue(mb_type);
+            for prediction in &predictions {
+                if prediction.uses_list0() {
+                    writer.write_se(mb_type as i32);
+                    writer.write_se(0);
+                }
+            }
+            for prediction in &predictions {
+                if prediction.uses_list1() {
+                    writer.write_se(-(mb_type as i32));
+                    writer.write_se(0);
+                }
+            }
+            writer.write_ue(0);
+
+            let data = writer.finish();
+            let mut reader = BitReader::new(&data);
+            let BSliceMacroblock::Inter(header) =
+                parse_cavlc_b_macroblock(&mut reader, b_context()).unwrap()
+            else {
+                panic!("expected B inter macroblock type {mb_type}");
+            };
+            assert_eq!(
+                header
+                    .partitions
+                    .iter()
+                    .map(|partition| partition.prediction)
+                    .collect::<Vec<_>>(),
+                predictions,
+                "mb_type={mb_type}"
+            );
+            let expected_mode = match mb_type {
+                1..=3 => BPartitionMode::SixteenBySixteen,
+                value if value.is_multiple_of(2) => BPartitionMode::SixteenByEight,
+                _ => BPartitionMode::EightBySixteen,
+            };
+            assert_eq!(header.partition_mode, expected_mode, "mb_type={mb_type}");
+            assert_eq!(reader.bit_position(), writer.bit_len, "mb_type={mb_type}");
+        }
+    }
+
+    #[test]
+    fn parses_b_direct_and_bidirectional_reference_syntax() {
+        let mut direct = BitWriter::default();
+        direct.write_ue(0);
+        direct.write_ue(0);
+        let data = direct.finish();
+        let mut reader = BitReader::new(&data);
+        let BSliceMacroblock::Inter(header) =
+            parse_cavlc_b_macroblock(&mut reader, b_context()).unwrap()
+        else {
+            panic!("expected direct macroblock");
+        };
+        assert_eq!(header.partition_mode, BPartitionMode::Direct16x16);
+        assert_eq!(header.partitions[0].prediction, BPredictionMode::Direct);
+        assert_eq!(reader.bit_position(), direct.bit_len);
+
+        let mut bi = BitWriter::default();
+        bi.write_ue(20);
+        bi.write_flag(true);
+        bi.write_flag(false);
+        bi.write_flag(false);
+        bi.write_flag(true);
+        for (x, y) in [(1, 2), (3, 4), (-1, -2), (-3, -4)] {
+            bi.write_se(x);
+            bi.write_se(y);
+        }
+        bi.write_ue(2);
+        bi.write_flag(true);
+        bi.write_se(-1);
+        let data = bi.finish();
+        let mut reader = BitReader::new(&data);
+        let BSliceMacroblock::Inter(header) = parse_cavlc_b_macroblock(
+            &mut reader,
+            BMacroblockContext {
+                num_ref_idx_l0_active: 2,
+                num_ref_idx_l1_active: 2,
+                transform_8x8_mode_enabled: true,
+                direct_8x8_inference: true,
+            },
+        )
+        .unwrap() else {
+            panic!("expected bidirectional macroblock");
+        };
+        assert_eq!(header.partition_mode, BPartitionMode::SixteenByEight);
+        assert_eq!(header.partitions[0].reference_index_l0, Some(0));
+        assert_eq!(header.partitions[1].reference_index_l0, Some(1));
+        assert_eq!(header.partitions[0].reference_index_l1, Some(1));
+        assert_eq!(header.partitions[1].reference_index_l1, Some(0));
+        assert_eq!(
+            header.partitions[0].differences_l0,
+            [MotionVectorDifference { x: 1, y: 2 }]
+        );
+        assert_eq!(
+            header.partitions[0].differences_l1,
+            [MotionVectorDifference { x: -1, y: -2 }]
+        );
+        assert!(header.transform_size_8x8);
+        assert_eq!(header.qp_delta, -1);
+        assert_eq!(reader.bit_position(), bi.bit_len);
+    }
+
+    #[test]
+    fn parses_mixed_b_sub_macroblock_shapes_in_list_order() {
+        let mut writer = BitWriter::default();
+        writer.write_ue(22);
+        for sub_type in [0, 4, 7, 12] {
+            writer.write_ue(sub_type);
+        }
+        for index in 0..6 {
+            writer.write_se(index);
+            writer.write_se(-index);
+        }
+        for index in 6..12 {
+            writer.write_se(index);
+            writer.write_se(-index);
+        }
+        writer.write_ue(0);
+
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        let BSliceMacroblock::Inter(header) =
+            parse_cavlc_b_macroblock(&mut reader, b_context()).unwrap()
+        else {
+            panic!("expected B_8x8 macroblock");
+        };
+        assert_eq!(
+            header.partition_mode,
+            BPartitionMode::EightByEight {
+                sub_macroblocks: [
+                    BSubMacroblockType::Direct8x8,
+                    BSubMacroblockType::List0_8x4,
+                    BSubMacroblockType::List1_4x8,
+                    BSubMacroblockType::Bi4x4,
+                ],
+            }
+        );
+        assert_eq!(
+            header
+                .partitions
+                .iter()
+                .map(|partition| partition.differences_l0.len())
+                .collect::<Vec<_>>(),
+            [0, 2, 0, 4]
+        );
+        assert_eq!(
+            header
+                .partitions
+                .iter()
+                .map(|partition| partition.differences_l1.len())
+                .collect::<Vec<_>>(),
+            [0, 0, 2, 4]
+        );
+        assert!(!header.transform_size_8x8);
+        assert_eq!(reader.bit_position(), writer.bit_len);
+    }
+
+    #[test]
+    fn maps_b_intra_types_and_rejects_invalid_syntax_atomically() {
+        let mut intra = BitWriter::default();
+        intra.write_ue(23);
+        for _ in 0..16 {
+            intra.write_flag(true);
+        }
+        intra.write_ue(0);
+        intra.write_ue(3);
+        let data = intra.finish();
+        let mut reader = BitReader::new(&data);
+        assert!(matches!(
+            parse_cavlc_b_macroblock(&mut reader, b_context()),
+            Ok(BSliceMacroblock::Intra(IntraMacroblock::Predicted(_)))
+        ));
+
+        let mut invalid_type = BitWriter::default();
+        invalid_type.write_ue(49);
+        let mut invalid_sub_type = BitWriter::default();
+        invalid_sub_type.write_ue(22);
+        invalid_sub_type.write_ue(13);
+        for writer in [invalid_type, invalid_sub_type] {
+            let data = writer.finish();
+            let mut reader = BitReader::new(&data);
+            assert!(parse_cavlc_b_macroblock(&mut reader, b_context()).is_err());
+            assert_eq!(reader.bit_position(), 0);
+        }
+    }
+
+    #[test]
     fn maps_p_slice_intra_types_and_bounds_skip_runs() {
         let mut writer = BitWriter::default();
         writer.write_ue(5);
@@ -989,6 +1570,15 @@ mod tests {
         writer.write_ue(25);
         writer.write_flag(true);
         writer
+    }
+
+    fn b_context() -> BMacroblockContext {
+        BMacroblockContext {
+            num_ref_idx_l0_active: 1,
+            num_ref_idx_l1_active: 1,
+            transform_8x8_mode_enabled: false,
+            direct_8x8_inference: true,
+        }
     }
 
     #[derive(Default)]
