@@ -258,6 +258,29 @@ fn predict_luma<const CLIP: bool>(
     }
 
     #[cfg(target_arch = "x86_64")]
+    if !CLIP
+        && prediction.width == 16
+        && ((x_fraction == 0) != (y_fraction == 0))
+        && std::is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: Runtime detection proves AVX2 support. The caller selected
+        // the non-clipping specialization only after checking the complete
+        // six-tap interpolation window.
+        unsafe {
+            predict_luma_axis_avx2(
+                prediction,
+                plane,
+                width,
+                reference_x as usize,
+                reference_y as usize,
+                x_fraction,
+                y_fraction,
+            );
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
     if !CLIP && matches!(prediction.width, 8 | 16) && ((x_fraction == 0) != (y_fraction == 0)) {
         // SAFETY: SSE2 is part of the x86_64 baseline. The caller selected
         // the non-clipping specialization only after checking the complete
@@ -305,6 +328,130 @@ fn predict_luma<const CLIP: bool>(
                 reference_y + y as i32,
                 x_fraction,
                 y_fraction,
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn predict_luma_axis_avx2(
+    prediction: &mut InterPrediction420,
+    plane: &[u8],
+    stride: usize,
+    reference_x: usize,
+    reference_y: usize,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_avg_epu8, _mm_loadu_si128, _mm_storeu_si128, _mm_unpacklo_epi64,
+        _mm256_add_epi16, _mm256_castsi256_si128, _mm256_cvtepu8_epi16, _mm256_extracti128_si256,
+        _mm256_mullo_epi16, _mm256_packus_epi16, _mm256_set1_epi16, _mm256_setzero_si256,
+        _mm256_srai_epi16, _mm256_sub_epi16,
+    };
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_sixteen(ptr: *const u8) -> __m256i {
+        // SAFETY: The caller validated the complete sixteen-byte source row.
+        let bytes = unsafe { _mm_loadu_si128(ptr.cast::<__m128i>()) };
+        _mm256_cvtepu8_epi16(bytes)
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn six_tap(
+        s0: *const u8,
+        s1: *const u8,
+        s2: *const u8,
+        s3: *const u8,
+        s4: *const u8,
+        s5: *const u8,
+    ) -> __m128i {
+        // SAFETY: Every pointer addresses sixteen validated source samples.
+        let s0 = unsafe { load_sixteen(s0) };
+        // SAFETY: See above.
+        let s1 = unsafe { load_sixteen(s1) };
+        // SAFETY: See above.
+        let s2 = unsafe { load_sixteen(s2) };
+        // SAFETY: See above.
+        let s3 = unsafe { load_sixteen(s3) };
+        // SAFETY: See above.
+        let s4 = unsafe { load_sixteen(s4) };
+        // SAFETY: See above.
+        let s5 = unsafe { load_sixteen(s5) };
+        let positive = _mm256_add_epi16(
+            _mm256_add_epi16(s0, s5),
+            _mm256_mullo_epi16(_mm256_add_epi16(s2, s3), _mm256_set1_epi16(20)),
+        );
+        let negative = _mm256_mullo_epi16(_mm256_add_epi16(s1, s4), _mm256_set1_epi16(5));
+        let filtered = _mm256_srai_epi16::<5>(_mm256_add_epi16(
+            _mm256_sub_epi16(positive, negative),
+            _mm256_set1_epi16(16),
+        ));
+        let packed = _mm256_packus_epi16(filtered, _mm256_setzero_si256());
+        _mm_unpacklo_epi64(
+            _mm256_castsi256_si128(packed),
+            _mm256_extracti128_si256::<1>(packed),
+        )
+    }
+
+    debug_assert_eq!(prediction.width, 16);
+    let output_height = usize::from(prediction.height);
+    for output_y in 0..output_height {
+        let base = plane
+            .as_ptr()
+            .wrapping_add((reference_y + output_y) * stride + reference_x);
+        let half = if y_fraction == 0 {
+            // SAFETY: The validated window includes x - 2 through x + 18.
+            unsafe {
+                six_tap(
+                    base.wrapping_sub(2),
+                    base.wrapping_sub(1),
+                    base,
+                    base.wrapping_add(1),
+                    base.wrapping_add(2),
+                    base.wrapping_add(3),
+                )
+            }
+        } else {
+            // SAFETY: The validated window includes all six source rows.
+            unsafe {
+                six_tap(
+                    base.wrapping_sub(2 * stride),
+                    base.wrapping_sub(stride),
+                    base,
+                    base.wrapping_add(stride),
+                    base.wrapping_add(2 * stride),
+                    base.wrapping_add(3 * stride),
+                )
+            }
+        };
+        let fraction = if y_fraction == 0 {
+            x_fraction
+        } else {
+            y_fraction
+        };
+        let output = if fraction == 2 {
+            half
+        } else {
+            let integer = if fraction == 1 {
+                base
+            } else if y_fraction == 0 {
+                base.wrapping_add(1)
+            } else {
+                base.wrapping_add(stride)
+            };
+            // SAFETY: The integer row is part of the validated window.
+            let integer = unsafe { _mm_loadu_si128(integer.cast::<__m128i>()) };
+            _mm_avg_epu8(integer, half)
+        };
+        // SAFETY: Every luma row contains sixteen writable bytes.
+        unsafe {
+            _mm_storeu_si128(
+                prediction.luma[output_y].as_mut_ptr().cast::<__m128i>(),
+                output,
             );
         }
     }
@@ -1215,6 +1362,45 @@ mod tests {
                             "size={size} fraction=({x_fraction},{y_fraction}) x={x} y={y}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn axis_avx2_matches_per_sample_luma_interpolation() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        let plane: Vec<u8> = (0..40 * 40)
+            .map(|index| ((index * 73 + index / 11 * 29) & 0xff) as u8)
+            .collect();
+        for (x_fraction, y_fraction) in [(1, 0), (2, 0), (3, 0), (0, 1), (0, 2), (0, 3)] {
+            let mut prediction = InterPrediction420::empty();
+            prediction.width = 16;
+            prediction.height = 16;
+            // SAFETY: Runtime detection proves AVX2 support, and the
+            // reference position leaves the complete six-tap window inside
+            // this 40x40 plane.
+            unsafe {
+                predict_luma_axis_avx2(&mut prediction, &plane, 40, 8, 8, x_fraction, y_fraction);
+            }
+            for y in 0..16 {
+                for x in 0..16 {
+                    assert_eq!(
+                        prediction.luma[y][x],
+                        interpolate_luma_inner::<false>(
+                            &plane,
+                            40,
+                            40,
+                            8 + x as i32,
+                            8 + y as i32,
+                            x_fraction,
+                            y_fraction,
+                        ),
+                        "fraction=({x_fraction},{y_fraction}) x={x} y={y}"
+                    );
                 }
             }
         }
