@@ -101,7 +101,7 @@ pub enum ReferencePictureMarking {
     Adaptive(Vec<MemoryManagementOperation>),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct DeblockingFilter {
     /// Zero enables filtering, one disables it, and two enables filtering
     /// except across slice boundaries.

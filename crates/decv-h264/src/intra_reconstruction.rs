@@ -3,15 +3,16 @@
 use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 
+use crate::deblock::{MacroblockDeblockInfo, filter_intra_420_picture};
 use crate::rbsp::more_rbsp_data;
 use crate::{
-    ActiveParameterSets, CavlcNeighborState, ChromaPlane, DecodedIntraMacroblock,
-    EntropyCodingMode, H264Error, IntraLumaPrediction, IntraMacroblock, IntraModeState,
-    IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
+    ActiveParameterSets, CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedIntraMacroblock,
+    EntropyCodingMode, H264Error, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader,
+    IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
     MacroblockQuantizerState, ParsedSliceHeader, ReconstructedIntraResidual,
     ResolvedScalingLists4x4, Result, ScanMode, SliceType, Yuv420Picture,
-    consume_rbsp_trailing_bits, predict_intra_4x4, predict_intra_16x16, predict_intra_chroma_420,
-    reconstruct_intra_residual, resolve_scaling_lists_4x4,
+    consume_rbsp_trailing_bits, derive_chroma_qp, predict_intra_4x4, predict_intra_16x16,
+    predict_intra_chroma_420, reconstruct_intra_residual, resolve_scaling_lists_4x4,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -37,6 +38,7 @@ const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
 struct CompletedMacroblock {
     slice_id: u32,
     is_intra: bool,
+    deblock: MacroblockDeblockInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -48,6 +50,7 @@ struct IntraSliceConfig {
     chroma_cb_offset: i8,
     chroma_cr_offset: i8,
     transform_bypass_enabled: bool,
+    deblocking_filter: DeblockingFilter,
 }
 
 /// Reconstructs one progressively scanned intra picture in macroblock order.
@@ -155,6 +158,7 @@ impl IntraPictureReconstructor {
             chroma_cb_offset: pps.chroma_qp_index_offset,
             chroma_cr_offset: pps.second_chroma_qp_index_offset,
             transform_bypass_enabled: sps.qpprime_y_zero_transform_bypass,
+            deblocking_filter: header.deblocking_filter.unwrap_or_default(),
         };
         self.decode_cavlc_intra_slice_data(rbsp, config)
     }
@@ -182,6 +186,10 @@ impl IntraPictureReconstructor {
         )?;
         let mut macroblock_address = config.first_macroblock;
         let mut decoded_count = 0usize;
+        let pcm_chroma_qp = [
+            derive_chroma_qp(0, config.chroma_cb_offset),
+            derive_chroma_qp(0, config.chroma_cr_offset),
+        ];
         while more_rbsp_data(&reader) {
             if macroblock_address >= self.completed.len() {
                 return Err(H264Error::InvalidSyntax(
@@ -204,7 +212,14 @@ impl IntraPictureReconstructor {
                 IntraMacroblock::Pcm(_) => 0,
             };
             if let Err(error) = quantizers.with_macroblock(qp_delta, |quantizer| {
-                self.reconstruct_macroblock(macroblock_address, slice_id, &decoded, quantizer)
+                self.reconstruct_macroblock_with_deblocking(
+                    macroblock_address,
+                    slice_id,
+                    &decoded,
+                    quantizer,
+                    config.deblocking_filter,
+                    pcm_chroma_qp,
+                )
             }) {
                 self.cavlc
                     .restore_macroblock(macroblock_x, macroblock_y, cavlc_snapshot);
@@ -233,7 +248,35 @@ impl IntraPictureReconstructor {
         decoded: &DecodedIntraMacroblock,
         quantizer: MacroblockQuantizer,
     ) -> Result<()> {
+        self.reconstruct_macroblock_with_deblocking(
+            macroblock_address,
+            slice_id,
+            decoded,
+            quantizer,
+            DeblockingFilter::default(),
+            [0, 0],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reconstruct_macroblock_with_deblocking(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        decoded: &DecodedIntraMacroblock,
+        quantizer: MacroblockQuantizer,
+        deblocking_filter: DeblockingFilter,
+        pcm_chroma_qp: [u8; 2],
+    ) -> Result<()> {
         let (macroblock_x, macroblock_y) = self.validate_new_macroblock(macroblock_address)?;
+        let is_pcm = matches!(&decoded.macroblock, IntraMacroblock::Pcm(_));
+        let transform_8x8 = matches!(
+            &decoded.macroblock,
+            IntraMacroblock::Predicted(IntraMacroblockHeader {
+                luma_prediction: IntraLumaPrediction::EightByEight(_),
+                ..
+            })
+        );
         match &decoded.macroblock {
             IntraMacroblock::Pcm(pcm) => {
                 if decoded.residual.is_some() {
@@ -301,6 +344,22 @@ impl IntraPictureReconstructor {
         self.completed[macroblock_address] = Some(CompletedMacroblock {
             slice_id,
             is_intra: true,
+            deblock: MacroblockDeblockInfo {
+                slice_id,
+                luma_qp: if is_pcm { 0 } else { quantizer.luma },
+                cb_qp: if is_pcm {
+                    pcm_chroma_qp[0]
+                } else {
+                    quantizer.chroma_cb
+                },
+                cr_qp: if is_pcm {
+                    pcm_chroma_qp[1]
+                } else {
+                    quantizer.chroma_cr
+                },
+                transform_8x8,
+                filter: deblocking_filter,
+            },
         });
         Ok(())
     }
@@ -368,7 +427,7 @@ impl IntraPictureReconstructor {
     }
 
     pub fn into_nv12_frame(
-        self,
+        mut self,
         id: u64,
         pts: Option<MediaTime>,
         duration: Option<MediaTime>,
@@ -379,6 +438,16 @@ impl IntraPictureReconstructor {
                 "cannot output an incomplete reconstructed picture",
             ));
         }
+        let macroblocks = self
+            .completed
+            .iter()
+            .map(|macroblock| {
+                macroblock
+                    .expect("picture completeness was checked above")
+                    .deblock
+            })
+            .collect::<Vec<_>>();
+        filter_intra_420_picture(&mut self.picture, &macroblocks, self.width_in_macroblocks)?;
         self.picture.into_nv12_frame(id, pts, duration, format)
     }
 
@@ -612,9 +681,9 @@ mod tests {
 
     use super::{IntraPictureReconstructor, IntraSliceConfig};
     use crate::{
-        CodedBlockPattern, DecodedIntraMacroblock, IntraLumaPrediction, IntraMacroblock,
-        IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer,
-        PcmMacroblock, ResidualBlock, resolve_scaling_lists_4x4,
+        CodedBlockPattern, DeblockingFilter, DecodedIntraMacroblock, IntraLumaPrediction,
+        IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual,
+        MacroblockQuantizer, PcmMacroblock, ResidualBlock, resolve_scaling_lists_4x4,
     };
 
     const PREDICTED_MODE: IntraPredictionModeSyntax = IntraPredictionModeSyntax {
@@ -730,6 +799,7 @@ mod tests {
                     chroma_cb_offset: 0,
                     chroma_cr_offset: 0,
                     transform_bypass_enabled: false,
+                    deblocking_filter: DeblockingFilter::default(),
                 }
             ),
             Ok(1)

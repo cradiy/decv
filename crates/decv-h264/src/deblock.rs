@@ -5,7 +5,7 @@
 //! are deliberately kept separate: callers provide the already-derived
 //! boundary strength and the QPs on both sides of one edge.
 
-use crate::{H264Error, Result};
+use crate::{DeblockingFilter, H264Error, Result, Yuv420Picture};
 
 const ALPHA: [u8; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20,
@@ -48,6 +48,16 @@ pub struct DeblockEdgeSamples {
 pub struct FilteredDeblockEdge {
     pub p: [u8; 3],
     pub q: [u8; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MacroblockDeblockInfo {
+    pub slice_id: u32,
+    pub luma_qp: u8,
+    pub cb_qp: u8,
+    pub cr_qp: u8,
+    pub transform_8x8: bool,
+    pub filter: DeblockingFilter,
 }
 
 impl DeblockEdgeSamples {
@@ -168,6 +178,239 @@ pub fn filter_deblock_edge(
     Ok(FilteredDeblockEdge { p, q })
 }
 
+pub(crate) fn filter_intra_420_picture(
+    picture: &mut Yuv420Picture,
+    macroblocks: &[MacroblockDeblockInfo],
+    width_in_macroblocks: usize,
+) -> Result<()> {
+    let (width, height) = picture.dimensions();
+    if width_in_macroblocks == 0
+        || !width.is_multiple_of(16)
+        || !height.is_multiple_of(16)
+        || width / 16 != width_in_macroblocks
+        || macroblocks.len() != (width / 16) * (height / 16)
+    {
+        return Err(H264Error::InvalidSyntax(
+            "deblocking metadata does not match picture dimensions",
+        ));
+    }
+
+    let chroma_stride = width / 2;
+    let (luma, cb, cr) = picture.planes_mut();
+    for (address, &current) in macroblocks.iter().enumerate() {
+        let macroblock_x = address % width_in_macroblocks;
+        let macroblock_y = address / width_in_macroblocks;
+        if current.filter.idc == 1 {
+            continue;
+        }
+
+        let left = (macroblock_x > 0).then(|| macroblocks[address - 1]);
+        let top = (macroblock_y > 0).then(|| macroblocks[address - width_in_macroblocks]);
+        let filter_left = left.is_some_and(|neighbor| {
+            current.filter.idc != 2 || neighbor.slice_id == current.slice_id
+        });
+        let filter_top = top.is_some_and(|neighbor| {
+            current.filter.idc != 2 || neighbor.slice_id == current.slice_id
+        });
+
+        let luma_x = macroblock_x * 16;
+        let luma_y = macroblock_y * 16;
+        if filter_left {
+            filter_vertical_edge(
+                luma,
+                width,
+                luma_x,
+                luma_y,
+                16,
+                edge_parameters(
+                    left.expect("filter_left requires a neighbor"),
+                    current,
+                    4,
+                    0,
+                ),
+            )?;
+        }
+        for edge in [4, 8, 12] {
+            if edge == 8 || !current.transform_8x8 {
+                filter_vertical_edge(
+                    luma,
+                    width,
+                    luma_x + edge,
+                    luma_y,
+                    16,
+                    edge_parameters(current, current, 3, 0),
+                )?;
+            }
+        }
+        if filter_top {
+            filter_horizontal_edge(
+                luma,
+                width,
+                luma_x,
+                luma_y,
+                16,
+                edge_parameters(top.expect("filter_top requires a neighbor"), current, 4, 0),
+            )?;
+        }
+        for edge in [4, 8, 12] {
+            if edge == 8 || !current.transform_8x8 {
+                filter_horizontal_edge(
+                    luma,
+                    width,
+                    luma_x,
+                    luma_y + edge,
+                    16,
+                    edge_parameters(current, current, 3, 0),
+                )?;
+            }
+        }
+
+        let chroma_x = macroblock_x * 8;
+        let chroma_y = macroblock_y * 8;
+        for (plane, component) in [(&mut *cb, 1), (&mut *cr, 2)] {
+            if filter_left {
+                filter_vertical_edge(
+                    plane,
+                    chroma_stride,
+                    chroma_x,
+                    chroma_y,
+                    8,
+                    edge_parameters(
+                        left.expect("filter_left requires a neighbor"),
+                        current,
+                        4,
+                        component,
+                    ),
+                )?;
+            }
+            filter_vertical_edge(
+                plane,
+                chroma_stride,
+                chroma_x + 4,
+                chroma_y,
+                8,
+                edge_parameters(current, current, 3, component),
+            )?;
+            if filter_top {
+                filter_horizontal_edge(
+                    plane,
+                    chroma_stride,
+                    chroma_x,
+                    chroma_y,
+                    8,
+                    edge_parameters(
+                        top.expect("filter_top requires a neighbor"),
+                        current,
+                        4,
+                        component,
+                    ),
+                )?;
+            }
+            filter_horizontal_edge(
+                plane,
+                chroma_stride,
+                chroma_x,
+                chroma_y + 4,
+                8,
+                edge_parameters(current, current, 3, component),
+            )?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EdgeParameters {
+    boundary_strength: u8,
+    qp_p: u8,
+    qp_q: u8,
+    alpha_offset_div2: i8,
+    beta_offset_div2: i8,
+    chroma_style: bool,
+}
+
+fn edge_parameters(
+    previous: MacroblockDeblockInfo,
+    current: MacroblockDeblockInfo,
+    boundary_strength: u8,
+    component: u8,
+) -> EdgeParameters {
+    let qp = |macroblock: MacroblockDeblockInfo| match component {
+        0 => macroblock.luma_qp,
+        1 => macroblock.cb_qp,
+        _ => macroblock.cr_qp,
+    };
+    EdgeParameters {
+        boundary_strength,
+        qp_p: qp(previous),
+        qp_q: qp(current),
+        alpha_offset_div2: current.filter.alpha_c0_offset_div2,
+        beta_offset_div2: current.filter.beta_offset_div2,
+        chroma_style: component != 0,
+    }
+}
+
+fn filter_vertical_edge(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    length: usize,
+    parameters: EdgeParameters,
+) -> Result<()> {
+    for offset in 0..length {
+        let q0 = (y + offset) * stride + x;
+        let samples = DeblockEdgeSamples {
+            p: std::array::from_fn(|index| plane[q0 - index - 1]),
+            q: std::array::from_fn(|index| plane[q0 + index]),
+        };
+        let filtered = apply_parameters(samples, parameters)?;
+        for index in 0..3 {
+            plane[q0 - index - 1] = filtered.p[index];
+            plane[q0 + index] = filtered.q[index];
+        }
+    }
+    Ok(())
+}
+
+fn filter_horizontal_edge(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    length: usize,
+    parameters: EdgeParameters,
+) -> Result<()> {
+    for offset in 0..length {
+        let q0 = y * stride + x + offset;
+        let samples = DeblockEdgeSamples {
+            p: std::array::from_fn(|index| plane[q0 - (index + 1) * stride]),
+            q: std::array::from_fn(|index| plane[q0 + index * stride]),
+        };
+        let filtered = apply_parameters(samples, parameters)?;
+        for index in 0..3 {
+            plane[q0 - (index + 1) * stride] = filtered.p[index];
+            plane[q0 + index * stride] = filtered.q[index];
+        }
+    }
+    Ok(())
+}
+
+fn apply_parameters(
+    samples: DeblockEdgeSamples,
+    parameters: EdgeParameters,
+) -> Result<FilteredDeblockEdge> {
+    filter_deblock_edge(
+        samples,
+        parameters.boundary_strength,
+        parameters.qp_p,
+        parameters.qp_q,
+        parameters.alpha_offset_div2,
+        parameters.beta_offset_div2,
+        parameters.chroma_style,
+    )
+}
+
 fn validate_inputs(
     boundary_strength: u8,
     qp_p: u8,
@@ -198,13 +441,33 @@ fn clip_sample(value: i16) -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ALPHA, BETA, DeblockEdgeSamples, FilteredDeblockEdge, TC0, filter_deblock_edge};
-    use crate::H264Error;
+    use decv_core::Size;
+
+    use super::{
+        ALPHA, BETA, DeblockEdgeSamples, FilteredDeblockEdge, MacroblockDeblockInfo, TC0,
+        filter_deblock_edge, filter_intra_420_picture,
+    };
+    use crate::{DeblockingFilter, H264Error, Yuv420Picture};
 
     const SMOOTH_EDGE: DeblockEdgeSamples = DeblockEdgeSamples {
         p: [100, 99, 98, 97],
         q: [110, 111, 112, 113],
     };
+
+    fn macroblock(slice_id: u32, idc: u8) -> MacroblockDeblockInfo {
+        MacroblockDeblockInfo {
+            slice_id,
+            luma_qp: 40,
+            cb_qp: 40,
+            cr_qp: 40,
+            transform_8x8: false,
+            filter: DeblockingFilter {
+                idc,
+                alpha_c0_offset_div2: 0,
+                beta_offset_div2: 0,
+            },
+        }
+    }
 
     #[test]
     fn normative_threshold_tables_have_expected_boundaries() {
@@ -288,5 +551,43 @@ mod tests {
         );
         assert!(filter_deblock_edge(SMOOTH_EDGE, 1, 52, 40, 0, 0, false).is_err());
         assert!(filter_deblock_edge(SMOOTH_EDGE, 1, 40, 40, 7, 0, false).is_err());
+    }
+
+    #[test]
+    fn filters_intra_macroblock_boundaries_in_place() {
+        let mut picture = Yuv420Picture::new(Size::new(32, 16)).unwrap();
+        let (luma, cb, cr) = picture.planes_mut();
+        for row in luma.chunks_exact_mut(32) {
+            row[..16].fill(100);
+            row[16..].fill(110);
+        }
+        for plane in [cb, cr] {
+            for row in plane.chunks_exact_mut(16) {
+                row[..8].fill(100);
+                row[8..].fill(110);
+            }
+        }
+
+        filter_intra_420_picture(&mut picture, &[macroblock(1, 0), macroblock(1, 0)], 2).unwrap();
+
+        let (luma, cb, cr) = picture.planes_mut();
+        assert_eq!(&luma[12..20], &[100, 101, 103, 104, 106, 108, 109, 110]);
+        assert_eq!(&cb[4..12], &[100, 100, 100, 103, 108, 110, 110, 110]);
+        assert_eq!(&cr[4..12], &[100, 100, 100, 103, 108, 110, 110, 110]);
+    }
+
+    #[test]
+    fn idc_two_preserves_edges_between_slices() {
+        let mut picture = Yuv420Picture::new(Size::new(32, 16)).unwrap();
+        let (luma, _, _) = picture.planes_mut();
+        for row in luma.chunks_exact_mut(32) {
+            row[..16].fill(100);
+            row[16..].fill(110);
+        }
+
+        filter_intra_420_picture(&mut picture, &[macroblock(1, 0), macroblock(2, 2)], 2).unwrap();
+
+        let (luma, _, _) = picture.planes_mut();
+        assert_eq!(&luma[12..20], &[100, 100, 100, 100, 110, 110, 110, 110]);
     }
 }

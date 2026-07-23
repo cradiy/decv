@@ -84,6 +84,16 @@ impl Yuv420Picture {
         self.coded_size
     }
 
+    #[inline]
+    pub(crate) const fn dimensions(&self) -> (usize, usize) {
+        (self.width, self.height)
+    }
+
+    #[inline]
+    pub(crate) fn planes_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
+        (&mut self.luma, &mut self.cb, &mut self.cr)
+    }
+
     pub fn intra4x4_references(
         &self,
         x: usize,
