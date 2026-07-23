@@ -6,3 +6,10 @@ edition = "2024"
 [dependencies]
 bit-readers = { path = "../bit-readers" }
 decv-core = { path = "../decv-core" }
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "cavlc"
+harness = false

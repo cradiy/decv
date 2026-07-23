@@ -8,8 +8,10 @@ use crate::{H264Error, Result};
 mod tables;
 
 use tables::{
-    COEFF_TOKEN_0_TO_1, COEFF_TOKEN_2_TO_3, COEFF_TOKEN_4_TO_7, COEFF_TOKEN_CHROMA_DC_420,
-    RUN_BEFORE_SMALL, TOTAL_ZEROS_4X4, TOTAL_ZEROS_CHROMA_DC_420, VlcCode, VlcEntry,
+    COEFF_TOKEN_0_TO_1, COEFF_TOKEN_0_TO_1_LOOKUP, COEFF_TOKEN_2_TO_3, COEFF_TOKEN_2_TO_3_LOOKUP,
+    COEFF_TOKEN_4_TO_7, COEFF_TOKEN_4_TO_7_LOOKUP, COEFF_TOKEN_CHROMA_DC_420,
+    COEFF_TOKEN_CHROMA_DC_420_LOOKUP, COEFF_TOKEN_LOOKUP_BITS, RUN_BEFORE_SMALL, TOTAL_ZEROS_4X4,
+    TOTAL_ZEROS_CHROMA_DC_420, VlcCode, VlcEntry,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,15 +56,19 @@ pub fn decode_coeff_token(
     let token = match context {
         CoeffTokenContext::NeighborTotal(n_c) if n_c >= 8 => decode_fixed_coeff_token(&mut probe)?,
         CoeffTokenContext::NeighborTotal(n_c) => {
-            let table = match n_c {
-                0..=1 => COEFF_TOKEN_0_TO_1,
-                2..=3 => COEFF_TOKEN_2_TO_3,
-                4..=7 => COEFF_TOKEN_4_TO_7,
+            let (table, lookup) = match n_c {
+                0..=1 => (COEFF_TOKEN_0_TO_1, &COEFF_TOKEN_0_TO_1_LOOKUP),
+                2..=3 => (COEFF_TOKEN_2_TO_3, &COEFF_TOKEN_2_TO_3_LOOKUP),
+                4..=7 => (COEFF_TOKEN_4_TO_7, &COEFF_TOKEN_4_TO_7_LOOKUP),
                 _ => unreachable!("u8 context is covered by the ranges above"),
             };
-            decode_vlc(&mut probe, table)?
+            decode_vlc(&mut probe, table, lookup)?
         }
-        CoeffTokenContext::ChromaDc420 => decode_vlc(&mut probe, COEFF_TOKEN_CHROMA_DC_420)?,
+        CoeffTokenContext::ChromaDc420 => decode_vlc(
+            &mut probe,
+            COEFF_TOKEN_CHROMA_DC_420,
+            &COEFF_TOKEN_CHROMA_DC_420_LOOKUP,
+        )?,
     };
 
     if token.total_coeff > max_num_coeff || token.trailing_ones > token.total_coeff.min(3) {
@@ -140,7 +146,24 @@ fn decode_fixed_coeff_token(reader: &mut BitReader<'_>) -> Result<CoeffToken> {
     })
 }
 
-fn decode_vlc(reader: &mut BitReader<'_>, table: &[VlcEntry]) -> Result<CoeffToken> {
+fn decode_vlc(
+    reader: &mut BitReader<'_>,
+    table: &[VlcEntry],
+    lookup: &[u16],
+) -> Result<CoeffToken> {
+    if let Some(prefix) = reader.peek_bits(COEFF_TOKEN_LOOKUP_BITS) {
+        let packed = lookup[prefix as usize];
+        if packed != 0 {
+            let length = packed & 0x1f;
+            let skipped = reader.skip_bits(usize::from(length));
+            debug_assert!(skipped);
+            return Ok(CoeffToken {
+                total_coeff: ((packed >> 5) & 0x1f) as u8,
+                trailing_ones: ((packed >> 10) & 0x03) as u8,
+            });
+        }
+    }
+
     let mut bits = 0u16;
     for length in 1..=16 {
         bits = (bits << 1) | u16::from(reader.read_bit().ok_or(H264Error::UnexpectedEof)?);
@@ -313,6 +336,18 @@ fn decode_code_index(
     invalid_syntax: &'static str,
 ) -> Result<u8> {
     let max_length = table.iter().map(|code| code.length).max().unwrap_or(0);
+    if let Some(window) = reader.peek_bits(u32::from(max_length)) {
+        for (value, code) in table.iter().enumerate() {
+            let prefix = window >> (max_length - code.length);
+            if prefix == u32::from(code.bits) {
+                let skipped = reader.skip_bits(usize::from(code.length));
+                debug_assert!(skipped);
+                return u8::try_from(value).map_err(|_| H264Error::IntegerOverflow);
+            }
+        }
+        return Err(H264Error::InvalidSyntax(invalid_syntax));
+    }
+
     let mut bits = 0u16;
     for length in 1..=max_length {
         bits = (bits << 1) | u16::from(reader.read_bit().ok_or(H264Error::UnexpectedEof)?);
@@ -651,7 +686,8 @@ mod tests {
     }
 
     fn code_bytes(bits: u16, length: u8) -> Vec<u8> {
-        let bits = format!("{bits:0width$b}", width = usize::from(length));
+        let mut bits = format!("{bits:0width$b}", width = usize::from(length));
+        bits.push_str(&"0".repeat(16usize.saturating_sub(bits.len())));
         bit_string(&bits)
     }
 }

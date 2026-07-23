@@ -17,6 +17,32 @@ impl VlcEntry {
     }
 }
 
+pub(super) const COEFF_TOKEN_LOOKUP_BITS: u32 = 12;
+pub(super) const COEFF_TOKEN_LOOKUP_SIZE: usize = 1 << COEFF_TOKEN_LOOKUP_BITS;
+
+const fn build_coeff_token_lookup(table: &[VlcEntry]) -> [u16; COEFF_TOKEN_LOOKUP_SIZE] {
+    let mut lookup = [0u16; COEFF_TOKEN_LOOKUP_SIZE];
+    let mut entry_index = 0;
+    while entry_index < table.len() {
+        let entry = table[entry_index];
+        if (entry.length as u32) <= COEFF_TOKEN_LOOKUP_BITS {
+            let suffix_bits = COEFF_TOKEN_LOOKUP_BITS - entry.length as u32;
+            let start = (entry.bits as usize) << suffix_bits;
+            let end = start + (1usize << suffix_bits);
+            let packed = entry.length as u16
+                | ((entry.total_coeff as u16) << 5)
+                | ((entry.trailing_ones as u16) << 10);
+            let mut lookup_index = start;
+            while lookup_index < end {
+                lookup[lookup_index] = packed;
+                lookup_index += 1;
+            }
+        }
+        entry_index += 1;
+    }
+    lookup
+}
+
 pub(super) const COEFF_TOKEN_0_TO_1: &[VlcEntry] = &[
     VlcEntry::new(0b1, 1, 0, 0),
     VlcEntry::new(0b000101, 6, 1, 0),
@@ -228,6 +254,15 @@ pub(super) const COEFF_TOKEN_CHROMA_DC_420: &[VlcEntry] = &[
     VlcEntry::new(0b00000010, 8, 4, 2),
     VlcEntry::new(0b0000000, 7, 4, 3),
 ];
+
+pub(super) const COEFF_TOKEN_0_TO_1_LOOKUP: [u16; COEFF_TOKEN_LOOKUP_SIZE] =
+    build_coeff_token_lookup(COEFF_TOKEN_0_TO_1);
+pub(super) const COEFF_TOKEN_2_TO_3_LOOKUP: [u16; COEFF_TOKEN_LOOKUP_SIZE] =
+    build_coeff_token_lookup(COEFF_TOKEN_2_TO_3);
+pub(super) const COEFF_TOKEN_4_TO_7_LOOKUP: [u16; COEFF_TOKEN_LOOKUP_SIZE] =
+    build_coeff_token_lookup(COEFF_TOKEN_4_TO_7);
+pub(super) const COEFF_TOKEN_CHROMA_DC_420_LOOKUP: [u16; COEFF_TOKEN_LOOKUP_SIZE] =
+    build_coeff_token_lookup(COEFF_TOKEN_CHROMA_DC_420);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct VlcCode {
