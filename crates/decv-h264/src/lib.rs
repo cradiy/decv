@@ -27,6 +27,10 @@ pub use cavlc::{
 };
 pub use decoder::{H264StreamParser, ParserEvent};
 pub use error::{H264Error, Result};
+pub use macroblock::{
+    CodedBlockPattern, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader,
+    IntraPredictionModeSyntax, PcmMacroblock, parse_cavlc_intra_macroblock,
+};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
 pub use picture::{FieldOrderCount, PictureOrderCount, PictureOrderCountState};
