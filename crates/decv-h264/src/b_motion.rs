@@ -267,7 +267,7 @@ impl BMotionState {
                     list0,
                     list1,
                 };
-                fill_partition_cells(&mut local, slice_id, partition)?;
+                fill_direct_partition_cells(&mut local, slice_id, partition);
                 partitions.push(partition);
             }
         }
@@ -1131,6 +1131,31 @@ fn fill_partition_cells(
         }
     }
     Ok(())
+}
+
+/// Records a partition produced by the Direct grid derivation.
+///
+/// Unlike syntax-provided explicit partitions, Direct partitions are generated
+/// internally on a regular 4x4 or 8x8 grid, so bounds and overlap have already
+/// been established by construction.
+#[inline]
+fn fill_direct_partition_cells(
+    cells: &mut [Option<MotionCell>; 16],
+    slice_id: u32,
+    partition: ResolvedBPartition,
+) {
+    let cell = Some(MotionCell {
+        slice_id,
+        list0: partition.list0,
+        list1: partition.list1,
+    });
+    let start_x = usize::from(partition.x / 4);
+    let end_x = start_x + usize::from(partition.width / 4);
+    let start_y = usize::from(partition.y / 4);
+    let end_y = start_y + usize::from(partition.height / 4);
+    for y in start_y..end_y {
+        cells[y * 4 + start_x..y * 4 + end_x].fill(cell);
+    }
 }
 
 fn add_motion_vector_difference(
