@@ -676,6 +676,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   with per-reference luma/Cb/Cr weights, normative rounding and clipping,
   per-partition List-0 selection, complete coverage validation, and saturating
   prediction-plus-residual writes;
+- transactional unweighted B macroblock pixel reconstruction with independent
+  per-partition List-0/List-1 selection, rounded bidirectional averaging,
+  complete coverage validation, and prediction-plus-residual writes;
 - an `Arc`-backed progressive reference-picture DPB subset with IDR reset,
   default P List-0 PicNum ordering, frame-number wrap handling, long-term IDR
   index zero, and sliding-window short-term eviction;

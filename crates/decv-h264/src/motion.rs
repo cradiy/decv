@@ -37,6 +37,28 @@ pub struct ResolvedPMacroblock {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedBListMotion {
+    pub reference_index: u8,
+    pub motion_vector: MotionVector,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedBPartition {
+    pub x: u8,
+    pub y: u8,
+    pub width: u8,
+    pub height: u8,
+    pub list0: Option<ResolvedBListMotion>,
+    pub list1: Option<ResolvedBListMotion>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedBMacroblock {
+    pub direct: bool,
+    pub partitions: Vec<ResolvedBPartition>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MotionKind {
     Intra,
     Inter {

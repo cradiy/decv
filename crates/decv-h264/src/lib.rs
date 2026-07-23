@@ -43,8 +43,8 @@ pub use dpb::{
 pub use error::{H264Error, Result};
 pub use inter_prediction::InterPrediction420;
 pub use inter_reconstruction::{
-    reconstruct_p_macroblock_420, reconstruct_p_macroblock_from_list_420,
-    reconstruct_weighted_p_macroblock_from_list_420,
+    reconstruct_b_macroblock_from_lists_420, reconstruct_p_macroblock_420,
+    reconstruct_p_macroblock_from_list_420, reconstruct_weighted_p_macroblock_from_list_420,
 };
 pub use intra_modes::IntraModeState;
 pub use intra_reconstruction::IntraPictureReconstructor;
@@ -58,7 +58,10 @@ pub use macroblock::{
     parse_cavlc_b_macroblock, parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run,
     parse_cavlc_p_macroblock,
 };
-pub use motion::{MotionVector, PMotionState, ResolvedPMacroblock, ResolvedPPartition};
+pub use motion::{
+    MotionVector, PMotionState, ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition,
+    ResolvedPMacroblock, ResolvedPPartition,
+};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
 pub use picture::{FieldOrderCount, PictureOrderCount, PictureOrderCountState};

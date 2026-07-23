@@ -2,7 +2,8 @@
 
 use crate::{
     H264Error, InterPrediction420, PredictionWeightTable, ReconstructedInterResidual,
-    ReconstructedLumaResidual, ResolvedPMacroblock, Result, WeightOffset, Yuv420Picture,
+    ReconstructedLumaResidual, ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition,
+    ResolvedPMacroblock, ResolvedPPartition, Result, WeightOffset, Yuv420Picture,
 };
 
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
@@ -23,6 +24,14 @@ const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
     (2, 3),
     (3, 3),
 ];
+
+type LumaResidualSamples = [[i32; 16]; 16];
+type ChromaResidualSamples = [[i32; 8]; 8];
+type MacroblockResidualSamples = (
+    LumaResidualSamples,
+    ChromaResidualSamples,
+    ChromaResidualSamples,
+);
 
 /// Reconstructs one progressive 8-bit 4:2:0 P macroblock using default
 /// (unweighted) List-0 prediction.
@@ -126,6 +135,191 @@ pub(crate) fn reconstruct_weighted_p_skip_macroblock_from_list_420(
     )
 }
 
+/// Reconstructs one progressive 8-bit 4:2:0 B macroblock with default
+/// unweighted List-0, List-1, or bidirectional prediction.
+///
+/// Bidirectional samples use the normative rounded average `(p0 + p1 + 1) >>
+/// 1`. All prediction and coverage validation completes before the current
+/// picture is modified.
+pub fn reconstruct_b_macroblock_from_lists_420(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: &ReconstructedInterResidual,
+) -> Result<()> {
+    let luma_x = macroblock_x
+        .checked_mul(16)
+        .ok_or(H264Error::IntegerOverflow)?;
+    let luma_y = macroblock_y
+        .checked_mul(16)
+        .ok_or(H264Error::IntegerOverflow)?;
+    let (width, height) = current.dimensions();
+    if luma_x.checked_add(16).is_none_or(|right| right > width)
+        || luma_y.checked_add(16).is_none_or(|bottom| bottom > height)
+    {
+        return Err(H264Error::InvalidSyntax(
+            "B macroblock lies outside the current picture",
+        ));
+    }
+
+    let mut predicted_luma = [[0u8; 16]; 16];
+    let mut predicted_cb = [[0u8; 8]; 8];
+    let mut predicted_cr = [[0u8; 8]; 8];
+    let mut covered = [[false; 4]; 4];
+    for partition in &motion.partitions {
+        let prediction_l0 = predict_b_partition_list(
+            references_l0,
+            current.coded_size(),
+            macroblock_x,
+            macroblock_y,
+            *partition,
+            partition.list0,
+            "B partition selects no reference picture in List 0",
+        )?;
+        let prediction_l1 = predict_b_partition_list(
+            references_l1,
+            current.coded_size(),
+            macroblock_x,
+            macroblock_y,
+            *partition,
+            partition.list1,
+            "B partition selects no reference picture in List 1",
+        )?;
+        let prediction = merge_b_predictions(prediction_l0, prediction_l1)?;
+        for y in 0..usize::from(partition.height) {
+            let destination = &mut predicted_luma[usize::from(partition.y) + y]
+                [usize::from(partition.x)..usize::from(partition.x + partition.width)];
+            destination.copy_from_slice(&prediction.luma[y][..usize::from(partition.width)]);
+        }
+        for y in 0..usize::from(partition.height / 2) {
+            let start = usize::from(partition.x / 2);
+            let end = usize::from((partition.x + partition.width) / 2);
+            predicted_cb[usize::from(partition.y / 2) + y][start..end]
+                .copy_from_slice(&prediction.cb[y][..usize::from(partition.width / 2)]);
+            predicted_cr[usize::from(partition.y / 2) + y][start..end]
+                .copy_from_slice(&prediction.cr[y][..usize::from(partition.width / 2)]);
+        }
+        for y in (partition.y..partition.y + partition.height).step_by(4) {
+            for x in (partition.x..partition.x + partition.width).step_by(4) {
+                let cell = covered
+                    .get_mut(usize::from(y / 4))
+                    .and_then(|row| row.get_mut(usize::from(x / 4)))
+                    .ok_or(H264Error::InvalidSyntax(
+                        "B prediction partition exceeds the macroblock",
+                    ))?;
+                if *cell {
+                    return Err(H264Error::InvalidSyntax("B prediction partitions overlap"));
+                }
+                *cell = true;
+            }
+        }
+    }
+    if covered.iter().flatten().any(|covered| !covered) {
+        return Err(H264Error::InvalidSyntax(
+            "B prediction partitions do not cover the macroblock",
+        ));
+    }
+
+    let (residual_luma, residual_cb, residual_cr) = assemble_residual(residual);
+    let chroma_x = macroblock_x * 8;
+    let chroma_y = macroblock_y * 8;
+    let chroma_stride = width / 2;
+    let (luma, cb, cr) = current.planes_mut();
+    add_prediction_and_residual(luma, width, luma_x, luma_y, &predicted_luma, &residual_luma);
+    add_prediction_and_residual(
+        cb,
+        chroma_stride,
+        chroma_x,
+        chroma_y,
+        &predicted_cb,
+        &residual_cb,
+    );
+    add_prediction_and_residual(
+        cr,
+        chroma_stride,
+        chroma_x,
+        chroma_y,
+        &predicted_cr,
+        &residual_cr,
+    );
+    Ok(())
+}
+
+fn predict_b_partition_list(
+    references: &[Option<&Yuv420Picture>],
+    expected_size: decv_core::Size,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    partition: ResolvedBPartition,
+    list_motion: Option<ResolvedBListMotion>,
+    missing_reference: &'static str,
+) -> Result<Option<InterPrediction420>> {
+    let Some(list_motion) = list_motion else {
+        return Ok(None);
+    };
+    let reference = references
+        .get(usize::from(list_motion.reference_index))
+        .copied()
+        .flatten()
+        .ok_or(H264Error::InvalidSyntax(missing_reference))?;
+    if reference.coded_size() != expected_size {
+        return Err(H264Error::InvalidSyntax(
+            "B reference picture coded size does not match",
+        ));
+    }
+    Ok(Some(reference.predict_inter_420(
+        macroblock_x,
+        macroblock_y,
+        ResolvedPPartition {
+            x: partition.x,
+            y: partition.y,
+            width: partition.width,
+            height: partition.height,
+            reference_index: list_motion.reference_index,
+            motion_vector: list_motion.motion_vector,
+        },
+    )?))
+}
+
+fn merge_b_predictions(
+    list0: Option<InterPrediction420>,
+    list1: Option<InterPrediction420>,
+) -> Result<InterPrediction420> {
+    match (list0, list1) {
+        (Some(prediction), None) | (None, Some(prediction)) => Ok(prediction),
+        (Some(mut list0), Some(list1)) => {
+            if list0.width != list1.width || list0.height != list1.height {
+                return Err(H264Error::InvalidSyntax(
+                    "bidirectional prediction dimensions do not match",
+                ));
+            }
+            for y in 0..usize::from(list0.height) {
+                for x in 0..usize::from(list0.width) {
+                    list0.luma[y][x] = rounded_average(list0.luma[y][x], list1.luma[y][x]);
+                }
+            }
+            for y in 0..usize::from(list0.height / 2) {
+                for x in 0..usize::from(list0.width / 2) {
+                    list0.cb[y][x] = rounded_average(list0.cb[y][x], list1.cb[y][x]);
+                    list0.cr[y][x] = rounded_average(list0.cr[y][x], list1.cr[y][x]);
+                }
+            }
+            Ok(list0)
+        }
+        (None, None) => Err(H264Error::InvalidSyntax(
+            "B partition uses neither reference list",
+        )),
+    }
+}
+
+#[inline]
+fn rounded_average(left: u8, right: u8) -> u8 {
+    ((u16::from(left) + u16::from(right) + 1) >> 1) as u8
+}
+
 fn reconstruct_p_macroblock_from_list_inner(
     current: &mut Yuv420Picture,
     references_l0: &[Option<&Yuv420Picture>],
@@ -200,38 +394,10 @@ fn reconstruct_p_macroblock_from_list_inner(
         ));
     }
 
-    let mut residual_luma = [[0i32; 16]; 16];
-    let mut residual_cb = [[0i32; 8]; 8];
-    let mut residual_cr = [[0i32; 8]; 8];
-    if let Some(residual) = residual {
-        match &residual.luma {
-            ReconstructedLumaResidual::FourByFour(blocks) => {
-                for (index, block) in blocks.iter().enumerate() {
-                    let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
-                    copy_residual_block(&mut residual_luma, block_x * 4, block_y * 4, block);
-                }
-            }
-            ReconstructedLumaResidual::EightByEight(blocks) => {
-                for (index, block) in blocks.iter().enumerate() {
-                    copy_residual_block(&mut residual_luma, index % 2 * 8, index / 2 * 8, block);
-                }
-            }
-        }
-        for index in 0..4 {
-            copy_residual_block(
-                &mut residual_cb,
-                index % 2 * 4,
-                index / 2 * 4,
-                &residual.chroma_cb[index],
-            );
-            copy_residual_block(
-                &mut residual_cr,
-                index % 2 * 4,
-                index / 2 * 4,
-                &residual.chroma_cr[index],
-            );
-        }
-    }
+    let (residual_luma, residual_cb, residual_cr) = residual.map_or_else(
+        || ([[0; 16]; 16], [[0; 8]; 8], [[0; 8]; 8]),
+        assemble_residual,
+    );
 
     let chroma_x = macroblock_x * 8;
     let chroma_y = macroblock_y * 8;
@@ -255,6 +421,40 @@ fn reconstruct_p_macroblock_from_list_inner(
         &residual_cr,
     );
     Ok(())
+}
+
+fn assemble_residual(residual: &ReconstructedInterResidual) -> MacroblockResidualSamples {
+    let mut residual_luma = [[0i32; 16]; 16];
+    let mut residual_cb = [[0i32; 8]; 8];
+    let mut residual_cr = [[0i32; 8]; 8];
+    match &residual.luma {
+        ReconstructedLumaResidual::FourByFour(blocks) => {
+            for (index, block) in blocks.iter().enumerate() {
+                let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
+                copy_residual_block(&mut residual_luma, block_x * 4, block_y * 4, block);
+            }
+        }
+        ReconstructedLumaResidual::EightByEight(blocks) => {
+            for (index, block) in blocks.iter().enumerate() {
+                copy_residual_block(&mut residual_luma, index % 2 * 8, index / 2 * 8, block);
+            }
+        }
+    }
+    for index in 0..4 {
+        copy_residual_block(
+            &mut residual_cb,
+            index % 2 * 4,
+            index / 2 * 4,
+            &residual.chroma_cb[index],
+        );
+        copy_residual_block(
+            &mut residual_cr,
+            index % 2 * 4,
+            index / 2 * 4,
+            &residual.chroma_cr[index],
+        );
+    }
+    (residual_luma, residual_cb, residual_cr)
 }
 
 fn apply_prediction_weights(
@@ -386,6 +586,31 @@ mod tests {
         }
     }
 
+    fn b_list(reference_index: u8) -> ResolvedBListMotion {
+        ResolvedBListMotion {
+            reference_index,
+            motion_vector: MotionVector::default(),
+        }
+    }
+
+    fn b_partition(
+        x: u8,
+        y: u8,
+        width: u8,
+        height: u8,
+        list0: Option<ResolvedBListMotion>,
+        list1: Option<ResolvedBListMotion>,
+    ) -> ResolvedBPartition {
+        ResolvedBPartition {
+            x,
+            y,
+            width,
+            height,
+            list0,
+            list1,
+        }
+    }
+
     #[test]
     fn reconstructs_prediction_plus_residual_with_clipping() {
         let reference = picture(40);
@@ -498,6 +723,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(defaulted, reference);
+    }
+
+    #[test]
+    fn reconstructs_list0_list1_and_default_bipred_partitions() {
+        let first = picture(20);
+        let second = picture(80);
+        let mut current = picture(0);
+        reconstruct_b_macroblock_from_lists_420(
+            &mut current,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions: vec![
+                    b_partition(0, 0, 8, 8, Some(b_list(0)), None),
+                    b_partition(8, 0, 8, 8, None, Some(b_list(0))),
+                    b_partition(0, 8, 16, 8, Some(b_list(0)), Some(b_list(0))),
+                ],
+            },
+            &zero_residual(),
+        )
+        .unwrap();
+        let (luma, cb, cr) = current.planes();
+        assert_eq!((luma[0], luma[8], luma[8 * 16]), (20, 80, 50));
+        assert_eq!((cb[0], cb[4], cb[4 * 8]), (21, 81, 51));
+        assert_eq!(cr[4 * 8], 52);
+        assert_eq!(rounded_average(20, 81), 51);
+    }
+
+    #[test]
+    fn adds_residual_after_bidirectional_prediction() {
+        let first = picture(20);
+        let second = picture(80);
+        let mut current = picture(0);
+        let mut residual = zero_residual();
+        let ReconstructedLumaResidual::FourByFour(blocks) = &mut residual.luma else {
+            unreachable!()
+        };
+        blocks[0] = [[10; 4]; 4];
+        reconstruct_b_macroblock_from_lists_420(
+            &mut current,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions: vec![b_partition(0, 0, 16, 16, Some(b_list(0)), Some(b_list(0)))],
+            },
+            &residual,
+        )
+        .unwrap();
+        assert_eq!((current.planes().0[0], current.planes().0[4]), (60, 50));
+    }
+
+    #[test]
+    fn b_validation_failure_leaves_current_picture_unchanged() {
+        let reference = picture(20);
+        let mut current = picture(7);
+        let before = current.clone();
+        let result = reconstruct_b_macroblock_from_lists_420(
+            &mut current,
+            &[Some(&reference)],
+            &[Some(&reference)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions: vec![b_partition(0, 0, 16, 16, None, None)],
+            },
+            &zero_residual(),
+        );
+        assert!(matches!(result, Err(H264Error::InvalidSyntax(_))));
+        assert_eq!(current, before);
     }
 
     #[test]
