@@ -360,7 +360,7 @@ pub(crate) fn filter_420_picture(
                 }
             }
         }
-        if filter_top {
+        if filter_top && horizontal_strengths[0] != [0; 4] {
             for block_column in 0..4 {
                 filter_horizontal_edge(
                     luma,
@@ -374,7 +374,9 @@ pub(crate) fn filter_420_picture(
             }
         }
         for block_row in 1..4 {
-            if block_row == 2 || !current.transform_8x8 {
+            if (block_row == 2 || !current.transform_8x8)
+                && horizontal_strengths[block_row] != [0; 4]
+            {
                 for block_column in 0..4 {
                     filter_horizontal_edge(
                         luma,
@@ -418,7 +420,7 @@ pub(crate) fn filter_420_picture(
                     );
                 }
             }
-            if filter_top {
+            if filter_top && horizontal_strengths[0] != [0; 4] {
                 for block_column in 0..4 {
                     filter_horizontal_edge(
                         plane,
@@ -431,16 +433,18 @@ pub(crate) fn filter_420_picture(
                     );
                 }
             }
-            for block_column in 0..4 {
-                filter_horizontal_edge(
-                    plane,
-                    chroma_stride,
-                    chroma_x + block_column * 2,
-                    chroma_y + 4,
-                    2,
-                    horizontal_strengths[2][block_column],
-                    internal_thresholds[component],
-                );
+            if horizontal_strengths[2] != [0; 4] {
+                for block_column in 0..4 {
+                    filter_horizontal_edge(
+                        plane,
+                        chroma_stride,
+                        chroma_x + block_column * 2,
+                        chroma_y + 4,
+                        2,
+                        horizontal_strengths[2][block_column],
+                        internal_thresholds[component],
+                    );
+                }
             }
         }
     }
