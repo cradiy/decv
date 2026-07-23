@@ -576,6 +576,12 @@ impl CabacResidualState {
                 CabacResidualBlock::LumaDc,
             )?)
         } else {
+            self.record_block(
+                macroblock_address,
+                slice_id,
+                CabacResidualBlock::LumaDc,
+                false,
+            )?;
             None
         };
         let transform_size_8x8 =
@@ -1316,6 +1322,12 @@ mod tests {
                 .coded_block_flag_context_index(1, 7, true, CabacResidualBlock::Luma4x4(0),)
                 .unwrap(),
             Some(95)
+        );
+        assert_eq!(
+            state
+                .coded_block_flag_context_index(1, 7, true, CabacResidualBlock::LumaDc)
+                .unwrap(),
+            Some(87)
         );
     }
 

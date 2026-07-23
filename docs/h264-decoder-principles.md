@@ -796,6 +796,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - pixel-producing progressive CABAC B slices with spatial/temporal Direct,
   explicit and weighted bidirectional prediction, residual reconstruction,
   deblocking, output reordering, and byte-exact x264/FFmpeg regression;
+- explicit inferred-zero CABAC LumaDC neighbour state for non-Intra16x16
+  macroblocks, preventing later Intra16x16 coded-block contexts from drifting;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band

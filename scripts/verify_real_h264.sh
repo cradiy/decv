@@ -47,6 +47,15 @@ verify_stream testsrc2
 
 ffmpeg -hide_banner -loglevel error \
     -f lavfi \
+    -i "nullsrc=size=32x32:rate=1,geq=lum='40+X+Y':cb='90+X':cr='150-Y'" \
+    -frames:v 1 -pix_fmt yuv420p -c:v libx264 -profile:v high -qp 30 \
+    -x264-params \
+    "cabac=1:bframes=0:keyint=1:scenecut=0:8x8dct=1:deblock=0" \
+    -f h264 -y "$work_dir/cabac-i-neighbours.h264"
+verify_stream cabac-i-neighbours
+
+ffmpeg -hide_banner -loglevel error \
+    -f lavfi \
     -i "nullsrc=size=32x16:rate=1,geq=lum='50+10*N+X':cb=100:cr=150" \
     -frames:v 2 -pix_fmt yuv420p -c:v libx264 -profile:v high \
     -x264-params \
