@@ -8,7 +8,7 @@ use crate::{H264Error, PcmMacroblock, Result, SliceType};
 const INITIAL_RANGE: u16 = 510;
 
 // H.264 Table 9-44, indexed by pStateIdx and qCodIRangeIdx.
-const RANGE_TAB_LPS: [[u16; 4]; 64] = [
+const RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128, 176, 208, 240],
     [128, 167, 197, 227],
     [128, 158, 187, 216],
@@ -87,11 +87,34 @@ const TRANS_IDX_LPS: [u8; 64] = [
     34, 35, 35, 35, 36, 36, 36, 37, 37, 37, 38, 38, 63,
 ];
 
+const fn packed_transitions(lps: bool) -> [u8; 128] {
+    let mut transitions = [0; 128];
+    let mut packed = 0;
+    while packed < transitions.len() {
+        let probability_state = packed >> 1;
+        let mut most_probable_symbol = packed & 1;
+        let next_probability_state = if lps {
+            if probability_state == 0 {
+                most_probable_symbol ^= 1;
+            }
+            TRANS_IDX_LPS[probability_state]
+        } else {
+            TRANS_IDX_MPS[probability_state]
+        };
+        transitions[packed] = (next_probability_state << 1) | most_probable_symbol as u8;
+        packed += 1;
+    }
+    transitions
+}
+
+const TRANS_STATE_MPS: [u8; 128] = packed_transitions(false);
+const TRANS_STATE_LPS: [u8; 128] = packed_transitions(true);
+
 /// One adaptive CABAC probability state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CabacContextState {
-    probability_state: u8,
-    most_probable_symbol: u8,
+    /// `(pStateIdx << 1) | valMPS`.
+    packed: u8,
 }
 
 impl CabacContextState {
@@ -107,19 +130,18 @@ impl CabacContextState {
             ));
         }
         Ok(Self {
-            probability_state,
-            most_probable_symbol,
+            packed: (probability_state << 1) | most_probable_symbol,
         })
     }
 
     #[inline]
     pub const fn probability_state(self) -> u8 {
-        self.probability_state
+        self.packed >> 1
     }
 
     #[inline]
     pub const fn most_probable_symbol(self) -> u8 {
-        self.most_probable_symbol
+        self.packed & 1
     }
 
     #[inline]
@@ -128,13 +150,11 @@ impl CabacContextState {
         let pre_context_state = pre_context_state.clamp(1, 126) as u8;
         if pre_context_state <= 63 {
             Self {
-                probability_state: 63 - pre_context_state,
-                most_probable_symbol: 0,
+                packed: (63 - pre_context_state) << 1,
             }
         } else {
             Self {
-                probability_state: pre_context_state - 64,
-                most_probable_symbol: 1,
+                packed: ((pre_context_state - 64) << 1) | 1,
             }
         }
     }
@@ -309,36 +329,40 @@ impl<'data> CabacDecoder<'data> {
     /// only after any required renormalization bits are available.
     #[inline]
     pub fn decode_decision(&mut self, context: &mut CabacContextState) -> Result<u8> {
-        let mut reader = self.reader;
         let mut range = self.range;
         let mut offset = self.offset;
-        let mut next_context = *context;
+        let packed_state = context.packed;
+        debug_assert!(packed_state < 128);
 
         let range_index = usize::from((range >> 6) & 3);
-        let lps_range = RANGE_TAB_LPS[usize::from(next_context.probability_state)][range_index];
+        let probability_state = usize::from(packed_state >> 1);
+        // SAFETY: CabacContextState constructors and transition tables keep
+        // pStateIdx below 64, while the range-derived index is in 0..4.
+        let lps_range = u16::from(unsafe {
+            *RANGE_TAB_LPS
+                .get_unchecked(probability_state)
+                .get_unchecked(range_index)
+        });
         range -= lps_range;
 
-        let bin = if offset < range {
-            next_context.probability_state =
-                TRANS_IDX_MPS[usize::from(next_context.probability_state)];
-            next_context.most_probable_symbol
+        let (bin, next_state) = if offset < range {
+            // SAFETY: A packed CABAC context is always in 0..128.
+            let next_state = unsafe { *TRANS_STATE_MPS.get_unchecked(usize::from(packed_state)) };
+            (packed_state & 1, next_state)
         } else {
             offset -= range;
             range = lps_range;
-            let bin = 1 - next_context.most_probable_symbol;
-            if next_context.probability_state == 0 {
-                next_context.most_probable_symbol ^= 1;
-            }
-            next_context.probability_state =
-                TRANS_IDX_LPS[usize::from(next_context.probability_state)];
-            bin
+            // SAFETY: A packed CABAC context is always in 0..128.
+            let next_state = unsafe { *TRANS_STATE_LPS.get_unchecked(usize::from(packed_state)) };
+            ((packed_state & 1) ^ 1, next_state)
         };
 
-        renormalize(&mut reader, &mut range, &mut offset)?;
-        self.reader = reader;
+        // BitReader reads are failure-atomic, so this can operate directly on
+        // the decoder reader without snapshotting and copying its 40 bytes.
+        renormalize(&mut self.reader, &mut range, &mut offset)?;
         self.range = range;
         self.offset = offset;
-        *context = next_context;
+        context.packed = next_state;
         Ok(bin)
     }
 
@@ -358,7 +382,6 @@ impl<'data> CabacDecoder<'data> {
     /// Decodes `end_of_slice_flag` using the fixed termination probability.
     #[inline]
     pub fn decode_terminate(&mut self) -> Result<u8> {
-        let mut reader = self.reader;
         let mut range = self.range - 2;
         let mut offset = self.offset;
         if offset >= range {
@@ -367,8 +390,9 @@ impl<'data> CabacDecoder<'data> {
             return Ok(1);
         }
 
-        renormalize(&mut reader, &mut range, &mut offset)?;
-        self.reader = reader;
+        // BitReader reads are failure-atomic; arithmetic fields are committed
+        // only after renormalization succeeds.
+        renormalize(&mut self.reader, &mut range, &mut offset)?;
         self.range = range;
         self.offset = offset;
         Ok(0)
@@ -564,12 +588,35 @@ mod tests {
         loop {
             let range = decoder.range();
             let offset = decoder.offset();
+            let bit_position = decoder.bit_position();
             let state = context;
             match decoder.decode_decision(&mut context) {
                 Ok(_) => {}
                 Err(H264Error::UnexpectedEof) => {
                     assert_eq!((decoder.range(), decoder.offset()), (range, offset));
+                    assert_eq!(decoder.bit_position(), bit_position);
                     assert_eq!(context, state);
+                    break;
+                }
+                Err(error) => panic!("unexpected CABAC error: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn termination_failure_is_atomic() {
+        let mut decoder = CabacDecoder::new(BitReader::new(&[0, 0])).unwrap();
+        loop {
+            let range = decoder.range();
+            let offset = decoder.offset();
+            let bit_position = decoder.bit_position();
+            match decoder.decode_terminate() {
+                Ok(0) => {}
+                Ok(1) => panic!("zero input unexpectedly terminated CABAC"),
+                Ok(_) => unreachable!(),
+                Err(H264Error::UnexpectedEof) => {
+                    assert_eq!((decoder.range(), decoder.offset()), (range, offset));
+                    assert_eq!(decoder.bit_position(), bit_position);
                     break;
                 }
                 Err(error) => panic!("unexpected CABAC error: {error}"),
@@ -623,6 +670,28 @@ mod tests {
         assert!(!contexts.is_empty());
         assert!(contexts.get(460).is_err());
         assert!(contexts.get_mut(460).is_err());
+    }
+
+    #[test]
+    fn packs_every_valid_context_state_into_one_byte() {
+        assert_eq!(std::mem::size_of::<CabacContextState>(), 1);
+        for probability_state in 0..64 {
+            for most_probable_symbol in 0..=1 {
+                let state =
+                    CabacContextState::new(probability_state, most_probable_symbol).unwrap();
+                assert_eq!(state.probability_state(), probability_state);
+                assert_eq!(state.most_probable_symbol(), most_probable_symbol);
+                assert_eq!(
+                    TRANS_STATE_MPS[usize::from(state.packed)],
+                    (TRANS_IDX_MPS[usize::from(probability_state)] << 1) | most_probable_symbol
+                );
+                assert_eq!(
+                    TRANS_STATE_LPS[usize::from(state.packed)],
+                    (TRANS_IDX_LPS[usize::from(probability_state)] << 1)
+                        | (most_probable_symbol ^ u8::from(probability_state == 0))
+                );
+            }
+        }
     }
 
     #[test]
