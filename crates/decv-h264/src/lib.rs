@@ -51,3 +51,7 @@ pub use sps::{
     BitstreamRestrictions, PicOrderCount, Profile, SampleAspectRatio, ScalingList, ScalingMatrices,
     SequenceParameterSet, TimingInfo, VuiParameters,
 };
+pub use transform::{
+    Block4x4, FLAT_SCALING_LIST_4X4, ScanMode, inverse_scale_4x4, inverse_scan_4x4,
+    inverse_scan_scaling_list_4x4, inverse_transform_4x4, reconstruct_residual_4x4,
+};
