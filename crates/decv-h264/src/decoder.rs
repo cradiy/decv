@@ -10,13 +10,14 @@ use decv_core::{
 
 use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
 use crate::intra_reconstruction::ReconstructionReferenceList;
+use crate::parallelism::ReconstructionExecutor;
 use crate::reorder::PictureReorderBuffer;
 use crate::{
     AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference, EntropyCodingMode,
-    H264Error, ImplicitWeightReference, IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType,
-    ParameterSetStore, ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile,
-    ReferenceKind, ReferencePictureMarking, Result, SequenceParameterSet, SliceType,
-    consume_rbsp_trailing_bits, decode_rbsp,
+    H264Error, H264Parallelism, ImplicitWeightReference, IntraPictureReconstructor, NalHeader,
+    NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader, PictureOrderCount,
+    PictureParameterSet, Profile, ReferenceKind, ReferencePictureMarking, Result,
+    SequenceParameterSet, SliceType, consume_rbsp_trailing_bits, decode_rbsp,
 };
 
 #[derive(Debug)]
@@ -58,6 +59,8 @@ pub struct H264Decoder {
     announced_format: Option<VideoFormat>,
     next_frame_id: u64,
     draining: bool,
+    parallelism: H264Parallelism,
+    reconstruction_executor: Option<ReconstructionExecutor>,
 }
 
 impl Default for H264Decoder {
@@ -74,6 +77,8 @@ impl Default for H264Decoder {
             announced_format: None,
             next_frame_id: 0,
             draining: false,
+            parallelism: H264Parallelism::Auto,
+            reconstruction_executor: None,
         }
     }
 }
@@ -81,6 +86,32 @@ impl Default for H264Decoder {
 impl H264Decoder {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Selects reconstruction parallelism.
+    ///
+    /// The policy may be changed before decoding begins. This is kept
+    /// H.264-specific so the codec-independent [`VideoDecoderConfig`] remains
+    /// stable as other decoder backends are added.
+    pub fn set_parallelism(&mut self, parallelism: H264Parallelism) -> Result<()> {
+        if self.current_picture.is_some()
+            || self.dpb.is_some()
+            || !self.outputs.is_empty()
+            || self.next_frame_id != 0
+            || self.draining
+        {
+            return Err(H264Error::InvalidSyntax(
+                "H.264 parallelism cannot change after decoding begins",
+            ));
+        }
+        let executor = ReconstructionExecutor::try_new(parallelism)?;
+        self.parallelism = parallelism;
+        self.reconstruction_executor = Some(executor);
+        Ok(())
+    }
+
+    pub fn parallelism(&self) -> H264Parallelism {
+        self.parallelism
     }
 
     fn process_packet(&mut self, packet: &EncodedVideoPacket) -> Result<()> {
@@ -130,7 +161,13 @@ impl H264Decoder {
                     self.ensure_dpb(&parsed, nal_header)?;
                     let format = video_format(&parsed)?;
                     let reconstructor =
-                        IntraPictureReconstructor::from_parameter_sets(&parsed.parameter_sets)?;
+                        IntraPictureReconstructor::from_parameter_sets_with_executor(
+                            &parsed.parameter_sets,
+                            self.reconstruction_executor
+                                .as_ref()
+                                .expect("configure initializes the reconstruction executor")
+                                .clone(),
+                        )?;
                     self.current_picture = Some(PendingPicture {
                         reconstructor,
                         format,
@@ -516,6 +553,9 @@ impl VideoDecoder for H264Decoder {
             ));
         }
         self.reset_all_state();
+        if self.reconstruction_executor.is_none() {
+            self.reconstruction_executor = Some(ReconstructionExecutor::try_new(self.parallelism)?);
+        }
         self.bitstream_format = config.bitstream_format;
         if let Some(codec_data) = config.codec_data {
             let avcc = parse_avcc(codec_data.as_ref())?;
@@ -822,6 +862,8 @@ fn validate_empty_rbsp(ebsp: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::num::NonZeroUsize;
+
     use decv_core::{
         BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, DecodeInputStatus,
         DecodeOutput, EncodedVideoPacket, FrameStorage, MediaTime, PixelFormat, Rect, Size,
@@ -830,7 +872,8 @@ mod tests {
 
     use super::{H264Decoder, H264StreamParser, ParserEvent, PictureIdentity};
     use crate::{
-        AnnexBReader, H264Error, IntraPictureReconstructor, MotionVector, NalHeader, NalUnit,
+        AnnexBReader, H264Error, H264Parallelism, IntraPictureReconstructor, MotionVector,
+        NalHeader, NalUnit,
     };
 
     fn exercise_decoder(bytes: Vec<u8>) {
@@ -1078,7 +1121,7 @@ mod tests {
     }
 
     #[test]
-    fn decodes_real_x264_cabac_b_pictures_byte_exactly() {
+    fn decodes_real_x264_cabac_b_pictures_byte_exactly_in_serial_and_parallel_modes() {
         // Six 32x16 gradient pictures encoded by x264 with CABAC, two B
         // pictures per reference interval, two references, and spatial Direct.
         // The SEI was removed and every NV12 CRC was checked against FFmpeg.
@@ -1097,42 +1140,58 @@ mod tests {
             0xc9, 0x9a, 0x73, 0x35, 0x56, 0x66, 0x5f, 0xe1, 0x00, 0x00, 0x00, 0x01, 0x01, 0x9e,
             0x84, 0x44, 0x5f, 0xb0, 0x81,
         ];
-        let mut decoder = H264Decoder::new();
-        decoder.configure(byte_stream_config()).unwrap();
-        assert!(matches!(
-            decoder
-                .send_packet(EncodedVideoPacket::new(stream))
-                .unwrap(),
-            DecodeInputStatus::Accepted
-        ));
-        decoder.drain().unwrap();
-        assert!(matches!(
-            decoder.receive_frame().unwrap(),
-            DecodeOutput::FormatChanged(_)
-        ));
+        let decode = |parallelism| {
+            let mut decoder = H264Decoder::new();
+            decoder.set_parallelism(parallelism).unwrap();
+            decoder.configure(byte_stream_config()).unwrap();
+            assert_eq!(decoder.parallelism(), parallelism);
+            assert!(matches!(
+                decoder
+                    .send_packet(EncodedVideoPacket::new(stream.to_vec()))
+                    .unwrap(),
+                DecodeInputStatus::Accepted
+            ));
+            assert!(matches!(
+                decoder.set_parallelism(H264Parallelism::Auto),
+                Err(H264Error::InvalidSyntax(_))
+            ));
+            decoder.drain().unwrap();
+            assert!(matches!(
+                decoder.receive_frame().unwrap(),
+                DecodeOutput::FormatChanged(_)
+            ));
 
-        for expected_crc in [
+            let mut frames = Vec::new();
+            loop {
+                match decoder.receive_frame().unwrap() {
+                    DecodeOutput::Frame(frame) => {
+                        let FrameStorage::Cpu(cpu) = frame.storage else {
+                            panic!("expected CPU frame");
+                        };
+                        frames.push(cpu.planes[0].bytes.to_vec());
+                    }
+                    DecodeOutput::EndOfStream => break,
+                    output => panic!("expected CABAC B frame, got {output:?}"),
+                }
+            }
+            frames
+        };
+
+        let serial_frames = decode(H264Parallelism::Serial);
+        let parallel_frames = decode(H264Parallelism::Threads(NonZeroUsize::new(2).unwrap()));
+        assert_eq!(parallel_frames, serial_frames);
+        assert_eq!(serial_frames.len(), 6);
+        for (frame, expected_crc) in serial_frames.iter().zip([
             2_233_814_414,
             1_801_912_313,
             3_452_851_269,
             2_181_253_705,
             1_436_501_184,
             1_038_502_273,
-        ] {
-            let frame = match decoder.receive_frame().unwrap() {
-                DecodeOutput::Frame(frame) => frame,
-                output => panic!("expected CABAC B frame, got {output:?}"),
-            };
-            let FrameStorage::Cpu(cpu) = frame.storage else {
-                panic!("expected CPU frame");
-            };
-            assert_eq!(cpu.planes[0].bytes.len(), 768);
-            assert_eq!(crc32(cpu.planes[0].bytes.as_ref()), expected_crc);
+        ]) {
+            assert_eq!(frame.len(), 768);
+            assert_eq!(crc32(frame), expected_crc);
         }
-        assert!(matches!(
-            decoder.receive_frame().unwrap(),
-            DecodeOutput::EndOfStream
-        ));
     }
 
     #[test]

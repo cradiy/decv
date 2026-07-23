@@ -1,7 +1,5 @@
 //! Stateful reconstruction of progressive 8-bit 4:2:0 intra pictures.
 
-use std::sync::OnceLock;
-
 use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 use rayon::prelude::*;
@@ -16,6 +14,7 @@ use crate::inter_reconstruction::{
     reconstruct_weighted_p_skip_macroblock_from_list_420,
 };
 use crate::motion_field::MotionFieldBuilder;
+use crate::parallelism::ReconstructionExecutor;
 use crate::picture_surface::StagedMacroblockPixels;
 use crate::rbsp::more_rbsp_data;
 use crate::{
@@ -149,19 +148,6 @@ struct PendingBInterMacroblock {
     deblock: MacroblockDeblockInfo,
 }
 
-fn b_reconstruction_pool() -> Result<&'static rayon::ThreadPool> {
-    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
-    if let Some(pool) = POOL.get() {
-        return Ok(pool);
-    }
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(2)
-        .thread_name(|index| format!("decv-h264-b-{index}"))
-        .build()
-        .map_err(|_| H264Error::UnsupportedFeature("failed to create H.264 worker pool"))?;
-    Ok(POOL.get_or_init(|| pool))
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct ReconstructionReferenceList<'a> {
     pictures: &'a [Option<&'a Yuv420Picture>],
@@ -224,6 +210,7 @@ pub struct IntraPictureReconstructor {
     scaling_lists_8x8: ResolvedScalingLists8x8,
     scan_mode: ScanMode,
     constrained_intra_prediction: bool,
+    reconstruction_executor: ReconstructionExecutor,
     next_slice_id: u32,
 }
 
@@ -246,6 +233,22 @@ impl IntraPictureReconstructor {
         scaling_lists: ResolvedScalingLists4x4,
         scaling_lists_8x8: ResolvedScalingLists8x8,
         constrained_intra_prediction: bool,
+    ) -> Result<Self> {
+        Self::new_with_executor(
+            coded_size,
+            scaling_lists,
+            scaling_lists_8x8,
+            constrained_intra_prediction,
+            ReconstructionExecutor::serial(),
+        )
+    }
+
+    fn new_with_executor(
+        coded_size: Size,
+        scaling_lists: ResolvedScalingLists4x4,
+        scaling_lists_8x8: ResolvedScalingLists8x8,
+        constrained_intra_prediction: bool,
+        reconstruction_executor: ReconstructionExecutor,
     ) -> Result<Self> {
         let picture = Yuv420Picture::new(coded_size)?;
         let width_in_macroblocks =
@@ -270,11 +273,19 @@ impl IntraPictureReconstructor {
             scaling_lists_8x8,
             scan_mode: ScanMode::Frame,
             constrained_intra_prediction,
+            reconstruction_executor,
             next_slice_id: 0,
         })
     }
 
     pub fn from_parameter_sets(parameter_sets: &ActiveParameterSets) -> Result<Self> {
+        Self::from_parameter_sets_with_executor(parameter_sets, ReconstructionExecutor::serial())
+    }
+
+    pub(crate) fn from_parameter_sets_with_executor(
+        parameter_sets: &ActiveParameterSets,
+        reconstruction_executor: ReconstructionExecutor,
+    ) -> Result<Self> {
         let sps = &parameter_sets.sequence;
         let pps = &parameter_sets.picture;
         let scaling_lists = resolve_scaling_lists_4x4(
@@ -285,11 +296,12 @@ impl IntraPictureReconstructor {
             sps.scaling_matrices.as_ref(),
             pps.scaling_matrices.as_ref(),
         )?;
-        Self::new_with_scaling_lists(
+        Self::new_with_executor(
             sps.coded_size,
             scaling_lists,
             scaling_lists_8x8,
             pps.constrained_intra_prediction,
+            reconstruction_executor,
         )
     }
 
@@ -1897,24 +1909,26 @@ impl IntraPictureReconstructor {
             },
         };
         let coded_size = self.picture.coded_size();
-        let reconstructed: Vec<Result<StagedMacroblockPixels>> =
-            b_reconstruction_pool()?.install(|| {
-                jobs.par_iter()
-                    .map(|job| {
-                        reconstruct_b_macroblock_pixels_from_lists(
-                            coded_size,
-                            references_l0,
-                            references_l1,
-                            job.macroblock_x,
-                            job.macroblock_y,
-                            &job.motion,
-                            &job.residual,
-                            weight_mode,
-                        )
-                        .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
-                    })
-                    .collect()
-            });
+        let reconstruct = |job: &PendingBInterMacroblock| {
+            reconstruct_b_macroblock_pixels_from_lists(
+                coded_size,
+                references_l0,
+                references_l1,
+                job.macroblock_x,
+                job.macroblock_y,
+                &job.motion,
+                &job.residual,
+                weight_mode,
+            )
+            .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
+        };
+        let reconstructed: Vec<Result<StagedMacroblockPixels>> = if jobs.len() > 1
+            && let Some(pool) = self.reconstruction_executor.pool()
+        {
+            pool.install(|| jobs.par_iter().map(&reconstruct).collect())
+        } else {
+            jobs.iter().map(&reconstruct).collect()
+        };
         let staged = reconstructed
             .into_iter()
             .collect::<Result<Vec<StagedMacroblockPixels>>>()?;

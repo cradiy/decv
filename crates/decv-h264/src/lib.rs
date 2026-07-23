@@ -28,6 +28,7 @@ mod macroblock;
 mod motion;
 mod motion_field;
 mod nal;
+mod parallelism;
 mod parameter_sets;
 mod picture;
 mod picture_surface;
@@ -106,6 +107,7 @@ pub use motion::{
 };
 pub use motion_field::{MotionFieldCell, ReferenceMotionField, StoredListMotion};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
+pub use parallelism::H264Parallelism;
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
 pub use picture::{FieldOrderCount, PictureOrderCount, PictureOrderCountState};
 pub use picture_surface::{ChromaPlane, IntraReferenceAvailability, Yuv420Picture};

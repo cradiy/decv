@@ -117,24 +117,30 @@ The worker pool may borrow the batch reference table through scoped tasks.
 `decv` remains synchronous and runtime-independent. Internal parallelism must
 not require Tokio or another async runtime.
 
-The eventual decoder configuration should expose:
+The H.264-specific decoder configuration exposes:
 
 ```rust
-pub enum DecodeParallelism {
+pub enum H264Parallelism {
     Serial,
     Auto,
     Threads(NonZeroUsize),
 }
+
+decoder.set_parallelism(H264Parallelism::Auto)?;
+decoder.configure(video_config)?;
 ```
 
 Rules:
 
 - `Serial` is the deterministic fallback and test oracle.
-- `Auto` caps worker count to a conservative value instead of consuming every
-  logical CPU on a UI application.
-- a decoder owns or shares a persistent pool; it must not create OS threads
+- `Auto` currently caps the worker count at two instead of consuming every
+  logical CPU in a UI application. This is based on the 1080p benchmark and
+  can be retuned as more stages become parallel.
+- `set_parallelism` must run before decoding begins. It is separate from the
+  codec-independent `VideoDecoderConfig`.
+- a decoder owns a persistent pool; it must not create OS threads
   per frame;
-- small pictures and small batches stay serial;
+- single-job batches stay serial;
 - `flush` waits for or cancels all internal work before clearing the DPB;
 - no task may outlive the decoder or a borrowed reference picture.
 
@@ -171,13 +177,15 @@ does not justify a thread-pool dependency.
 7. Design deblocking wavefront scheduling only if reconstruction parallelism
    still leaves 1080p60 below target.
 
-Current status: stages 1 through 3 are implemented for CABAC B inter
+Current status: stages 1 through 4 are implemented for CABAC B inter
 macroblocks. Syntax, QP, residual transform, Direct motion, and metadata
 derivation remain serial. Four macroblock rows of owned jobs are reconstructed
-on a persistent two-thread pool, results are collected in address order, and
-batch commit validates all addresses before touching the picture. Intra/PCM
-macroblocks flush the pending batch before using current-picture neighbours.
-Configurable serial/auto/thread-count policy remains to be implemented.
+on a decoder-owned persistent pool, results are collected in address order,
+and batch commit validates all addresses before touching the picture.
+Intra/PCM macroblocks flush the pending batch before using current-picture
+neighbours. `Serial`, conservative `Auto`, and explicit `Threads(n)` policies
+are available, and the embedded real CABAC B fixture must match byte for byte
+between serial and two-thread decoding.
 
 ## Acceptance Checks
 
