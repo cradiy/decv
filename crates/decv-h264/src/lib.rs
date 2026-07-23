@@ -43,11 +43,11 @@ pub use inter_reconstruction::reconstruct_p_macroblock_420;
 pub use intra_modes::IntraModeState;
 pub use intra_reconstruction::IntraPictureReconstructor;
 pub use macroblock::{
-    CodedBlockPattern, DecodedIntraMacroblock, InterResidual, IntraLumaPrediction, IntraMacroblock,
-    IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MotionVectorDifference,
-    PInterMacroblockHeader, PMacroblockContext, PPartitionMode, PPartitionMotion, PSliceMacroblock,
-    PSubMacroblockType, PcmMacroblock, parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run,
-    parse_cavlc_p_macroblock,
+    CodedBlockPattern, DecodedIntraMacroblock, DecodedPSliceMacroblock, InterResidual,
+    IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax,
+    IntraResidual, MotionVectorDifference, PInterMacroblockHeader, PMacroblockContext,
+    PPartitionMode, PPartitionMotion, PSliceMacroblock, PSubMacroblockType, PcmMacroblock,
+    parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run, parse_cavlc_p_macroblock,
 };
 pub use motion::{MotionVector, PMotionState, ResolvedPMacroblock, ResolvedPPartition};
 pub use nal::{NalHeader, NalUnit, NalUnitType};

@@ -3,9 +3,10 @@
 use bit_readers::BitReader;
 
 use crate::{
-    CoeffTokenContext, DecodedIntraMacroblock, H264Error, InterResidual, IntraLumaPrediction,
-    IntraMacroblock, IntraMacroblockHeader, IntraResidual, PInterMacroblockHeader, ResidualBlock,
-    Result, decode_residual_block, parse_cavlc_intra_macroblock,
+    CoeffTokenContext, DecodedIntraMacroblock, DecodedPSliceMacroblock, H264Error, InterResidual,
+    IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraResidual,
+    PInterMacroblockHeader, PMacroblockContext, PSliceMacroblock, ResidualBlock, Result,
+    decode_residual_block, parse_cavlc_intra_macroblock, parse_cavlc_p_macroblock,
 };
 
 const DECODED_BIT: u32 = 1 << 5;
@@ -191,6 +192,53 @@ impl CavlcNeighborState {
         };
         *reader = probe;
         Ok(decoded)
+    }
+
+    /// Parses and coefficient-decodes one complete non-skipped CAVLC P-slice
+    /// macroblock, including embedded Intra macroblock types.
+    pub fn decode_p_macroblock(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        context: PMacroblockContext,
+    ) -> Result<DecodedPSliceMacroblock> {
+        self.ensure_slice_started()?;
+        self.ensure_macroblock(mb_x, mb_y)?;
+        let snapshot = self.snapshot_macroblock(mb_x, mb_y)?;
+        let mut probe = *reader;
+        let result = (|| {
+            Ok(match parse_cavlc_p_macroblock(&mut probe, context)? {
+                PSliceMacroblock::Inter(header) => {
+                    let residual = self.decode_inter_residual(&mut probe, mb_x, mb_y, &header)?;
+                    DecodedPSliceMacroblock::Inter { header, residual }
+                }
+                PSliceMacroblock::Intra(IntraMacroblock::Predicted(header)) => {
+                    let residual = self.decode_intra_residual(&mut probe, mb_x, mb_y, &header)?;
+                    DecodedPSliceMacroblock::Intra(DecodedIntraMacroblock {
+                        macroblock: IntraMacroblock::Predicted(header),
+                        residual: Some(residual),
+                    })
+                }
+                PSliceMacroblock::Intra(IntraMacroblock::Pcm(pcm)) => {
+                    self.record_pcm_macroblock(mb_x, mb_y)?;
+                    DecodedPSliceMacroblock::Intra(DecodedIntraMacroblock {
+                        macroblock: IntraMacroblock::Pcm(pcm),
+                        residual: None,
+                    })
+                }
+            })
+        })();
+        match result {
+            Ok(decoded) => {
+                *reader = probe;
+                Ok(decoded)
+            }
+            Err(error) => {
+                self.restore_macroblock(mb_x, mb_y, snapshot);
+                Err(error)
+            }
+        }
     }
 
     #[inline]
@@ -655,9 +703,9 @@ mod tests {
 
     use super::CavlcNeighborState;
     use crate::{
-        CodedBlockPattern, CoeffTokenContext, H264Error, IntraLumaPrediction, IntraMacroblock,
-        IntraMacroblockHeader, IntraPredictionModeSyntax, PInterMacroblockHeader, PPartitionMode,
-        PPartitionMotion,
+        CodedBlockPattern, CoeffTokenContext, DecodedPSliceMacroblock, H264Error,
+        IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax,
+        PInterMacroblockHeader, PMacroblockContext, PPartitionMode, PPartitionMotion,
     };
 
     #[test]
@@ -949,6 +997,74 @@ mod tests {
         assert!(
             state
                 .decode_intra_macroblock(&mut reader, 0, 0, false)
+                .is_err()
+        );
+        assert_eq!(reader.bit_position(), 0);
+        assert_eq!(
+            state.luma_context(0, 0, 1),
+            Ok(CoeffTokenContext::NeighborTotal(6))
+        );
+    }
+
+    #[test]
+    fn decodes_complete_inter_and_embedded_intra_p_macroblocks() {
+        let mut state = CavlcNeighborState::new(2, 1).unwrap();
+        state.begin_slice();
+        let context = PMacroblockContext {
+            num_ref_idx_l0_active: 1,
+            transform_8x8_mode_enabled: false,
+        };
+
+        // P_L0_16x16, zero MVD, coded_block_pattern zero.
+        let data = bit_string("1111");
+        let mut reader = BitReader::new(&data);
+        let decoded = state
+            .decode_p_macroblock(&mut reader, 0, 0, context)
+            .unwrap();
+        let DecodedPSliceMacroblock::Inter { header, residual } = decoded else {
+            panic!("expected inter P macroblock");
+        };
+        assert!(!header.coded_block_pattern.has_residual());
+        assert!(residual.luma.iter().all(|block| block.total_coeff == 0));
+        assert_eq!(reader.bit_position(), 4);
+
+        // P mb_type 5 maps to I_NxN, followed by predicted Intra4x4 modes.
+        let bits = format!("00110{}100100", "1".repeat(16));
+        let data = bit_string(&bits);
+        let mut reader = BitReader::new(&data);
+        let decoded = state
+            .decode_p_macroblock(&mut reader, 1, 0, context)
+            .unwrap();
+        let DecodedPSliceMacroblock::Intra(decoded) = decoded else {
+            panic!("expected embedded intra P macroblock");
+        };
+        assert!(matches!(
+            decoded.macroblock,
+            IntraMacroblock::Predicted(IntraMacroblockHeader {
+                luma_prediction: IntraLumaPrediction::FourByFour(_),
+                ..
+            })
+        ));
+        assert_eq!(reader.bit_position(), bits.len());
+    }
+
+    #[test]
+    fn complete_p_macroblock_failure_restores_bits_and_neighbours() {
+        let mut state = CavlcNeighborState::new(1, 1).unwrap();
+        state.begin_slice();
+        state.record_luma(0, 0, 0, 6).unwrap();
+        let mut reader = BitReader::new(&[0b1110_0000]);
+        assert!(
+            state
+                .decode_p_macroblock(
+                    &mut reader,
+                    0,
+                    0,
+                    PMacroblockContext {
+                        num_ref_idx_l0_active: 1,
+                        transform_8x8_mode_enabled: false,
+                    }
+                )
                 .is_err()
         );
         assert_eq!(reader.bit_position(), 0);

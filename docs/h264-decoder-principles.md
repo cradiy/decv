@@ -660,6 +660,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   bilinear filtering, negative-vector decomposition, and edge extension;
 - transactional CAVLC inter residual decoding plus 4x4/8x8 inverse transform
   paths using the Inter scaling lists;
+- a transactional complete non-skipped CAVLC P-macroblock entry point that
+  joins P syntax and residuals while correctly mapping embedded Intra and
+  I_PCM macroblock types;
 - transactional default-weight P macroblock pixel reconstruction with
   per-partition List-0 reference selection, complete coverage validation, and
   saturating prediction-plus-residual writes;

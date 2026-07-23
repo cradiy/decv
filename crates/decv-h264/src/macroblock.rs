@@ -169,6 +169,15 @@ pub enum PSliceMacroblock {
     Intra(IntraMacroblock),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedPSliceMacroblock {
+    Inter {
+        header: PInterMacroblockHeader,
+        residual: InterResidual,
+    },
+    Intra(DecodedIntraMacroblock),
+}
+
 /// Syntax context needed to decode a frame-coded CAVLC P macroblock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PMacroblockContext {
