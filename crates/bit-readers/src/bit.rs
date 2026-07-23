@@ -89,7 +89,9 @@ impl<'a> BitReader<'a> {
                 return None;
             }
 
-            if self.data.len() - self.cursor >= 4 {
+            if self.data.len() - self.cursor >= 8 {
+                self.refill_double_word();
+            } else if self.data.len() - self.cursor >= 4 {
                 self.refill_word();
             } else {
                 self.refill_byte();
@@ -345,6 +347,22 @@ impl<'a> BitReader<'a> {
         self.cache |= (word as u64) << (32 - self.cached_bits);
         self.cached_bits += 32;
         self.cursor += 4;
+    }
+
+    #[inline(always)]
+    fn refill_double_word(&mut self) {
+        debug_assert_eq!(self.cached_bits, 0);
+        debug_assert!(self.data.len() - self.cursor >= 8);
+
+        // SAFETY: The length check above guarantees that eight bytes starting
+        // at `cursor` belong to `data`. `read_unaligned` imposes no alignment
+        // requirement. Reading a u64 does not outlive or mutate the slice.
+        self.cache = unsafe {
+            let pointer = self.data.as_ptr().add(self.cursor).cast::<u64>();
+            u64::from_be(std::ptr::read_unaligned(pointer))
+        };
+        self.cached_bits = 64;
+        self.cursor += 8;
     }
 
     #[cold]
