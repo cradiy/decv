@@ -777,6 +777,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   post-PCM end-of-slice decoding;
 - CABAC P-slice `mb_type` and `sub_mb_type` binarizations for every inter
   partition shape plus embedded intra transitions;
+- CABAC per-list motion syntax state for `ref_idx_lX` and both `mvd_lX`
+  components, including same-macroblock partition neighbours and bypass
+  escapes;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
