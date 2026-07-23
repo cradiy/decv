@@ -302,7 +302,7 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
     let mut predicted_luma = [[0u8; 16]; 16];
     let mut predicted_cb = [[0u8; 8]; 8];
     let mut predicted_cr = [[0u8; 8]; 8];
-    let mut covered = [[false; 4]; 4];
+    let mut covered = 0u16;
     let uniform_direct = uniform_direct_partition(motion);
     let partitions = uniform_direct
         .as_ref()
@@ -370,20 +370,22 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
         }
         for y in (partition.y..partition.y + partition.height).step_by(4) {
             for x in (partition.x..partition.x + partition.width).step_by(4) {
-                let cell = covered
-                    .get_mut(usize::from(y / 4))
-                    .and_then(|row| row.get_mut(usize::from(x / 4)))
-                    .ok_or(H264Error::InvalidSyntax(
+                let row = usize::from(y / 4);
+                let column = usize::from(x / 4);
+                if row >= 4 || column >= 4 {
+                    return Err(H264Error::InvalidSyntax(
                         "B prediction partition exceeds the macroblock",
-                    ))?;
-                if *cell {
+                    ));
+                }
+                let cell = 1u16 << (row * 4 + column);
+                if covered & cell != 0 {
                     return Err(H264Error::InvalidSyntax("B prediction partitions overlap"));
                 }
-                *cell = true;
+                covered |= cell;
             }
         }
     }
-    if covered.iter().flatten().any(|covered| !covered) {
+    if covered != u16::MAX {
         return Err(H264Error::InvalidSyntax(
             "B prediction partitions do not cover the macroblock",
         ));
@@ -620,7 +622,7 @@ fn reconstruct_p_macroblock_from_list_inner(
     let mut predicted_luma = [[0u8; 16]; 16];
     let mut predicted_cb = [[0u8; 8]; 8];
     let mut predicted_cr = [[0u8; 8]; 8];
-    let mut covered = [[false; 4]; 4];
+    let mut covered = 0u16;
     let mut prediction = InterPrediction420::empty();
     for partition in &motion.partitions {
         let reference = references_l0
@@ -679,15 +681,15 @@ fn reconstruct_p_macroblock_from_list_inner(
         }
         for y in (partition.y..partition.y + partition.height).step_by(4) {
             for x in (partition.x..partition.x + partition.width).step_by(4) {
-                let cell = &mut covered[usize::from(y / 4)][usize::from(x / 4)];
-                if *cell {
+                let cell = 1u16 << (usize::from(y / 4) * 4 + usize::from(x / 4));
+                if covered & cell != 0 {
                     return Err(H264Error::InvalidSyntax("P prediction partitions overlap"));
                 }
-                *cell = true;
+                covered |= cell;
             }
         }
     }
-    if covered.iter().flatten().any(|covered| !covered) {
+    if covered != u16::MAX {
         return Err(H264Error::InvalidSyntax(
             "P prediction partitions do not cover the macroblock",
         ));
@@ -754,7 +756,7 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_with_scratch(
     let mut predicted_luma = [[0u8; 16]; 16];
     let mut predicted_cb = [[0u8; 8]; 8];
     let mut predicted_cr = [[0u8; 8]; 8];
-    let mut covered = [[false; 4]; 4];
+    let mut covered = 0u16;
     for partition in &motion.partitions {
         let reference = references_l0
             .get(usize::from(partition.reference_index))
@@ -807,15 +809,15 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_with_scratch(
         }
         for y in (partition.y..partition.y + partition.height).step_by(4) {
             for x in (partition.x..partition.x + partition.width).step_by(4) {
-                let cell = &mut covered[usize::from(y / 4)][usize::from(x / 4)];
-                if *cell {
+                let cell = 1u16 << (usize::from(y / 4) * 4 + usize::from(x / 4));
+                if covered & cell != 0 {
                     return Err(H264Error::InvalidSyntax("P prediction partitions overlap"));
                 }
-                *cell = true;
+                covered |= cell;
             }
         }
     }
-    if covered.iter().flatten().any(|covered| !covered) {
+    if covered != u16::MAX {
         return Err(H264Error::InvalidSyntax(
             "P prediction partitions do not cover the macroblock",
         ));
