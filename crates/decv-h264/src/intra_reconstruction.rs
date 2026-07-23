@@ -2657,13 +2657,13 @@ fn inter_deblock_info(
         }
         for y in start_y..end_y {
             for x in start_x..end_x {
-                motion[y * 4 + x] = DeblockMotion {
-                    list0: DeblockListMotion {
+                motion[y * 4 + x] = DeblockMotion::new(
+                    DeblockListMotion {
                         reference_id,
                         vector: partition.motion_vector,
                     },
-                    list1: DeblockListMotion::default(),
-                };
+                    DeblockListMotion::default(),
+                );
             }
         }
     }
@@ -2713,7 +2713,7 @@ fn b_inter_deblock_info(
         let list1 = b_deblock_list_motion(partition.list1, references_l1, "List 1")?;
         for y in start_y..end_y {
             for x in start_x..end_x {
-                motion[y * 4 + x] = DeblockMotion { list0, list1 };
+                motion[y * 4 + x] = DeblockMotion::new(list0, list1);
             }
         }
     }

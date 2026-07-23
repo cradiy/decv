@@ -67,8 +67,8 @@ pub(crate) struct MacroblockDeblockInfo {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeblockMotion {
-    pub list0: DeblockListMotion,
-    pub list1: DeblockListMotion,
+    reference_ids: [usize; 2],
+    vectors: [MotionVector; 2],
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +76,32 @@ pub(crate) struct DeblockListMotion {
     /// Stable for the lifetime of the active reference list. Zero means absent.
     pub reference_id: usize,
     pub vector: MotionVector,
+}
+
+impl DeblockMotion {
+    #[inline]
+    pub const fn new(list0: DeblockListMotion, list1: DeblockListMotion) -> Self {
+        Self {
+            reference_ids: [list0.reference_id, list1.reference_id],
+            vectors: [list0.vector, list1.vector],
+        }
+    }
+
+    #[inline]
+    const fn list0(self) -> DeblockListMotion {
+        DeblockListMotion {
+            reference_id: self.reference_ids[0],
+            vector: self.vectors[0],
+        }
+    }
+
+    #[inline]
+    const fn list1(self) -> DeblockListMotion {
+        DeblockListMotion {
+            reference_id: self.reference_ids[1],
+            vector: self.vectors[1],
+        }
+    }
 }
 
 impl DeblockEdgeSamples {
@@ -554,20 +580,23 @@ fn boundary_strength(
 }
 
 fn motion_differs(previous: DeblockMotion, current: DeblockMotion) -> bool {
-    let same_order_differs = list_motion_differs(previous.list0, current.list0)
-        || list_motion_differs(previous.list1, current.list1);
+    let previous_l0 = previous.list0();
+    let previous_l1 = previous.list1();
+    let current_l0 = current.list0();
+    let current_l1 = current.list1();
+    let same_order_differs = list_motion_differs(previous_l0, current_l0)
+        || list_motion_differs(previous_l1, current_l1);
     if !same_order_differs {
         return false;
     }
 
-    let references_are_swapped = previous.list0.reference_id == current.list1.reference_id
-        && previous.list1.reference_id == current.list0.reference_id;
+    let references_are_swapped = previous_l0.reference_id == current_l1.reference_id
+        && previous_l1.reference_id == current_l0.reference_id;
     if !references_are_swapped {
         return true;
     }
 
-    list_motion_differs(previous.list0, current.list1)
-        || list_motion_differs(previous.list1, current.list0)
+    list_motion_differs(previous_l0, current_l1) || list_motion_differs(previous_l1, current_l0)
 }
 
 #[inline]
@@ -1000,13 +1029,13 @@ mod tests {
     fn inter_macroblock(reference_id: usize, vector: MotionVector) -> MacroblockDeblockInfo {
         MacroblockDeblockInfo {
             is_intra: false,
-            motion: [DeblockMotion {
-                list0: DeblockListMotion {
+            motion: [DeblockMotion::new(
+                DeblockListMotion {
                     reference_id,
                     vector,
                 },
-                list1: DeblockListMotion::default(),
-            }; 16],
+                DeblockListMotion::default(),
+            ); 16],
             ..macroblock(1, 0)
         }
     }
@@ -1021,6 +1050,14 @@ mod tests {
         assert_eq!((TC0[0][22], TC0[0][23], TC0[0][51]), (0, 1, 13));
         assert_eq!((TC0[1][20], TC0[1][21], TC0[1][51]), (0, 1, 17));
         assert_eq!((TC0[2][16], TC0[2][17], TC0[2][51]), (0, 1, 25));
+    }
+
+    #[test]
+    fn motion_cells_do_not_pad_each_reference_list() {
+        assert_eq!(
+            std::mem::size_of::<DeblockMotion>(),
+            2 * std::mem::size_of::<usize>() + 2 * std::mem::size_of::<MotionVector>()
+        );
     }
 
     #[test]
@@ -1214,7 +1251,7 @@ mod tests {
         let same = inter_macroblock(7, MotionVector { x: 3, y: -2 });
         assert_eq!(boundary_strength(&same, 3, &same, 0, true), 0);
 
-        let different_reference = inter_macroblock(8, same.motion[0].list0.vector);
+        let different_reference = inter_macroblock(8, same.motion[0].list0().vector);
         assert_eq!(
             boundary_strength(&same, 3, &different_reference, 0, true),
             1
@@ -1238,7 +1275,7 @@ mod tests {
         };
         let bidirectional = |list0, list1| MacroblockDeblockInfo {
             is_intra: false,
-            motion: [DeblockMotion { list0, list1 }; 16],
+            motion: [DeblockMotion::new(list0, list1); 16],
             ..macroblock(1, 0)
         };
 
