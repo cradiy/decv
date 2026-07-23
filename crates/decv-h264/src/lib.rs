@@ -43,8 +43,9 @@ pub use pps::{
     WeightedBiprediction,
 };
 pub use prediction::{
-    Intra16x16References, IntraChroma420References, Prediction8x8, Prediction16x16,
-    predict_intra_16x16, predict_intra_chroma_420,
+    Intra4x4References, Intra16x16References, IntraChroma420References, Prediction4x4,
+    Prediction8x8, Prediction16x16, predict_intra_4x4, predict_intra_16x16,
+    predict_intra_chroma_420,
 };
 pub use quantization::{MacroblockQuantizer, MacroblockQuantizerState, derive_chroma_qp};
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};
