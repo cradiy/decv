@@ -232,6 +232,52 @@ impl BMotionState {
         let partition_size = if context.direct_8x8_inference { 8 } else { 4 };
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let col_zero_can_change = |prediction: Option<(u8, MotionVector)>| {
+            prediction.is_some_and(|(reference_index, vector)| {
+                reference_index == 0 && vector != MotionVector::default()
+            })
+        };
+        if !col_zero_can_change(predicted_l0) && !col_zero_can_change(predicted_l1) {
+            let last_colocated_x = macroblock_x * 4 + 3;
+            let last_colocated_y = macroblock_y * 4 + 3;
+            if last_colocated_x >= context.colocated_motion.width_in_4x4_blocks()
+                || last_colocated_y >= context.colocated_motion.height_in_4x4_blocks()
+            {
+                return Err(H264Error::InvalidSyntax(
+                    "spatial Direct co-located block lies outside the reference motion field",
+                ));
+            }
+            let list0 = predicted_l0.map(|(reference_index, motion_vector)| ResolvedBListMotion {
+                reference_index,
+                motion_vector,
+            });
+            let list1 = predicted_l1.map(|(reference_index, motion_vector)| ResolvedBListMotion {
+                reference_index,
+                motion_vector,
+            });
+            let partition = ResolvedBPartition {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                list0,
+                list1,
+            };
+            let mut partitions = SmallVec::new();
+            partitions.push(partition);
+            self.commit_local_cells(
+                macroblock_address,
+                [Some(MotionCell {
+                    slice_id,
+                    list0,
+                    list1,
+                }); 16],
+            );
+            return Ok(ResolvedBMacroblock {
+                direct: true,
+                partitions,
+            });
+        }
         let mut local = [None; 16];
         let mut partitions = SmallVec::with_capacity((16 / partition_size) * (16 / partition_size));
         for y in (0..16).step_by(partition_size) {
@@ -1538,6 +1584,25 @@ mod tests {
                         )],
                     ),
                 )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn zero_vector_spatial_direct_still_validates_the_colocated_grid() {
+        let mut state = BMotionState::new(2, 1).unwrap();
+        let too_small = ReferenceMotionField::all_intra(Size::new(16, 16)).unwrap();
+        assert!(matches!(
+            state.resolve_spatial_direct_macroblock(1, 1, spatial_direct_context(&too_small),),
+            Err(H264Error::InvalidSyntax(
+                "spatial Direct co-located block lies outside the reference motion field"
+            ))
+        ));
+
+        let complete = ReferenceMotionField::all_intra(Size::new(32, 16)).unwrap();
+        assert!(
+            state
+                .resolve_spatial_direct_macroblock(1, 1, spatial_direct_context(&complete),)
                 .is_ok()
         );
     }
