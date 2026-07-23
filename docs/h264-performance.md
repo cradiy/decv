@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 3.29 s | 3.19 s | 84,588 KiB | 54.7 FPS |
-| decv Auto (2 workers) | NV12 | 3.36 s | 3.62 s | 84,464 KiB | 53.6 FPS |
-| FFmpeg 1 thread | NV12 | 0.61 s | 0.68 s | 152,200 KiB | 295.1 FPS |
-| FFmpeg Auto | NV12 | 0.25 s | 1.41 s | 290,252 KiB | 720.0 FPS |
-| FFmpeg 1 thread | decode-only | 0.57 s | 0.56 s | 95,652 KiB | 315.8 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.96 s | 194,980 KiB | 818.2 FPS |
+| decv Serial | NV12 | 3.19 s | 3.10 s | 84,776 KiB | 56.4 FPS |
+| decv Auto (2 workers) | NV12 | 3.37 s | 3.64 s | 83,648 KiB | 53.4 FPS |
+| FFmpeg 1 thread | NV12 | 0.62 s | 0.70 s | 152,008 KiB | 290.3 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 293,400 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,668 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.95 s | 192,960 KiB | 818.2 FPS |
 
 On this workload:
 
-- decv Serial takes about **5.4x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **5.1x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **13.4x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **13.0x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **2.6x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **2.5x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **56%** of FFmpeg single-threaded NV12 peak RSS and about
   **29%** of FFmpeg Auto NV12 peak RSS;
@@ -62,9 +62,9 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current 3.29-second Serial result is about 0.91x real time, or
-roughly 10% more wall-clock work than the target permits. The measured
-two-worker Auto median is 3.36 seconds, about 12% over the target. The ordering
+seconds. The current 3.19-second Serial result is about 0.94x real time, or
+roughly 6% more wall-clock work than the target permits. The measured
+two-worker Auto median is 3.37 seconds, about 12% over the target. The ordering
 between Serial and Auto is sensitive to scheduling and thermal state because
 the current parallel region is narrow.
 
@@ -86,7 +86,9 @@ B-partition assembly reduced the current result to 3.34 seconds.
 Applying the same specialization to P-partition assembly reduced it to 3.31
 seconds. Loading 64 bits when the single-bit reservoir is empty and batching
 CABAC renormalization reads reduced the current Serial snapshot to 3.29
-seconds.
+seconds. Vectorizing single-list prediction weights and compacting each
+deblocking motion cell from 32 to 24 bytes then reduced the current snapshot
+to 3.19 seconds.
 
 A separate alternating A/B run used the same 300-frame stream and pinned CPU
 sets to isolate those two bit-reading changes from run-to-run drift. Serial
@@ -95,10 +97,17 @@ moved from 5.375 to 5.290 seconds (about 1.6%). This confirms that bit reading
 has a measurable effect, but is not a dominant explanation for the remaining
 FFmpeg gap.
 
+The prediction-weight SIMD change moved the pinned 300-frame Serial median
+from 5.470 to 5.365 seconds and Auto from 5.310 to 5.180 seconds. Packing the
+two reference identities and two motion vectors in each deblocking cell moved
+Serial from 5.420 to 5.260 seconds and Auto from 5.240 to 5.120 seconds. The
+metadata layout change reduces both the per-macroblock copy and the later
+boundary-strength traversal footprint.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
-FFmpeg is already about 5.4x faster in the comparable NV12 case. FFmpeg then
+FFmpeg is already about 5.1x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
 parallelizes only owned CABAC B-macroblock pixel reconstruction. CABAC parsing,
 residual reconstruction, most P-picture reconstruction, output packaging, and
