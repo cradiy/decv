@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use decv_core::{EncodedVideoPacket, MediaInput, MediaTime};
+use decv_core::{EncodedVideoPacket, MediaInput, MediaTime, VideoDecoderConfig};
 
 use crate::{Movie, Mp4Error, Mp4File, Result, Track};
 
@@ -49,8 +49,90 @@ where
         track.read_packet(&self.input, sample_index)
     }
 
+    pub fn packet_cursor(&self, track_index: usize) -> Result<PacketCursor<'_, I>> {
+        if track_index >= self.movie.tracks().len() {
+            return Err(Mp4Error::IndexOutOfRange {
+                kind: "track",
+                index: track_index,
+            });
+        }
+        Ok(PacketCursor {
+            demuxer: self,
+            track_index,
+            next_sample_index: 0,
+        })
+    }
+
     pub fn into_input(self) -> I {
         self.input
+    }
+}
+
+/// A lightweight sequential view over one track. Multiple cursors can read
+/// independently from the same immutable random-access input.
+#[derive(Debug)]
+pub struct PacketCursor<'demuxer, I> {
+    demuxer: &'demuxer Mp4Demuxer<I>,
+    track_index: usize,
+    next_sample_index: usize,
+}
+
+impl<I> PacketCursor<'_, I>
+where
+    I: MediaInput,
+{
+    #[inline]
+    pub const fn track_index(&self) -> usize {
+        self.track_index
+    }
+
+    #[inline]
+    pub const fn next_sample_index(&self) -> usize {
+        self.next_sample_index
+    }
+
+    #[inline]
+    pub fn track(&self) -> &Track {
+        &self.demuxer.movie().tracks()[self.track_index]
+    }
+
+    pub fn next_packet(&mut self) -> Result<Option<EncodedVideoPacket>> {
+        if self.next_sample_index == self.track().samples().len() {
+            return Ok(None);
+        }
+        let sample_index = self.next_sample_index;
+        let packet = self.demuxer.read_packet(self.track_index, sample_index)?;
+        self.next_sample_index = self
+            .next_sample_index
+            .checked_add(1)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        Ok(Some(packet))
+    }
+
+    pub fn decoder_config(&self) -> Result<Option<VideoDecoderConfig>> {
+        let Some(sample) = self.track().samples().get(self.next_sample_index) else {
+            return Ok(None);
+        };
+        self.track()
+            .decoder_config(sample.description_index())
+            .map(Some)
+    }
+
+    /// Repositions to the closest sync sample at or before `target`.
+    ///
+    /// After this call, the decoder must be flushed and packets should be
+    /// decoded until the first output frame at or after the requested target.
+    pub fn seek_to_keyframe(&mut self, target: MediaTime) -> Result<Option<usize>> {
+        let sample_index = self.track().keyframe_at_or_before(target)?;
+        if let Some(sample_index) = sample_index {
+            self.next_sample_index = sample_index;
+        }
+        Ok(sample_index)
+    }
+
+    #[inline]
+    pub const fn rewind(&mut self) {
+        self.next_sample_index = 0;
     }
 }
 

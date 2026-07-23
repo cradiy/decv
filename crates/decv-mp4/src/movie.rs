@@ -105,6 +105,7 @@ pub struct Track {
     display_height_16_16: u32,
     sample_descriptions: Vec<SampleDescription>,
     samples: Vec<Sample>,
+    sync_sample_indices: Vec<usize>,
     edits: Vec<Edit>,
 }
 
@@ -160,6 +161,11 @@ impl Track {
         } else {
             (Vec::new(), Vec::new())
         };
+        let sync_sample_indices = samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sample)| sample.is_sync().then_some(index))
+            .collect();
 
         Ok(Self {
             id,
@@ -172,6 +178,7 @@ impl Track {
             display_height_16_16,
             sample_descriptions,
             samples,
+            sync_sample_indices,
             edits,
         })
     }
@@ -227,6 +234,11 @@ impl Track {
     }
 
     #[inline]
+    pub fn sync_sample_indices(&self) -> &[usize] {
+        &self.sync_sample_indices
+    }
+
+    #[inline]
     pub fn edits(&self) -> &[Edit] {
         &self.edits
     }
@@ -264,6 +276,25 @@ impl Track {
         let value =
             linear_timeline_offset(&self.edits, self.movie_timescale, self.media_timescale)?;
         Ok(MediaTime::new(value, self.media_timescale))
+    }
+
+    /// Finds the sync sample with the greatest presentation time not after
+    /// `target`. The returned index is in decode/sample-table order.
+    pub fn keyframe_at_or_before(&self, target: MediaTime) -> Result<Option<usize>> {
+        let offset = self.presentation_time_offset()?.value;
+        let mut best: Option<(usize, MediaTime)> = None;
+        for &index in &self.sync_sample_indices {
+            let sample = &self.samples[index];
+            let value = sample
+                .presentation_time()
+                .checked_add(offset)
+                .ok_or(Mp4Error::IntegerOverflow)?;
+            let time = MediaTime::new(value, self.media_timescale);
+            if time <= target && best.is_none_or(|(_, best_time)| time > best_time) {
+                best = Some((index, time));
+            }
+        }
+        Ok(best.map(|(index, _)| index))
     }
 }
 
@@ -610,25 +641,30 @@ mod tests {
         stsd.extend_from_slice(&avc1);
         let stts = boxed(
             *b"stts",
-            &full(0, 0, &[1u32, 1, 3_000].map(u32::to_be_bytes).concat()),
+            &full(0, 0, &[1u32, 3, 3_000].map(u32::to_be_bytes).concat()),
         );
         let stsc = boxed(
             *b"stsc",
-            &full(0, 0, &[1u32, 1, 1, 1].map(u32::to_be_bytes).concat()),
+            &full(0, 0, &[1u32, 1, 3, 1].map(u32::to_be_bytes).concat()),
         );
         let stsz = boxed(
             *b"stsz",
-            &full(0, 0, &[1u32, 1].map(u32::to_be_bytes).concat()),
+            &full(0, 0, &[1u32, 3].map(u32::to_be_bytes).concat()),
         );
         let stco = boxed(
             *b"stco",
             &full(0, 0, &[1u32, 0].map(u32::to_be_bytes).concat()),
+        );
+        let stss = boxed(
+            *b"stss",
+            &full(0, 0, &[2u32, 1, 3].map(u32::to_be_bytes).concat()),
         );
         let mut stbl_payload = boxed(*b"stsd", &stsd);
         stbl_payload.extend_from_slice(&stts);
         stbl_payload.extend_from_slice(&stsc);
         stbl_payload.extend_from_slice(&stsz);
         stbl_payload.extend_from_slice(&stco);
+        stbl_payload.extend_from_slice(&stss);
         let stbl = boxed(*b"stbl", &stbl_payload);
         let minf = boxed(*b"minf", &stbl);
 
@@ -670,11 +706,31 @@ mod tests {
         assert_eq!(track.media_duration(), Some(450_000));
         assert_eq!(track.display_width_16_16(), 1_920 << 16);
         assert_eq!(track.display_height_16_16(), 1_080 << 16);
+        assert_eq!(track.samples().len(), 3);
+        assert_eq!(track.sync_sample_indices(), [0, 2]);
         assert_eq!(track.edits().len(), 1);
         assert_eq!(track.edits()[0].media_time(), Some(9_000));
         assert_eq!(
             track.presentation_time_offset().unwrap(),
             MediaTime::from_parts(-9_000, 90_000).unwrap()
+        );
+        assert_eq!(
+            track
+                .keyframe_at_or_before(MediaTime::from_parts(-9_001, 90_000).unwrap())
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            track
+                .keyframe_at_or_before(MediaTime::from_parts(-5_000, 90_000).unwrap())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            track
+                .keyframe_at_or_before(MediaTime::from_parts(-1, 30).unwrap())
+                .unwrap(),
+            Some(2)
         );
 
         let SampleDescription::Avc(entry) = &track.sample_descriptions()[0] else {
@@ -755,5 +811,33 @@ mod tests {
                 index: 1
             })
         ));
+
+        let mut cursor = demuxer.packet_cursor(0).unwrap();
+        assert_eq!(cursor.next_sample_index(), 0);
+        assert_eq!(
+            cursor.decoder_config().unwrap().unwrap().bitstream_format,
+            BitstreamFormat::LengthPrefixed { length_size: 4 }
+        );
+        assert!(cursor.next_packet().unwrap().is_some());
+        assert_eq!(cursor.next_sample_index(), 1);
+        assert_eq!(
+            cursor
+                .seek_to_keyframe(MediaTime::from_parts(-5_000, 90_000).unwrap())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(cursor.next_sample_index(), 0);
+        assert_eq!(
+            cursor
+                .seek_to_keyframe(MediaTime::from_parts(-3_000, 90_000).unwrap())
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(cursor.next_sample_index(), 2);
+        assert!(cursor.next_packet().unwrap().is_some());
+        assert!(cursor.next_packet().unwrap().is_none());
+        assert!(cursor.decoder_config().unwrap().is_none());
+        cursor.rewind();
+        assert_eq!(cursor.next_sample_index(), 0);
     }
 }
