@@ -618,6 +618,12 @@ impl CabacResidualState {
         coded_block_pattern: CodedBlockPattern,
         transform_size_8x8: bool,
     ) -> Result<InterResidual> {
+        self.record_block(
+            macroblock_address,
+            slice_id,
+            CabacResidualBlock::LumaDc,
+            false,
+        )?;
         let luma = self.decode_luma_residual(
             syntax,
             macroblock_address,
@@ -1326,6 +1332,32 @@ mod tests {
         assert_eq!(
             state
                 .coded_block_flag_context_index(1, 7, true, CabacResidualBlock::LumaDc)
+                .unwrap(),
+            Some(87)
+        );
+    }
+
+    #[test]
+    fn records_inferred_zero_luma_dc_for_inter_macroblocks() {
+        let mut arithmetic = CabacDecoder::new(BitReader::new(&[0; 2])).unwrap();
+        let mut contexts = CabacContextSet::new(CabacInitializationTable::Intra, 26).unwrap();
+        let mut syntax = CabacSyntaxDecoder::new(&mut arithmetic, &mut contexts);
+        let mut state = CabacResidualState::new(2, 1).unwrap();
+
+        let residual = state
+            .decode_inter_residual(
+                &mut syntax,
+                0,
+                9,
+                CodedBlockPattern { luma: 0, chroma: 0 },
+                false,
+            )
+            .unwrap();
+
+        assert!(residual.luma.iter().all(|block| block.total_coeff == 0));
+        assert_eq!(
+            state
+                .coded_block_flag_context_index(1, 9, true, CabacResidualBlock::LumaDc)
                 .unwrap(),
             Some(87)
         );
