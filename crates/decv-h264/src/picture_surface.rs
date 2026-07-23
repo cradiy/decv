@@ -481,11 +481,35 @@ impl Yuv420Picture {
             previous_address = Some(entry.address);
         }
 
+        if staged.is_empty() {
+            return Ok(());
+        }
+
+        let luma = Arc::make_mut(&mut self.luma);
+        let chroma_stride = self.width / 2;
         for entry in staged {
-            self.restore_macroblock(
-                entry.address % width_in_macroblocks,
-                entry.address / width_in_macroblocks,
-                &entry.pixels,
+            let macroblock_x = entry.address % width_in_macroblocks;
+            let macroblock_y = entry.address / width_in_macroblocks;
+            write_block(
+                luma,
+                self.width,
+                macroblock_x * 16,
+                macroblock_y * 16,
+                &entry.pixels.luma,
+            );
+            write_block(
+                &mut self.cb,
+                chroma_stride,
+                macroblock_x * 8,
+                macroblock_y * 8,
+                &entry.pixels.cb,
+            );
+            write_block(
+                &mut self.cr,
+                chroma_stride,
+                macroblock_x * 8,
+                macroblock_y * 8,
+                &entry.pixels.cr,
             );
         }
         Ok(())
@@ -898,6 +922,12 @@ mod tests {
             ))
         );
         assert_eq!(picture, before);
+
+        picture
+            .commit_macroblock_batch(&[StagedMacroblockPixels::new(0, pixels(70, 80, 90))])
+            .unwrap();
+        assert_eq!(&picture.luma[..16], &[70; 16]);
+        assert_eq!(&before.luma[..16], &[10; 16]);
     }
 
     #[test]
