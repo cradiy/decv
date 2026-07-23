@@ -7,6 +7,7 @@ const STTS: FourCc = FourCc::new(*b"stts");
 const CTTS: FourCc = FourCc::new(*b"ctts");
 const STSC: FourCc = FourCc::new(*b"stsc");
 const STSZ: FourCc = FourCc::new(*b"stsz");
+const STZ2: FourCc = FourCc::new(*b"stz2");
 const STCO: FourCc = FourCc::new(*b"stco");
 const CO64: FourCc = FourCc::new(*b"co64");
 const STSS: FourCc = FourCc::new(*b"stss");
@@ -106,7 +107,7 @@ pub(crate) fn parse_sample_table(
             STTS => set_once(&mut time_to_sample, child, "duplicate stts box")?,
             CTTS => set_once(&mut composition_offsets, child, "duplicate ctts box")?,
             STSC => set_once(&mut sample_to_chunk, child, "duplicate stsc box")?,
-            STSZ => set_once(&mut sample_sizes, child, "duplicate stsz box")?,
+            STSZ | STZ2 => set_once(&mut sample_sizes, child, "multiple sample-size boxes")?,
             STCO | CO64 => set_once(&mut chunk_offsets, child, "multiple chunk-offset boxes")?,
             STSS => set_once(&mut sync_samples, child, "duplicate stss box")?,
             _ => {}
@@ -115,7 +116,7 @@ pub(crate) fn parse_sample_table(
 
     let sample_sizes = parse_sample_sizes(
         file,
-        sample_sizes.ok_or(Mp4Error::InvalidData("sample table has no stsz box"))?,
+        sample_sizes.ok_or(Mp4Error::InvalidData("sample table has no sample-size box"))?,
     )?;
     let sample_count = sample_sizes.len();
     let time_to_sample = parse_time_to_sample(
@@ -312,6 +313,9 @@ fn parse_sample_to_chunk(
 }
 
 fn parse_sample_sizes(file: Mp4File<'_>, header: BoxHeader) -> Result<Vec<u32>> {
+    if header.kind() == STZ2 {
+        return parse_compact_sample_sizes(file, header);
+    }
     let mut reader = payload_reader(file, header)?;
     require_full_box_version_zero(&mut reader, "stsz")?;
     let default_size = reader.read_u32()?;
@@ -330,6 +334,53 @@ fn parse_sample_sizes(file: Mp4File<'_>, header: BoxHeader) -> Result<Vec<u32>> 
         vec![default_size; sample_count]
     };
     require_finished(&reader, "stsz has trailing bytes")?;
+    Ok(sizes)
+}
+
+fn parse_compact_sample_sizes(file: Mp4File<'_>, header: BoxHeader) -> Result<Vec<u32>> {
+    let mut reader = payload_reader(file, header)?;
+    require_full_box_version_zero(&mut reader, "stz2")?;
+    if reader.read_u24()? != 0 {
+        return Err(Mp4Error::InvalidData("stz2 reserved bits are not zero"));
+    }
+    let field_size = reader.read_u8()?;
+    if !matches!(field_size, 4 | 8 | 16) {
+        return Err(Mp4Error::InvalidData(
+            "stz2 field size is not 4, 8, or 16 bits",
+        ));
+    }
+    let sample_count =
+        usize::try_from(reader.read_u32()?).map_err(|_| Mp4Error::IntegerOverflow)?;
+    if sample_count > MAX_SAMPLE_COUNT {
+        return Err(Mp4Error::InvalidData("sample count exceeds its limit"));
+    }
+
+    let mut sizes = Vec::with_capacity(sample_count);
+    match field_size {
+        4 => {
+            for index in 0..sample_count {
+                if index & 1 == 0 {
+                    let packed = reader.read_u8()?;
+                    sizes.push(u32::from(packed >> 4));
+                    if index + 1 < sample_count {
+                        sizes.push(u32::from(packed & 0x0f));
+                    }
+                }
+            }
+        }
+        8 => {
+            for _ in 0..sample_count {
+                sizes.push(u32::from(reader.read_u8()?));
+            }
+        }
+        16 => {
+            for _ in 0..sample_count {
+                sizes.push(u32::from(reader.read_u16()?));
+            }
+        }
+        _ => unreachable!("field size was validated above"),
+    }
+    require_finished(&reader, "stz2 has trailing bytes")?;
     Ok(sizes)
 }
 
@@ -454,6 +505,7 @@ fn require_full_box_version_zero(reader: &mut BoundedReader<'_>, name: &'static 
             "stts" => "unsupported stts version or flags",
             "stsc" => "unsupported stsc version or flags",
             "stsz" => "unsupported stsz version or flags",
+            "stz2" => "unsupported stz2 version or flags",
             "chunk offsets" => "unsupported chunk-offset version or flags",
             "stss" => "unsupported stss version or flags",
             _ => "unsupported full-box version or flags",
@@ -582,6 +634,19 @@ mod tests {
         (input, header)
     }
 
+    fn parse_compact_sizes(field_size: u8, sample_count: u32, packed: &[u8]) -> Result<Vec<u32>> {
+        let mut body = vec![0, 0, 0, field_size];
+        body.extend_from_slice(&sample_count.to_be_bytes());
+        body.extend_from_slice(packed);
+        let input = MemoryInput(boxed(*b"stz2", &full(&body)));
+        let file = Mp4File::open(&input)?;
+        let header = file
+            .boxes()
+            .next()
+            .ok_or(Mp4Error::InvalidData("missing test stz2 box"))??;
+        parse_sample_sizes(file, header)
+    }
+
     #[test]
     fn combines_timing_chunks_sizes_and_sync_samples() {
         let (input, header) = synthetic_table();
@@ -624,6 +689,37 @@ mod tests {
         let samples = parse_sample_table(file, header, 1).unwrap();
         assert_eq!(samples[0].presentation_time(), -10);
         assert_eq!(samples[1].presentation_time(), 90);
+    }
+
+    #[test]
+    fn parses_each_compact_sample_size_width() {
+        assert_eq!(
+            parse_compact_sizes(4, 5, &[0x12, 0xf0, 0x70]).unwrap(),
+            [1, 2, 15, 0, 7]
+        );
+        assert_eq!(
+            parse_compact_sizes(8, 3, &[1, 200, 0]).unwrap(),
+            [1, 200, 0]
+        );
+        assert_eq!(
+            parse_compact_sizes(16, 3, &[0, 1, 1, 44, 0xff, 0xff]).unwrap(),
+            [1, 300, 65_535]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_trailing_compact_sample_sizes() {
+        assert!(matches!(
+            parse_compact_sizes(12, 1, &[0]),
+            Err(Mp4Error::InvalidData(
+                "stz2 field size is not 4, 8, or 16 bits"
+            ))
+        ));
+        assert!(matches!(
+            parse_compact_sizes(8, 1, &[7, 8]),
+            Err(Mp4Error::InvalidData("stz2 has trailing bytes"))
+        ));
+        assert!(parse_compact_sizes(16, 1, &[0]).is_err());
     }
 
     #[test]

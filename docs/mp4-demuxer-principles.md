@@ -73,7 +73,7 @@ moov
                 ├── stts
                 ├── ctts
                 ├── stsc
-                ├── stsz
+                ├── stsz or stz2
                 ├── stco or co64
                 └── stss
 ```
@@ -204,7 +204,7 @@ combining several tables.
 
 ## 6. How the sample tables combine
 
-### 6.1 `stsz`: sample sizes
+### 6.1 `stsz` or `stz2`: sample sizes
 
 `stsz` gives:
 
@@ -219,6 +219,11 @@ size[sample_index]
 
 This count becomes the reference count against which timing and chunk tables
 are checked.
+
+`stz2` is the compact alternative. It stores every size in a fixed 4-, 8-, or
+16-bit field. Four-bit entries are packed most-significant nibble first. The
+parser expands either representation into the same `Vec<u32>`, so all later
+table-fusion logic is shared.
 
 ### 6.2 `stts`: decode times and durations
 
@@ -586,7 +591,8 @@ Implemented:
 - known-length random-access inputs;
 - bounded ordinary, extended-size, size-zero, and UUID box traversal;
 - `moov`, movie headers, video tracks, and AVC sample descriptions;
-- `stts`, `ctts` version 0/1, `stsc`, `stsz`, `stco`, `co64`, and `stss`;
+- `stts`, `ctts` version 0/1, `stsc`, `stsz`, `stz2`, `stco`, `co64`, and
+  `stss`;
 - `edts`/`elst` version 0/1 parsing;
 - common linear edit-list timestamp mapping;
 - `avc1` and `avc3` configuration through `avcC`;
@@ -597,7 +603,6 @@ Implemented:
 Not implemented yet:
 
 - fragmented MP4 (`moof`, `traf`, `trun`, and fragment defaults);
-- compact sample sizes in `stz2`;
 - encrypted/protected sample entries and CENC metadata;
 - audio tracks and interleaved A/V playback;
 - complex/repeated/variable-rate edit lists;
