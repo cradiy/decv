@@ -36,6 +36,7 @@ pub use cavlc::{
 };
 pub use cavlc_context::CavlcNeighborState;
 pub use decoder::{H264Decoder, H264StreamParser, ParserEvent};
+pub use dpb::{DecodedPictureBuffer, DpbReference, ReferenceKind};
 pub use error::{H264Error, Result};
 pub use inter_prediction::InterPrediction420;
 pub use inter_reconstruction::reconstruct_p_macroblock_420;

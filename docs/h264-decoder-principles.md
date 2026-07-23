@@ -663,6 +663,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - transactional default-weight P macroblock pixel reconstruction with
   per-partition List-0 reference selection, complete coverage validation, and
   saturating prediction-plus-residual writes;
+- an `Arc`-backed progressive reference-picture DPB subset with IDR reset,
+  default P List-0 PicNum ordering, frame-number wrap handling, long-term IDR
+  index zero, and sliding-window short-term eviction;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
@@ -708,7 +711,7 @@ still rejects or has not yet connected:
 The next dependency chain is:
 
 ```text
-reference-picture list and storage management
+reference-list modification and adaptive memory-control operations
     -> connect P macroblocks to the slice and access-unit decoder
     -> DPB reference marking and POC-based output
     -> CABAC
