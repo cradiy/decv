@@ -589,6 +589,15 @@ fn filter_vertical_edge(
     let Some(parameters) = prepare_edge_strength(boundary_strength, thresholds) else {
         return;
     };
+    #[cfg(target_arch = "x86_64")]
+    if length == 4 && parameters.boundary_strength < 4 && !parameters.chroma_style {
+        // SAFETY: SSE2 is part of the x86_64 baseline. Picture traversal
+        // guarantees four complete rows and three samples on either side.
+        unsafe {
+            filter_vertical_weak_luma_sse2(plane, stride, x, y, parameters);
+        }
+        return;
+    }
     for offset in 0..length {
         let q0 = (y + offset) * stride + x;
         let samples = DeblockEdgeSamples {
@@ -768,6 +777,134 @@ unsafe fn filter_horizontal_weak_luma_sse2(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn filter_vertical_weak_luma_sse2(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    parameters: PreparedEdgeParameters,
+) {
+    use std::arch::x86_64::{
+        _mm_add_epi16, _mm_and_si128, _mm_andnot_si128, _mm_cmplt_epi16, _mm_cvtsi64_si128,
+        _mm_cvtsi128_si32, _mm_max_epi16, _mm_min_epi16, _mm_or_si128, _mm_packus_epi16,
+        _mm_set1_epi16, _mm_setzero_si128, _mm_slli_epi16, _mm_srai_epi16, _mm_srli_si128,
+        _mm_sub_epi16, _mm_unpacklo_epi8, _mm_unpacklo_epi16,
+    };
+
+    macro_rules! absolute {
+        ($value:expr, $zero:expr) => {{
+            let value = $value;
+            _mm_max_epi16(value, _mm_sub_epi16($zero, value))
+        }};
+    }
+    macro_rules! select {
+        ($mask:expr, $selected:expr, $fallback:expr) => {
+            _mm_or_si128(
+                _mm_and_si128($mask, $selected),
+                _mm_andnot_si128($mask, $fallback),
+            )
+        };
+    }
+    macro_rules! column {
+        ($columns:expr, $shift:literal, $zero:expr) => {
+            _mm_unpacklo_epi8(_mm_srli_si128::<$shift>($columns), $zero)
+        };
+    }
+
+    let base = plane
+        .as_mut_ptr()
+        .wrapping_add(y * stride + x)
+        .wrapping_sub(4);
+    let mut rows = [0u64; 4];
+    for (row, value) in rows.iter_mut().enumerate() {
+        // SAFETY: The edge has at least three samples on the left and the
+        // eight-byte load covers p3 through q3 within the luma row.
+        *value = unsafe {
+            base.wrapping_add(row * stride)
+                .cast::<u64>()
+                .read_unaligned()
+        };
+    }
+    let row0 = _mm_cvtsi64_si128(rows[0] as i64);
+    let row1 = _mm_cvtsi64_si128(rows[1] as i64);
+    let row2 = _mm_cvtsi64_si128(rows[2] as i64);
+    let row3 = _mm_cvtsi64_si128(rows[3] as i64);
+    let rows01 = _mm_unpacklo_epi8(row0, row1);
+    let rows23 = _mm_unpacklo_epi8(row2, row3);
+    let columns0 = _mm_unpacklo_epi16(rows01, rows23);
+    let columns4 = _mm_unpacklo_epi16(_mm_srli_si128::<8>(rows01), _mm_srli_si128::<8>(rows23));
+    let zero = _mm_setzero_si128();
+    let p2 = column!(columns0, 4, zero);
+    let p1 = column!(columns0, 8, zero);
+    let p0 = column!(columns0, 12, zero);
+    let q0 = column!(columns4, 0, zero);
+    let q1 = column!(columns4, 4, zero);
+    let q2 = column!(columns4, 8, zero);
+
+    let alpha = _mm_set1_epi16(parameters.alpha);
+    let beta = _mm_set1_epi16(parameters.beta);
+    let valid = _mm_and_si128(
+        _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p0, q0), zero), alpha),
+        _mm_and_si128(
+            _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p1, p0), zero), beta),
+            _mm_cmplt_epi16(absolute!(_mm_sub_epi16(q1, q0), zero), beta),
+        ),
+    );
+    let ap = _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p2, p0), zero), beta);
+    let aq = _mm_cmplt_epi16(absolute!(_mm_sub_epi16(q2, q0), zero), beta);
+    let one = _mm_set1_epi16(1);
+    let tc0 = _mm_set1_epi16(parameters.tc0);
+    let tc = _mm_add_epi16(
+        tc0,
+        _mm_add_epi16(_mm_and_si128(ap, one), _mm_and_si128(aq, one)),
+    );
+    let negative_tc = _mm_sub_epi16(zero, tc);
+    let delta = _mm_srai_epi16::<3>(_mm_add_epi16(
+        _mm_add_epi16(
+            _mm_slli_epi16::<2>(_mm_sub_epi16(q0, p0)),
+            _mm_sub_epi16(p1, q1),
+        ),
+        _mm_set1_epi16(4),
+    ));
+    let delta = _mm_min_epi16(_mm_max_epi16(delta, negative_tc), tc);
+    let average = _mm_srai_epi16::<1>(_mm_add_epi16(_mm_add_epi16(p0, q0), one));
+    let negative_tc0 = _mm_sub_epi16(zero, tc0);
+    let p1_delta = _mm_srai_epi16::<1>(_mm_sub_epi16(
+        _mm_add_epi16(p2, average),
+        _mm_slli_epi16::<1>(p1),
+    ));
+    let p1_delta = _mm_min_epi16(_mm_max_epi16(p1_delta, negative_tc0), tc0);
+    let q1_delta = _mm_srai_epi16::<1>(_mm_sub_epi16(
+        _mm_add_epi16(q2, average),
+        _mm_slli_epi16::<1>(q1),
+    ));
+    let q1_delta = _mm_min_epi16(_mm_max_epi16(q1_delta, negative_tc0), tc0);
+    let filtered = [
+        select!(valid, select!(ap, _mm_add_epi16(p1, p1_delta), p1), p1),
+        select!(valid, _mm_add_epi16(p0, delta), p0),
+        select!(valid, _mm_sub_epi16(q0, delta), q0),
+        select!(valid, select!(aq, _mm_add_epi16(q1, q1_delta), q1), q1),
+    ]
+    .map(|values| _mm_cvtsi128_si32(_mm_packus_epi16(values, zero)) as u32);
+
+    const REPLACED_BYTES: u64 = 0x0000_ffff_ffff_0000;
+    for (row, row_samples) in rows.iter_mut().enumerate() {
+        let replacement = u64::from(filtered[0].to_le_bytes()[row]) << 16
+            | u64::from(filtered[1].to_le_bytes()[row]) << 24
+            | u64::from(filtered[2].to_le_bytes()[row]) << 32
+            | u64::from(filtered[3].to_le_bytes()[row]) << 40;
+        *row_samples = (*row_samples & !REPLACED_BYTES) | replacement;
+        // SAFETY: This is the same validated eight-byte row loaded above.
+        unsafe {
+            base.wrapping_add(row * stride)
+                .cast::<u64>()
+                .write_unaligned(*row_samples);
+        }
+    }
+}
+
 fn apply_parameters(
     samples: DeblockEdgeSamples,
     parameters: PreparedEdgeParameters,
@@ -833,7 +970,7 @@ mod tests {
     #[cfg(target_arch = "x86_64")]
     use super::{
         EdgeParameters, filter_horizontal_edge_scalar, filter_horizontal_weak_luma_sse2,
-        prepare_edge_parameters,
+        filter_vertical_weak_luma_sse2, prepare_edge_parameters,
     };
     use crate::{DeblockingFilter, H264Error, MotionVector, Yuv420Picture};
 
@@ -963,6 +1100,37 @@ mod tests {
                     assert_eq!(
                         simd, scalar,
                         "qp={qp} boundary_strength={boundary_strength} seed={seed}"
+                    );
+
+                    let mut scalar = simd.clone();
+                    for row in 0..4 {
+                        let q0 = (8 + row) * 32 + 16;
+                        let samples = DeblockEdgeSamples {
+                            p: std::array::from_fn(|index| scalar[q0 - index - 1]),
+                            q: std::array::from_fn(|index| scalar[q0 + index]),
+                        };
+                        let filtered = filter_deblock_edge(
+                            samples,
+                            boundary_strength,
+                            qp,
+                            qp.saturating_sub(2),
+                            0,
+                            0,
+                            false,
+                        )
+                        .unwrap();
+                        for index in 0..3 {
+                            scalar[q0 - index - 1] = filtered.p[index];
+                            scalar[q0 + index] = filtered.q[index];
+                        }
+                    }
+                    // SAFETY: The test supplies an in-bounds four-row edge.
+                    unsafe {
+                        filter_vertical_weak_luma_sse2(&mut simd, 32, 16, 8, parameters);
+                    }
+                    assert_eq!(
+                        simd, scalar,
+                        "vertical qp={qp} boundary_strength={boundary_strength} seed={seed}"
                     );
                 }
             }
