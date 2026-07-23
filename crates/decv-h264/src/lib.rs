@@ -20,4 +20,7 @@ mod slice;
 mod sps;
 mod transform;
 
+pub use annex_b::{AnnexBNalUnit, AnnexBReader};
 pub use error::{H264Error, Result};
+pub use nal::{NalHeader, NalUnit, NalUnitType};
+pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};

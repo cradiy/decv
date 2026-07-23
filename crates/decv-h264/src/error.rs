@@ -7,6 +7,7 @@ pub enum H264Error {
     Core(decv_core::MediaError),
     UnexpectedEof,
     InvalidStartCode,
+    EmptyNalUnit { offset: usize },
     InvalidNalHeader,
     InvalidRbspEscape,
     InvalidTrailingBits,
@@ -24,6 +25,9 @@ impl fmt::Display for H264Error {
             Self::Core(error) => error.fmt(formatter),
             Self::UnexpectedEof => formatter.write_str("unexpected end of H.264 data"),
             Self::InvalidStartCode => formatter.write_str("invalid Annex-B start code"),
+            Self::EmptyNalUnit { offset } => {
+                write!(formatter, "empty H.264 NAL unit at byte offset {offset}")
+            }
             Self::InvalidNalHeader => formatter.write_str("invalid H.264 NAL header"),
             Self::InvalidRbspEscape => {
                 formatter.write_str("invalid H.264 emulation-prevention sequence")
