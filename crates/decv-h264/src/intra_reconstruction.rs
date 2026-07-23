@@ -23,11 +23,11 @@ use crate::{
     PredictionWeightTable, ReconstructedInterResidual, ReconstructedIntraResidual,
     ReconstructedLumaResidual, ReferenceId, ReferenceMotionField, ResolvedBListMotion,
     ResolvedBMacroblock, ResolvedPMacroblock, ResolvedScalingLists4x4, ResolvedScalingLists8x8,
-    Result, ScanMode, SliceType, SpatialDirectContext, WeightedBiprediction, Yuv420Picture,
-    consume_rbsp_trailing_bits, derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4,
-    predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420, reconstruct_b_inter_residual,
-    reconstruct_inter_residual, reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420,
-    resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
+    Result, ScanMode, SliceType, SpatialDirectContext, TemporalDirectContext, WeightedBiprediction,
+    Yuv420Picture, consume_rbsp_trailing_bits, derive_chroma_qp, parse_cavlc_mb_skip_run,
+    predict_intra_4x4, predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420,
+    reconstruct_b_inter_residual, reconstruct_inter_residual, reconstruct_intra_residual,
+    reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -83,7 +83,7 @@ enum BSlicePredictionWeights<'a> {
 #[derive(Debug, Clone, Copy)]
 enum BDirectPrediction<'a> {
     Spatial(Option<SpatialDirectContext<'a>>),
-    Temporal,
+    Temporal(Option<TemporalDirectContext<'a>>),
 }
 
 impl BDirectPrediction<'_> {
@@ -100,8 +100,11 @@ impl BDirectPrediction<'_> {
             Self::Spatial(None) => Err(H264Error::InvalidSyntax(
                 "spatial Direct requires active List 1 reference metadata",
             )),
-            Self::Temporal => Err(H264Error::UnsupportedFeature(
-                "temporal Direct B motion-vector derivation",
+            Self::Temporal(Some(context)) => {
+                state.resolve_temporal_direct_macroblock(macroblock_address, slice_id, context)
+            }
+            Self::Temporal(None) => Err(H264Error::InvalidSyntax(
+                "temporal Direct requires active reference metadata",
             )),
         }
     }
@@ -414,7 +417,23 @@ impl IntraPictureReconstructor {
                 num_ref_idx_l1_active: header.num_ref_idx_l1_active,
             }))
         } else {
-            BDirectPrediction::Temporal
+            let context = references_l0
+                .direct_references
+                .zip(references_l1.direct_references)
+                .and_then(|(list0, list1)| {
+                    list1
+                        .first()
+                        .copied()
+                        .flatten()
+                        .map(|colocated| TemporalDirectContext {
+                            current_picture_order_count,
+                            colocated,
+                            references_l0: list0,
+                            direct_8x8_inference: sps.direct_8x8_inference,
+                            num_ref_idx_l1_active: header.num_ref_idx_l1_active,
+                        })
+                });
+            BDirectPrediction::Temporal(context)
         };
         if sps.coded_size != self.picture.coded_size()
             || pps.constrained_intra_prediction != self.constrained_intra_prediction
@@ -1997,7 +2016,7 @@ mod tests {
     fn b_reconstruction_modes() -> BReconstructionModes<'static> {
         BReconstructionModes {
             weights: BSlicePredictionWeights::Default,
-            direct: BDirectPrediction::Temporal,
+            direct: BDirectPrediction::Temporal(None),
         }
     }
 
@@ -2127,7 +2146,7 @@ mod tests {
                 ReconstructionReferenceList::new(&references_l1),
                 b_reconstruction_modes(),
             ),
-            Err(H264Error::UnsupportedFeature(_))
+            Err(H264Error::InvalidSyntax(_))
         ));
     }
 

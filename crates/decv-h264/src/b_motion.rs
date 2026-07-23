@@ -24,6 +24,15 @@ pub struct SpatialDirectContext<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub struct TemporalDirectContext<'a> {
+    pub current_picture_order_count: i32,
+    pub colocated: DirectReference<'a>,
+    pub references_l0: &'a [Option<DirectReference<'a>>],
+    pub direct_8x8_inference: bool,
+    pub num_ref_idx_l1_active: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
 struct MotionCell {
     slice_id: u32,
     list0: Option<ResolvedBListMotion>,
@@ -277,6 +286,52 @@ impl BMotionState {
         })
     }
 
+    pub fn resolve_temporal_direct_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        context: TemporalDirectContext<'_>,
+    ) -> Result<ResolvedBMacroblock> {
+        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        if context.num_ref_idx_l1_active == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "temporal Direct requires an active List 1 reference",
+            ));
+        }
+        let partition_size = if context.direct_8x8_inference { 8 } else { 4 };
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let mut local = [None; 16];
+        let mut partitions = Vec::with_capacity((16 / partition_size) * (16 / partition_size));
+        for y in (0..16).step_by(partition_size) {
+            for x in (0..16).step_by(partition_size) {
+                let colocated = context
+                    .colocated
+                    .motion
+                    .cell(macroblock_x * 4 + x / 4, macroblock_y * 4 + y / 4)
+                    .ok_or(H264Error::InvalidSyntax(
+                        "temporal Direct co-located block lies outside the reference motion field",
+                    ))?;
+                let (list0, list1) = temporal_direct_motion(colocated, context)?;
+                let partition = ResolvedBPartition {
+                    x: x as u8,
+                    y: y as u8,
+                    width: partition_size as u8,
+                    height: partition_size as u8,
+                    list0: Some(list0),
+                    list1: Some(list1),
+                };
+                fill_partition_cells(&mut local, slice_id, partition)?;
+                partitions.push(partition);
+            }
+        }
+        self.commit_local_cells(macroblock_address, local);
+        Ok(ResolvedBMacroblock {
+            direct: true,
+            partitions,
+        })
+    }
+
     pub(crate) fn clear_macroblock(&mut self, macroblock_address: usize) -> Result<()> {
         if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
             return Err(H264Error::InvalidSyntax(
@@ -465,6 +520,95 @@ impl BMotionState {
         let start = macroblock_address * 16;
         self.cells[start..start + 16].copy_from_slice(&local);
     }
+}
+
+fn temporal_direct_motion(
+    colocated: crate::MotionFieldCell,
+    context: TemporalDirectContext<'_>,
+) -> Result<(ResolvedBListMotion, ResolvedBListMotion)> {
+    if colocated.intra {
+        return Ok((
+            ResolvedBListMotion {
+                reference_index: 0,
+                motion_vector: MotionVector::default(),
+            },
+            ResolvedBListMotion {
+                reference_index: 0,
+                motion_vector: MotionVector::default(),
+            },
+        ));
+    }
+    let Some(colocated_motion) = colocated.list0.or(colocated.list1) else {
+        return Err(H264Error::InvalidSyntax(
+            "temporal Direct co-located inter block has no motion",
+        ));
+    };
+    let reference_id = colocated_motion
+        .reference_id
+        .ok_or(H264Error::InvalidSyntax(
+            "temporal Direct co-located motion has no stable reference identity",
+        ))?;
+    let (reference_index, reference) = context
+        .references_l0
+        .iter()
+        .enumerate()
+        .find_map(|(index, reference)| {
+            reference
+                .filter(|reference| reference.id == reference_id)
+                .map(|reference| (index, reference))
+        })
+        .ok_or(H264Error::InvalidSyntax(
+            "temporal Direct co-located reference is absent from current List 0",
+        ))?;
+    let reference_index = u8::try_from(reference_index).map_err(|_| H264Error::IntegerOverflow)?;
+    let scale = temporal_direct_scale(
+        context.current_picture_order_count,
+        context.colocated.picture_order_count,
+        reference,
+    );
+    let motion_l0 = MotionVector {
+        x: scale_temporal_component(colocated_motion.vector.x, scale)?,
+        y: scale_temporal_component(colocated_motion.vector.y, scale)?,
+    };
+    let motion_l1 = MotionVector {
+        x: i16::try_from(i32::from(motion_l0.x) - i32::from(colocated_motion.vector.x)).map_err(
+            |_| H264Error::InvalidSyntax("temporal Direct List-1 horizontal MV overflow"),
+        )?,
+        y: i16::try_from(i32::from(motion_l0.y) - i32::from(colocated_motion.vector.y))
+            .map_err(|_| H264Error::InvalidSyntax("temporal Direct List-1 vertical MV overflow"))?,
+    };
+    Ok((
+        ResolvedBListMotion {
+            reference_index,
+            motion_vector: motion_l0,
+        },
+        ResolvedBListMotion {
+            reference_index: 0,
+            motion_vector: motion_l1,
+        },
+    ))
+}
+
+fn temporal_direct_scale(
+    current_picture_order_count: i32,
+    colocated_picture_order_count: i32,
+    reference_l0: DirectReference<'_>,
+) -> i32 {
+    let td = (i64::from(colocated_picture_order_count)
+        - i64::from(reference_l0.picture_order_count))
+    .clamp(-128, 127);
+    if td == 0 || reference_l0.long_term {
+        return 256;
+    }
+    let tb = (i64::from(current_picture_order_count) - i64::from(reference_l0.picture_order_count))
+        .clamp(-128, 127);
+    let tx = (16_384 + td.abs() / 2) / td;
+    ((tb * tx + 32) >> 6).clamp(-1024, 1023) as i32
+}
+
+fn scale_temporal_component(component: i16, scale: i32) -> Result<i16> {
+    i16::try_from((scale * i32::from(component) + 128) >> 8)
+        .map_err(|_| H264Error::InvalidSyntax("scaled temporal Direct motion vector exceeds i16"))
 }
 
 fn validate_direct_reference(
@@ -1058,6 +1202,105 @@ mod tests {
                 },
             )
             .unwrap();
+        assert!(resolved.partitions.iter().all(|partition| {
+            partition.list0.unwrap().motion_vector == MotionVector::default()
+                && partition.list1.unwrap().motion_vector == MotionVector::default()
+        }));
+    }
+
+    #[test]
+    fn temporal_direct_maps_stable_identity_and_scales_colocated_motion() {
+        let reference_id = crate::ReferenceId(7);
+        let mut colocated = MotionFieldBuilder::new(Size::new(16, 16)).unwrap();
+        colocated
+            .record_p(
+                0,
+                &ResolvedPMacroblock {
+                    skipped: false,
+                    partitions: vec![ResolvedPPartition {
+                        x: 0,
+                        y: 0,
+                        width: 16,
+                        height: 16,
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: 8, y: 4 },
+                    }],
+                },
+                Some(&[Some(reference_id)]),
+            )
+            .unwrap();
+        let colocated_motion = colocated.finish().unwrap();
+        let reference_motion = ReferenceMotionField::all_intra(Size::new(16, 16)).unwrap();
+        let references_l0 = [Some(DirectReference {
+            id: reference_id,
+            picture_order_count: 0,
+            long_term: false,
+            motion: &reference_motion,
+        })];
+        let mut state = BMotionState::new(1, 1).unwrap();
+        let resolved = state
+            .resolve_temporal_direct_macroblock(
+                0,
+                1,
+                TemporalDirectContext {
+                    current_picture_order_count: 2,
+                    colocated: DirectReference {
+                        id: crate::ReferenceId(8),
+                        picture_order_count: 8,
+                        long_term: false,
+                        motion: &colocated_motion,
+                    },
+                    references_l0: &references_l0,
+                    direct_8x8_inference: true,
+                    num_ref_idx_l1_active: 1,
+                },
+            )
+            .unwrap();
+        assert!(resolved.direct);
+        assert!(resolved.partitions.iter().all(|partition| {
+            partition.list0
+                == Some(ResolvedBListMotion {
+                    reference_index: 0,
+                    motion_vector: MotionVector { x: 2, y: 1 },
+                })
+                && partition.list1
+                    == Some(ResolvedBListMotion {
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: -6, y: -3 },
+                    })
+        }));
+    }
+
+    #[test]
+    fn temporal_direct_uses_zero_motion_for_colocated_intra_blocks() {
+        let colocated_motion = ReferenceMotionField::all_intra(Size::new(16, 16)).unwrap();
+        let reference_motion = ReferenceMotionField::all_intra(Size::new(16, 16)).unwrap();
+        let references_l0 = [Some(DirectReference {
+            id: crate::ReferenceId(7),
+            picture_order_count: 0,
+            long_term: false,
+            motion: &reference_motion,
+        })];
+        let mut state = BMotionState::new(1, 1).unwrap();
+        let resolved = state
+            .resolve_temporal_direct_macroblock(
+                0,
+                1,
+                TemporalDirectContext {
+                    current_picture_order_count: 2,
+                    colocated: DirectReference {
+                        id: crate::ReferenceId(8),
+                        picture_order_count: 4,
+                        long_term: false,
+                        motion: &colocated_motion,
+                    },
+                    references_l0: &references_l0,
+                    direct_8x8_inference: false,
+                    num_ref_idx_l1_active: 1,
+                },
+            )
+            .unwrap();
+        assert_eq!(resolved.partitions.len(), 16);
         assert!(resolved.partitions.iter().all(|partition| {
             partition.list0.unwrap().motion_vector == MotionVector::default()
                 && partition.list1.unwrap().motion_vector == MotionVector::default()

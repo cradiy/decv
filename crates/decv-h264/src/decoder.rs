@@ -1106,6 +1106,41 @@ mod tests {
     }
 
     #[test]
+    fn decodes_a_temporally_skipped_b_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x01, single_macroblock_temporal_skip_b_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        for expected_id in [1, 3, 2] {
+            let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
+                panic!("expected a decoded frame");
+            };
+            assert_eq!(frame.id, expected_id);
+            let FrameStorage::Cpu(cpu) = frame.storage else {
+                panic!("expected CPU frame");
+            };
+            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        }
+    }
+
+    #[test]
     fn decodes_an_explicitly_weighted_bidirectional_b_picture() {
         let stream = annex_b_stream(&[
             (0x67, single_macroblock_main_sps_rbsp()),
@@ -1962,6 +1997,22 @@ mod tests {
         writer.write_bits(1, 4); // frame_num
         writer.write_bits(2, 4); // pic_order_cnt_lsb
         writer.write_flag(true); // direct_spatial_mv_pred_flag
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // ref_pic_list_modification_flag_l1
+        writer.write_se(0); // slice_qp_delta
+        writer.write_ue(1); // mb_skip_run
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_temporal_skip_b_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(1); // B slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num
+        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_flag(false); // direct_spatial_mv_pred_flag
         writer.write_flag(false); // num_ref_idx_active_override_flag
         writer.write_flag(false); // ref_pic_list_modification_flag_l0
         writer.write_flag(false); // ref_pic_list_modification_flag_l1
