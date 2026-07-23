@@ -806,14 +806,16 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - a synchronous `VideoDecoder` implementation with packet ownership,
   backpressure, `FormatChanged`, timestamps, flush, and drain behavior.
 
-The first inter-picture pixel-producing path is therefore real, but
-deliberately narrow:
+The current pixel-producing path is:
 
 ```text
-Annex-B CAVLC or CABAC progressive 8-bit 4:2:0 I/IDR -> P
-    -> Intra, P_L0, P_8x8, or P_Skip macroblocks
-    -> List-0 motion compensation plus residual reconstruction
+Annex-B or AVCC progressive 8-bit 4:2:0
+    -> Baseline, Main, or High Profile
+    -> CAVLC or CABAC I/IDR, P, and B slices
+    -> Intra, List-0, List-1, bidirectional, Direct, or Skip macroblocks
+    -> weighted/default motion compensation plus residual reconstruction
     -> progressive in-loop deblocking and reference-picture marking
+    -> bounded DPB and POC display reordering
     -> immutable CPU NV12 frame
     -> synchronous pull output
 ```
@@ -825,13 +827,16 @@ still rejects or has not yet connected:
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;
+- data-partition and slice-extension NAL units;
+- chroma formats other than 4:2:0 and bit depths other than 8-bit.
 
 The next dependency chain is:
 
 ```text
-broader CABAC I/P/B stream corpus
-    -> isolate unsupported syntax combinations
-    -> extend profiles, fields, and transform-bypass coverage
+broader conformance and fuzz corpus
+    -> 1080p60 profiling and bounded-memory soak testing
+    -> MP4 demuxing and GPUI playback integration
+    -> fields, transform bypass, and hardware backends as needed
 ```
 
 The synchronous decoder currently keeps an unfinished picture across packets.
@@ -850,7 +855,8 @@ cargo bench -p decv-h264 --bench cavlc
 ./scripts/verify_real_h264.sh
 ```
 
-The last command generates fresh Baseline/CAVLC streams with libx264 and
-compares every decoded NV12 byte with FFmpeg. It uses a unique temporary
-directory so an old reference output cannot accidentally be compared with a
-new bitstream.
+The last command generates fresh Baseline, Main, and High Profile streams with
+libx264. Its cases cover CAVLC/CABAC I/P/B, CABAC neighbour-state transitions,
+weighted and Direct B prediction, multiple references, reordering, and a
+cropped realistic stream. It compares every visible NV12 byte with FFmpeg and
+uses a unique temporary directory so stale output cannot produce a false pass.
