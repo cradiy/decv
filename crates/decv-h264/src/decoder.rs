@@ -1,13 +1,230 @@
 //! Top-level NAL dispatch, picture-boundary detection, and frame output.
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::VecDeque, sync::Arc};
 
 use bit_readers::BitReader;
+use decv_core::{
+    BitstreamFormat, DecodeInputStatus, DecodeOutput, EncodedVideoPacket, MediaTime, PixelFormat,
+    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+};
 
 use crate::{
-    AnnexBNalUnit, H264Error, NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader,
-    PictureParameterSet, Result, SequenceParameterSet, consume_rbsp_trailing_bits, decode_rbsp,
+    AnnexBNalUnit, AnnexBReader, H264Error, IntraPictureReconstructor, NalUnit, NalUnitType,
+    ParameterSetStore, ParsedSliceHeader, PictureParameterSet, Result, SequenceParameterSet,
+    consume_rbsp_trailing_bits, decode_rbsp,
 };
+
+#[derive(Debug)]
+struct PendingPicture {
+    reconstructor: IntraPictureReconstructor,
+    format: VideoFormat,
+    pts: Option<MediaTime>,
+    duration: Option<MediaTime>,
+}
+
+/// Synchronous pure-Rust H.264 decoder implementing the codec-independent
+/// push/pull contract.
+///
+/// The current reconstruction backend accepts Annex-B CAVLC I pictures. Other
+/// H.264 coding tools return explicit [`H264Error::UnsupportedFeature`] errors.
+#[derive(Debug)]
+pub struct H264Decoder {
+    configured: bool,
+    parser: H264StreamParser,
+    current_picture: Option<PendingPicture>,
+    outputs: VecDeque<DecodeOutput>,
+    announced_format: Option<VideoFormat>,
+    next_frame_id: u64,
+    draining: bool,
+}
+
+impl Default for H264Decoder {
+    fn default() -> Self {
+        Self {
+            configured: false,
+            parser: H264StreamParser::new(),
+            current_picture: None,
+            outputs: VecDeque::new(),
+            announced_format: None,
+            next_frame_id: 0,
+            draining: false,
+        }
+    }
+}
+
+impl H264Decoder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn process_packet(&mut self, packet: &EncodedVideoPacket) -> Result<()> {
+        for unit in AnnexBReader::new(packet.data.as_ref()) {
+            let event = self.parser.push_annex_b(unit?)?;
+            match event {
+                ParserEvent::SequenceParameterSet(_)
+                | ParserEvent::PictureParameterSet(_)
+                | ParserEvent::Unhandled(_) => {}
+                ParserEvent::Slice {
+                    parsed,
+                    rbsp,
+                    starts_new_picture,
+                    ..
+                } => {
+                    if starts_new_picture {
+                        self.finish_current_picture()?;
+                    }
+                    if self.current_picture.is_none() {
+                        let format = video_format(&parsed)?;
+                        let reconstructor =
+                            IntraPictureReconstructor::from_parameter_sets(&parsed.parameter_sets)?;
+                        self.current_picture = Some(PendingPicture {
+                            reconstructor,
+                            format,
+                            pts: packet.pts,
+                            duration: packet.duration,
+                        });
+                    }
+                    self.current_picture
+                        .as_mut()
+                        .expect("the picture is initialized above")
+                        .reconstructor
+                        .decode_cavlc_intra_slice(rbsp.as_ref(), &parsed)?;
+                }
+                ParserEvent::AccessUnitDelimiter { .. } | ParserEvent::EndOfSequence => {
+                    self.finish_current_picture()?;
+                }
+                ParserEvent::EndOfStream => {
+                    self.finish_current_picture()?;
+                    self.draining = true;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_current_picture(&mut self) -> Result<()> {
+        let Some(picture) = self.current_picture.take() else {
+            return Ok(());
+        };
+        self.next_frame_id = self
+            .next_frame_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let frame = picture.reconstructor.into_nv12_frame(
+            self.next_frame_id,
+            picture.pts,
+            picture.duration,
+            picture.format,
+        )?;
+        if self.announced_format != Some(picture.format) {
+            self.outputs
+                .push_back(DecodeOutput::FormatChanged(picture.format));
+            self.announced_format = Some(picture.format);
+        }
+        self.outputs.push_back(DecodeOutput::Frame(frame));
+        Ok(())
+    }
+
+    fn reset_all_state(&mut self) {
+        self.parser.reset();
+        self.current_picture = None;
+        self.outputs.clear();
+        self.announced_format = None;
+        self.next_frame_id = 0;
+        self.draining = false;
+    }
+
+    fn flush_timeline(&mut self) {
+        self.parser.reset_picture_history();
+        self.current_picture = None;
+        self.outputs.clear();
+        self.draining = false;
+    }
+}
+
+impl VideoDecoder for H264Decoder {
+    type Error = H264Error;
+
+    fn configure(&mut self, config: VideoDecoderConfig) -> Result<()> {
+        config.validate()?;
+        if !matches!(config.codec, VideoCodec::H264) {
+            return Err(H264Error::UnsupportedFeature(
+                "decoder configuration for a non-H.264 codec",
+            ));
+        }
+        if !matches!(config.bitstream_format, BitstreamFormat::ByteStream) {
+            return Err(H264Error::UnsupportedFeature("length-prefixed H.264 input"));
+        }
+        if config.codec_data.is_some() {
+            return Err(H264Error::UnsupportedFeature(
+                "out-of-band H.264 codec configuration",
+            ));
+        }
+        self.reset_all_state();
+        self.configured = true;
+        Ok(())
+    }
+
+    fn send_packet(&mut self, packet: EncodedVideoPacket) -> Result<DecodeInputStatus> {
+        if !self.configured {
+            return Err(H264Error::InvalidSyntax(
+                "H.264 decoder must be configured before input",
+            ));
+        }
+        if self.draining {
+            return Err(H264Error::InvalidSyntax(
+                "H.264 decoder cannot accept input while draining",
+            ));
+        }
+        if !self.outputs.is_empty() {
+            return Ok(DecodeInputStatus::NeedOutput(packet));
+        }
+        if packet.discontinuity {
+            self.flush_timeline();
+        }
+        self.process_packet(&packet)?;
+        Ok(DecodeInputStatus::Accepted)
+    }
+
+    fn receive_frame(&mut self) -> Result<DecodeOutput> {
+        if let Some(output) = self.outputs.pop_front() {
+            return Ok(output);
+        }
+        if self.draining {
+            Ok(DecodeOutput::EndOfStream)
+        } else {
+            Ok(DecodeOutput::NeedInput)
+        }
+    }
+
+    fn flush(&mut self) {
+        self.flush_timeline();
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        if !self.configured {
+            return Err(H264Error::InvalidSyntax(
+                "H.264 decoder must be configured before draining",
+            ));
+        }
+        self.finish_current_picture()?;
+        self.draining = true;
+        Ok(())
+    }
+}
+
+fn video_format(parsed: &ParsedSliceHeader) -> Result<VideoFormat> {
+    let sps = &parsed.parameter_sets.sequence;
+    let format = VideoFormat {
+        coded_size: sps.coded_size,
+        visible_rect: sps.visible_rect,
+        display_size: sps.display_size,
+        pixel_format: PixelFormat::Nv12,
+        color: sps.vui.as_ref().map(|vui| vui.color).unwrap_or_default(),
+    };
+    format.validate()?;
+    Ok(format)
+}
 
 #[derive(Debug)]
 #[non_exhaustive]
@@ -129,6 +346,10 @@ impl H264StreamParser {
     /// Clears parameter sets and picture-boundary history.
     pub fn reset(&mut self) {
         self.parameter_sets.clear();
+        self.reset_picture_history();
+    }
+
+    fn reset_picture_history(&mut self) {
         self.previous_vcl = None;
         self.poc_state.reset();
         self.current_picture_order_count = None;
@@ -204,9 +425,13 @@ fn validate_empty_rbsp(ebsp: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
+    use decv_core::{
+        BitstreamFormat, ColorInfo, DecodeInputStatus, DecodeOutput, EncodedVideoPacket,
+        FrameStorage, MediaTime, PixelFormat, Rect, Size, VideoCodec, VideoDecoder,
+        VideoDecoderConfig, VideoFormat,
+    };
 
-    use super::{H264StreamParser, ParserEvent, PictureIdentity};
+    use super::{H264Decoder, H264StreamParser, ParserEvent, PictureIdentity};
     use crate::{AnnexBReader, H264Error, IntraPictureReconstructor, NalHeader, NalUnit};
 
     #[test]
@@ -312,6 +537,112 @@ mod tests {
         };
         assert_eq!(cpu.planes[0].bytes.len(), 384);
         assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+    }
+
+    #[test]
+    fn exposes_cavlc_idr_through_the_video_decoder_contract() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        let mut packet = EncodedVideoPacket::new(stream);
+        packet.pts = MediaTime::from_parts(10, 30);
+        packet.duration = MediaTime::from_parts(1, 30);
+        assert!(matches!(
+            decoder.send_packet(packet).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::NeedInput
+        ));
+
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(VideoFormat {
+                coded_size: Size {
+                    width: 16,
+                    height: 16
+                },
+                pixel_format: PixelFormat::Nv12,
+                ..
+            })
+        ));
+        let frame = match decoder.receive_frame().unwrap() {
+            DecodeOutput::Frame(frame) => frame,
+            output => panic!("expected frame, got {output:?}"),
+        };
+        assert_eq!(frame.id, 1);
+        assert_eq!(frame.pts, MediaTime::from_parts(10, 30));
+        assert_eq!(frame.duration, MediaTime::from_parts(1, 30));
+        assert!(matches!(frame.storage, FrameStorage::Cpu(_)));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn returns_unconsumed_packets_while_output_is_pending() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]), // AUD, primary_pic_type=0
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+
+        let retry = EncodedVideoPacket::new([0, 0, 1, 0x0b]);
+        match decoder.send_packet(retry).unwrap() {
+            DecodeInputStatus::NeedOutput(packet) => {
+                assert_eq!(packet.data.as_ref(), &[0, 0, 1, 0x0b]);
+            }
+            DecodeInputStatus::Accepted => panic!("packet must remain unconsumed"),
+        }
+
+        decoder.flush();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::NeedInput
+        ));
+
+        let idr_only = annex_b_stream(&[(0x65, single_macroblock_idr_rbsp())]);
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(idr_only))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_unsupported_decoder_framing() {
+        let mut decoder = H264Decoder::new();
+        assert!(
+            decoder
+                .configure(VideoDecoderConfig {
+                    codec: VideoCodec::H264,
+                    bitstream_format: BitstreamFormat::LengthPrefixed { length_size: 4 },
+                    codec_data: None,
+                })
+                .is_err()
+        );
     }
 
     #[test]
@@ -518,6 +849,14 @@ mod tests {
 
     fn configured_parser() -> H264StreamParser {
         configured_parser_with_sps(sps_rbsp())
+    }
+
+    fn byte_stream_config() -> VideoDecoderConfig {
+        VideoDecoderConfig {
+            codec: VideoCodec::H264,
+            bitstream_format: BitstreamFormat::ByteStream,
+            codec_data: None,
+        }
     }
 
     fn configured_parser_with_sps(sps: Vec<u8>) -> H264StreamParser {

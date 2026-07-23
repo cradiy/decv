@@ -32,7 +32,7 @@ pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
 };
 pub use cavlc_context::CavlcNeighborState;
-pub use decoder::{H264StreamParser, ParserEvent};
+pub use decoder::{H264Decoder, H264StreamParser, ParserEvent};
 pub use error::{H264Error, Result};
 pub use intra_modes::IntraModeState;
 pub use intra_reconstruction::IntraPictureReconstructor;
