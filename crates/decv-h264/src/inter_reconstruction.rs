@@ -1,9 +1,10 @@
 //! P-macroblock assembly from reference prediction and spatial residuals.
 
 use crate::{
-    H264Error, InterPrediction420, PredictionWeightTable, ReconstructedInterResidual,
-    ReconstructedLumaResidual, ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition,
-    ResolvedPMacroblock, ResolvedPPartition, Result, WeightOffset, Yuv420Picture,
+    H264Error, InterPrediction420, PredictionWeight, PredictionWeightTable,
+    ReconstructedInterResidual, ReconstructedLumaResidual, ResolvedBListMotion,
+    ResolvedBMacroblock, ResolvedBPartition, ResolvedPMacroblock, ResolvedPPartition, Result,
+    WeightOffset, Yuv420Picture,
 };
 
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
@@ -150,6 +151,54 @@ pub fn reconstruct_b_macroblock_from_lists_420(
     motion: &ResolvedBMacroblock,
     residual: &ReconstructedInterResidual,
 ) -> Result<()> {
+    reconstruct_b_macroblock_from_lists_inner(
+        current,
+        references_l0,
+        references_l1,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        None,
+    )
+}
+
+/// Reconstructs one progressive B macroblock using the explicit
+/// `pred_weight_table` carried by the slice header.
+#[allow(clippy::too_many_arguments)]
+pub fn reconstruct_weighted_b_macroblock_from_lists_420(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: &ReconstructedInterResidual,
+    weights: &PredictionWeightTable,
+) -> Result<()> {
+    reconstruct_b_macroblock_from_lists_inner(
+        current,
+        references_l0,
+        references_l1,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        Some(weights),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_b_macroblock_from_lists_inner(
+    current: &mut Yuv420Picture,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: &ReconstructedInterResidual,
+    weights: Option<&PredictionWeightTable>,
+) -> Result<()> {
     let luma_x = macroblock_x
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
@@ -188,7 +237,13 @@ pub fn reconstruct_b_macroblock_from_lists_420(
             partition.list1,
             "B partition selects no reference picture in List 1",
         )?;
-        let prediction = merge_b_predictions(prediction_l0, prediction_l1)?;
+        let prediction = merge_b_predictions(
+            prediction_l0,
+            prediction_l1,
+            partition.list0.map(|motion| motion.reference_index),
+            partition.list1.map(|motion| motion.reference_index),
+            weights,
+        )?;
         for y in 0..usize::from(partition.height) {
             let destination = &mut predicted_luma[usize::from(partition.y) + y]
                 [usize::from(partition.x)..usize::from(partition.x + partition.width)];
@@ -287,14 +342,56 @@ fn predict_b_partition_list(
 fn merge_b_predictions(
     list0: Option<InterPrediction420>,
     list1: Option<InterPrediction420>,
+    reference_index_l0: Option<u8>,
+    reference_index_l1: Option<u8>,
+    weights: Option<&PredictionWeightTable>,
 ) -> Result<InterPrediction420> {
     match (list0, list1) {
-        (Some(prediction), None) | (None, Some(prediction)) => Ok(prediction),
+        (Some(mut prediction), None) => {
+            if let Some(weights) = weights {
+                apply_prediction_weights_for_list(
+                    &mut prediction,
+                    reference_index_l0.ok_or(H264Error::InvalidSyntax(
+                        "List-0 B prediction is missing its reference index",
+                    ))?,
+                    weights,
+                    false,
+                )?;
+            }
+            Ok(prediction)
+        }
+        (None, Some(mut prediction)) => {
+            if let Some(weights) = weights {
+                apply_prediction_weights_for_list(
+                    &mut prediction,
+                    reference_index_l1.ok_or(H264Error::InvalidSyntax(
+                        "List-1 B prediction is missing its reference index",
+                    ))?,
+                    weights,
+                    true,
+                )?;
+            }
+            Ok(prediction)
+        }
         (Some(mut list0), Some(list1)) => {
             if list0.width != list1.width || list0.height != list1.height {
                 return Err(H264Error::InvalidSyntax(
                     "bidirectional prediction dimensions do not match",
                 ));
+            }
+            if let Some(weights) = weights {
+                apply_explicit_bipred_weights(
+                    &mut list0,
+                    &list1,
+                    reference_index_l0.ok_or(H264Error::InvalidSyntax(
+                        "bidirectional List-0 prediction is missing its reference index",
+                    ))?,
+                    reference_index_l1.ok_or(H264Error::InvalidSyntax(
+                        "bidirectional List-1 prediction is missing its reference index",
+                    ))?,
+                    weights,
+                )?;
+                return Ok(list0);
             }
             for y in 0..usize::from(list0.height) {
                 for x in 0..usize::from(list0.width) {
@@ -462,12 +559,16 @@ fn apply_prediction_weights(
     reference_index: u8,
     table: &PredictionWeightTable,
 ) -> Result<()> {
-    let weights = table
-        .list0
-        .get(usize::from(reference_index))
-        .ok_or(H264Error::InvalidSyntax(
-            "weighted P partition reference index exceeds pred_weight_table",
-        ))?;
+    apply_prediction_weights_for_list(prediction, reference_index, table, false)
+}
+
+fn apply_prediction_weights_for_list(
+    prediction: &mut InterPrediction420,
+    reference_index: u8,
+    table: &PredictionWeightTable,
+    list1: bool,
+) -> Result<()> {
+    let weights = prediction_weight(table, list1, reference_index)?;
     let luma_default = 1i32 << table.luma_log2_weight_denom;
     let luma = weights.luma.unwrap_or(WeightOffset {
         weight: luma_default,
@@ -509,6 +610,84 @@ fn apply_prediction_weights(
     Ok(())
 }
 
+fn apply_explicit_bipred_weights(
+    list0: &mut InterPrediction420,
+    list1: &InterPrediction420,
+    reference_index_l0: u8,
+    reference_index_l1: u8,
+    table: &PredictionWeightTable,
+) -> Result<()> {
+    let weights_l0 = prediction_weight(table, false, reference_index_l0)?;
+    let weights_l1 = prediction_weight(table, true, reference_index_l1)?;
+    let default_luma = 1i32 << table.luma_log2_weight_denom;
+    let luma_l0 = weights_l0.luma.unwrap_or(WeightOffset {
+        weight: default_luma,
+        offset: 0,
+    });
+    let luma_l1 = weights_l1.luma.unwrap_or(WeightOffset {
+        weight: default_luma,
+        offset: 0,
+    });
+    for y in 0..usize::from(list0.height) {
+        for x in 0..usize::from(list0.width) {
+            list0.luma[y][x] = weighted_bipred_sample(
+                list0.luma[y][x],
+                list1.luma[y][x],
+                luma_l0,
+                luma_l1,
+                table.luma_log2_weight_denom,
+            );
+        }
+    }
+
+    let default_chroma = 1i32 << table.chroma_log2_weight_denom;
+    let default_chroma_weights = [
+        WeightOffset {
+            weight: default_chroma,
+            offset: 0,
+        },
+        WeightOffset {
+            weight: default_chroma,
+            offset: 0,
+        },
+    ];
+    let chroma_l0 = weights_l0.chroma.unwrap_or(default_chroma_weights);
+    let chroma_l1 = weights_l1.chroma.unwrap_or(default_chroma_weights);
+    for y in 0..usize::from(list0.height / 2) {
+        for x in 0..usize::from(list0.width / 2) {
+            list0.cb[y][x] = weighted_bipred_sample(
+                list0.cb[y][x],
+                list1.cb[y][x],
+                chroma_l0[0],
+                chroma_l1[0],
+                table.chroma_log2_weight_denom,
+            );
+            list0.cr[y][x] = weighted_bipred_sample(
+                list0.cr[y][x],
+                list1.cr[y][x],
+                chroma_l0[1],
+                chroma_l1[1],
+                table.chroma_log2_weight_denom,
+            );
+        }
+    }
+    Ok(())
+}
+
+fn prediction_weight(
+    table: &PredictionWeightTable,
+    list1: bool,
+    reference_index: u8,
+) -> Result<&PredictionWeight> {
+    let list = if list1 { &table.list1 } else { &table.list0 };
+    list.get(usize::from(reference_index))
+        .ok_or(H264Error::InvalidSyntax(if list1 {
+            "weighted partition List-1 index exceeds pred_weight_table"
+        } else {
+            "weighted partition List-0 index exceeds pred_weight_table"
+        }))
+}
+
 #[inline]
 fn weighted_sample(sample: u8, weight: WeightOffset, denominator: u8) -> u8 {
     let rounding = if denominator == 0 {
@@ -518,6 +697,22 @@ fn weighted_sample(sample: u8, weight: WeightOffset, denominator: u8) -> u8 {
     };
     (((weight.weight * i32::from(sample) + rounding) >> denominator) + weight.offset).clamp(0, 255)
         as u8
+}
+
+#[inline]
+fn weighted_bipred_sample(
+    sample_l0: u8,
+    sample_l1: u8,
+    weight_l0: WeightOffset,
+    weight_l1: WeightOffset,
+    denominator: u8,
+) -> u8 {
+    let rounding = 1i32 << denominator;
+    let offset = (weight_l0.offset + weight_l1.offset + 1) >> 1;
+    ((weight_l0.weight * i32::from(sample_l0) + weight_l1.weight * i32::from(sample_l1) + rounding)
+        >> (denominator + 1))
+        .saturating_add(offset)
+        .clamp(0, 255) as u8
 }
 
 fn copy_residual_block<const OUTPUT: usize, const BLOCK: usize>(
@@ -752,6 +947,70 @@ mod tests {
         assert_eq!((cb[0], cb[4], cb[4 * 8]), (21, 81, 51));
         assert_eq!(cr[4 * 8], 52);
         assert_eq!(rounded_average(20, 81), 51);
+    }
+
+    #[test]
+    fn applies_explicit_weights_to_each_b_prediction_mode() {
+        let first = picture(20);
+        let second = picture(80);
+        let mut current = picture(0);
+        reconstruct_weighted_b_macroblock_from_lists_420(
+            &mut current,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions: vec![
+                    b_partition(0, 0, 8, 8, Some(b_list(0)), None),
+                    b_partition(8, 0, 8, 8, None, Some(b_list(0))),
+                    b_partition(0, 8, 16, 8, Some(b_list(0)), Some(b_list(0))),
+                ],
+            },
+            &zero_residual(),
+            &PredictionWeightTable {
+                luma_log2_weight_denom: 0,
+                chroma_log2_weight_denom: 0,
+                list0: vec![PredictionWeight {
+                    luma: Some(WeightOffset {
+                        weight: 1,
+                        offset: 10,
+                    }),
+                    chroma: Some([
+                        WeightOffset {
+                            weight: 1,
+                            offset: 5,
+                        },
+                        WeightOffset {
+                            weight: 1,
+                            offset: 5,
+                        },
+                    ]),
+                }],
+                list1: vec![PredictionWeight {
+                    luma: Some(WeightOffset {
+                        weight: 3,
+                        offset: -2,
+                    }),
+                    chroma: Some([
+                        WeightOffset {
+                            weight: 1,
+                            offset: -5,
+                        },
+                        WeightOffset {
+                            weight: 1,
+                            offset: -5,
+                        },
+                    ]),
+                }],
+            },
+        )
+        .unwrap();
+        let (luma, cb, cr) = current.planes();
+        assert_eq!((luma[0], luma[8], luma[8 * 16]), (30, 238, 134));
+        assert_eq!((cb[0], cb[4], cb[4 * 8]), (26, 76, 51));
+        assert_eq!((cr[0], cr[4], cr[4 * 8]), (27, 77, 52));
     }
 
     #[test]

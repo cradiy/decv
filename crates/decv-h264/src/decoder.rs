@@ -876,6 +876,52 @@ mod tests {
     }
 
     #[test]
+    fn decodes_an_explicitly_weighted_bidirectional_b_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_explicit_b_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x01, single_macroblock_explicit_b_weighted_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        let mut frames = Vec::new();
+        for _ in 0..3 {
+            let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
+                panic!("expected a decoded frame");
+            };
+            frames.push(frame);
+        }
+        assert_eq!(
+            frames.iter().map(|frame| frame.id).collect::<Vec<_>>(),
+            [1, 3, 2]
+        );
+        let FrameStorage::Cpu(weighted_b) = &frames[1].storage else {
+            panic!("expected CPU frame");
+        };
+        let luma = &weighted_b.planes[0];
+        let luma_bytes = &luma.bytes[luma.offset..luma.offset + luma.stride * luma.rows];
+        assert!(luma_bytes.iter().all(|&sample| sample == 138));
+        let chroma = &weighted_b.planes[1];
+        let chroma_bytes =
+            &chroma.bytes[chroma.offset..chroma.offset + chroma.stride * chroma.rows];
+        assert!(chroma_bytes.iter().all(|&sample| sample == 128));
+    }
+
+    #[test]
     fn decodes_explicitly_weighted_reference_p_picture() {
         let stream = annex_b_stream(&[
             (0x67, single_macroblock_sps_rbsp()),
@@ -1438,6 +1484,26 @@ mod tests {
         writer.finish_rbsp()
     }
 
+    fn single_macroblock_explicit_b_pps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_ue(0); // seq_parameter_set_id
+        writer.write_flag(false); // entropy_coding_mode_flag: CAVLC
+        writer.write_flag(false); // bottom_field_pic_order_in_frame_present_flag
+        writer.write_ue(0); // num_slice_groups_minus1
+        writer.write_ue(0); // num_ref_idx_l0_default_active_minus1
+        writer.write_ue(0); // num_ref_idx_l1_default_active_minus1
+        writer.write_flag(false); // weighted_pred_flag
+        writer.write_bits(1, 2); // explicit weighted_bipred_idc
+        writer.write_se(0); // pic_init_qp_minus26
+        writer.write_se(0); // pic_init_qs_minus26
+        writer.write_se(0); // chroma_qp_index_offset
+        writer.write_flag(false); // deblocking_filter_control_present_flag
+        writer.write_flag(false); // constrained_intra_pred_flag
+        writer.write_flag(false); // redundant_pic_cnt_present_flag
+        writer.finish_rbsp()
+    }
+
     fn single_macroblock_idr_rbsp() -> Vec<u8> {
         let mut writer = BitWriter::default();
         writer.write_ue(0); // first_mb_in_slice
@@ -1502,6 +1568,40 @@ mod tests {
         writer.write_flag(false); // ref_pic_list_modification_flag_l1
         writer.write_se(0); // slice_qp_delta
 
+        writer.write_ue(0); // mb_skip_run
+        writer.write_ue(3); // B_Bi_16x16
+        writer.write_se(0); // mvd_l0.x
+        writer.write_se(0); // mvd_l0.y
+        writer.write_se(0); // mvd_l1.x
+        writer.write_se(0); // mvd_l1.y
+        writer.write_ue(0); // coded_block_pattern -> zero
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_explicit_b_weighted_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(1); // B slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num
+        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_flag(true); // direct_spatial_mv_pred_flag
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // ref_pic_list_modification_flag_l1
+
+        writer.write_ue(0); // luma_log2_weight_denom
+        writer.write_ue(0); // chroma_log2_weight_denom
+        writer.write_flag(true); // luma_weight_l0_flag
+        writer.write_se(1); // luma_weight_l0
+        writer.write_se(20); // luma_offset_l0
+        writer.write_flag(false); // chroma_weight_l0_flag
+        writer.write_flag(true); // luma_weight_l1_flag
+        writer.write_se(1); // luma_weight_l1
+        writer.write_se(0); // luma_offset_l1
+        writer.write_flag(false); // chroma_weight_l1_flag
+
+        writer.write_se(0); // slice_qp_delta
         writer.write_ue(0); // mb_skip_run
         writer.write_ue(3); // B_Bi_16x16
         writer.write_se(0); // mvd_l0.x

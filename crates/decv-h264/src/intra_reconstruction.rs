@@ -6,6 +6,7 @@ use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
     reconstruct_b_macroblock_from_lists_420, reconstruct_p_skip_macroblock_from_list_420,
+    reconstruct_weighted_b_macroblock_from_lists_420,
     reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
 };
@@ -281,11 +282,17 @@ impl IntraPictureReconstructor {
                 "B reconstruction currently requires progressive non-FMO CAVLC",
             ));
         }
-        if pps.weighted_biprediction != WeightedBiprediction::Default {
-            return Err(H264Error::UnsupportedFeature(
-                "weighted B prediction reconstruction",
-            ));
-        }
+        let prediction_weights = match pps.weighted_biprediction {
+            WeightedBiprediction::Default => None,
+            WeightedBiprediction::Explicit => Some(header.prediction_weights.as_ref().ok_or(
+                H264Error::InvalidSyntax("explicit weighted B slice is missing pred_weight_table"),
+            )?),
+            WeightedBiprediction::Implicit => {
+                return Err(H264Error::UnsupportedFeature(
+                    "implicit weighted B prediction reconstruction",
+                ));
+            }
+        };
         if sps.coded_size != self.picture.coded_size()
             || pps.constrained_intra_prediction != self.constrained_intra_prediction
         {
@@ -315,6 +322,7 @@ impl IntraPictureReconstructor {
             },
             references_l0,
             references_l1,
+            prediction_weights,
         )
     }
 
@@ -596,6 +604,7 @@ impl IntraPictureReconstructor {
         context: BMacroblockContext,
         references_l0: &[Option<&Yuv420Picture>],
         references_l1: &[Option<&Yuv420Picture>],
+        prediction_weights: Option<&PredictionWeightTable>,
     ) -> Result<usize> {
         let mut reader = BitReader::new(rbsp);
         if !reader.skip_bits(config.header_bit_size) {
@@ -681,16 +690,30 @@ impl IntraPictureReconstructor {
                     let picture_snapshot = self
                         .picture
                         .snapshot_macroblock(macroblock_x, macroblock_y)?;
-                    if let Err(error) = reconstruct_b_macroblock_from_lists_420(
-                        &mut self.picture,
-                        references_l0,
-                        references_l1,
-                        macroblock_x,
-                        macroblock_y,
-                        &motion,
-                        &reconstructed,
-                    )
-                    .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
+                    let reconstruction = if let Some(weights) = prediction_weights {
+                        reconstruct_weighted_b_macroblock_from_lists_420(
+                            &mut self.picture,
+                            references_l0,
+                            references_l1,
+                            macroblock_x,
+                            macroblock_y,
+                            &motion,
+                            &reconstructed,
+                            weights,
+                        )
+                    } else {
+                        reconstruct_b_macroblock_from_lists_420(
+                            &mut self.picture,
+                            references_l0,
+                            references_l1,
+                            macroblock_x,
+                            macroblock_y,
+                            &motion,
+                            &reconstructed,
+                        )
+                    };
+                    if let Err(error) = reconstruction
+                        .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
                     {
                         self.picture.restore_macroblock(
                             macroblock_x,
@@ -1749,6 +1772,7 @@ mod tests {
                 b_macroblock_context(),
                 &references_l0,
                 &references_l1,
+                None,
             ),
             Ok(1)
         );
@@ -1766,6 +1790,7 @@ mod tests {
                 b_macroblock_context(),
                 &references_l0,
                 &references_l1,
+                None,
             ),
             Ok(1)
         );
@@ -1782,6 +1807,7 @@ mod tests {
                 b_macroblock_context(),
                 &references_l0,
                 &references_l1,
+                None,
             ),
             Err(H264Error::UnsupportedFeature(_))
         ));
