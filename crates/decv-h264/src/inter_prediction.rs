@@ -249,6 +249,25 @@ fn predict_luma<const CLIP: bool>(
         return;
     }
 
+    #[cfg(target_arch = "x86_64")]
+    if !CLIP && matches!(prediction.width, 8 | 16) && ((x_fraction == 0) != (y_fraction == 0)) {
+        // SAFETY: SSE2 is part of the x86_64 baseline. The caller selected
+        // the non-clipping specialization only after checking the complete
+        // six-tap interpolation window.
+        unsafe {
+            predict_luma_axis_sse2(
+                prediction,
+                plane,
+                width,
+                reference_x as usize,
+                reference_y as usize,
+                x_fraction,
+                y_fraction,
+            );
+        }
+        return;
+    }
+
     for y in 0..usize::from(prediction.height) {
         for x in 0..usize::from(prediction.width) {
             prediction.luma[y][x] = interpolate_luma_inner::<CLIP>(
@@ -260,6 +279,133 @@ fn predict_luma<const CLIP: bool>(
                 x_fraction,
                 y_fraction,
             );
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn predict_luma_axis_sse2(
+    prediction: &mut InterPrediction420,
+    plane: &[u8],
+    stride: usize,
+    reference_x: usize,
+    reference_y: usize,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_avg_epu8, _mm_loadl_epi64, _mm_mullo_epi16, _mm_packus_epi16,
+        _mm_set1_epi16, _mm_setzero_si128, _mm_srai_epi16, _mm_storel_epi64, _mm_sub_epi16,
+        _mm_unpacklo_epi8,
+    };
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load_eight(ptr: *const u8, zero: __m128i) -> __m128i {
+        // SAFETY: The caller validated the complete eight-byte source range.
+        let bytes = unsafe { _mm_loadl_epi64(ptr.cast::<__m128i>()) };
+        _mm_unpacklo_epi8(bytes, zero)
+    }
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn six_tap(
+        s0: *const u8,
+        s1: *const u8,
+        s2: *const u8,
+        s3: *const u8,
+        s4: *const u8,
+        s5: *const u8,
+        zero: __m128i,
+    ) -> __m128i {
+        // SAFETY: Every pointer addresses an eight-byte interpolation row.
+        let s0 = unsafe { load_eight(s0, zero) };
+        // SAFETY: See above.
+        let s1 = unsafe { load_eight(s1, zero) };
+        // SAFETY: See above.
+        let s2 = unsafe { load_eight(s2, zero) };
+        // SAFETY: See above.
+        let s3 = unsafe { load_eight(s3, zero) };
+        // SAFETY: See above.
+        let s4 = unsafe { load_eight(s4, zero) };
+        // SAFETY: See above.
+        let s5 = unsafe { load_eight(s5, zero) };
+        let positive = _mm_add_epi16(
+            _mm_add_epi16(s0, s5),
+            _mm_mullo_epi16(_mm_add_epi16(s2, s3), _mm_set1_epi16(20)),
+        );
+        let negative = _mm_mullo_epi16(_mm_add_epi16(s1, s4), _mm_set1_epi16(5));
+        let filtered = _mm_srai_epi16::<5>(_mm_add_epi16(
+            _mm_sub_epi16(positive, negative),
+            _mm_set1_epi16(16),
+        ));
+        _mm_packus_epi16(filtered, zero)
+    }
+
+    let zero = _mm_setzero_si128();
+    let output_width = usize::from(prediction.width);
+    let output_height = usize::from(prediction.height);
+    for output_y in 0..output_height {
+        for output_x in (0..output_width).step_by(8) {
+            let base = plane
+                .as_ptr()
+                .wrapping_add((reference_y + output_y) * stride + reference_x + output_x);
+            let half = if y_fraction == 0 {
+                // SAFETY: The non-clipping window includes x - 2 through
+                // the final output sample plus 3.
+                unsafe {
+                    six_tap(
+                        base.wrapping_sub(2),
+                        base.wrapping_sub(1),
+                        base,
+                        base.wrapping_add(1),
+                        base.wrapping_add(2),
+                        base.wrapping_add(3),
+                        zero,
+                    )
+                }
+            } else {
+                // SAFETY: The non-clipping window includes the six source
+                // rows from y - 2 through y + 3.
+                unsafe {
+                    six_tap(
+                        base.wrapping_sub(2 * stride),
+                        base.wrapping_sub(stride),
+                        base,
+                        base.wrapping_add(stride),
+                        base.wrapping_add(2 * stride),
+                        base.wrapping_add(3 * stride),
+                        zero,
+                    )
+                }
+            };
+            let fraction = if y_fraction == 0 {
+                x_fraction
+            } else {
+                y_fraction
+            };
+            let output = if fraction == 2 {
+                half
+            } else {
+                let integer = if fraction == 1 {
+                    base
+                } else if y_fraction == 0 {
+                    base.wrapping_add(1)
+                } else {
+                    base.wrapping_add(stride)
+                };
+                // SAFETY: The integer row is part of the validated window.
+                let integer = unsafe { _mm_loadl_epi64(integer.cast::<__m128i>()) };
+                _mm_avg_epu8(integer, half)
+            };
+            let destination = prediction.luma[output_y]
+                .as_mut_ptr()
+                .wrapping_add(output_x);
+            // SAFETY: Width is 8 or 16 and the loop writes one full chunk.
+            unsafe {
+                _mm_storel_epi64(destination.cast::<__m128i>(), output);
+            }
         }
     }
 }
@@ -551,6 +697,52 @@ mod tests {
                     interpolate_luma(luma, 16, 16, 4, 4, x_fraction, y_fraction),
                     68 + x_fraction + 2 * y_fraction
                 );
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn axis_sse2_matches_per_sample_luma_interpolation() {
+        let plane: Vec<u8> = (0..40 * 40)
+            .map(|index| ((index * 73 + index / 11 * 29) & 0xff) as u8)
+            .collect();
+        for size in [8u8, 16] {
+            for (x_fraction, y_fraction) in [(1, 0), (2, 0), (3, 0), (0, 1), (0, 2), (0, 3)] {
+                let mut prediction = InterPrediction420::empty();
+                prediction.width = size;
+                prediction.height = size;
+                // SAFETY: SSE2 is part of the x86_64 baseline, and the
+                // reference position leaves the full six-tap window inside
+                // this 40x40 plane.
+                unsafe {
+                    predict_luma_axis_sse2(
+                        &mut prediction,
+                        &plane,
+                        40,
+                        8,
+                        8,
+                        x_fraction,
+                        y_fraction,
+                    );
+                }
+                for y in 0..usize::from(size) {
+                    for x in 0..usize::from(size) {
+                        assert_eq!(
+                            prediction.luma[y][x],
+                            interpolate_luma_inner::<false>(
+                                &plane,
+                                40,
+                                40,
+                                8 + x as i32,
+                                8 + y as i32,
+                                x_fraction,
+                                y_fraction,
+                            ),
+                            "size={size} fraction=({x_fraction},{y_fraction}) x={x} y={y}"
+                        );
+                    }
+                }
             }
         }
     }
