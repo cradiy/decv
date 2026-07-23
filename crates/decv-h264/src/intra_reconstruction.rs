@@ -3,7 +3,7 @@
 use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 
-use crate::deblock::{DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
+use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
     reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
@@ -1151,8 +1151,11 @@ fn inter_deblock_info(
         for y in start_y..end_y {
             for x in start_x..end_x {
                 motion[y * 4 + x] = DeblockMotion {
-                    reference_id,
-                    vector: partition.motion_vector,
+                    list0: DeblockListMotion {
+                        reference_id,
+                        vector: partition.motion_vector,
+                    },
+                    list1: DeblockListMotion::default(),
                 };
             }
         }

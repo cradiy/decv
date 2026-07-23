@@ -67,6 +67,12 @@ pub(crate) struct MacroblockDeblockInfo {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeblockMotion {
+    pub list0: DeblockListMotion,
+    pub list1: DeblockListMotion,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeblockListMotion {
     /// Stable for the lifetime of the active reference list. Zero means absent.
     pub reference_id: usize,
     pub vector: MotionVector,
@@ -419,13 +425,34 @@ fn boundary_strength(
         return 2;
     }
 
-    let previous_motion = previous.motion[previous_cell];
-    let current_motion = current.motion[current_cell];
-    let vector_differs = (i32::from(previous_motion.vector.x) - i32::from(current_motion.vector.x))
-        .abs()
-        >= 4
-        || (i32::from(previous_motion.vector.y) - i32::from(current_motion.vector.y)).abs() >= 4;
-    u8::from(previous_motion.reference_id != current_motion.reference_id || vector_differs)
+    u8::from(motion_differs(
+        previous.motion[previous_cell],
+        current.motion[current_cell],
+    ))
+}
+
+fn motion_differs(previous: DeblockMotion, current: DeblockMotion) -> bool {
+    let same_order_differs = list_motion_differs(previous.list0, current.list0)
+        || list_motion_differs(previous.list1, current.list1);
+    if !same_order_differs {
+        return false;
+    }
+
+    let references_are_swapped = previous.list0.reference_id == current.list1.reference_id
+        && previous.list1.reference_id == current.list0.reference_id;
+    if !references_are_swapped {
+        return true;
+    }
+
+    list_motion_differs(previous.list0, current.list1)
+        || list_motion_differs(previous.list1, current.list0)
+}
+
+#[inline]
+fn list_motion_differs(previous: DeblockListMotion, current: DeblockListMotion) -> bool {
+    previous.reference_id != current.reference_id
+        || (i32::from(previous.vector.x) - i32::from(current.vector.x)).abs() >= 4
+        || (i32::from(previous.vector.y) - i32::from(current.vector.y)).abs() >= 4
 }
 
 fn filter_vertical_edge(
@@ -522,8 +549,8 @@ mod tests {
     use decv_core::Size;
 
     use super::{
-        ALPHA, BETA, DeblockEdgeSamples, DeblockMotion, FilteredDeblockEdge, MacroblockDeblockInfo,
-        TC0, boundary_strength, filter_420_picture, filter_deblock_edge,
+        ALPHA, BETA, DeblockEdgeSamples, DeblockListMotion, DeblockMotion, FilteredDeblockEdge,
+        MacroblockDeblockInfo, TC0, boundary_strength, filter_420_picture, filter_deblock_edge,
     };
     use crate::{DeblockingFilter, H264Error, MotionVector, Yuv420Picture};
 
@@ -554,8 +581,11 @@ mod tests {
         MacroblockDeblockInfo {
             is_intra: false,
             motion: [DeblockMotion {
-                reference_id,
-                vector,
+                list0: DeblockListMotion {
+                    reference_id,
+                    vector,
+                },
+                list1: DeblockListMotion::default(),
             }; 16],
             ..macroblock(1, 0)
         }
@@ -688,7 +718,7 @@ mod tests {
         let same = inter_macroblock(7, MotionVector { x: 3, y: -2 });
         assert_eq!(boundary_strength(same, 3, same, 0, true), 0);
 
-        let different_reference = inter_macroblock(8, same.motion[0].vector);
+        let different_reference = inter_macroblock(8, same.motion[0].list0.vector);
         assert_eq!(boundary_strength(same, 3, different_reference, 0, true), 1);
 
         let different_vector = inter_macroblock(7, MotionVector { x: 7, y: -2 });
@@ -699,5 +729,31 @@ mod tests {
         assert_eq!(boundary_strength(residual, 3, same, 0, true), 2);
         assert_eq!(boundary_strength(macroblock(1, 0), 3, same, 0, true), 4);
         assert_eq!(boundary_strength(macroblock(1, 0), 3, same, 0, false), 3);
+    }
+
+    #[test]
+    fn derives_bidirectional_boundary_strength_with_swapped_lists() {
+        let list = |reference_id, x| DeblockListMotion {
+            reference_id,
+            vector: MotionVector { x, y: 0 },
+        };
+        let bidirectional = |list0, list1| MacroblockDeblockInfo {
+            is_intra: false,
+            motion: [DeblockMotion { list0, list1 }; 16],
+            ..macroblock(1, 0)
+        };
+
+        let previous = bidirectional(list(7, 2), list(8, 9));
+        let swapped = bidirectional(list(8, 9), list(7, 2));
+        assert_eq!(boundary_strength(previous, 3, swapped, 0, true), 0);
+
+        let crossed_difference = bidirectional(list(8, 13), list(7, 2));
+        assert_eq!(
+            boundary_strength(previous, 3, crossed_difference, 0, true),
+            1
+        );
+
+        let mismatched_pair = bidirectional(list(7, 2), list(9, 9));
+        assert_eq!(boundary_strength(previous, 3, mismatched_pair, 0, true), 1);
     }
 }

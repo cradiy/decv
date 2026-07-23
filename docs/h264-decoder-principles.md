@@ -713,6 +713,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   boundary strength from Intra/Inter mode, luma coefficients, reference-picture
   identity, and motion-vector differences; chroma-to-luma boundary mapping;
   slice-controlled offsets; and cross-slice edge suppression;
+- bidirectional deblocking motion comparison with List 0/List 1 reference
+  identity, motion-vector thresholds, and equivalent swapped-list handling;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
