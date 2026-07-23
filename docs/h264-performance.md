@@ -40,18 +40,18 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.89 s | 1.81 s | 80,020 KiB | 95.2 FPS |
-| decv Auto (2 workers) | NV12 | 2.10 s | 2.23 s | 79,552 KiB | 85.7 FPS |
-| FFmpeg 1 thread | NV12 | 0.64 s | 0.73 s | 152,168 KiB | 281.3 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.48 s | 281,444 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,684 KiB | 305.1 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.98 s | 192,100 KiB | 782.6 FPS |
+| decv Serial | NV12 | 1.87 s | 1.77 s | 80,208 KiB | 96.3 FPS |
+| decv Auto (2 workers) | NV12 | 2.09 s | 2.20 s | 79,496 KiB | 86.1 FPS |
+| FFmpeg 1 thread | NV12 | 0.63 s | 0.72 s | 152,452 KiB | 285.7 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.47 s | 299,600 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,648 KiB | 305.1 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.99 s | 192,340 KiB | 818.2 FPS |
 
 On this workload:
 
 - decv Serial takes about **3.0x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **7.8x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **8.0x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.5x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 58.7% throughput headroom over that
-line, and the measured two-worker Auto result has about 42.9%. The ordering
+seconds. The current Serial result has about 60.4% throughput headroom over that
+line, and the measured two-worker Auto result has about 43.5%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -344,6 +344,14 @@ motion-field rows. CABAC instructions fell another 0.8%, branches 0.6%, and
 reference cycles about 2.3%; CAVLC instructions fell 0.9% with reference
 cycles down about 0.5%. This keeps the same per-row bounds established by the
 validated picture and macroblock address.
+
+On AVX2-capable x86-64 CPUs, a sixteen-pixel single-axis luma partition now
+evaluates each six-tap row in one 256-bit operation instead of two eight-pixel
+SSE2 chunks. Runtime feature detection retains the SSE2 fallback for other
+x86-64 CPUs, and a direct scalar-oracle test covers all six horizontal and
+vertical quarter-sample positions. Alternating samples reduced CABAC reference
+cycles about 1.1% and CAVLC about 0.9%. The fixed benchmark now measures 1.87
+seconds in Serial mode and 2.09 seconds in Auto mode.
 
 ## BitReader Checkpoint
 
