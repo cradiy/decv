@@ -12,6 +12,11 @@ struct MotionSyntaxCell {
     mvd_absolute: [u8; 2],
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MacroblockMotionSyntaxSnapshot {
+    cells: [Option<MotionSyntaxCell>; 16],
+}
+
 /// One rectangular motion partition in luma-sample coordinates relative to
 /// the current macroblock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -145,6 +150,37 @@ impl CabacMotionSyntaxState {
         )
     }
 
+    pub(crate) fn snapshot_macroblock(
+        &self,
+        macroblock_address: usize,
+    ) -> Result<MacroblockMotionSyntaxSnapshot> {
+        let base = self.macroblock_cell_base(macroblock_address)?;
+        let picture_width = self.width_in_macroblocks * 4;
+        let mut cells = [None; 16];
+        for local_y in 0..4 {
+            for local_x in 0..4 {
+                cells[local_y * 4 + local_x] = self.cells[base + local_y * picture_width + local_x];
+            }
+        }
+        Ok(MacroblockMotionSyntaxSnapshot { cells })
+    }
+
+    pub(crate) fn restore_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        snapshot: MacroblockMotionSyntaxSnapshot,
+    ) -> Result<()> {
+        let base = self.macroblock_cell_base(macroblock_address)?;
+        let picture_width = self.width_in_macroblocks * 4;
+        for local_y in 0..4 {
+            for local_x in 0..4 {
+                self.cells[base + local_y * picture_width + local_x] =
+                    snapshot.cells[local_y * 4 + local_x];
+            }
+        }
+        Ok(())
+    }
+
     fn reference_context_increment(
         &self,
         macroblock_address: usize,
@@ -266,6 +302,17 @@ impl CabacMotionSyntaxState {
             usize::from(partition.width / 4),
             usize::from(partition.height / 4),
         ))
+    }
+
+    fn macroblock_cell_base(&self, macroblock_address: usize) -> Result<usize> {
+        if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC motion macroblock address exceeds the picture",
+            ));
+        }
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        Ok(macroblock_y * 4 * self.width_in_macroblocks * 4 + macroblock_x * 4)
     }
 }
 
@@ -487,6 +534,27 @@ mod tests {
         assert_eq!(
             state.reference_context_increment(1, 8, second, false),
             Ok(0)
+        );
+    }
+
+    #[test]
+    fn restores_only_the_snapshotted_macroblock() {
+        let mut state = CabacMotionSyntaxState::new(2, 1).unwrap();
+        state.record_skip_macroblock(0, 3).unwrap();
+        state.record_intra_macroblock(1, 3).unwrap();
+        let first_before = state.snapshot_macroblock(0).unwrap();
+        let second_before = state.snapshot_macroblock(1).unwrap();
+
+        state.record_intra_macroblock(0, 4).unwrap();
+        state.restore_macroblock(0, first_before).unwrap();
+
+        assert_eq!(
+            state.snapshot_macroblock(0).unwrap().cells,
+            first_before.cells
+        );
+        assert_eq!(
+            state.snapshot_macroblock(1).unwrap().cells,
+            second_before.cells
         );
     }
 }

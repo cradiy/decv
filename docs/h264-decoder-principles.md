@@ -780,6 +780,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - CABAC per-list motion syntax state for `ref_idx_lX` and both `mvd_lX`
   components, including same-macroblock partition neighbours and bypass
   escapes;
+- transactional CABAC P-macroblock assembly in normative syntax order,
+  including P_Skip, every List-0 partition shape, embedded Intra/I_PCM,
+  coded-block patterns, transform selection, QP deltas, and residuals;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
@@ -803,7 +806,7 @@ Annex-B CAVLC progressive 8-bit 4:2:0 I/IDR -> P
 This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
-- CABAC slice data;
+- CABAC inter-slice pixel reconstruction;
 - SP and SI reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;

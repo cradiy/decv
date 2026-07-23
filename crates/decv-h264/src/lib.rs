@@ -9,6 +9,7 @@ mod avcc;
 mod b_motion;
 mod cabac;
 mod cabac_context_tables;
+mod cabac_macroblock;
 mod cabac_motion;
 mod cabac_residual;
 mod cabac_syntax;
@@ -46,6 +47,9 @@ pub use b_motion::{
 pub use cabac::{
     CabacContextSet, CabacContextState, CabacDecoder, CabacInitializationTable,
     consume_cabac_alignment,
+};
+pub use cabac_macroblock::{
+    CabacPMacroblock, CabacPMacroblockContext, CabacPMacroblockDecode, CabacPMacroblockState,
 };
 pub use cabac_motion::{CabacMotionPartition, CabacMotionSyntaxState};
 pub use cabac_residual::{

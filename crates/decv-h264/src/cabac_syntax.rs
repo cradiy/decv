@@ -147,6 +147,27 @@ impl CabacMacroblockState {
     ) -> Result<CabacIntraMacroblockSyntax> {
         let macroblock_type =
             self.decode_intra_macroblock_type(syntax, macroblock_address, slice_id, SliceType::I)?;
+        self.decode_intra_macroblock_syntax_for_type(
+            syntax,
+            macroblock_address,
+            slice_id,
+            macroblock_type,
+            transform_8x8_mode_enabled,
+            previous_qp_delta_nonzero,
+        )
+    }
+
+    /// Decodes the prediction/header syntax following an already decoded
+    /// intra `mb_type`. Inter slices use this for their embedded I macroblocks.
+    pub(crate) fn decode_intra_macroblock_syntax_for_type(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        macroblock_type: u8,
+        transform_8x8_mode_enabled: bool,
+        previous_qp_delta_nonzero: bool,
+    ) -> Result<CabacIntraMacroblockSyntax> {
         match macroblock_type {
             0 => {
                 let transform_size_8x8 = transform_8x8_mode_enabled
@@ -198,7 +219,9 @@ impl CabacMacroblockState {
                 ))
             }
             25 => Ok(CabacIntraMacroblockSyntax::Pcm),
-            _ => unreachable!("the CABAC I mb_type decoder returns 0..=25"),
+            _ => Err(H264Error::InvalidSyntax(
+                "CABAC intra macroblock type exceeds 25",
+            )),
         }
     }
 

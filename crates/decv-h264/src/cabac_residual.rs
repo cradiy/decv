@@ -939,7 +939,7 @@ impl CabacResidualState {
         }
     }
 
-    fn validate_macroblock(&self, macroblock_address: usize) -> Result<()> {
+    pub(crate) fn validate_macroblock(&self, macroblock_address: usize) -> Result<()> {
         if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
             return Err(H264Error::InvalidSyntax(
                 "CABAC residual macroblock address exceeds the picture",
