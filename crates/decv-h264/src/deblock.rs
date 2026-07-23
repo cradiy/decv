@@ -330,7 +330,7 @@ pub(crate) fn filter_420_picture(
 
         let luma_x = macroblock_x * 16;
         let luma_y = macroblock_y * 16;
-        if filter_left {
+        if filter_left && vertical_strengths[0] != [0; 4] {
             for block_row in 0..4 {
                 filter_vertical_edge(
                     luma,
@@ -344,7 +344,9 @@ pub(crate) fn filter_420_picture(
             }
         }
         for block_column in 1..4 {
-            if block_column == 2 || !current.transform_8x8 {
+            if (block_column == 2 || !current.transform_8x8)
+                && vertical_strengths[block_column] != [0; 4]
+            {
                 for block_row in 0..4 {
                     filter_vertical_edge(
                         luma,
@@ -390,7 +392,7 @@ pub(crate) fn filter_420_picture(
         let chroma_x = macroblock_x * 8;
         let chroma_y = macroblock_y * 8;
         for (plane, component) in [(&mut *cb, 1usize), (&mut *cr, 2usize)] {
-            if filter_left {
+            if filter_left && vertical_strengths[0] != [0; 4] {
                 for block_row in 0..4 {
                     filter_vertical_edge(
                         plane,
@@ -403,16 +405,18 @@ pub(crate) fn filter_420_picture(
                     );
                 }
             }
-            for block_row in 0..4 {
-                filter_vertical_edge(
-                    plane,
-                    chroma_stride,
-                    chroma_x + 4,
-                    chroma_y + block_row * 2,
-                    2,
-                    vertical_strengths[2][block_row],
-                    internal_thresholds[component],
-                );
+            if vertical_strengths[2] != [0; 4] {
+                for block_row in 0..4 {
+                    filter_vertical_edge(
+                        plane,
+                        chroma_stride,
+                        chroma_x + 4,
+                        chroma_y + block_row * 2,
+                        2,
+                        vertical_strengths[2][block_row],
+                        internal_thresholds[component],
+                    );
+                }
             }
             if filter_top {
                 for block_column in 0..4 {
