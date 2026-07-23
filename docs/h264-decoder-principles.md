@@ -660,6 +660,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   bilinear filtering, negative-vector decomposition, and edge extension;
 - transactional CAVLC inter residual decoding plus 4x4/8x8 inverse transform
   paths using the Inter scaling lists;
+- transactional default-weight P macroblock pixel reconstruction with
+  per-partition List-0 reference selection, complete coverage validation, and
+  saturating prediction-plus-residual writes;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
@@ -706,7 +709,7 @@ The next dependency chain is:
 
 ```text
 reference-picture list and storage management
-    -> connect fractional-sample prediction to P-picture reconstruction
+    -> connect P macroblocks to the slice and access-unit decoder
     -> DPB reference marking and POC-based output
     -> CABAC
 ```
