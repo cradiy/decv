@@ -204,8 +204,10 @@ fn validate_empty_rbsp(ebsp: &[u8]) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
+
     use super::{H264StreamParser, ParserEvent, PictureIdentity};
-    use crate::{AnnexBReader, H264Error, NalHeader, NalUnit};
+    use crate::{AnnexBReader, H264Error, IntraPictureReconstructor, NalHeader, NalUnit};
 
     #[test]
     fn dispatches_an_annex_b_stream_and_detects_picture_boundaries() {
@@ -250,6 +252,66 @@ mod tests {
 
         assert_eq!(parameter_set_events, 2);
         assert_eq!(boundaries, [true, false, true]);
+    }
+
+    #[test]
+    fn reconstructs_a_complete_annex_b_cavlc_idr_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+        ]);
+        let mut parser = H264StreamParser::new();
+        let mut reconstructor = None;
+        for unit in AnnexBReader::new(&stream) {
+            match parser.push_annex_b(unit.unwrap()).unwrap() {
+                ParserEvent::SequenceParameterSet(sps) => {
+                    assert_eq!(sps.coded_size, Size::new(16, 16));
+                }
+                ParserEvent::PictureParameterSet(_) => {}
+                ParserEvent::Slice {
+                    parsed,
+                    rbsp,
+                    starts_new_picture,
+                    picture_order_count,
+                } => {
+                    assert!(starts_new_picture);
+                    assert_eq!(picture_order_count.stored.top, Some(0));
+                    let mut picture =
+                        IntraPictureReconstructor::from_parameter_sets(&parsed.parameter_sets)
+                            .unwrap();
+                    assert_eq!(
+                        picture.decode_cavlc_intra_slice(rbsp.as_ref(), &parsed),
+                        Ok(1)
+                    );
+                    reconstructor = Some(picture);
+                }
+                event => panic!("unexpected parser event: {event:?}"),
+            }
+        }
+
+        let size = Size::new(16, 16);
+        let frame = reconstructor
+            .unwrap()
+            .into_nv12_frame(
+                1,
+                None,
+                None,
+                VideoFormat {
+                    coded_size: size,
+                    visible_rect: Rect::new(0, 0, 16, 16),
+                    display_size: size,
+                    pixel_format: PixelFormat::Nv12,
+                    color: ColorInfo::default(),
+                },
+            )
+            .unwrap();
+        let cpu = match frame.storage {
+            FrameStorage::Cpu(cpu) => cpu,
+            _ => panic!("expected CPU frame"),
+        };
+        assert_eq!(cpu.planes[0].bytes.len(), 384);
+        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
     }
 
     #[test]
@@ -620,6 +682,67 @@ mod tests {
         writer.write_flag(true);
         writer.write_flag(false);
         writer.write_flag(false);
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_sps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_bits(66, 8); // Baseline profile
+        writer.write_bits(0, 8); // constraints + reserved_zero_2bits
+        writer.write_bits(10, 8); // level_idc
+        writer.write_ue(0); // seq_parameter_set_id
+        writer.write_ue(0); // log2_max_frame_num_minus4
+        writer.write_ue(0); // pic_order_cnt_type
+        writer.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        writer.write_ue(0); // max_num_ref_frames
+        writer.write_flag(false); // gaps_in_frame_num_value_allowed_flag
+        writer.write_ue(0); // pic_width_in_mbs_minus1
+        writer.write_ue(0); // pic_height_in_map_units_minus1
+        writer.write_flag(true); // frame_mbs_only_flag
+        writer.write_flag(true); // direct_8x8_inference_flag
+        writer.write_flag(false); // frame_cropping_flag
+        writer.write_flag(false); // vui_parameters_present_flag
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_pps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_ue(0); // seq_parameter_set_id
+        writer.write_flag(false); // entropy_coding_mode_flag: CAVLC
+        writer.write_flag(false); // bottom_field_pic_order_in_frame_present_flag
+        writer.write_ue(0); // num_slice_groups_minus1
+        writer.write_ue(0); // num_ref_idx_l0_default_active_minus1
+        writer.write_ue(0); // num_ref_idx_l1_default_active_minus1
+        writer.write_flag(false); // weighted_pred_flag
+        writer.write_bits(0, 2); // weighted_bipred_idc
+        writer.write_se(0); // pic_init_qp_minus26
+        writer.write_se(0); // pic_init_qs_minus26
+        writer.write_se(0); // chroma_qp_index_offset
+        writer.write_flag(false); // deblocking_filter_control_present_flag
+        writer.write_flag(false); // constrained_intra_pred_flag
+        writer.write_flag(false); // redundant_pic_cnt_present_flag
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_idr_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(2); // I slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(0, 4); // frame_num
+        writer.write_ue(0); // idr_pic_id
+        writer.write_bits(0, 4); // pic_order_cnt_lsb
+        writer.write_flag(false); // no_output_of_prior_pics_flag
+        writer.write_flag(false); // long_term_reference_flag
+        writer.write_se(0); // slice_qp_delta
+
+        writer.write_ue(0); // I_NxN
+        for _ in 0..16 {
+            writer.write_flag(true); // prev_intra4x4_pred_mode_flag
+        }
+        writer.write_ue(0); // intra_chroma_pred_mode: DC
+        writer.write_ue(3); // coded_block_pattern codeNum -> zero
         writer.finish_rbsp()
     }
 
