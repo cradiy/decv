@@ -8,6 +8,10 @@ const INTRA_CODED_BLOCK_PATTERNS_420: [u8; 48] = [
     47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46, 16, 3, 5, 10, 12, 19, 21, 26, 28,
     35, 37, 42, 44, 1, 2, 4, 8, 17, 18, 20, 24, 6, 9, 22, 25, 32, 33, 34, 36, 40, 38, 41,
 ];
+const INTER_CODED_BLOCK_PATTERNS_420: [u8; 48] = [
+    0, 16, 1, 2, 4, 8, 32, 3, 5, 10, 12, 15, 47, 7, 11, 13, 14, 6, 9, 31, 35, 37, 42, 44, 33, 34,
+    36, 40, 39, 43, 45, 46, 17, 18, 20, 24, 19, 21, 26, 28, 23, 27, 29, 30, 22, 25, 38, 41,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodedBlockPattern {
@@ -86,6 +90,85 @@ pub struct DecodedIntraMacroblock {
     pub residual: Option<IntraResidual>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MotionVectorDifference {
+    /// Horizontal displacement difference in quarter-luma-sample units.
+    pub x: i16,
+    /// Vertical displacement difference in quarter-luma-sample units.
+    pub y: i16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PSubMacroblockType {
+    L0_8x8,
+    L0_8x4,
+    L0_4x8,
+    L0_4x4,
+}
+
+impl PSubMacroblockType {
+    #[inline]
+    pub const fn partition_count(self) -> usize {
+        match self {
+            Self::L0_8x8 => 1,
+            Self::L0_8x4 | Self::L0_4x8 => 2,
+            Self::L0_4x4 => 4,
+        }
+    }
+
+    #[inline]
+    pub const fn partition_size(self) -> (u8, u8) {
+        match self {
+            Self::L0_8x8 => (8, 8),
+            Self::L0_8x4 => (8, 4),
+            Self::L0_4x8 => (4, 8),
+            Self::L0_4x4 => (4, 4),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PPartitionMode {
+    L0_16x16,
+    L0_16x8,
+    L0_8x16,
+    L0_8x8 {
+        sub_macroblocks: [PSubMacroblockType; 4],
+        reference_index_forced_zero: bool,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PPartitionMotion {
+    pub reference_index: u8,
+    /// One entry for ordinary macroblock partitions, or one per sub-partition
+    /// for P_8x8/P_8x8ref0.
+    pub differences: Vec<MotionVectorDifference>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PInterMacroblockHeader {
+    pub partition_mode: PPartitionMode,
+    pub partitions: Vec<PPartitionMotion>,
+    pub coded_block_pattern: CodedBlockPattern,
+    pub transform_size_8x8: bool,
+    /// Zero when `mb_qp_delta` is absent and inferred.
+    pub qp_delta: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PSliceMacroblock {
+    Inter(PInterMacroblockHeader),
+    Intra(IntraMacroblock),
+}
+
+/// Syntax context needed to decode a frame-coded CAVLC P macroblock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PMacroblockContext {
+    pub num_ref_idx_l0_active: u8,
+    pub transform_8x8_mode_enabled: bool,
+}
+
 /// Parses the non-residual portion of one CAVLC I-slice macroblock.
 ///
 /// For predicted macroblocks the reader stops immediately before residual
@@ -97,18 +180,81 @@ pub fn parse_cavlc_intra_macroblock(
 ) -> Result<IntraMacroblock> {
     let mut probe = *reader;
     let mb_type = probe.read_ue().ok_or(H264Error::UnexpectedEof)?;
+    let macroblock = parse_intra_macroblock_type(&mut probe, mb_type, transform_8x8_mode_enabled)?;
+    *reader = probe;
+    Ok(macroblock)
+}
+
+/// Parses one non-skipped, frame-coded CAVLC P-slice macroblock up to the
+/// residual coefficient syntax.
+///
+/// P-slice mb_type values 5 through 30 are mapped to their I-slice
+/// counterparts, including complete I_PCM sample consumption. Any failure
+/// leaves the reader unchanged.
+pub fn parse_cavlc_p_macroblock(
+    reader: &mut BitReader<'_>,
+    context: PMacroblockContext,
+) -> Result<PSliceMacroblock> {
+    if context.num_ref_idx_l0_active == 0 || context.num_ref_idx_l0_active > 32 {
+        return Err(H264Error::InvalidSyntax(
+            "P macroblock active reference count is outside 1..=32",
+        ));
+    }
+
+    let mut probe = *reader;
+    let mb_type = probe.read_ue().ok_or(H264Error::UnexpectedEof)?;
     let macroblock = match mb_type {
-        0 => IntraMacroblock::Predicted(parse_intra_nxn(&mut probe, transform_8x8_mode_enabled)?),
-        1..=24 => IntraMacroblock::Predicted(parse_intra_16x16(&mut probe, mb_type)?),
-        25 => IntraMacroblock::Pcm(parse_pcm(&mut probe)?),
+        0..=4 => PSliceMacroblock::Inter(parse_p_inter_macroblock(&mut probe, mb_type, context)?),
+        5..=30 => PSliceMacroblock::Intra(parse_intra_macroblock_type(
+            &mut probe,
+            mb_type - 5,
+            context.transform_8x8_mode_enabled,
+        )?),
         _ => {
             return Err(H264Error::InvalidSyntax(
-                "mb_type exceeds the I-slice macroblock table",
+                "mb_type exceeds the P-slice macroblock table",
             ));
         }
     };
     *reader = probe;
     Ok(macroblock)
+}
+
+/// Parses CAVLC `mb_skip_run` and bounds it to the remaining picture.
+pub fn parse_cavlc_mb_skip_run(
+    reader: &mut BitReader<'_>,
+    remaining_macroblocks: usize,
+) -> Result<usize> {
+    let mut probe = *reader;
+    let value = probe.read_ue().ok_or(H264Error::UnexpectedEof)?;
+    let value = usize::try_from(value).map_err(|_| H264Error::IntegerOverflow)?;
+    if value > remaining_macroblocks {
+        return Err(H264Error::InvalidSyntax(
+            "mb_skip_run exceeds the remaining picture",
+        ));
+    }
+    *reader = probe;
+    Ok(value)
+}
+
+fn parse_intra_macroblock_type(
+    reader: &mut BitReader<'_>,
+    mb_type: u32,
+    transform_8x8_mode_enabled: bool,
+) -> Result<IntraMacroblock> {
+    match mb_type {
+        0 => Ok(IntraMacroblock::Predicted(parse_intra_nxn(
+            reader,
+            transform_8x8_mode_enabled,
+        )?)),
+        1..=24 => Ok(IntraMacroblock::Predicted(parse_intra_16x16(
+            reader, mb_type,
+        )?)),
+        25 => Ok(IntraMacroblock::Pcm(parse_pcm(reader)?)),
+        _ => Err(H264Error::InvalidSyntax(
+            "mb_type exceeds the I-slice macroblock table",
+        )),
+    }
 }
 
 fn parse_intra_nxn(
@@ -166,6 +312,147 @@ fn parse_intra_16x16(reader: &mut BitReader<'_>, mb_type: u32) -> Result<IntraMa
     })
 }
 
+fn parse_p_inter_macroblock(
+    reader: &mut BitReader<'_>,
+    mb_type: u32,
+    context: PMacroblockContext,
+) -> Result<PInterMacroblockHeader> {
+    let (partition_mode, partitions, permits_transform_8x8) = match mb_type {
+        0 => (
+            PPartitionMode::L0_16x16,
+            parse_macroblock_partition_motion(reader, 1, context.num_ref_idx_l0_active)?,
+            true,
+        ),
+        1 => (
+            PPartitionMode::L0_16x8,
+            parse_macroblock_partition_motion(reader, 2, context.num_ref_idx_l0_active)?,
+            true,
+        ),
+        2 => (
+            PPartitionMode::L0_8x16,
+            parse_macroblock_partition_motion(reader, 2, context.num_ref_idx_l0_active)?,
+            true,
+        ),
+        3 | 4 => {
+            let forced_zero = mb_type == 4;
+            let mut sub_macroblocks = [PSubMacroblockType::L0_8x8; 4];
+            for sub_type in &mut sub_macroblocks {
+                *sub_type = parse_p_sub_macroblock_type(reader)?;
+            }
+            let mut reference_indices = [0; 4];
+            if !forced_zero {
+                for reference_index in &mut reference_indices {
+                    *reference_index =
+                        parse_reference_index(reader, context.num_ref_idx_l0_active)?;
+                }
+            }
+            let mut partitions = Vec::with_capacity(4);
+            for (sub_type, reference_index) in sub_macroblocks.into_iter().zip(reference_indices) {
+                let mut differences = Vec::with_capacity(sub_type.partition_count());
+                for _ in 0..sub_type.partition_count() {
+                    differences.push(parse_motion_vector_difference(reader)?);
+                }
+                partitions.push(PPartitionMotion {
+                    reference_index,
+                    differences,
+                });
+            }
+            (
+                PPartitionMode::L0_8x8 {
+                    sub_macroblocks,
+                    reference_index_forced_zero: forced_zero,
+                },
+                partitions,
+                sub_macroblocks
+                    .iter()
+                    .all(|sub_type| *sub_type == PSubMacroblockType::L0_8x8),
+            )
+        }
+        _ => unreachable!("caller restricts P inter mb_type to 0..=4"),
+    };
+
+    let coded_block_pattern = parse_inter_coded_block_pattern(reader)?;
+    let transform_size_8x8 = coded_block_pattern.luma != 0
+        && context.transform_8x8_mode_enabled
+        && permits_transform_8x8
+        && read_flag(reader)?;
+    let qp_delta = if coded_block_pattern.has_residual() {
+        parse_qp_delta(reader)?
+    } else {
+        0
+    };
+    Ok(PInterMacroblockHeader {
+        partition_mode,
+        partitions,
+        coded_block_pattern,
+        transform_size_8x8,
+        qp_delta,
+    })
+}
+
+fn parse_macroblock_partition_motion(
+    reader: &mut BitReader<'_>,
+    partition_count: usize,
+    num_ref_idx_l0_active: u8,
+) -> Result<Vec<PPartitionMotion>> {
+    let mut reference_indices = Vec::with_capacity(partition_count);
+    for _ in 0..partition_count {
+        reference_indices.push(parse_reference_index(reader, num_ref_idx_l0_active)?);
+    }
+    let mut partitions = Vec::with_capacity(partition_count);
+    for reference_index in reference_indices {
+        partitions.push(PPartitionMotion {
+            reference_index,
+            differences: vec![parse_motion_vector_difference(reader)?],
+        });
+    }
+    Ok(partitions)
+}
+
+fn parse_p_sub_macroblock_type(reader: &mut BitReader<'_>) -> Result<PSubMacroblockType> {
+    match reader.read_ue().ok_or(H264Error::UnexpectedEof)? {
+        0 => Ok(PSubMacroblockType::L0_8x8),
+        1 => Ok(PSubMacroblockType::L0_8x4),
+        2 => Ok(PSubMacroblockType::L0_4x8),
+        3 => Ok(PSubMacroblockType::L0_4x4),
+        _ => Err(H264Error::InvalidSyntax(
+            "sub_mb_type exceeds the P-slice table",
+        )),
+    }
+}
+
+fn parse_reference_index(reader: &mut BitReader<'_>, active_count: u8) -> Result<u8> {
+    match active_count {
+        0 => Err(H264Error::InvalidSyntax(
+            "P macroblock has no active reference pictures",
+        )),
+        1 => Ok(0),
+        2 => Ok(u8::from(!read_flag(reader)?)),
+        _ => {
+            let index = reader.read_ue().ok_or(H264Error::UnexpectedEof)?;
+            u8::try_from(index)
+                .ok()
+                .filter(|&index| index < active_count)
+                .ok_or(H264Error::InvalidSyntax(
+                    "ref_idx_l0 exceeds the active reference list",
+                ))
+        }
+    }
+}
+
+fn parse_motion_vector_difference(reader: &mut BitReader<'_>) -> Result<MotionVectorDifference> {
+    let x = reader.read_se().ok_or(H264Error::UnexpectedEof)?;
+    let y = reader.read_se().ok_or(H264Error::UnexpectedEof)?;
+    Ok(MotionVectorDifference {
+        x: i16::try_from(x).map_err(|_| {
+            H264Error::InvalidSyntax("horizontal mvd_l0 is outside the supported range")
+        })?,
+        y: i16::try_from(y).map_err(|_| {
+            H264Error::InvalidSyntax("vertical mvd_l0 is outside the supported range")
+        })?,
+    })
+}
+
 fn parse_intra_prediction_mode(reader: &mut BitReader<'_>) -> Result<IntraPredictionModeSyntax> {
     let use_predicted = read_flag(reader)?;
     let remaining_mode = if use_predicted {
@@ -194,6 +481,19 @@ fn parse_chroma_prediction_mode(reader: &mut BitReader<'_>) -> Result<u8> {
 fn parse_intra_coded_block_pattern(reader: &mut BitReader<'_>) -> Result<CodedBlockPattern> {
     let code_num = reader.read_ue().ok_or(H264Error::UnexpectedEof)?;
     let value = *INTRA_CODED_BLOCK_PATTERNS_420
+        .get(usize::try_from(code_num).map_err(|_| H264Error::IntegerOverflow)?)
+        .ok_or(H264Error::InvalidSyntax(
+            "coded_block_pattern codeNum exceeds 47",
+        ))?;
+    Ok(CodedBlockPattern {
+        luma: value & 0x0f,
+        chroma: value >> 4,
+    })
+}
+
+fn parse_inter_coded_block_pattern(reader: &mut BitReader<'_>) -> Result<CodedBlockPattern> {
+    let code_num = reader.read_ue().ok_or(H264Error::UnexpectedEof)?;
+    let value = *INTER_CODED_BLOCK_PATTERNS_420
         .get(usize::try_from(code_num).map_err(|_| H264Error::IntegerOverflow)?)
         .ok_or(H264Error::InvalidSyntax(
             "coded_block_pattern codeNum exceeds 47",
@@ -256,7 +556,9 @@ mod tests {
 
     use super::{
         CodedBlockPattern, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader,
-        IntraPredictionModeSyntax, parse_cavlc_intra_macroblock,
+        IntraPredictionModeSyntax, MotionVectorDifference, PInterMacroblockHeader,
+        PMacroblockContext, PPartitionMode, PPartitionMotion, PSliceMacroblock, PSubMacroblockType,
+        parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run, parse_cavlc_p_macroblock,
     };
     use crate::H264Error;
 
@@ -386,6 +688,238 @@ mod tests {
         assert_eq!(pcm.chroma[0], 0);
         assert_eq!(pcm.chroma[127], 127);
         assert_eq!(reader.bit_position(), writer.bit_len);
+    }
+
+    #[test]
+    fn parses_p_16x16_with_inferred_reference_index() {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0);
+        writer.write_se(2);
+        writer.write_se(-1);
+        writer.write_ue(0); // inter coded_block_pattern = 0
+
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        assert_eq!(
+            parse_cavlc_p_macroblock(
+                &mut reader,
+                PMacroblockContext {
+                    num_ref_idx_l0_active: 1,
+                    transform_8x8_mode_enabled: false,
+                },
+            ),
+            Ok(PSliceMacroblock::Inter(PInterMacroblockHeader {
+                partition_mode: PPartitionMode::L0_16x16,
+                partitions: vec![PPartitionMotion {
+                    reference_index: 0,
+                    differences: vec![MotionVectorDifference { x: 2, y: -1 }],
+                }],
+                coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
+                transform_size_8x8: false,
+                qp_delta: 0,
+            }))
+        );
+        assert_eq!(reader.bit_position(), writer.bit_len);
+    }
+
+    #[test]
+    fn parses_p_16x8_reference_indices_transform_and_qp() {
+        let mut writer = BitWriter::default();
+        writer.write_ue(1);
+        writer.write_flag(true); // te(v) value 0
+        writer.write_flag(false); // te(v) value 1
+        for (x, y) in [(1, 2), (-3, 4)] {
+            writer.write_se(x);
+            writer.write_se(y);
+        }
+        writer.write_ue(2); // inter coded_block_pattern = 1
+        writer.write_flag(true);
+        writer.write_se(-2);
+
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        let parsed = parse_cavlc_p_macroblock(
+            &mut reader,
+            PMacroblockContext {
+                num_ref_idx_l0_active: 2,
+                transform_8x8_mode_enabled: true,
+            },
+        )
+        .unwrap();
+        let PSliceMacroblock::Inter(header) = parsed else {
+            panic!("expected inter macroblock");
+        };
+        assert_eq!(header.partition_mode, PPartitionMode::L0_16x8);
+        assert_eq!(
+            header
+                .partitions
+                .iter()
+                .map(|partition| partition.reference_index)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert_eq!(
+            header
+                .partitions
+                .iter()
+                .map(|partition| partition.differences[0])
+                .collect::<Vec<_>>(),
+            [
+                MotionVectorDifference { x: 1, y: 2 },
+                MotionVectorDifference { x: -3, y: 4 },
+            ]
+        );
+        assert_eq!(
+            header.coded_block_pattern,
+            CodedBlockPattern { luma: 1, chroma: 0 }
+        );
+        assert!(header.transform_size_8x8);
+        assert_eq!(header.qp_delta, -2);
+        assert_eq!(reader.bit_position(), writer.bit_len);
+    }
+
+    #[test]
+    fn parses_every_p_sub_macroblock_shape_in_syntax_order() {
+        let mut writer = BitWriter::default();
+        writer.write_ue(3);
+        for sub_type in 0..4 {
+            writer.write_ue(sub_type);
+        }
+        for index in 0..9 {
+            writer.write_se(index);
+            writer.write_se(-index);
+        }
+        writer.write_ue(0);
+
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        let PSliceMacroblock::Inter(header) = parse_cavlc_p_macroblock(
+            &mut reader,
+            PMacroblockContext {
+                num_ref_idx_l0_active: 1,
+                transform_8x8_mode_enabled: true,
+            },
+        )
+        .unwrap() else {
+            panic!("expected inter macroblock");
+        };
+        assert_eq!(
+            header.partition_mode,
+            PPartitionMode::L0_8x8 {
+                sub_macroblocks: [
+                    PSubMacroblockType::L0_8x8,
+                    PSubMacroblockType::L0_8x4,
+                    PSubMacroblockType::L0_4x8,
+                    PSubMacroblockType::L0_4x4,
+                ],
+                reference_index_forced_zero: false,
+            }
+        );
+        assert_eq!(
+            header
+                .partitions
+                .iter()
+                .map(|partition| partition.differences.len())
+                .collect::<Vec<_>>(),
+            [1, 2, 2, 4]
+        );
+        assert!(!header.transform_size_8x8);
+        assert_eq!(reader.bit_position(), writer.bit_len);
+    }
+
+    #[test]
+    fn p_8x8ref0_omits_reference_index_syntax() {
+        let mut writer = BitWriter::default();
+        writer.write_ue(4);
+        for _ in 0..4 {
+            writer.write_ue(0);
+        }
+        for _ in 0..4 {
+            writer.write_se(0);
+            writer.write_se(0);
+        }
+        writer.write_ue(0);
+
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        let PSliceMacroblock::Inter(header) = parse_cavlc_p_macroblock(
+            &mut reader,
+            PMacroblockContext {
+                num_ref_idx_l0_active: 3,
+                transform_8x8_mode_enabled: false,
+            },
+        )
+        .unwrap() else {
+            panic!("expected inter macroblock");
+        };
+        assert!(
+            header
+                .partitions
+                .iter()
+                .all(|part| part.reference_index == 0)
+        );
+        assert!(matches!(
+            header.partition_mode,
+            PPartitionMode::L0_8x8 {
+                reference_index_forced_zero: true,
+                ..
+            }
+        ));
+        assert_eq!(reader.bit_position(), writer.bit_len);
+    }
+
+    #[test]
+    fn maps_p_slice_intra_types_and_bounds_skip_runs() {
+        let mut writer = BitWriter::default();
+        writer.write_ue(5);
+        for _ in 0..16 {
+            writer.write_flag(true);
+        }
+        writer.write_ue(0);
+        writer.write_ue(3);
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        assert!(matches!(
+            parse_cavlc_p_macroblock(
+                &mut reader,
+                PMacroblockContext {
+                    num_ref_idx_l0_active: 1,
+                    transform_8x8_mode_enabled: false,
+                },
+            ),
+            Ok(PSliceMacroblock::Intra(IntraMacroblock::Predicted(_)))
+        ));
+
+        let mut writer = BitWriter::default();
+        writer.write_ue(3);
+        let data = writer.finish();
+        let mut reader = BitReader::new(&data);
+        assert_eq!(parse_cavlc_mb_skip_run(&mut reader, 3), Ok(3));
+        let mut reader = BitReader::new(&data);
+        assert!(parse_cavlc_mb_skip_run(&mut reader, 2).is_err());
+        assert_eq!(reader.bit_position(), 0);
+    }
+
+    #[test]
+    fn rejects_invalid_p_syntax_atomically() {
+        let context = PMacroblockContext {
+            num_ref_idx_l0_active: 3,
+            transform_8x8_mode_enabled: false,
+        };
+        let mut invalid_type = BitWriter::default();
+        invalid_type.write_ue(31);
+        let mut invalid_sub_type = BitWriter::default();
+        invalid_sub_type.write_ue(3);
+        invalid_sub_type.write_ue(4);
+        let mut invalid_reference = BitWriter::default();
+        invalid_reference.write_ue(0);
+        invalid_reference.write_ue(3);
+        for writer in [invalid_type, invalid_sub_type, invalid_reference] {
+            let data = writer.finish();
+            let mut reader = BitReader::new(&data);
+            assert!(parse_cavlc_p_macroblock(&mut reader, context).is_err());
+            assert_eq!(reader.bit_position(), 0);
+        }
     }
 
     #[test]

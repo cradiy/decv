@@ -650,6 +650,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - lookup-table acceleration plus Criterion benchmarks for CAVLC;
 - slice-aware Y/Cb/Cr `nC` neighbour state;
 - transactional CAVLC I_4x4, I_8x8, I_16x16, and I_PCM macroblocks;
+- transactional frame-coded CAVLC P macroblock headers, including skip runs,
+  reference indices, all P partition shapes, and motion-vector differences;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;

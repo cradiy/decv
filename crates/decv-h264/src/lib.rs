@@ -38,8 +38,10 @@ pub use intra_modes::IntraModeState;
 pub use intra_reconstruction::IntraPictureReconstructor;
 pub use macroblock::{
     CodedBlockPattern, DecodedIntraMacroblock, IntraLumaPrediction, IntraMacroblock,
-    IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, PcmMacroblock,
-    parse_cavlc_intra_macroblock,
+    IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MotionVectorDifference,
+    PInterMacroblockHeader, PMacroblockContext, PPartitionMode, PPartitionMotion, PSliceMacroblock,
+    PSubMacroblockType, PcmMacroblock, parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run,
+    parse_cavlc_p_macroblock,
 };
 pub use nal::{NalHeader, NalUnit, NalUnitType};
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
