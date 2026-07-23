@@ -243,8 +243,16 @@ fn predict_luma<const CLIP: bool>(
         let reference_y = reference_y as usize;
         for output_y in 0..usize::from(prediction.height) {
             let start = (reference_y + output_y) * width + reference_x;
-            prediction.luma[output_y][..output_width]
-                .copy_from_slice(&plane[start..start + output_width]);
+            // SAFETY: the complete source rectangle was validated as
+            // interior, the destination row has 16 bytes, and valid luma
+            // partition widths are exactly 4, 8, or 16 bytes.
+            unsafe {
+                copy_fixed_row(
+                    prediction.luma[output_y].as_mut_ptr(),
+                    plane.as_ptr().add(start),
+                    output_width,
+                );
+            }
         }
         return;
     }
@@ -428,9 +436,21 @@ fn predict_chroma<const CLIP: bool>(
         let reference_y = reference_y as usize;
         for output_y in 0..usize::from(prediction.height / 2) {
             let start = (reference_y + output_y) * width + reference_x;
-            let end = start + output_width;
-            prediction.cb[output_y][..output_width].copy_from_slice(&cb[start..end]);
-            prediction.cr[output_y][..output_width].copy_from_slice(&cr[start..end]);
+            // SAFETY: the complete source rectangles were validated as
+            // interior, each destination row has eight bytes, and valid
+            // chroma partition widths are exactly 2, 4, or 8 bytes.
+            unsafe {
+                copy_fixed_row(
+                    prediction.cb[output_y].as_mut_ptr(),
+                    cb.as_ptr().add(start),
+                    output_width,
+                );
+                copy_fixed_row(
+                    prediction.cr[output_y].as_mut_ptr(),
+                    cr.as_ptr().add(start),
+                    output_width,
+                );
+            }
         }
         return;
     }
@@ -444,6 +464,31 @@ fn predict_chroma<const CLIP: bool>(
             prediction.cr[output_y][output_x] =
                 interpolate_chroma_inner::<CLIP>(cr, width, height, x, y, x_fraction, y_fraction);
         }
+    }
+}
+
+#[inline(always)]
+unsafe fn copy_fixed_row(destination: *mut u8, source: *const u8, width: usize) {
+    use std::ptr::{read_unaligned, write_unaligned};
+
+    match width {
+        2 => {
+            // SAFETY: the caller guarantees two readable and writable bytes.
+            unsafe { write_unaligned(destination.cast::<u16>(), read_unaligned(source.cast())) };
+        }
+        4 => {
+            // SAFETY: the caller guarantees four readable and writable bytes.
+            unsafe { write_unaligned(destination.cast::<u32>(), read_unaligned(source.cast())) };
+        }
+        8 => {
+            // SAFETY: the caller guarantees eight readable and writable bytes.
+            unsafe { write_unaligned(destination.cast::<u64>(), read_unaligned(source.cast())) };
+        }
+        16 => {
+            // SAFETY: the caller guarantees sixteen readable and writable bytes.
+            unsafe { write_unaligned(destination.cast::<u128>(), read_unaligned(source.cast())) };
+        }
+        _ => unreachable!("validated 4:2:0 partition rows have fixed power-of-two widths"),
     }
 }
 
@@ -685,6 +730,22 @@ mod tests {
             }
         }
         picture
+    }
+
+    #[test]
+    fn fixed_row_copy_matches_slice_copy_at_unaligned_addresses() {
+        let source: Vec<u8> = (0..32).map(|index| (index * 37 + 11) as u8).collect();
+        for width in [2usize, 4, 8, 16] {
+            let mut actual = [0xa5; 24];
+            let mut expected = actual;
+            expected[3..3 + width].copy_from_slice(&source[1..1 + width]);
+            // SAFETY: both explicitly selected ranges contain `width` bytes;
+            // offsets one and three exercise unaligned loads and stores.
+            unsafe {
+                copy_fixed_row(actual.as_mut_ptr().add(3), source.as_ptr().add(1), width);
+            }
+            assert_eq!(actual, expected, "width={width}");
+        }
     }
 
     #[test]
