@@ -784,12 +784,17 @@ impl IntraPictureReconstructor {
     }
 
     pub fn into_nv12_frame(
-        mut self,
+        self,
         id: u64,
         pts: Option<MediaTime>,
         duration: Option<MediaTime>,
         format: VideoFormat,
     ) -> Result<DecodedVideoFrame> {
+        self.into_deblocked_picture()?
+            .into_nv12_frame(id, pts, duration, format)
+    }
+
+    pub(crate) fn into_deblocked_picture(mut self) -> Result<Yuv420Picture> {
         if self.completed.iter().any(Option::is_none) {
             return Err(H264Error::InvalidSyntax(
                 "cannot output an incomplete reconstructed picture",
@@ -805,7 +810,7 @@ impl IntraPictureReconstructor {
             })
             .collect::<Vec<_>>();
         filter_420_picture(&mut self.picture, &macroblocks, self.width_in_macroblocks)?;
-        self.picture.into_nv12_frame(id, pts, duration, format)
+        Ok(self.picture)
     }
 
     #[allow(clippy::too_many_arguments)]

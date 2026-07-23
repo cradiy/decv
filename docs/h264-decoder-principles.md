@@ -678,6 +678,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - transactional progressive-frame MMCO 1 through 6, including short/long-term
   removal, reassignment, MaxLongTermFrameIdx limits, MMCO 5 reset, current
   long-term marking, and final DPB-capacity validation;
+- top-level DPB integration that constructs the active P List 0 per slice,
+  retains deblocked planar reference pictures while packaging NV12 output,
+  and applies IDR, sliding-window, or adaptive marking when a picture finishes;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
@@ -696,16 +699,19 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
-- a complete Annex-B SPS/PPS/IDR-to-NV12 integration test;
+- complete Annex-B SPS/PPS/IDR-to-NV12 and IDR-to-reference-P integration
+  tests;
 - a synchronous `VideoDecoder` implementation with packet ownership,
   backpressure, `FormatChanged`, timestamps, flush, and drain behavior.
 
-The first pixel-producing path is therefore real, but deliberately narrow:
+The first inter-picture pixel-producing path is therefore real, but
+deliberately narrow:
 
 ```text
-Annex-B CAVLC progressive 8-bit 4:2:0 I/IDR
-    -> I_4x4, I_8x8, I_16x16, or I_PCM macroblocks
-    -> planar reconstruction and in-loop deblocking
+Annex-B CAVLC progressive 8-bit 4:2:0 I/IDR -> P
+    -> Intra, P_L0, P_8x8, or P_Skip macroblocks
+    -> List-0 motion compensation plus residual reconstruction
+    -> progressive in-loop deblocking and reference-picture marking
     -> immutable CPU NV12 frame
     -> synchronous pull output
 ```
@@ -719,17 +725,16 @@ still rejects or has not yet connected:
 - field pictures and MBAFF;
 - FMO slice groups;
 - weighted prediction;
-- the implemented P-slice reconstruction and DPB reference marking to the
-  access-unit decoder;
 - POC-based display reordering;
 - length-prefixed input and out-of-band `avcC` configuration.
 
 The next dependency chain is:
 
 ```text
-connect P macroblocks to the slice and access-unit decoder
-    -> DPB reference marking and POC-based output
-    -> CABAC
+weighted P prediction
+    -> B slices and List 1
+    -> POC-based output reordering
+    -> CABAC slice data
 ```
 
 The synchronous decoder currently keeps an unfinished picture across packets.

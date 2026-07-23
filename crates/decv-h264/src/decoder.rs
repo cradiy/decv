@@ -5,12 +5,13 @@ use std::{borrow::Cow, collections::VecDeque, sync::Arc};
 use bit_readers::BitReader;
 use decv_core::{
     BitstreamFormat, DecodeInputStatus, DecodeOutput, EncodedVideoPacket, MediaTime, PixelFormat,
-    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+    Size, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
 
 use crate::{
-    AnnexBNalUnit, AnnexBReader, H264Error, IntraPictureReconstructor, NalUnit, NalUnitType,
-    ParameterSetStore, ParsedSliceHeader, PictureParameterSet, Result, SequenceParameterSet,
+    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, H264Error, IntraPictureReconstructor,
+    NalHeader, NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader, PictureOrderCount,
+    PictureParameterSet, ReferencePictureMarking, Result, SequenceParameterSet, SliceType,
     consume_rbsp_trailing_bits, decode_rbsp,
 };
 
@@ -20,18 +21,32 @@ struct PendingPicture {
     format: VideoFormat,
     pts: Option<MediaTime>,
     duration: Option<MediaTime>,
+    nal_header: NalHeader,
+    frame_num: u32,
+    picture_order_count: PictureOrderCount,
+    reference_picture_marking: ReferencePictureMarking,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DpbConfiguration {
+    max_num_ref_frames: u32,
+    log2_max_frame_num: u8,
+    coded_size: Size,
 }
 
 /// Synchronous pure-Rust H.264 decoder implementing the codec-independent
 /// push/pull contract.
 ///
-/// The current reconstruction backend accepts Annex-B CAVLC I pictures. Other
-/// H.264 coding tools return explicit [`H264Error::UnsupportedFeature`] errors.
+/// The current reconstruction backend accepts progressive Annex-B CAVLC I and
+/// unweighted P pictures. Other H.264 coding tools return explicit
+/// [`H264Error::UnsupportedFeature`] errors.
 #[derive(Debug)]
 pub struct H264Decoder {
     configured: bool,
     parser: H264StreamParser,
     current_picture: Option<PendingPicture>,
+    dpb: Option<DecodedPictureBuffer>,
+    dpb_configuration: Option<DpbConfiguration>,
     outputs: VecDeque<DecodeOutput>,
     announced_format: Option<VideoFormat>,
     next_frame_id: u64,
@@ -44,6 +59,8 @@ impl Default for H264Decoder {
             configured: false,
             parser: H264StreamParser::new(),
             current_picture: None,
+            dpb: None,
+            dpb_configuration: None,
             outputs: VecDeque::new(),
             announced_format: None,
             next_frame_id: 0,
@@ -68,12 +85,14 @@ impl H264Decoder {
                     parsed,
                     rbsp,
                     starts_new_picture,
-                    ..
+                    picture_order_count,
+                    nal_header,
                 } => {
                     if starts_new_picture {
                         self.finish_current_picture()?;
                     }
                     if self.current_picture.is_none() {
+                        self.ensure_dpb(&parsed, nal_header)?;
                         let format = video_format(&parsed)?;
                         let reconstructor =
                             IntraPictureReconstructor::from_parameter_sets(&parsed.parameter_sets)?;
@@ -82,16 +101,56 @@ impl H264Decoder {
                             format,
                             pts: packet.pts,
                             duration: packet.duration,
+                            nal_header,
+                            frame_num: parsed.header.frame_num,
+                            picture_order_count,
+                            reference_picture_marking: parsed
+                                .header
+                                .reference_picture_marking
+                                .clone(),
                         });
                     }
-                    self.current_picture
-                        .as_mut()
-                        .expect("the picture is initialized above")
-                        .reconstructor
-                        .decode_cavlc_intra_slice(rbsp.as_ref(), &parsed)?;
+                    match parsed.header.slice_type {
+                        SliceType::I => {
+                            self.current_picture
+                                .as_mut()
+                                .expect("the picture is initialized above")
+                                .reconstructor
+                                .decode_cavlc_intra_slice(rbsp.as_ref(), &parsed)?;
+                        }
+                        SliceType::P => {
+                            let references = self
+                                .dpb
+                                .as_ref()
+                                .expect("the DPB is initialized with the picture")
+                                .p_list0(
+                                    parsed.header.frame_num,
+                                    parsed.header.num_ref_idx_l0_active,
+                                    &parsed.header.ref_pic_list_modifications_l0,
+                                )?;
+                            let borrowed = references
+                                .iter()
+                                .map(|picture| picture.as_deref())
+                                .collect::<Vec<_>>();
+                            self.current_picture
+                                .as_mut()
+                                .expect("the picture is initialized above")
+                                .reconstructor
+                                .decode_cavlc_p_slice(rbsp.as_ref(), &parsed, &borrowed)?;
+                        }
+                        SliceType::B | SliceType::Sp | SliceType::Si => {
+                            return Err(H264Error::UnsupportedFeature(
+                                "top-level reconstruction of B, SP, and SI slices",
+                            ));
+                        }
+                    }
                 }
-                ParserEvent::AccessUnitDelimiter { .. } | ParserEvent::EndOfSequence => {
+                ParserEvent::AccessUnitDelimiter { .. } => {
                     self.finish_current_picture()?;
+                }
+                ParserEvent::EndOfSequence => {
+                    self.finish_current_picture()?;
+                    self.clear_dpb();
                 }
                 ParserEvent::EndOfStream => {
                     self.finish_current_picture()?;
@@ -110,12 +169,40 @@ impl H264Decoder {
             .next_frame_id
             .checked_add(1)
             .ok_or(H264Error::IntegerOverflow)?;
-        let frame = picture.reconstructor.into_nv12_frame(
+        let decoded = Arc::new(picture.reconstructor.into_deblocked_picture()?);
+        let frame = decoded.to_nv12_frame(
             self.next_frame_id,
             picture.pts,
             picture.duration,
             picture.format,
         )?;
+        if picture.nal_header.nal_ref_idc != 0 {
+            let picture_order_count = picture.picture_order_count.stored.picture_order_count();
+            let dpb = self
+                .dpb
+                .as_mut()
+                .expect("a pending picture always has an initialized DPB");
+            match &picture.reference_picture_marking {
+                ReferencePictureMarking::Idr {
+                    long_term_reference,
+                    ..
+                } => dpb.store_idr(picture_order_count, decoded.clone(), *long_term_reference)?,
+                ReferencePictureMarking::SlidingWindow => {
+                    dpb.store_short_term(picture.frame_num, picture_order_count, decoded.clone())?
+                }
+                ReferencePictureMarking::Adaptive(operations) => dpb.store_adaptive(
+                    picture.frame_num,
+                    picture_order_count,
+                    decoded.clone(),
+                    operations,
+                )?,
+                ReferencePictureMarking::None => {
+                    return Err(H264Error::InvalidSyntax(
+                        "reference picture is missing decoded-picture-buffer marking",
+                    ));
+                }
+            }
+        }
         if self.announced_format != Some(picture.format) {
             self.outputs
                 .push_back(DecodeOutput::FormatChanged(picture.format));
@@ -128,6 +215,7 @@ impl H264Decoder {
     fn reset_all_state(&mut self) {
         self.parser.reset();
         self.current_picture = None;
+        self.clear_dpb();
         self.outputs.clear();
         self.announced_format = None;
         self.next_frame_id = 0;
@@ -137,8 +225,37 @@ impl H264Decoder {
     fn flush_timeline(&mut self) {
         self.parser.reset_picture_history();
         self.current_picture = None;
+        self.clear_dpb();
         self.outputs.clear();
         self.draining = false;
+    }
+
+    fn ensure_dpb(&mut self, parsed: &ParsedSliceHeader, nal_header: NalHeader) -> Result<()> {
+        let sps = &parsed.parameter_sets.sequence;
+        let configuration = DpbConfiguration {
+            max_num_ref_frames: sps.max_num_ref_frames,
+            log2_max_frame_num: sps.log2_max_frame_num,
+            coded_size: sps.coded_size,
+        };
+        if self.dpb_configuration == Some(configuration) {
+            return Ok(());
+        }
+        if self.dpb.is_some() && nal_header.unit_type != NalUnitType::IdrSlice {
+            return Err(H264Error::InvalidSyntax(
+                "DPB parameter change requires an IDR picture",
+            ));
+        }
+        self.dpb = Some(DecodedPictureBuffer::new(
+            configuration.max_num_ref_frames,
+            configuration.log2_max_frame_num,
+        )?);
+        self.dpb_configuration = Some(configuration);
+        Ok(())
+    }
+
+    fn clear_dpb(&mut self) {
+        self.dpb = None;
+        self.dpb_configuration = None;
     }
 }
 
@@ -236,6 +353,7 @@ pub enum ParserEvent<'a> {
     PictureParameterSet(Arc<PictureParameterSet>),
     Slice {
         parsed: ParsedSliceHeader,
+        nal_header: NalHeader,
         /// Unescaped payload retained for the following slice-data parser.
         rbsp: Cow<'a, [u8]>,
         starts_new_picture: bool,
@@ -305,6 +423,7 @@ impl H264StreamParser {
                 self.current_picture_order_count = Some(picture_order_count);
                 Ok(ParserEvent::Slice {
                     parsed,
+                    nal_header: nal.header,
                     rbsp,
                     starts_new_picture,
                     picture_order_count,
@@ -463,6 +582,7 @@ mod tests {
                     rbsp,
                     starts_new_picture,
                     picture_order_count,
+                    ..
                 } => {
                     assert!(parsed.header.bit_size <= rbsp.len() * 8);
                     assert_eq!(
@@ -499,6 +619,7 @@ mod tests {
                     rbsp,
                     starts_new_picture,
                     picture_order_count,
+                    ..
                 } => {
                     assert!(starts_new_picture);
                     assert_eq!(picture_order_count.stored.top, Some(0));
@@ -580,6 +701,45 @@ mod tests {
         assert_eq!(frame.pts, MediaTime::from_parts(10, 30));
         assert_eq!(frame.duration, MediaTime::from_parts(1, 30));
         assert!(matches!(frame.storage, FrameStorage::Cpu(_)));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn decodes_annex_b_idr_then_reference_p_picture() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_p_skip_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        for expected_id in [1, 2] {
+            let frame = match decoder.receive_frame().unwrap() {
+                DecodeOutput::Frame(frame) => frame,
+                output => panic!("expected decoded frame, got {output:?}"),
+            };
+            assert_eq!(frame.id, expected_id);
+            let FrameStorage::Cpu(cpu) = frame.storage else {
+                panic!("expected CPU frame");
+            };
+            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        }
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::EndOfStream
@@ -1082,6 +1242,21 @@ mod tests {
         }
         writer.write_ue(0); // intra_chroma_pred_mode: DC
         writer.write_ue(3); // coded_block_pattern codeNum -> zero
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_p_skip_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_ue(0); // first_mb_in_slice
+        writer.write_ue(0); // P slice
+        writer.write_ue(0); // pic_parameter_set_id
+        writer.write_bits(1, 4); // frame_num
+        writer.write_bits(2, 4); // pic_order_cnt_lsb
+        writer.write_flag(false); // num_ref_idx_active_override_flag
+        writer.write_flag(false); // ref_pic_list_modification_flag_l0
+        writer.write_flag(false); // adaptive_ref_pic_marking_mode_flag
+        writer.write_se(0); // slice_qp_delta
+        writer.write_ue(1); // mb_skip_run
         writer.finish_rbsp()
     }
 

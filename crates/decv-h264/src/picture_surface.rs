@@ -417,6 +417,18 @@ impl Yuv420Picture {
         duration: Option<MediaTime>,
         format: VideoFormat,
     ) -> Result<DecodedVideoFrame> {
+        self.to_nv12_frame(id, pts, duration, format)
+    }
+
+    /// Packages an NV12 output copy while retaining the planar picture for
+    /// future inter prediction in the decoded-picture buffer.
+    pub fn to_nv12_frame(
+        &self,
+        id: u64,
+        pts: Option<MediaTime>,
+        duration: Option<MediaTime>,
+        format: VideoFormat,
+    ) -> Result<DecodedVideoFrame> {
         if format.pixel_format != PixelFormat::Nv12 {
             return Err(H264Error::InvalidSyntax(
                 "YUV picture output format must be NV12",
