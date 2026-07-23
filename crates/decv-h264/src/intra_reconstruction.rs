@@ -15,8 +15,9 @@ use crate::motion_field::MotionFieldBuilder;
 use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, BSubMacroblockType,
-    CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary, CabacResidualState,
-    CabacSliceDecoder, CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock,
+    CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary, CabacPMacroblock,
+    CabacPMacroblockContext, CabacPMacroblockState, CabacResidualState, CabacSliceDecoder,
+    CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock,
     DecodedIntraMacroblock, DecodedPSliceMacroblock, DirectMotionContext, DirectReference,
     EntropyCodingMode, H264Error, InterResidual, IntraLumaPrediction, IntraMacroblock,
     IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability,
@@ -420,6 +421,59 @@ impl IntraPictureReconstructor {
         )
     }
 
+    /// Decodes one progressive CABAC P slice against an already constructed
+    /// active List 0.
+    pub fn decode_cabac_p_slice(
+        &mut self,
+        rbsp: &[u8],
+        parsed: &ParsedSliceHeader,
+        references_l0: ReconstructionReferenceList<'_>,
+    ) -> Result<usize> {
+        let header = &parsed.header;
+        let sps = &parsed.parameter_sets.sequence;
+        let pps = &parsed.parameter_sets.picture;
+        if header.slice_type != SliceType::P {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC P reconstruction requires a P slice header",
+            ));
+        }
+        if pps.entropy_coding_mode != EntropyCodingMode::Cabac
+            || pps.num_slice_groups != 1
+            || header.field_picture
+            || sps.mb_adaptive_frame_field
+        {
+            return Err(H264Error::UnsupportedFeature(
+                "CABAC P reconstruction currently requires progressive non-FMO input",
+            ));
+        }
+        if sps.coded_size != self.picture.coded_size()
+            || pps.constrained_intra_prediction != self.constrained_intra_prediction
+        {
+            return Err(H264Error::InvalidSyntax(
+                "slice parameter sets do not match the picture reconstructor",
+            ));
+        }
+        let config = IntraSliceConfig {
+            header_bit_size: header.bit_size,
+            first_macroblock: usize::try_from(header.first_mb_in_slice)
+                .map_err(|_| H264Error::IntegerOverflow)?,
+            slice_qp_y: header.slice_qp_y,
+            transform_8x8_mode: pps.transform_8x8_mode,
+            chroma_cb_offset: pps.chroma_qp_index_offset,
+            chroma_cr_offset: pps.second_chroma_qp_index_offset,
+            transform_bypass_enabled: sps.qpprime_y_zero_transform_bypass,
+            deblocking_filter: header.deblocking_filter.unwrap_or_default(),
+        };
+        self.decode_cabac_p_slice_data(
+            rbsp,
+            config,
+            header.cabac_init_idc,
+            header.num_ref_idx_l0_active,
+            references_l0,
+            header.prediction_weights.as_ref(),
+        )
+    }
+
     /// Decodes one progressive CAVLC B slice using default, unweighted
     /// explicit List 0/List 1 prediction.
     ///
@@ -751,6 +805,214 @@ impl IntraPictureReconstructor {
             if macroblock_address >= self.completed.len() {
                 return Err(H264Error::InvalidSyntax(
                     "CABAC slice has no terminating end_of_slice_flag",
+                ));
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_cabac_p_slice_data(
+        &mut self,
+        rbsp: &[u8],
+        config: IntraSliceConfig,
+        cabac_init_idc: Option<u8>,
+        num_ref_idx_l0_active: u8,
+        references_l0: ReconstructionReferenceList<'_>,
+        prediction_weights: Option<&PredictionWeightTable>,
+    ) -> Result<usize> {
+        self.next_slice_id = self
+            .next_slice_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let slice_id = self.next_slice_id;
+        let mut cabac = CabacSliceDecoder::new(
+            rbsp,
+            config.header_bit_size,
+            SliceType::P,
+            cabac_init_idc,
+            config.slice_qp_y,
+        )?;
+        let height_in_macroblocks = self.completed.len() / self.width_in_macroblocks;
+        let mut macroblocks =
+            CabacPMacroblockState::new(self.width_in_macroblocks, height_in_macroblocks)?;
+        let mut quantizers = MacroblockQuantizerState::new(
+            config.slice_qp_y,
+            config.chroma_cb_offset,
+            config.chroma_cr_offset,
+            config.transform_bypass_enabled,
+        )?;
+        let pcm_chroma_qp = [
+            derive_chroma_qp(0, config.chroma_cb_offset),
+            derive_chroma_qp(0, config.chroma_cr_offset),
+        ];
+        let reference_ids_l0 = references_l0.reference_ids;
+        let references_l0 = references_l0.pictures;
+        let mut macroblock_address = config.first_macroblock;
+        let mut decoded_count = 0usize;
+        let mut previous_qp_delta_nonzero = false;
+
+        loop {
+            let (macroblock_x, macroblock_y) = self.macroblock_coordinates(macroblock_address)?;
+            let residual_snapshot = self.cabac_residual.snapshot_macroblock(macroblock_address);
+            let decoded = macroblocks.decode_macroblock(
+                &mut cabac,
+                &mut self.cabac_residual,
+                macroblock_address,
+                slice_id,
+                CabacPMacroblockContext {
+                    num_ref_idx_l0_active,
+                    transform_8x8_mode_enabled: config.transform_8x8_mode,
+                    previous_qp_delta_nonzero,
+                },
+            )?;
+            let qp_delta = decoded.macroblock.qp_delta();
+            let reconstruction =
+                quantizers.with_macroblock(qp_delta, |quantizer| match &decoded.macroblock {
+                    CabacPMacroblock::Skip => {
+                        let motion = self
+                            .motion
+                            .resolve_skip_macroblock(macroblock_address, slice_id)?;
+                        if let Err(error) = self.reference_motion.record_p(
+                            macroblock_address,
+                            &motion,
+                            reference_ids_l0,
+                        ) {
+                            self.motion.clear_macroblock(macroblock_address)?;
+                            return Err(error);
+                        }
+                        let reconstruction = if let Some(weights) = prediction_weights {
+                            reconstruct_weighted_p_skip_macroblock_from_list_420(
+                                &mut self.picture,
+                                references_l0,
+                                macroblock_x,
+                                macroblock_y,
+                                &motion,
+                                weights,
+                            )
+                        } else {
+                            reconstruct_p_skip_macroblock_from_list_420(
+                                &mut self.picture,
+                                references_l0,
+                                macroblock_x,
+                                macroblock_y,
+                                &motion,
+                            )
+                        };
+                        if let Err(error) = reconstruction
+                            .and_then(|()| self.modes.record_inter(macroblock_address, slice_id))
+                        {
+                            self.motion.clear_macroblock(macroblock_address)?;
+                            self.reference_motion.clear_macroblock(macroblock_address)?;
+                            return Err(error);
+                        }
+                        self.complete_inter_macroblock(
+                            macroblock_address,
+                            inter_deblock_info(
+                                slice_id,
+                                quantizer,
+                                false,
+                                config.deblocking_filter,
+                                &motion,
+                                None,
+                                references_l0,
+                            )?,
+                        );
+                        Ok(())
+                    }
+                    CabacPMacroblock::Decoded(decoded) => match decoded.as_ref() {
+                        DecodedPSliceMacroblock::Inter { header, residual } => {
+                            let reconstructed = reconstruct_inter_residual(
+                                header,
+                                residual,
+                                quantizer,
+                                &self.scaling_lists,
+                                &self.scaling_lists_8x8,
+                                self.scan_mode,
+                            )?;
+                            let motion = self.motion.resolve_inter_macroblock(
+                                macroblock_address,
+                                slice_id,
+                                header,
+                            )?;
+                            if let Err(error) = self.reference_motion.record_p(
+                                macroblock_address,
+                                &motion,
+                                reference_ids_l0,
+                            ) {
+                                self.motion.clear_macroblock(macroblock_address)?;
+                                return Err(error);
+                            }
+                            let reconstruction = if let Some(weights) = prediction_weights {
+                                reconstruct_weighted_p_macroblock_from_list_420(
+                                    &mut self.picture,
+                                    references_l0,
+                                    macroblock_x,
+                                    macroblock_y,
+                                    &motion,
+                                    &reconstructed,
+                                    weights,
+                                )
+                            } else {
+                                reconstruct_p_macroblock_from_list_420(
+                                    &mut self.picture,
+                                    references_l0,
+                                    macroblock_x,
+                                    macroblock_y,
+                                    &motion,
+                                    &reconstructed,
+                                )
+                            };
+                            if let Err(error) = reconstruction.and_then(|()| {
+                                self.modes.record_inter(macroblock_address, slice_id)
+                            }) {
+                                self.motion.clear_macroblock(macroblock_address)?;
+                                self.reference_motion.clear_macroblock(macroblock_address)?;
+                                return Err(error);
+                            }
+                            self.complete_inter_macroblock(
+                                macroblock_address,
+                                inter_deblock_info(
+                                    slice_id,
+                                    quantizer,
+                                    header.transform_size_8x8,
+                                    config.deblocking_filter,
+                                    &motion,
+                                    Some(residual),
+                                    references_l0,
+                                )?,
+                            );
+                            Ok(())
+                        }
+                        DecodedPSliceMacroblock::Intra(decoded) => self
+                            .reconstruct_macroblock_with_deblocking(
+                                macroblock_address,
+                                slice_id,
+                                decoded,
+                                quantizer,
+                                config.deblocking_filter,
+                                pcm_chroma_qp,
+                            ),
+                    },
+                });
+            if let Err(error) = reconstruction {
+                self.cabac_residual
+                    .restore_macroblock(macroblock_address, residual_snapshot);
+                return Err(error);
+            }
+
+            previous_qp_delta_nonzero = qp_delta != 0;
+            macroblock_address = macroblock_address
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+            decoded_count = decoded_count
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+            if decoded.end_of_slice {
+                return Ok(decoded_count);
+            }
+            if macroblock_address >= self.completed.len() {
+                return Err(H264Error::InvalidSyntax(
+                    "CABAC P slice has no terminating end_of_slice_flag",
                 ));
             }
         }

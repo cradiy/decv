@@ -783,6 +783,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - transactional CABAC P-macroblock assembly in normative syntax order,
   including P_Skip, every List-0 partition shape, embedded Intra/I_PCM,
   coded-block patterns, transform selection, QP deltas, and residuals;
+- pixel-producing progressive CABAC P slices with List-0 motion prediction,
+  weighted or default compensation, residual reconstruction, deblocking, DPB
+  motion metadata, and byte-exact x264/FFmpeg regression coverage;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
@@ -795,7 +798,7 @@ The first inter-picture pixel-producing path is therefore real, but
 deliberately narrow:
 
 ```text
-Annex-B CAVLC progressive 8-bit 4:2:0 I/IDR -> P
+Annex-B CAVLC or CABAC progressive 8-bit 4:2:0 I/IDR -> P
     -> Intra, P_L0, P_8x8, or P_Skip macroblocks
     -> List-0 motion compensation plus residual reconstruction
     -> progressive in-loop deblocking and reference-picture marking
@@ -806,7 +809,7 @@ Annex-B CAVLC progressive 8-bit 4:2:0 I/IDR -> P
 This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
-- CABAC inter-slice pixel reconstruction;
+- CABAC B-slice pixel reconstruction;
 - SP and SI reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
@@ -815,9 +818,9 @@ still rejects or has not yet connected:
 The next dependency chain is:
 
 ```text
-B slices and List 1
-    -> POC-based output reordering
-    -> CABAC slice data
+CABAC B macroblock syntax
+    -> CABAC List 0/List 1 and Direct motion syntax
+    -> CABAC B-slice pixel reconstruction
 ```
 
 The synchronous decoder currently keeps an unfinished picture across packets.

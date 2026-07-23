@@ -183,15 +183,28 @@ impl H264Decoder {
                             .iter()
                             .map(|reference| reference.as_ref().map(|reference| reference.id))
                             .collect::<Vec<_>>();
-                        self.current_picture
+                        let picture = self
+                            .current_picture
                             .as_mut()
-                            .expect("the picture is initialized above")
-                            .reconstructor
-                            .decode_cavlc_p_slice(
-                                rbsp.as_ref(),
-                                &parsed,
-                                ReconstructionReferenceList::with_ids(&borrowed, &reference_ids),
-                            )?;
+                            .expect("the picture is initialized above");
+                        let references =
+                            ReconstructionReferenceList::with_ids(&borrowed, &reference_ids);
+                        match parsed.parameter_sets.picture.entropy_coding_mode {
+                            EntropyCodingMode::Cavlc => {
+                                picture.reconstructor.decode_cavlc_p_slice(
+                                    rbsp.as_ref(),
+                                    &parsed,
+                                    references,
+                                )?;
+                            }
+                            EntropyCodingMode::Cabac => {
+                                picture.reconstructor.decode_cabac_p_slice(
+                                    rbsp.as_ref(),
+                                    &parsed,
+                                    references,
+                                )?;
+                            }
+                        }
                     }
                     SliceType::B => {
                         let current_poc = picture_order_count.stored.picture_order_count();
@@ -953,6 +966,52 @@ mod tests {
         };
         assert_eq!(cpu.planes[0].bytes.len(), 384);
         assert_eq!(crc32(cpu.planes[0].bytes.as_ref()), 2_320_103_694);
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn decodes_real_x264_cabac_p_pictures_byte_exactly() {
+        // Two 32x16 gradient pictures encoded by x264 as one High-profile
+        // CABAC IDR followed by a CABAC P picture containing an inter and an
+        // embedded-intra macroblock. The SEI was removed. CRCs cover the
+        // complete tightly packed NV12 frame and were checked against FFmpeg.
+        let stream = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0a, 0xac, 0xb4, 0x5d, 0x80, 0x88, 0x00,
+            0x00, 0x03, 0x00, 0x08, 0x00, 0x00, 0x03, 0x00, 0x10, 0x78, 0x91, 0x35, 0x00, 0x00,
+            0x00, 0x01, 0x68, 0xee, 0x0f, 0x2c, 0x8b, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x08,
+            0xff, 0xf6, 0x1d, 0x64, 0x4f, 0xf9, 0x3c, 0x4b, 0xf8, 0x47, 0x3a, 0x19, 0xd8, 0xaa,
+            0xdf, 0x12, 0x0c, 0x06, 0x28, 0xa0, 0x38, 0x83, 0x9e, 0x63, 0xbd, 0x00, 0x00, 0x00,
+            0x01, 0x41, 0x9a, 0x22, 0x11, 0xff, 0x73, 0x44, 0xc3, 0x02, 0x47, 0x78, 0x2d, 0xff,
+            0x91, 0xe9, 0x6b, 0xed, 0x82, 0xfe, 0xc0,
+        ];
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+
+        for expected_crc in [3_812_764_094, 1_790_393_901] {
+            let frame = match decoder.receive_frame().unwrap() {
+                DecodeOutput::Frame(frame) => frame,
+                output => panic!("expected CABAC P frame, got {output:?}"),
+            };
+            let FrameStorage::Cpu(cpu) = frame.storage else {
+                panic!("expected CPU frame");
+            };
+            assert_eq!(cpu.planes[0].bytes.len(), 768);
+            assert_eq!(crc32(cpu.planes[0].bytes.as_ref()), expected_crc);
+        }
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::EndOfStream
