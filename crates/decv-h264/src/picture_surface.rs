@@ -44,14 +44,24 @@ pub struct Yuv420Picture {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct MacroblockPixels {
-    luma: [[u8; 16]; 16],
-    cb: [[u8; 8]; 8],
-    cr: [[u8; 8]; 8],
+    luma: Prediction16x16,
+    cb: Prediction8x8,
+    cr: Prediction8x8,
 }
 
 impl MacroblockPixels {
-    pub(crate) const fn new(luma: [[u8; 16]; 16], cb: [[u8; 8]; 8], cr: [[u8; 8]; 8]) -> Self {
+    pub(crate) const fn new(luma: Prediction16x16, cb: Prediction8x8, cr: Prediction8x8) -> Self {
         Self { luma, cb, cr }
+    }
+
+    pub(crate) const fn empty() -> Self {
+        Self::new([[0; 16]; 16], [[0; 8]; 8], [[0; 8]; 8])
+    }
+
+    pub(crate) fn planes_mut(
+        &mut self,
+    ) -> (&mut Prediction16x16, &mut Prediction8x8, &mut Prediction8x8) {
+        (&mut self.luma, &mut self.cb, &mut self.cr)
     }
 }
 
@@ -64,6 +74,14 @@ pub(crate) struct StagedMacroblockPixels {
 impl StagedMacroblockPixels {
     pub(crate) const fn new(address: usize, pixels: MacroblockPixels) -> Self {
         Self { address, pixels }
+    }
+
+    pub(crate) const fn empty(address: usize) -> Self {
+        Self::new(address, MacroblockPixels::empty())
+    }
+
+    pub(crate) fn pixels_mut(&mut self) -> &mut MacroblockPixels {
+        &mut self.pixels
     }
 }
 

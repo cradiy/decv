@@ -7,7 +7,9 @@ use rayon::prelude::*;
 use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
     BPredictionWeightMode, ImplicitWeightReference, reconstruct_b_macroblock_from_lists_with_mode,
+    reconstruct_b_macroblock_pixels_from_lists_into_with_scratch,
     reconstruct_b_macroblock_pixels_from_lists_with_scratch,
+    reconstruct_p_macroblock_pixels_from_list_into_with_scratch,
     reconstruct_p_macroblock_pixels_from_list_with_scratch,
     reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
@@ -1981,7 +1983,21 @@ impl IntraPictureReconstructor {
             let mut scratch = InterPrediction420::empty();
             let mut staged = Vec::with_capacity(jobs.len());
             for job in jobs.iter() {
-                staged.push(reconstruct(job, &mut scratch)?);
+                staged.push(StagedMacroblockPixels::empty(job.address));
+                reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
+                    coded_size,
+                    references_l0,
+                    job.macroblock_x,
+                    job.macroblock_y,
+                    &job.motion,
+                    job.residual.as_ref(),
+                    weights,
+                    &mut scratch,
+                    staged
+                        .last_mut()
+                        .expect("the staged macroblock was just appended")
+                        .pixels_mut(),
+                )?;
             }
             staged
         };
@@ -2068,7 +2084,24 @@ impl IntraPictureReconstructor {
             let mut scratch = (InterPrediction420::empty(), InterPrediction420::empty());
             let mut staged = Vec::with_capacity(jobs.len());
             for job in jobs.iter() {
-                staged.push(reconstruct(job, &mut scratch)?);
+                staged.push(StagedMacroblockPixels::empty(job.address));
+                let (prediction_l0, prediction_l1) = &mut scratch;
+                reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
+                    coded_size,
+                    references_l0,
+                    references_l1,
+                    job.macroblock_x,
+                    job.macroblock_y,
+                    &job.motion,
+                    job.residual.as_ref(),
+                    weight_mode,
+                    prediction_l0,
+                    prediction_l1,
+                    staged
+                        .last_mut()
+                        .expect("the staged macroblock was just appended")
+                        .pixels_mut(),
+                )?;
             }
             staged
         };

@@ -283,6 +283,37 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
     prediction_l0: &mut InterPrediction420,
     prediction_l1: &mut InterPrediction420,
 ) -> Result<MacroblockPixels> {
+    let mut pixels = MacroblockPixels::empty();
+    reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
+        current_size,
+        references_l0,
+        references_l1,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        weight_mode,
+        prediction_l0,
+        prediction_l1,
+        &mut pixels,
+    )?;
+    Ok(pixels)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
+    current_size: Size,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: Option<&ReconstructedInterResidual>,
+    weight_mode: BPredictionWeightMode<'_>,
+    prediction_l0: &mut InterPrediction420,
+    prediction_l1: &mut InterPrediction420,
+    pixels: &mut MacroblockPixels,
+) -> Result<()> {
     let luma_x = macroblock_x
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
@@ -299,9 +330,7 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
         ));
     }
 
-    let mut predicted_luma = [[0u8; 16]; 16];
-    let mut predicted_cb = [[0u8; 8]; 8];
-    let mut predicted_cr = [[0u8; 8]; 8];
+    let (predicted_luma, predicted_cb, predicted_cr) = pixels.planes_mut();
     let mut covered = 0u16;
     let uniform_direct = uniform_direct_partition(motion);
     let partitions = uniform_direct
@@ -392,18 +421,9 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
     }
 
     if let Some(residual) = residual {
-        add_inter_residual_to_prediction(
-            &mut predicted_luma,
-            &mut predicted_cb,
-            &mut predicted_cr,
-            residual,
-        );
+        add_inter_residual_to_prediction(predicted_luma, predicted_cb, predicted_cr, residual);
     }
-    Ok(MacroblockPixels::new(
-        predicted_luma,
-        predicted_cb,
-        predicted_cr,
-    ))
+    Ok(())
 }
 
 /// Coalesces an internally resolved Direct grid when every cell uses the same
@@ -737,6 +757,33 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_with_scratch(
     weights: Option<&PredictionWeightTable>,
     prediction: &mut InterPrediction420,
 ) -> Result<MacroblockPixels> {
+    let mut pixels = MacroblockPixels::empty();
+    reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
+        current_size,
+        references_l0,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        weights,
+        prediction,
+        &mut pixels,
+    )?;
+    Ok(pixels)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
+    current_size: Size,
+    references_l0: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedPMacroblock,
+    residual: Option<&ReconstructedInterResidual>,
+    weights: Option<&PredictionWeightTable>,
+    prediction: &mut InterPrediction420,
+    pixels: &mut MacroblockPixels,
+) -> Result<()> {
     let luma_x = macroblock_x
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
@@ -753,9 +800,7 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_with_scratch(
         ));
     }
 
-    let mut predicted_luma = [[0u8; 16]; 16];
-    let mut predicted_cb = [[0u8; 8]; 8];
-    let mut predicted_cr = [[0u8; 8]; 8];
+    let (predicted_luma, predicted_cb, predicted_cr) = pixels.planes_mut();
     let mut covered = 0u16;
     for partition in &motion.partitions {
         let reference = references_l0
@@ -824,18 +869,9 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_with_scratch(
     }
 
     if let Some(residual) = residual {
-        add_inter_residual_to_prediction(
-            &mut predicted_luma,
-            &mut predicted_cb,
-            &mut predicted_cr,
-            residual,
-        );
+        add_inter_residual_to_prediction(predicted_luma, predicted_cb, predicted_cr, residual);
     }
-    Ok(MacroblockPixels::new(
-        predicted_luma,
-        predicted_cb,
-        predicted_cr,
-    ))
+    Ok(())
 }
 
 fn assemble_residual(residual: &ReconstructedInterResidual) -> MacroblockResidualSamples {
