@@ -2,7 +2,7 @@
 
 use decv_core::Size;
 
-use crate::picture_surface::MacroblockPixels;
+use crate::picture_surface::{MacroblockPixels, StagedMacroblockPixels};
 use crate::{
     H264Error, InterPrediction420, PredictionWeight, PredictionWeightTable,
     ReconstructedInterResidual, ReconstructedLumaResidual, ResolvedBListMotion,
@@ -258,8 +258,13 @@ fn reconstruct_b_macroblock_from_lists_inner(
         residual,
         weight_mode,
     )?;
-    current.restore_macroblock(macroblock_x, macroblock_y, &pixels);
-    Ok(())
+    let width_in_macroblocks =
+        usize::try_from(current.coded_size().width / 16).map_err(|_| H264Error::IntegerOverflow)?;
+    let address = macroblock_y
+        .checked_mul(width_in_macroblocks)
+        .and_then(|address| address.checked_add(macroblock_x))
+        .ok_or(H264Error::IntegerOverflow)?;
+    current.commit_macroblock_batch(&[StagedMacroblockPixels::new(address, pixels)])
 }
 
 #[allow(clippy::too_many_arguments)]

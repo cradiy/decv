@@ -55,6 +55,18 @@ impl MacroblockPixels {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StagedMacroblockPixels {
+    address: usize,
+    pixels: MacroblockPixels,
+}
+
+impl StagedMacroblockPixels {
+    pub(crate) const fn new(address: usize, pixels: MacroblockPixels) -> Self {
+        Self { address, pixels }
+    }
+}
+
 impl Yuv420Picture {
     pub fn new(coded_size: Size) -> Result<Self> {
         if coded_size.width == 0 || coded_size.height == 0 {
@@ -425,6 +437,39 @@ impl Yuv420Picture {
         );
     }
 
+    pub(crate) fn commit_macroblock_batch(
+        &mut self,
+        staged: &[StagedMacroblockPixels],
+    ) -> Result<()> {
+        let width_in_macroblocks = self.width / 16;
+        let macroblock_count = width_in_macroblocks
+            .checked_mul(self.height / 16)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let mut previous_address = None;
+        for entry in staged {
+            if entry.address >= macroblock_count {
+                return Err(H264Error::InvalidSyntax(
+                    "staged macroblock address exceeds picture",
+                ));
+            }
+            if previous_address.is_some_and(|previous| previous >= entry.address) {
+                return Err(H264Error::InvalidSyntax(
+                    "staged macroblock addresses are not strictly increasing",
+                ));
+            }
+            previous_address = Some(entry.address);
+        }
+
+        for entry in staged {
+            self.restore_macroblock(
+                entry.address % width_in_macroblocks,
+                entry.address / width_in_macroblocks,
+                &entry.pixels,
+            );
+        }
+        Ok(())
+    }
+
     pub fn into_nv12_frame(
         self,
         id: u64,
@@ -663,7 +708,10 @@ mod tests {
 
     use decv_core::{ColorInfo, FrameStorage, MediaTime, PixelFormat, Rect, Size, VideoFormat};
 
-    use super::{ChromaPlane, IntraReferenceAvailability, Yuv420Picture};
+    use super::{
+        ChromaPlane, IntraReferenceAvailability, MacroblockPixels, StagedMacroblockPixels,
+        Yuv420Picture,
+    };
     use crate::{H264Error, PcmMacroblock};
 
     const ALL_REFERENCES: IntraReferenceAvailability = IntraReferenceAvailability {
@@ -794,6 +842,41 @@ mod tests {
             .unwrap();
         assert_eq!(picture.cr[0], 100);
         assert_eq!(picture.cr[63], 0);
+    }
+
+    #[test]
+    fn validates_a_staged_macroblock_batch_before_committing_pixels() {
+        let pixels =
+            |luma, cb, cr| MacroblockPixels::new([[luma; 16]; 16], [[cb; 8]; 8], [[cr; 8]; 8]);
+        let mut picture = Yuv420Picture::new(Size::new(32, 16)).unwrap();
+        picture
+            .commit_macroblock_batch(&[
+                StagedMacroblockPixels::new(0, pixels(10, 20, 30)),
+                StagedMacroblockPixels::new(1, pixels(40, 50, 60)),
+            ])
+            .unwrap();
+        assert_eq!(&picture.luma[..16], &[10; 16]);
+        assert_eq!(&picture.luma[16..32], &[40; 16]);
+
+        let before = picture.clone();
+        assert_eq!(
+            picture.commit_macroblock_batch(&[
+                StagedMacroblockPixels::new(1, pixels(1, 2, 3)),
+                StagedMacroblockPixels::new(1, pixels(4, 5, 6)),
+            ]),
+            Err(H264Error::InvalidSyntax(
+                "staged macroblock addresses are not strictly increasing"
+            ))
+        );
+        assert_eq!(picture, before);
+
+        assert_eq!(
+            picture.commit_macroblock_batch(&[StagedMacroblockPixels::new(2, pixels(7, 8, 9))]),
+            Err(H264Error::InvalidSyntax(
+                "staged macroblock address exceeds picture"
+            ))
+        );
+        assert_eq!(picture, before);
     }
 
     #[test]
