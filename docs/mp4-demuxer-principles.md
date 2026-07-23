@@ -618,11 +618,19 @@ The reproducible MP4 regression is:
 
 It:
 
-1. generates a High Profile AVC MP4 with CABAC, B pictures, multiple
+1. generates a 48-frame High Profile AVC MP4 with CABAC, B pictures, multiple
    references, weighted prediction, and edit-list timing;
 2. decodes the MP4 with FFmpeg to visible NV12;
 3. decodes the same MP4 through `decv-mp4` and `decv-h264`;
-4. compares the complete raw outputs byte for byte.
+4. compares the complete raw outputs byte for byte;
+5. seeks both implementations to a non-frame-aligned time after a later
+   keyframe and compares the complete decoded suffix byte for byte.
+
+The same accurate-seek path is available manually:
+
+```bash
+cargo run -p decv-cli -- --seek 1.37 file.mp4 output.nv12
+```
 
 Useful local checks are:
 

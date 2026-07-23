@@ -8,12 +8,13 @@ use std::{
 
 use decv_core::{
     BitstreamFormat, DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket,
-    FrameStorage, PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
+    FrameStorage, MediaTime, PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
 };
 use decv_h264::{AnnexBReader, H264Decoder};
 use decv_mp4::{FourCc, Mp4Demuxer};
 
 const VIDE: FourCc = FourCc::new(*b"vide");
+const USAGE: &str = "usage: decv-cli [--seek <seconds>] <input.h264|input.mp4> [output.nv12]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullState {
@@ -21,25 +22,39 @@ enum PullState {
     EndOfStream,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CliOptions {
+    input_path: String,
+    output_path: Option<String>,
+    seek_target: Option<MediaTime>,
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
-    let mut arguments = env::args().skip(1);
-    let path = arguments
-        .next()
-        .ok_or("usage: decv-cli <input.h264|input.mp4> [output.nv12]")?;
-    let output_path = arguments.next();
-    if arguments.next().is_some() {
-        return Err("usage: decv-cli <input.h264|input.mp4> [output.nv12]".into());
-    }
+    let CliOptions {
+        input_path: path,
+        output_path,
+        seek_target,
+    } = parse_arguments(env::args().skip(1))?;
     let mut raw_output = output_path.as_deref().map(File::create).transpose()?;
     let mut decoder = H264Decoder::new();
     let mut frame_count = 0u64;
     if is_mp4(Path::new(&path))? {
-        decode_mp4(&path, &mut decoder, &mut raw_output, &mut frame_count)?;
+        decode_mp4(
+            &path,
+            &mut decoder,
+            &mut raw_output,
+            &mut frame_count,
+            seek_target,
+        )?;
     } else {
+        if seek_target.is_some() {
+            return Err("--seek requires an MP4 input with a sample index".into());
+        }
         decode_annex_b(&path, &mut decoder, &mut raw_output, &mut frame_count)?;
     }
     decoder.drain()?;
-    if receive_available(&mut decoder, &mut raw_output, &mut frame_count)? != PullState::EndOfStream
+    if receive_available(&mut decoder, &mut raw_output, &mut frame_count, seek_target)?
+        != PullState::EndOfStream
     {
         return Err("decoder requested input after drain".into());
     }
@@ -49,6 +64,61 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("decoded {frame_count} frame(s) from {path}");
     Ok(())
+}
+
+fn parse_arguments(
+    mut arguments: impl Iterator<Item = String>,
+) -> Result<CliOptions, Box<dyn Error>> {
+    let mut positional = Vec::new();
+    let mut seek_target = None;
+    while let Some(argument) = arguments.next() {
+        if argument == "--seek" {
+            if seek_target.is_some() {
+                return Err("--seek may only be specified once".into());
+            }
+            seek_target = Some(parse_seconds(&arguments.next().ok_or(USAGE)?)?);
+        } else if argument.starts_with('-') {
+            return Err(format!("unknown option: {argument}\n{USAGE}").into());
+        } else {
+            positional.push(argument);
+        }
+    }
+    if !(1..=2).contains(&positional.len()) {
+        return Err(USAGE.into());
+    }
+    let output = (positional.len() == 2).then(|| positional.remove(1));
+    Ok(CliOptions {
+        input_path: positional.remove(0),
+        output_path: output,
+        seek_target,
+    })
+}
+
+fn parse_seconds(seconds: &str) -> Result<MediaTime, Box<dyn Error>> {
+    let (whole, fraction) = seconds.split_once('.').unwrap_or((seconds, ""));
+    if whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > 9
+    {
+        return Err(
+            "--seek must be a non-negative decimal number with at most 9 fractional digits".into(),
+        );
+    }
+    let scale = 10u32
+        .checked_pow(u32::try_from(fraction.len())?)
+        .ok_or("seek timescale overflow")?;
+    let whole = whole.parse::<i64>()?;
+    let fraction = if fraction.is_empty() {
+        0
+    } else {
+        fraction.parse::<i64>()?
+    };
+    let value = whole
+        .checked_mul(i64::from(scale))
+        .and_then(|value| value.checked_add(fraction))
+        .ok_or("seek timestamp overflow")?;
+    MediaTime::from_parts(value, scale).ok_or_else(|| "seek timescale is zero".into())
 }
 
 fn decode_annex_b(
@@ -73,6 +143,7 @@ fn decode_annex_b(
             EncodedVideoPacket::new(framed),
             raw_output,
             frame_count,
+            None,
         )?;
     }
     Ok(())
@@ -83,28 +154,49 @@ fn decode_mp4(
     decoder: &mut H264Decoder,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
+    seek_target: Option<MediaTime>,
 ) -> Result<(), Box<dyn Error>> {
     let demuxer = Mp4Demuxer::open(File::open(path)?)?;
-    let (track_index, track) = demuxer
+    let track_index = demuxer
         .movie()
         .tracks()
         .iter()
         .enumerate()
         .find(|(_, track)| track.handler() == VIDE && !track.samples().is_empty())
+        .map(|(index, _)| index)
         .ok_or("MP4 contains no non-empty video track")?;
-    let first_description = track.samples()[0].description_index();
-    decoder.configure(track.decoder_config(first_description)?)?;
+    let mut cursor = demuxer.packet_cursor(track_index)?;
+    if let Some(target) = seek_target
+        && cursor.seek_to_keyframe(target)?.is_none()
+    {
+        return Err("the requested time is before the first MP4 keyframe".into());
+    }
+    let first_description = cursor
+        .track()
+        .samples()
+        .get(cursor.next_sample_index())
+        .ok_or("seek selected no MP4 sample")?
+        .description_index();
+    decoder.configure(
+        cursor
+            .decoder_config()?
+            .ok_or("seek selected no MP4 decoder configuration")?,
+    )?;
+    if seek_target.is_some() {
+        decoder.flush();
+    }
 
-    for (sample_index, sample) in track.samples().iter().enumerate() {
+    let mut first_packet = true;
+    while let Some(mut packet) = cursor.next_packet()? {
+        let sample = &cursor.track().samples()[cursor.next_sample_index() - 1];
         if sample.description_index() != first_description {
             return Err("mid-stream MP4 sample-description changes are not supported yet".into());
         }
-        send_packet(
-            decoder,
-            demuxer.read_packet(track_index, sample_index)?,
-            raw_output,
-            frame_count,
-        )?;
+        if first_packet && seek_target.is_some() {
+            packet.discontinuity = true;
+        }
+        first_packet = false;
+        send_packet(decoder, packet, raw_output, frame_count, seek_target)?;
     }
     Ok(())
 }
@@ -114,19 +206,22 @@ fn send_packet(
     mut packet: EncodedVideoPacket,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
+    minimum_pts: Option<MediaTime>,
 ) -> Result<(), Box<dyn Error>> {
     loop {
         match decoder.send_packet(packet)? {
             DecodeInputStatus::Accepted => break,
             DecodeInputStatus::NeedOutput(unconsumed) => {
                 packet = unconsumed;
-                if receive_available(decoder, raw_output, frame_count)? == PullState::EndOfStream {
+                if receive_available(decoder, raw_output, frame_count, minimum_pts)?
+                    == PullState::EndOfStream
+                {
                     return Err("decoder ended before all input was accepted".into());
                 }
             }
         }
     }
-    if receive_available(decoder, raw_output, frame_count)? == PullState::EndOfStream {
+    if receive_available(decoder, raw_output, frame_count, minimum_pts)? == PullState::EndOfStream {
         return Err("decoder ended before drain".into());
     }
     Ok(())
@@ -164,6 +259,7 @@ fn receive_available(
     decoder: &mut H264Decoder,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
+    minimum_pts: Option<MediaTime>,
 ) -> Result<PullState, Box<dyn Error>> {
     loop {
         match decoder.receive_frame()? {
@@ -174,6 +270,14 @@ fn receive_available(
                 );
             }
             DecodeOutput::Frame(frame) => {
+                if let Some(minimum_pts) = minimum_pts {
+                    let pts = frame
+                        .pts
+                        .ok_or("decoded MP4 frame has no presentation timestamp")?;
+                    if pts < minimum_pts {
+                        continue;
+                    }
+                }
                 let bytes = write_visible_frame(&frame, raw_output)?;
                 *frame_count = frame_count
                     .checked_add(1)
@@ -254,8 +358,10 @@ fn visible_plane_layout(
 mod tests {
     use std::path::Path;
 
-    use super::{has_mp4_extension, is_mp4_box_header, visible_plane_layout};
-    use decv_core::{PixelFormat, Rect};
+    use super::{
+        has_mp4_extension, is_mp4_box_header, parse_arguments, parse_seconds, visible_plane_layout,
+    };
+    use decv_core::{MediaTime, PixelFormat, Rect};
 
     #[test]
     fn derives_cropped_plane_layouts() {
@@ -295,5 +401,29 @@ mod tests {
         assert!(is_mp4_box_header(*b"\0\0\0\x18ftyp"));
         assert!(is_mp4_box_header(*b"\0\0\0\x08moov"));
         assert!(!is_mp4_box_header(*b"\0\0\0\x01\x67\x64\0\x28"));
+    }
+
+    #[test]
+    fn parses_exact_decimal_seek_times_and_options() {
+        assert_eq!(
+            parse_seconds("12.034").unwrap(),
+            MediaTime::from_parts(12_034, 1_000).unwrap()
+        );
+        assert_eq!(
+            parse_seconds("7").unwrap(),
+            MediaTime::from_parts(7, 1).unwrap()
+        );
+        assert!(parse_seconds("-1").is_err());
+        assert!(parse_seconds("1.1234567890").is_err());
+
+        let options = parse_arguments(
+            ["--seek", "1.25", "input.mp4", "output.nv12"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(options.input_path, "input.mp4");
+        assert_eq!(options.output_path.as_deref(), Some("output.nv12"));
+        assert_eq!(options.seek_target, MediaTime::from_parts(125, 100));
     }
 }
