@@ -466,19 +466,56 @@ impl CabacResidualState {
     ) {
         debug_assert!(self.validate_block(macroblock_address, block).is_ok());
         if let CabacResidualBlock::Luma8x8(index) = block {
-            let macroblock_x = macroblock_address % self.width_in_macroblocks;
-            let macroblock_y = macroblock_address / self.width_in_macroblocks;
-            let base_x = macroblock_x * 4 + usize::from(index % 2) * 2;
-            let base_y = macroblock_y * 4 + usize::from(index / 2) * 2;
-            for y in base_y..base_y + 2 {
-                for x in base_x..base_x + 2 {
-                    self.luma.record_known(x, y, slice_id, coded);
-                }
-            }
+            self.record_luma_region_known(macroblock_address, slice_id, index, coded);
             return;
         }
         let (grid, x, y) = self.grid_and_coordinates_mut_known(macroblock_address, block);
         grid.record_known(x, y, slice_id, coded);
+    }
+
+    #[inline]
+    fn record_luma_region_known(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        region: u8,
+        coded: bool,
+    ) {
+        debug_assert!(region < 4);
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let base_x = macroblock_x * 4 + usize::from(region % 2) * 2;
+        let base_y = macroblock_y * 4 + usize::from(region / 2) * 2;
+        for y in base_y..base_y + 2 {
+            for x in base_x..base_x + 2 {
+                self.luma.record_known(x, y, slice_id, coded);
+            }
+        }
+    }
+
+    #[inline]
+    fn record_chroma_ac_plane_known(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        plane: u8,
+        coded: bool,
+    ) {
+        debug_assert!(plane < 2);
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let base_x = macroblock_x * 2;
+        let base_y = macroblock_y * 2;
+        let grid = if plane == 0 {
+            &mut self.chroma_cb
+        } else {
+            &mut self.chroma_cr
+        };
+        for y in base_y..base_y + 2 {
+            for x in base_x..base_x + 2 {
+                grid.record_known(x, y, slice_id, coded);
+            }
+        }
     }
 
     pub fn record_pcm_macroblock(
@@ -747,23 +784,25 @@ impl CabacResidualState {
             return Ok(());
         }
 
-        for block_index in 0..16u8 {
-            let block = if intra_16x16 {
-                CabacResidualBlock::LumaAc(block_index)
-            } else {
-                CabacResidualBlock::Luma4x4(block_index)
-            };
-            if coded_block_pattern_luma & (1 << (block_index / 4)) == 0 {
-                self.record_block_known(macroblock_address, slice_id, block, false);
+        for region in 0..4u8 {
+            if coded_block_pattern_luma & (1 << region) == 0 {
+                self.record_luma_region_known(macroblock_address, slice_id, region, false);
                 continue;
             }
-            luma[usize::from(block_index)] = self.decode_residual_block(
-                syntax,
-                macroblock_address,
-                slice_id,
-                current_is_intra,
-                block,
-            )?;
+            for block_index in region * 4..region * 4 + 4 {
+                let block = if intra_16x16 {
+                    CabacResidualBlock::LumaAc(block_index)
+                } else {
+                    CabacResidualBlock::Luma4x4(block_index)
+                };
+                luma[usize::from(block_index)] = self.decode_residual_block(
+                    syntax,
+                    macroblock_address,
+                    slice_id,
+                    current_is_intra,
+                    block,
+                )?;
+            }
         }
         Ok(())
     }
@@ -779,19 +818,34 @@ impl CabacResidualState {
         chroma_dc: &mut [ResidualBlock; 2],
         chroma_ac: &mut [[ResidualBlock; 4]; 2],
     ) -> Result<()> {
+        debug_assert!(coded_block_pattern_chroma <= 2);
+        if coded_block_pattern_chroma == 0 {
+            let macroblock_x = macroblock_address % self.width_in_macroblocks;
+            let macroblock_y = macroblock_address / self.width_in_macroblocks;
+            self.chroma_dc_cb
+                .record_known(macroblock_x, macroblock_y, slice_id, false);
+            self.chroma_dc_cr
+                .record_known(macroblock_x, macroblock_y, slice_id, false);
+            self.record_chroma_ac_plane_known(macroblock_address, slice_id, 0, false);
+            self.record_chroma_ac_plane_known(macroblock_address, slice_id, 1, false);
+            return Ok(());
+        }
+
         for plane in 0..2u8 {
             let block = CabacResidualBlock::ChromaDc { plane };
-            if coded_block_pattern_chroma == 0 {
-                self.record_block_known(macroblock_address, slice_id, block, false);
-            } else {
-                chroma_dc[usize::from(plane)] = self.decode_residual_block(
-                    syntax,
-                    macroblock_address,
-                    slice_id,
-                    current_is_intra,
-                    block,
-                )?;
-            }
+            chroma_dc[usize::from(plane)] = self.decode_residual_block(
+                syntax,
+                macroblock_address,
+                slice_id,
+                current_is_intra,
+                block,
+            )?;
+        }
+
+        if coded_block_pattern_chroma == 1 {
+            self.record_chroma_ac_plane_known(macroblock_address, slice_id, 0, false);
+            self.record_chroma_ac_plane_known(macroblock_address, slice_id, 1, false);
+            return Ok(());
         }
 
         for plane in 0..2u8 {
@@ -800,18 +854,14 @@ impl CabacResidualState {
                     plane,
                     block: block_index,
                 };
-                if coded_block_pattern_chroma < 2 {
-                    self.record_block_known(macroblock_address, slice_id, block, false);
-                } else {
-                    chroma_ac[usize::from(plane)][usize::from(block_index)] = self
-                        .decode_residual_block(
-                            syntax,
-                            macroblock_address,
-                            slice_id,
-                            current_is_intra,
-                            block,
-                        )?;
-                }
+                chroma_ac[usize::from(plane)][usize::from(block_index)] = self
+                    .decode_residual_block(
+                        syntax,
+                        macroblock_address,
+                        slice_id,
+                        current_is_intra,
+                        block,
+                    )?;
             }
         }
         Ok(())
