@@ -744,6 +744,10 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   and reference POCs, including long-term, zero-distance, and range fallbacks;
 - complete Annex-B SPS/PPS/IDR-to-NV12 and IDR-to-reference-P integration
   tests;
+- end-to-end `FormatChanged` propagation of coded and cropped visible
+  geometry, non-square sample aspect ratio display size, BT.601-family limited
+  range metadata, and BT.709 full-range metadata, with the same format retained
+  on each output frame;
 - byte-exact FFmpeg regressions for encoder-generated Main and High Profile
   CAVLC streams with B pictures, display reordering, multiple references,
   weighted prediction, and 8x8 transforms;

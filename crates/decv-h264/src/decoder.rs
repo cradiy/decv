@@ -819,9 +819,9 @@ fn validate_empty_rbsp(ebsp: &[u8]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use decv_core::{
-        BitstreamFormat, ColorInfo, DecodeInputStatus, DecodeOutput, EncodedVideoPacket,
-        FrameStorage, MediaTime, PixelFormat, Rect, Size, VideoCodec, VideoDecoder,
-        VideoDecoderConfig, VideoFormat,
+        BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, DecodeInputStatus,
+        DecodeOutput, EncodedVideoPacket, FrameStorage, MediaTime, PixelFormat, Rect, Size,
+        TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
     };
 
     use super::{H264Decoder, H264StreamParser, ParserEvent, PictureIdentity};
@@ -1172,6 +1172,71 @@ mod tests {
         assert_eq!(frame.pts, MediaTime::from_parts(10, 30));
         assert_eq!(frame.duration, MediaTime::from_parts(1, 30));
         assert!(matches!(frame.storage, FrameStorage::Cpu(_)));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn propagates_crop_sar_and_color_changes_to_format_events() {
+        let stream = annex_b_stream(&[
+            (0x67, single_macroblock_metadata_sps_rbsp(false, 6, 6, 6)),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+            (0x67, single_macroblock_metadata_sps_rbsp(true, 1, 1, 1)),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        let geometry = VideoFormat {
+            coded_size: Size::new(16, 16),
+            visible_rect: Rect::new(2, 2, 12, 12),
+            display_size: Size::new(16, 12),
+            pixel_format: PixelFormat::Nv12,
+            color: ColorInfo {
+                range: ColorRange::Limited,
+                matrix: ColorMatrix::Smpte170M,
+                primaries: ColorPrimaries::Bt601_525,
+                transfer: TransferFunction::Smpte170M,
+            },
+        };
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(format) if format == geometry
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame) if frame.format == geometry
+        ));
+
+        let bt709_full = VideoFormat {
+            color: ColorInfo {
+                range: ColorRange::Full,
+                matrix: ColorMatrix::Bt709,
+                primaries: ColorPrimaries::Bt709,
+                transfer: TransferFunction::Bt709,
+            },
+            ..geometry
+        };
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(format) if format == bt709_full
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame) if frame.format == bt709_full
+        ));
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::EndOfStream
@@ -2101,6 +2166,52 @@ mod tests {
         writer.write_flag(true); // direct_8x8_inference_flag
         writer.write_flag(false); // frame_cropping_flag
         writer.write_flag(false); // vui_parameters_present_flag
+        writer.finish_rbsp()
+    }
+
+    fn single_macroblock_metadata_sps_rbsp(
+        full_range: bool,
+        color_primaries: u8,
+        transfer_characteristics: u8,
+        matrix_coefficients: u8,
+    ) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        writer.write_bits(66, 8); // Baseline profile
+        writer.write_bits(0, 8); // constraints + reserved_zero_2bits
+        writer.write_bits(10, 8); // level_idc
+        writer.write_ue(0); // seq_parameter_set_id
+        writer.write_ue(0); // log2_max_frame_num_minus4
+        writer.write_ue(0); // pic_order_cnt_type
+        writer.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        writer.write_ue(0); // max_num_ref_frames
+        writer.write_flag(false); // gaps_in_frame_num_value_allowed_flag
+        writer.write_ue(0); // pic_width_in_mbs_minus1
+        writer.write_ue(0); // pic_height_in_map_units_minus1
+        writer.write_flag(true); // frame_mbs_only_flag
+        writer.write_flag(true); // direct_8x8_inference_flag
+        writer.write_flag(true); // frame_cropping_flag
+        for _ in 0..4 {
+            writer.write_ue(1);
+        }
+        writer.write_flag(true); // vui_parameters_present_flag
+        writer.write_flag(true); // aspect_ratio_info_present_flag
+        writer.write_bits(255, 8); // Extended_SAR
+        writer.write_bits(4, 16);
+        writer.write_bits(3, 16);
+        writer.write_flag(false); // overscan_info_present_flag
+        writer.write_flag(true); // video_signal_type_present_flag
+        writer.write_bits(5, 3); // unspecified video_format
+        writer.write_flag(full_range);
+        writer.write_flag(true); // colour_description_present_flag
+        writer.write_bits(u64::from(color_primaries), 8);
+        writer.write_bits(u64::from(transfer_characteristics), 8);
+        writer.write_bits(u64::from(matrix_coefficients), 8);
+        writer.write_flag(false); // chroma_loc_info_present_flag
+        writer.write_flag(false); // timing_info_present_flag
+        writer.write_flag(false); // nal_hrd_parameters_present_flag
+        writer.write_flag(false); // vcl_hrd_parameters_present_flag
+        writer.write_flag(false); // pic_struct_present_flag
+        writer.write_flag(false); // bitstream_restriction_flag
         writer.finish_rbsp()
     }
 
