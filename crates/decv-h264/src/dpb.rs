@@ -6,6 +6,12 @@ use crate::{
     H264Error, MemoryManagementOperation, ReferenceListModification, Result, Yuv420Picture,
 };
 
+pub type ReferencePicture = Arc<Yuv420Picture>;
+pub type DefaultReferenceList = Vec<ReferencePicture>;
+pub type ActiveReferenceList = Vec<Option<ReferencePicture>>;
+pub type DefaultBReferenceLists = (DefaultReferenceList, DefaultReferenceList);
+pub type ActiveBReferenceLists = (ActiveReferenceList, ActiveReferenceList);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceKind {
     ShortTerm,
@@ -17,14 +23,14 @@ pub struct DpbReference {
     pub frame_num: u32,
     pub picture_order_count: i32,
     pub kind: ReferenceKind,
-    pub picture: Arc<Yuv420Picture>,
+    pub picture: ReferencePicture,
 }
 
 /// Reference-picture subset of the decoded picture buffer.
 ///
-/// This first DPB layer covers progressive frame pictures, IDR reset, default
-/// P List-0 ordering, and sliding-window marking. Adaptive MMCO and output
-/// reordering are intentionally separate later stages.
+/// This DPB layer covers progressive frame pictures, IDR reset, default P/B
+/// reference-list ordering, list modification, and reference-picture marking.
+/// Display reordering is intentionally a separate later stage.
 #[derive(Debug, Clone)]
 pub struct DecodedPictureBuffer {
     max_num_ref_frames: usize,
@@ -68,7 +74,7 @@ impl DecodedPictureBuffer {
     /// Builds the default reference picture List 0 for a progressive P slice:
     /// short-term pictures by descending PicNum, then long-term pictures by
     /// ascending long-term frame index.
-    pub fn default_p_list0(&self, current_frame_num: u32) -> Result<Vec<Arc<Yuv420Picture>>> {
+    pub fn default_p_list0(&self, current_frame_num: u32) -> Result<DefaultReferenceList> {
         self.ensure_frame_num(current_frame_num)?;
         Ok(self
             .ordered_p_references(current_frame_num)
@@ -85,15 +91,77 @@ impl DecodedPictureBuffer {
         current_frame_num: u32,
         active_count: u8,
         modifications: &[ReferenceListModification],
-    ) -> Result<Vec<Option<Arc<Yuv420Picture>>>> {
+    ) -> Result<ActiveReferenceList> {
         self.ensure_frame_num(current_frame_num)?;
+        let ordered = self.ordered_p_references(current_frame_num);
+        self.active_reference_list(current_frame_num, active_count, modifications, ordered)
+    }
+
+    /// Builds the default reference lists for a progressive B slice.
+    ///
+    /// List 0 starts with short-term pictures whose POC is no later than the
+    /// current picture in descending order, then later pictures in ascending
+    /// order. List 1 uses the opposite groups. Long-term pictures follow in
+    /// ascending frame-index order. When both lists would be identical, the
+    /// first two List-1 entries are swapped.
+    pub fn default_b_lists(
+        &self,
+        current_picture_order_count: i32,
+    ) -> Result<DefaultBReferenceLists> {
+        let (list0, list1) = self.ordered_b_references(current_picture_order_count)?;
+        Ok((
+            list0
+                .into_iter()
+                .map(|reference| reference.picture.clone())
+                .collect(),
+            list1
+                .into_iter()
+                .map(|reference| reference.picture.clone())
+                .collect(),
+        ))
+    }
+
+    /// Builds and independently modifies both active progressive B lists.
+    pub fn b_lists(
+        &self,
+        current_frame_num: u32,
+        current_picture_order_count: i32,
+        active_count_l0: u8,
+        modifications_l0: &[ReferenceListModification],
+        active_count_l1: u8,
+        modifications_l1: &[ReferenceListModification],
+    ) -> Result<ActiveBReferenceLists> {
+        self.ensure_frame_num(current_frame_num)?;
+        let (ordered_l0, ordered_l1) = self.ordered_b_references(current_picture_order_count)?;
+        Ok((
+            self.active_reference_list(
+                current_frame_num,
+                active_count_l0,
+                modifications_l0,
+                ordered_l0,
+            )?,
+            self.active_reference_list(
+                current_frame_num,
+                active_count_l1,
+                modifications_l1,
+                ordered_l1,
+            )?,
+        ))
+    }
+
+    fn active_reference_list<'a>(
+        &'a self,
+        current_frame_num: u32,
+        active_count: u8,
+        modifications: &[ReferenceListModification],
+        ordered: Vec<&'a DpbReference>,
+    ) -> Result<ActiveReferenceList> {
         if active_count == 0 || active_count > 32 {
             return Err(H264Error::InvalidSyntax(
-                "P List 0 active count is outside 1..=32",
+                "reference-list active count is outside 1..=32",
             ));
         }
         let active_count = usize::from(active_count);
-        let ordered = self.ordered_p_references(current_frame_num);
         let mut list: Vec<Option<&DpbReference>> =
             ordered.into_iter().take(active_count).map(Some).collect();
         list.resize(active_count + 1, None);
@@ -103,7 +171,7 @@ impl DecodedPictureBuffer {
         for modification in modifications {
             if reference_index >= active_count {
                 return Err(H264Error::InvalidSyntax(
-                    "P List 0 modifications exceed the active list",
+                    "reference-list modifications exceed the active list",
                 ));
             }
             let selected = match *modification {
@@ -157,7 +225,7 @@ impl DecodedPictureBuffer {
     pub fn store_idr(
         &mut self,
         picture_order_count: i32,
-        picture: Arc<Yuv420Picture>,
+        picture: ReferencePicture,
         long_term_reference: bool,
     ) -> Result<()> {
         let kind = if long_term_reference {
@@ -183,7 +251,7 @@ impl DecodedPictureBuffer {
         &mut self,
         frame_num: u32,
         picture_order_count: i32,
-        picture: Arc<Yuv420Picture>,
+        picture: ReferencePicture,
     ) -> Result<()> {
         self.ensure_frame_num(frame_num)?;
         self.ensure_can_store(&picture)?;
@@ -224,7 +292,7 @@ impl DecodedPictureBuffer {
         &mut self,
         frame_num: u32,
         picture_order_count: i32,
-        picture: Arc<Yuv420Picture>,
+        picture: ReferencePicture,
         operations: &[MemoryManagementOperation],
     ) -> Result<()> {
         self.ensure_frame_num(frame_num)?;
@@ -357,6 +425,51 @@ impl DecodedPictureBuffer {
         short
     }
 
+    fn ordered_b_references(
+        &self,
+        current_picture_order_count: i32,
+    ) -> Result<(Vec<&DpbReference>, Vec<&DpbReference>)> {
+        let mut earlier = Vec::new();
+        let mut later = Vec::new();
+        let mut long = Vec::new();
+        for reference in &self.references {
+            match reference.kind {
+                ReferenceKind::ShortTerm
+                    if reference.picture_order_count <= current_picture_order_count =>
+                {
+                    earlier.push(reference);
+                }
+                ReferenceKind::ShortTerm => later.push(reference),
+                ReferenceKind::LongTerm { .. } => long.push(reference),
+            }
+        }
+        earlier.sort_unstable_by_key(|reference| std::cmp::Reverse(reference.picture_order_count));
+        later.sort_unstable_by_key(|reference| reference.picture_order_count);
+        long.sort_unstable_by_key(|reference| match reference.kind {
+            ReferenceKind::LongTerm { frame_index } => frame_index,
+            ReferenceKind::ShortTerm => unreachable!(),
+        });
+
+        let mut list0 = Vec::with_capacity(self.references.len());
+        list0.extend(earlier.iter().copied());
+        list0.extend(later.iter().copied());
+        list0.extend(long.iter().copied());
+
+        let mut list1 = Vec::with_capacity(self.references.len());
+        list1.extend(later);
+        list1.extend(earlier);
+        list1.extend(long);
+        if list0.len() > 1
+            && list0
+                .iter()
+                .zip(&list1)
+                .all(|(left, right)| std::ptr::eq(*left, *right))
+        {
+            list1.swap(0, 1);
+        }
+        Ok((list0, list1))
+    }
+
     fn short_term_by_modified_pic_num(
         &self,
         current_frame_num: u32,
@@ -375,7 +488,7 @@ impl DecodedPictureBuffer {
                         == pic_num
             })
             .ok_or(H264Error::InvalidSyntax(
-                "P List 0 modification names a missing short-term reference",
+                "reference-list modification names a missing short-term reference",
             ))
     }
 
@@ -475,6 +588,100 @@ mod tests {
                 .collect::<Vec<_>>(),
             [0, 15, 14]
         );
+    }
+
+    #[test]
+    fn orders_default_b_lists_around_the_current_poc() {
+        let mut dpb = DecodedPictureBuffer::new(4, 4).unwrap();
+        dpb.store_short_term(0, 2, picture(10)).unwrap();
+        dpb.store_short_term(1, 6, picture(11)).unwrap();
+        dpb.store_short_term(2, 10, picture(12)).unwrap();
+
+        let (list0, list1) = dpb.default_b_lists(8).unwrap();
+        assert_eq!(
+            list0
+                .iter()
+                .map(|picture| luma_value(picture))
+                .collect::<Vec<_>>(),
+            [11, 10, 12]
+        );
+        assert_eq!(
+            list1
+                .iter()
+                .map(|picture| luma_value(picture))
+                .collect::<Vec<_>>(),
+            [12, 11, 10]
+        );
+    }
+
+    #[test]
+    fn swaps_default_b_list1_when_both_lists_match() {
+        let mut dpb = DecodedPictureBuffer::new(4, 4).unwrap();
+        dpb.store_short_term(0, 2, picture(10)).unwrap();
+        dpb.store_short_term(1, 6, picture(11)).unwrap();
+        dpb.store_short_term(2, 10, picture(12)).unwrap();
+
+        let (list0, list1) = dpb.default_b_lists(12).unwrap();
+        assert_eq!(
+            list0
+                .iter()
+                .map(|picture| luma_value(picture))
+                .collect::<Vec<_>>(),
+            [12, 11, 10]
+        );
+        assert_eq!(
+            list1
+                .iter()
+                .map(|picture| luma_value(picture))
+                .collect::<Vec<_>>(),
+            [11, 12, 10]
+        );
+    }
+
+    #[test]
+    fn modifies_b_lists_independently_and_preserves_missing_entries() {
+        let mut dpb = DecodedPictureBuffer::new(4, 4).unwrap();
+        dpb.store_idr(0, picture(9), true).unwrap();
+        dpb.store_short_term(1, 2, picture(10)).unwrap();
+        dpb.store_short_term(2, 10, picture(12)).unwrap();
+
+        let (list0, list1) = dpb
+            .b_lists(
+                3,
+                6,
+                3,
+                &[ReferenceListModification::LongTerm {
+                    long_term_pic_num: 0,
+                }],
+                4,
+                &[ReferenceListModification::SubtractPicNum {
+                    abs_diff_pic_num: 2,
+                }],
+            )
+            .unwrap();
+        assert_eq!(
+            list0
+                .iter()
+                .map(|picture| picture.as_deref().map(luma_value))
+                .collect::<Vec<_>>(),
+            [Some(9), Some(10), Some(12)]
+        );
+        assert_eq!(
+            list1
+                .iter()
+                .map(|picture| picture.as_deref().map(luma_value))
+                .collect::<Vec<_>>(),
+            [Some(10), Some(12), Some(9), None]
+        );
+    }
+
+    #[test]
+    fn includes_equal_poc_short_term_b_reference_in_the_earlier_group() {
+        let mut dpb = DecodedPictureBuffer::new(1, 4).unwrap();
+        dpb.store_short_term(0, 4, picture(1)).unwrap();
+        let (list0, list1) = dpb.default_b_lists(4).unwrap();
+        assert_eq!(luma_value(&list0[0]), 1);
+        assert_eq!(luma_value(&list1[0]), 1);
     }
 
     #[test]

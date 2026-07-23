@@ -676,6 +676,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - P List-0 modification for subtract/add PicNum and long-term targets,
   including ordered insertion, duplicate removal, and explicit missing
   active-list entries;
+- progressive B default List-0/List-1 construction around the current POC,
+  identical-list swapping, long-term ordering, and independent modification
+  of both active lists;
 - transactional progressive-frame MMCO 1 through 6, including short/long-term
   removal, reassignment, MaxLongTermFrameIdx limits, MMCO 5 reset, current
   long-term marking, and final DPB-capacity validation;
