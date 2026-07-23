@@ -544,6 +544,12 @@ The MP4 path checks:
 - allocation caps;
 - short reads and truncation.
 
+The unit suite also feeds every prefix truncation of a complete synthetic movie
+through the owned demuxer, then applies deterministic single-byte corruptions
+throughout the file. Any successfully parsed mutation is exercised through
+decoder-configuration lookup and packet reads. Errors are ordinary outcomes;
+panics are test failures.
+
 Valid but currently unimplemented format behavior returns
 `Mp4Error::UnsupportedFeature`. Corrupt structure returns
 `Mp4Error::InvalidData`.

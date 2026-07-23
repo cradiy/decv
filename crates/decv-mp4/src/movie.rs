@@ -840,4 +840,34 @@ mod tests {
         cursor.rewind();
         assert_eq!(cursor.next_sample_index(), 0);
     }
+
+    fn exercise_demuxer(bytes: Vec<u8>) {
+        let Ok(demuxer) = crate::Mp4Demuxer::open(MemoryInput(bytes)) else {
+            return;
+        };
+
+        for (track_index, track) in demuxer.movie().tracks().iter().enumerate() {
+            for sample_index in 0..track.samples().len() {
+                let _ = track.decoder_config_for_sample(sample_index);
+                let _ = demuxer.read_packet(track_index, sample_index);
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_or_single_byte_corrupted_movies_do_not_panic() {
+        let valid = synthetic_movie();
+
+        for end in 0..=valid.len() {
+            exercise_demuxer(valid[..end].to_vec());
+        }
+
+        for index in 0..valid.len() {
+            for mask in [0x01, 0x80, 0xff] {
+                let mut corrupted = valid.clone();
+                corrupted[index] ^= mask;
+                exercise_demuxer(corrupted);
+            }
+        }
+    }
 }

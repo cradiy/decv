@@ -8,7 +8,8 @@ use decv_core::{
 
 use crate::{
     Block4x4, H264Error, Intra4x4References, Intra8x8References, Intra16x16References,
-    IntraChroma420References, PcmMacroblock, Prediction4x4, Prediction8x8, Prediction16x16, Result,
+    IntraChroma420References, MAX_DECODED_PICTURE_MACROBLOCKS, PcmMacroblock, Prediction4x4,
+    Prediction8x8, Prediction16x16, Result,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -58,6 +59,14 @@ impl Yuv420Picture {
         if !coded_size.width.is_multiple_of(16) || !coded_size.height.is_multiple_of(16) {
             return Err(H264Error::InvalidSyntax(
                 "4:2:0 H.264 coded dimensions must be macroblock aligned",
+            ));
+        }
+        let macroblock_count = u64::from(coded_size.width / 16)
+            .checked_mul(u64::from(coded_size.height / 16))
+            .ok_or(H264Error::IntegerOverflow)?;
+        if macroblock_count > MAX_DECODED_PICTURE_MACROBLOCKS {
+            return Err(H264Error::InvalidSyntax(
+                "coded picture exceeds the decoder macroblock limit",
             ));
         }
 
@@ -668,6 +677,12 @@ mod tests {
             ))
         );
         assert!(Yuv420Picture::new(Size::new(0, 16)).is_err());
+        assert_eq!(
+            Yuv420Picture::new(Size::new(4096, 2320)),
+            Err(H264Error::InvalidSyntax(
+                "coded picture exceeds the decoder macroblock limit"
+            ))
+        );
     }
 
     #[test]

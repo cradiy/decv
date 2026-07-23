@@ -829,6 +829,46 @@ mod tests {
         AnnexBReader, H264Error, IntraPictureReconstructor, MotionVector, NalHeader, NalUnit,
     };
 
+    fn exercise_decoder(bytes: Vec<u8>) {
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+
+        let Ok(DecodeInputStatus::Accepted) = decoder.send_packet(EncodedVideoPacket::new(bytes))
+        else {
+            return;
+        };
+        if decoder.drain().is_err() {
+            return;
+        }
+        for _ in 0..16 {
+            match decoder.receive_frame() {
+                Ok(DecodeOutput::FormatChanged(_) | DecodeOutput::Frame(_)) => {}
+                Ok(DecodeOutput::NeedInput | DecodeOutput::EndOfStream) | Err(_) => break,
+            }
+        }
+    }
+
+    #[test]
+    fn truncated_or_single_byte_corrupted_streams_do_not_panic() {
+        let valid = annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+        ]);
+
+        for end in 0..=valid.len() {
+            exercise_decoder(valid[..end].to_vec());
+        }
+
+        for index in 0..valid.len() {
+            for mask in [0x01, 0x80, 0xff] {
+                let mut corrupted = valid.clone();
+                corrupted[index] ^= mask;
+                exercise_decoder(corrupted);
+            }
+        }
+    }
+
     #[test]
     fn dispatches_an_annex_b_stream_and_detects_picture_boundaries() {
         let nals = [

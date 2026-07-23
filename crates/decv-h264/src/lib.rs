@@ -41,6 +41,11 @@ mod slice;
 mod sps;
 mod transform;
 
+// AVC permits at most 16 decoded frames in the DPB. The picture limit covers
+// 4096x2304 while keeping allocations from untrusted SPS values bounded.
+pub(crate) const MAX_DPB_FRAMES: u32 = 16;
+pub(crate) const MAX_DECODED_PICTURE_MACROBLOCKS: u64 = 36_864;
+
 pub use annex_b::{AnnexBNalUnit, AnnexBReader};
 pub use b_motion::{
     BMotionState, DirectMotionContext, DirectReference, SpatialDirectContext, TemporalDirectContext,

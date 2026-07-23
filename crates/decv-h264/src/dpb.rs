@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use crate::{
-    H264Error, MemoryManagementOperation, ReferenceListModification, Result, Yuv420Picture,
+    H264Error, MAX_DPB_FRAMES, MemoryManagementOperation, ReferenceListModification, Result,
+    Yuv420Picture,
 };
 
 pub type ReferencePicture = Arc<Yuv420Picture>;
@@ -68,6 +69,11 @@ impl DecodedPictureBuffer {
         if !(4..=16).contains(&log2_max_frame_num) {
             return Err(H264Error::InvalidSyntax(
                 "DPB log2_max_frame_num is outside 4..=16",
+            ));
+        }
+        if max_num_ref_frames > MAX_DPB_FRAMES {
+            return Err(H264Error::InvalidSyntax(
+                "max_num_ref_frames exceeds the AVC DPB limit",
             ));
         }
         let max_num_ref_frames =
@@ -1033,5 +1039,15 @@ mod tests {
         dpb.store_short_term(1, 1, picture(6)).unwrap();
         assert_eq!(dpb.len(), 1);
         assert_eq!(luma_value(&dpb.default_p_list0(2).unwrap()[0]), 6);
+    }
+
+    #[test]
+    fn rejects_reference_capacity_beyond_the_avc_limit() {
+        assert!(matches!(
+            DecodedPictureBuffer::new(17, 4),
+            Err(H264Error::InvalidSyntax(
+                "max_num_ref_frames exceeds the AVC DPB limit"
+            ))
+        ));
     }
 }

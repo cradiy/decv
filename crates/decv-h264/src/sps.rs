@@ -3,7 +3,9 @@
 use bit_readers::BitReader;
 use decv_core::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, Rect, Size, TransferFunction};
 
-use crate::{H264Error, Result, consume_rbsp_trailing_bits};
+use crate::{
+    H264Error, MAX_DECODED_PICTURE_MACROBLOCKS, MAX_DPB_FRAMES, Result, consume_rbsp_trailing_bits,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -231,6 +233,11 @@ impl SequenceParameterSet {
         };
 
         let max_num_ref_frames = read_ue(&mut reader)?;
+        if max_num_ref_frames > MAX_DPB_FRAMES {
+            return Err(H264Error::InvalidSyntax(
+                "max_num_ref_frames exceeds the AVC DPB limit",
+            ));
+        }
         let gaps_in_frame_num_value_allowed = read_flag(&mut reader)?;
         let pic_width_in_mbs = add_u32(read_ue(&mut reader)?, 1)?;
         let pic_height_in_map_units = add_u32(read_ue(&mut reader)?, 1)?;
@@ -417,7 +424,7 @@ fn parse_vui(reader: &mut BitReader<'_>) -> Result<VuiParameters> {
 
     let pic_struct_present = read_flag(reader)?;
     let bitstream_restrictions = if read_flag(reader)? {
-        Some(BitstreamRestrictions {
+        let restrictions = BitstreamRestrictions {
             motion_vectors_over_pic_boundaries: read_flag(reader)?,
             max_bytes_per_pic_denom: read_ue(reader)?,
             max_bits_per_mb_denom: read_ue(reader)?,
@@ -425,7 +432,18 @@ fn parse_vui(reader: &mut BitReader<'_>) -> Result<VuiParameters> {
             log2_max_mv_length_vertical: read_ue(reader)?,
             max_num_reorder_frames: read_ue(reader)?,
             max_dec_frame_buffering: read_ue(reader)?,
-        })
+        };
+        if restrictions.max_num_reorder_frames > restrictions.max_dec_frame_buffering {
+            return Err(H264Error::InvalidSyntax(
+                "max_num_reorder_frames exceeds max_dec_frame_buffering",
+            ));
+        }
+        if restrictions.max_dec_frame_buffering > MAX_DPB_FRAMES {
+            return Err(H264Error::InvalidSyntax(
+                "max_dec_frame_buffering exceeds the AVC DPB limit",
+            ));
+        }
+        Some(restrictions)
     } else {
         None
     };
@@ -506,12 +524,22 @@ fn derive_coded_size(
     height_in_map_units: u32,
     frame_mbs_only: bool,
 ) -> Result<Size> {
+    let frame_height_factor = if frame_mbs_only { 1 } else { 2 };
+    let macroblock_count = u64::from(width_in_mbs)
+        .checked_mul(u64::from(height_in_map_units))
+        .and_then(|value| value.checked_mul(frame_height_factor))
+        .ok_or(H264Error::IntegerOverflow)?;
+    if macroblock_count > MAX_DECODED_PICTURE_MACROBLOCKS {
+        return Err(H264Error::InvalidSyntax(
+            "coded picture exceeds the decoder macroblock limit",
+        ));
+    }
+
     let width = width_in_mbs
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
-    let frame_height_factor = if frame_mbs_only { 1 } else { 2 };
     let height = height_in_map_units
-        .checked_mul(frame_height_factor)
+        .checked_mul(frame_height_factor as u32)
         .and_then(|value| value.checked_mul(16))
         .ok_or(H264Error::IntegerOverflow)?;
     Ok(Size::new(width, height))
@@ -665,6 +693,7 @@ mod tests {
     use super::{
         PicOrderCount, Profile, SampleAspectRatio, SequenceParameterSet, parse_sample_aspect_ratio,
     };
+    use crate::H264Error;
 
     #[test]
     fn parses_a_baseline_640_by_480_sps() {
@@ -909,6 +938,78 @@ mod tests {
         invalid_reserved.write_bits(30, 8);
         invalid_reserved.write_ue(0);
         assert!(SequenceParameterSet::parse(&invalid_reserved.finish_rbsp()).is_err());
+    }
+
+    #[test]
+    fn rejects_sps_resource_declarations_beyond_decoder_limits() {
+        assert_eq!(
+            SequenceParameterSet::parse(&baseline_sps_with_limits(17, 1, 1, None)),
+            Err(H264Error::InvalidSyntax(
+                "max_num_ref_frames exceeds the AVC DPB limit"
+            ))
+        );
+        assert_eq!(
+            SequenceParameterSet::parse(&baseline_sps_with_limits(1, 36_865, 1, None)),
+            Err(H264Error::InvalidSyntax(
+                "coded picture exceeds the decoder macroblock limit"
+            ))
+        );
+        assert_eq!(
+            SequenceParameterSet::parse(&baseline_sps_with_limits(1, 1, 1, Some((3, 2)))),
+            Err(H264Error::InvalidSyntax(
+                "max_num_reorder_frames exceeds max_dec_frame_buffering"
+            ))
+        );
+        assert_eq!(
+            SequenceParameterSet::parse(&baseline_sps_with_limits(1, 1, 1, Some((0, 17)))),
+            Err(H264Error::InvalidSyntax(
+                "max_dec_frame_buffering exceeds the AVC DPB limit"
+            ))
+        );
+
+        let largest_supported =
+            SequenceParameterSet::parse(&baseline_sps_with_limits(16, 256, 144, Some((16, 16))))
+                .unwrap();
+        assert_eq!(largest_supported.coded_size, Size::new(4096, 2304));
+    }
+
+    fn baseline_sps_with_limits(
+        max_num_ref_frames: u32,
+        width_in_mbs: u32,
+        height_in_mbs: u32,
+        restrictions: Option<(u32, u32)>,
+    ) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_common_header(&mut writer, 66, 52, 0);
+        writer.write_ue(0); // log2_max_frame_num_minus4
+        writer.write_ue(0); // pic_order_cnt_type
+        writer.write_ue(0); // log2_max_pic_order_cnt_lsb_minus4
+        writer.write_ue(max_num_ref_frames);
+        writer.write_flag(false); // gaps
+        writer.write_ue(width_in_mbs - 1);
+        writer.write_ue(height_in_mbs - 1);
+        writer.write_flag(true); // frame_mbs_only
+        writer.write_flag(true); // direct_8x8_inference
+        writer.write_flag(false); // cropping
+        writer.write_flag(restrictions.is_some());
+        if let Some((max_num_reorder_frames, max_dec_frame_buffering)) = restrictions {
+            writer.write_flag(false); // SAR
+            writer.write_flag(false); // overscan
+            writer.write_flag(false); // video signal
+            writer.write_flag(false); // chroma location
+            writer.write_flag(false); // timing
+            writer.write_flag(false); // NAL HRD
+            writer.write_flag(false); // VCL HRD
+            writer.write_flag(false); // pic_struct_present
+            writer.write_flag(true); // bitstream restrictions
+            writer.write_flag(true); // motion vectors over picture boundaries
+            for _ in 0..4 {
+                writer.write_ue(0);
+            }
+            writer.write_ue(max_num_reorder_frames);
+            writer.write_ue(max_dec_frame_buffering);
+        }
+        writer.finish_rbsp()
     }
 
     fn write_common_header(writer: &mut BitWriter, profile_idc: u8, level_idc: u8, sps_id: u32) {

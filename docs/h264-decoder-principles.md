@@ -846,6 +846,13 @@ It emits the picture when a new picture boundary, AUD/end marker, or explicit
 `flush()` clears timeline-dependent state while preserving active SPS/PPS, so
 the next random-access picture does not require parameter sets to be repeated.
 
+Untrusted SPS values are rejected before they can control large allocations.
+The current software path accepts at most 16 DPB/reorder frames and 36,864
+macroblocks per coded picture. The latter includes 4096x2304, while bounding a
+single reconstructed picture to the intended 4K product scope. The same limits
+are enforced both at SPS parsing and at the public DPB/picture constructors so
+an internal caller cannot accidentally bypass them.
+
 Useful verification commands are:
 
 ```bash
@@ -863,6 +870,9 @@ and a cropped realistic stream. It also concatenates streams with different
 SPS dimensions, requires both `FormatChanged` events, and compares each
 variable-size NV12 segment with its matching FFmpeg decode. It uses a unique
 temporary directory so stale output cannot produce a false pass.
+Unit tests additionally run a complete decodable stream through every prefix
+truncation and deterministic single-byte corruptions. Returning a structured
+error is expected; panicking is a regression.
 The benchmark command generates a reproducible 1080p60 High Profile stream,
 drives the decoder incrementally one NAL at a time, and reports wall time, CPU
 time, and peak resident memory. It is a measurement tool rather than a
