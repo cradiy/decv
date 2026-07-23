@@ -26,6 +26,7 @@ pub use decoder::{H264StreamParser, ParserEvent};
 pub use error::{H264Error, Result};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
 pub use parameter_sets::{ActiveParameterSets, ParameterSetStore};
+pub use picture::{FieldOrderCount, PictureOrderCount, PictureOrderCountState};
 pub use pps::{
     EntropyCodingMode, PictureParameterSet, SliceGroupMap, SliceGroupRectangle,
     WeightedBiprediction,

@@ -22,6 +22,7 @@ pub enum ParserEvent<'a> {
         /// Unescaped payload retained for the following slice-data parser.
         rbsp: Cow<'a, [u8]>,
         starts_new_picture: bool,
+        picture_order_count: crate::PictureOrderCount,
     },
     AccessUnitDelimiter {
         primary_pic_type: u8,
@@ -35,6 +36,8 @@ pub enum ParserEvent<'a> {
 pub struct H264StreamParser {
     parameter_sets: ParameterSetStore,
     previous_vcl: Option<PictureIdentity>,
+    poc_state: crate::PictureOrderCountState,
+    current_picture_order_count: Option<crate::PictureOrderCount>,
 }
 
 impl H264StreamParser {
@@ -75,27 +78,40 @@ impl H264StreamParser {
                     .previous_vcl
                     .as_ref()
                     .is_none_or(|previous| identity.starts_new_picture_after(previous));
+                let picture_order_count = if starts_new_picture {
+                    self.poc_state.derive(&parsed, nal.header)?
+                } else {
+                    self.current_picture_order_count
+                        .expect("a continued picture has a previously derived POC")
+                };
                 self.previous_vcl = Some(identity);
+                self.current_picture_order_count = Some(picture_order_count);
                 Ok(ParserEvent::Slice {
                     parsed,
                     rbsp,
                     starts_new_picture,
+                    picture_order_count,
                 })
             }
             NalUnitType::AccessUnitDelimiter => {
                 let rbsp = decode_rbsp(nal.ebsp)?;
                 let primary_pic_type = parse_access_unit_delimiter(rbsp.as_ref())?;
                 self.previous_vcl = None;
+                self.current_picture_order_count = None;
                 Ok(ParserEvent::AccessUnitDelimiter { primary_pic_type })
             }
             NalUnitType::EndOfSequence => {
                 validate_empty_rbsp(nal.ebsp)?;
                 self.previous_vcl = None;
+                self.current_picture_order_count = None;
+                self.poc_state.reset();
                 Ok(ParserEvent::EndOfSequence)
             }
             NalUnitType::EndOfStream => {
                 validate_empty_rbsp(nal.ebsp)?;
                 self.previous_vcl = None;
+                self.current_picture_order_count = None;
+                self.poc_state.reset();
                 Ok(ParserEvent::EndOfStream)
             }
             unit_type if unit_type.is_vcl() => Err(H264Error::UnsupportedFeature(
@@ -114,6 +130,8 @@ impl H264StreamParser {
     pub fn reset(&mut self) {
         self.parameter_sets.clear();
         self.previous_vcl = None;
+        self.poc_state.reset();
+        self.current_picture_order_count = None;
     }
 }
 
@@ -217,8 +235,13 @@ mod tests {
                     parsed,
                     rbsp,
                     starts_new_picture,
+                    picture_order_count,
                 } => {
                     assert!(parsed.header.bit_size <= rbsp.len() * 8);
+                    assert_eq!(
+                        picture_order_count.stored.picture_order_count(),
+                        parsed.header.picture_order.pic_order_cnt_lsb.unwrap() as i32
+                    );
                     boundaries.push(starts_new_picture);
                 }
                 event => panic!("unexpected parser event: {event:?}"),
@@ -257,6 +280,98 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn derives_type_zero_poc_wraparound_and_mmco5_reset() {
+        let mut parser = configured_parser();
+
+        assert_eq!(
+            push_poc(&mut parser, 0x41, reference_i_slice_type0(0, 6, false)),
+            (Some(6), Some(6))
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x41, reference_i_slice_type0(1, 14, false)),
+            (Some(14), Some(14))
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x41, reference_i_slice_type0(2, 2, false)),
+            (Some(18), Some(18))
+        );
+
+        let mut parser = configured_parser();
+        push_poc(&mut parser, 0x41, reference_i_slice_type0(0, 6, false));
+        let mmco5 =
+            push_picture_order_count(&mut parser, 0x41, reference_i_slice_type0(1, 14, true));
+        assert_eq!(
+            (mmco5.decoding.top, mmco5.decoding.bottom),
+            (Some(14), Some(14))
+        );
+        assert_eq!((mmco5.stored.top, mmco5.stored.bottom), (Some(0), Some(0)));
+        assert_eq!(
+            push_poc(&mut parser, 0x41, reference_i_slice_type0(2, 2, false)),
+            (Some(2), Some(2))
+        );
+    }
+
+    #[test]
+    fn derives_type_one_expected_cycles_and_non_reference_offset() {
+        let mut parser = configured_parser_with_sps(type1_sps_rbsp());
+
+        assert_eq!(
+            push_poc(&mut parser, 0x41, i_slice_type1(0, 0, true, false)),
+            (Some(0), Some(1))
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x41, i_slice_type1(1, 0, true, false)),
+            (Some(2), Some(3))
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x01, i_slice_type1(2, 0, false, false)),
+            (Some(1), Some(2))
+        );
+    }
+
+    #[test]
+    fn derives_type_two_reference_non_reference_and_mmco5_values() {
+        let mut parser = configured_parser_with_sps(type2_sps_rbsp());
+
+        assert_eq!(
+            push_poc(&mut parser, 0x41, i_slice_type2(0, true, false)),
+            (Some(0), Some(0))
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x01, i_slice_type2(1, false, false)),
+            (Some(1), Some(1))
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x41, i_slice_type2(2, true, false)),
+            (Some(4), Some(4))
+        );
+
+        let mut parser = configured_parser_with_sps(type2_sps_rbsp());
+        assert_eq!(
+            push_poc(&mut parser, 0x41, i_slice_type2(15, true, true)),
+            (Some(0), Some(0))
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x41, i_slice_type2(0, true, false)),
+            (Some(0), Some(0))
+        );
+    }
+
+    #[test]
+    fn derives_idr_top_and_complementary_bottom_field_counts() {
+        let mut parser = configured_parser_with_sps(interlaced_type0_sps_rbsp());
+
+        assert_eq!(
+            push_poc(&mut parser, 0x65, idr_field_slice_type0(false, 0)),
+            (Some(0), None)
+        );
+        assert_eq!(
+            push_poc(&mut parser, 0x41, reference_field_slice_type0(true, 1)),
+            (None, Some(1))
+        );
     }
 
     #[test]
@@ -340,12 +455,41 @@ mod tests {
     }
 
     fn configured_parser() -> H264StreamParser {
+        configured_parser_with_sps(sps_rbsp())
+    }
+
+    fn configured_parser_with_sps(sps: Vec<u8>) -> H264StreamParser {
         let mut parser = H264StreamParser::new();
-        let sps = sps_rbsp();
         let pps = pps_rbsp();
         parser.push_nal(nal(0x67, sps.as_slice())).unwrap();
         parser.push_nal(nal(0x68, pps.as_slice())).unwrap();
         parser
+    }
+
+    fn push_poc(
+        parser: &mut H264StreamParser,
+        nal_header: u8,
+        rbsp: Vec<u8>,
+    ) -> (Option<i32>, Option<i32>) {
+        let picture_order_count = push_picture_order_count(parser, nal_header, rbsp);
+        (
+            picture_order_count.stored.top,
+            picture_order_count.stored.bottom,
+        )
+    }
+
+    fn push_picture_order_count(
+        parser: &mut H264StreamParser,
+        nal_header: u8,
+        rbsp: Vec<u8>,
+    ) -> crate::PictureOrderCount {
+        match parser.push_nal(nal(nal_header, rbsp.as_slice())).unwrap() {
+            ParserEvent::Slice {
+                picture_order_count,
+                ..
+            } => picture_order_count,
+            event => panic!("expected slice event, got {event:?}"),
+        }
     }
 
     fn nal(header: u8, ebsp: &[u8]) -> NalUnit<'_> {
@@ -399,6 +543,66 @@ mod tests {
         writer.finish_rbsp()
     }
 
+    fn type1_sps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_sps_prefix(&mut writer);
+        writer.write_ue(0);
+        writer.write_ue(1);
+        writer.write_flag(false);
+        writer.write_se(-1);
+        writer.write_se(1);
+        writer.write_ue(2);
+        writer.write_se(2);
+        writer.write_se(3);
+        write_sps_geometry_and_tail(&mut writer);
+        writer.finish_rbsp()
+    }
+
+    fn type2_sps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_sps_prefix(&mut writer);
+        writer.write_ue(0);
+        writer.write_ue(2);
+        write_sps_geometry_and_tail(&mut writer);
+        writer.finish_rbsp()
+    }
+
+    fn interlaced_type0_sps_rbsp() -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_sps_prefix(&mut writer);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_ue(0);
+        writer.write_ue(2);
+        writer.write_flag(false);
+        writer.write_ue(3);
+        writer.write_ue(1);
+        writer.write_flag(false);
+        writer.write_flag(false);
+        writer.write_flag(true);
+        writer.write_flag(false);
+        writer.write_flag(false);
+        writer.finish_rbsp()
+    }
+
+    fn write_sps_prefix(writer: &mut BitWriter) {
+        writer.write_bits(66, 8);
+        writer.write_bits(0, 8);
+        writer.write_bits(30, 8);
+        writer.write_ue(0);
+    }
+
+    fn write_sps_geometry_and_tail(writer: &mut BitWriter) {
+        writer.write_ue(2);
+        writer.write_flag(false);
+        writer.write_ue(3);
+        writer.write_ue(2);
+        writer.write_flag(true);
+        writer.write_flag(true);
+        writer.write_flag(false);
+        writer.write_flag(false);
+    }
+
     fn pps_rbsp() -> Vec<u8> {
         let mut writer = BitWriter::default();
         writer.write_ue(0);
@@ -429,6 +633,80 @@ mod tests {
         writer.write_se(0);
         writer.write_ue(1);
         writer.finish_rbsp()
+    }
+
+    fn reference_i_slice_type0(frame_num: u64, poc_lsb: u64, mmco5: bool) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_i_slice_prefix(&mut writer, frame_num);
+        writer.write_bits(poc_lsb, 4);
+        write_reference_marking(&mut writer, mmco5);
+        write_i_slice_tail(&mut writer);
+        writer.finish_rbsp()
+    }
+
+    fn idr_field_slice_type0(bottom_field: bool, poc_lsb: u64) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_i_slice_prefix(&mut writer, 0);
+        writer.write_flag(true);
+        writer.write_flag(bottom_field);
+        writer.write_ue(0);
+        writer.write_bits(poc_lsb, 4);
+        writer.write_flag(false);
+        writer.write_flag(false);
+        write_i_slice_tail(&mut writer);
+        writer.finish_rbsp()
+    }
+
+    fn reference_field_slice_type0(bottom_field: bool, poc_lsb: u64) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_i_slice_prefix(&mut writer, 0);
+        writer.write_flag(true);
+        writer.write_flag(bottom_field);
+        writer.write_bits(poc_lsb, 4);
+        write_reference_marking(&mut writer, false);
+        write_i_slice_tail(&mut writer);
+        writer.finish_rbsp()
+    }
+
+    fn i_slice_type1(frame_num: u64, delta0: i32, reference: bool, mmco5: bool) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_i_slice_prefix(&mut writer, frame_num);
+        writer.write_se(delta0);
+        if reference {
+            write_reference_marking(&mut writer, mmco5);
+        }
+        write_i_slice_tail(&mut writer);
+        writer.finish_rbsp()
+    }
+
+    fn i_slice_type2(frame_num: u64, reference: bool, mmco5: bool) -> Vec<u8> {
+        let mut writer = BitWriter::default();
+        write_i_slice_prefix(&mut writer, frame_num);
+        if reference {
+            write_reference_marking(&mut writer, mmco5);
+        }
+        write_i_slice_tail(&mut writer);
+        writer.finish_rbsp()
+    }
+
+    fn write_i_slice_prefix(writer: &mut BitWriter, frame_num: u64) {
+        writer.write_ue(0);
+        writer.write_ue(2);
+        writer.write_ue(0);
+        writer.write_bits(frame_num, 4);
+    }
+
+    fn write_reference_marking(writer: &mut BitWriter, mmco5: bool) {
+        writer.write_flag(mmco5);
+        if mmco5 {
+            writer.write_ue(5);
+            writer.write_ue(0);
+        }
+    }
+
+    fn write_i_slice_tail(writer: &mut BitWriter) {
+        writer.write_se(0);
+        writer.write_ue(1);
     }
 
     #[derive(Default)]
