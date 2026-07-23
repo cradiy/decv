@@ -2,7 +2,8 @@
 
 use bit_readers::BitReader;
 
-use crate::{H264Error, Result};
+use crate::cabac_context_tables::{CABAC_CONTEXT_COUNT, CABAC_INIT_I, CABAC_INIT_PB};
+use crate::{H264Error, Result, SliceType};
 
 const INITIAL_RANGE: u16 = 510;
 
@@ -119,6 +120,111 @@ impl CabacContextState {
     #[inline]
     pub const fn most_probable_symbol(self) -> u8 {
         self.most_probable_symbol
+    }
+
+    #[inline]
+    fn initialize(m: i8, n: i8, slice_qp_y: u8) -> Self {
+        let pre_context_state = ((i32::from(m) * i32::from(slice_qp_y)) >> 4) + i32::from(n);
+        let pre_context_state = pre_context_state.clamp(1, 126) as u8;
+        if pre_context_state <= 63 {
+            Self {
+                probability_state: 63 - pre_context_state,
+                most_probable_symbol: 0,
+            }
+        } else {
+            Self {
+                probability_state: pre_context_state - 64,
+                most_probable_symbol: 1,
+            }
+        }
+    }
+}
+
+/// Selects one of the normative CABAC initialization parameter tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CabacInitializationTable {
+    Intra,
+    Inter0,
+    Inter1,
+    Inter2,
+}
+
+impl CabacInitializationTable {
+    pub fn for_slice(slice_type: SliceType, cabac_init_idc: Option<u8>) -> Result<Self> {
+        if slice_type.is_intra() {
+            if cabac_init_idc.is_some() {
+                return Err(H264Error::InvalidSyntax(
+                    "intra CABAC slice unexpectedly carries cabac_init_idc",
+                ));
+            }
+            return Ok(Self::Intra);
+        }
+        match cabac_init_idc {
+            Some(0) => Ok(Self::Inter0),
+            Some(1) => Ok(Self::Inter1),
+            Some(2) => Ok(Self::Inter2),
+            Some(_) => Err(H264Error::InvalidSyntax("cabac_init_idc exceeds 2")),
+            None => Err(H264Error::InvalidSyntax(
+                "inter CABAC slice is missing cabac_init_idc",
+            )),
+        }
+    }
+}
+
+/// The 460 CABAC context models used by 8-bit 4:2:0 H.264 syntax.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CabacContextSet {
+    states: [CabacContextState; CABAC_CONTEXT_COUNT],
+}
+
+impl CabacContextSet {
+    pub fn new(table: CabacInitializationTable, slice_qp_y: u8) -> Result<Self> {
+        if slice_qp_y > 51 {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC slice QP exceeds the 8-bit range",
+            ));
+        }
+        let parameters = match table {
+            CabacInitializationTable::Intra => &CABAC_INIT_I,
+            CabacInitializationTable::Inter0 => &CABAC_INIT_PB[0],
+            CabacInitializationTable::Inter1 => &CABAC_INIT_PB[1],
+            CabacInitializationTable::Inter2 => &CABAC_INIT_PB[2],
+        };
+        Ok(Self {
+            states: std::array::from_fn(|index| {
+                let (m, n) = parameters[index];
+                CabacContextState::initialize(m, n, slice_qp_y)
+            }),
+        })
+    }
+
+    #[inline]
+    pub fn get(&self, context_index: usize) -> Result<CabacContextState> {
+        self.states
+            .get(context_index)
+            .copied()
+            .ok_or(H264Error::InvalidSyntax(
+                "CABAC context index exceeds the 8-bit 4:2:0 set",
+            ))
+    }
+
+    #[inline]
+    pub fn get_mut(&mut self, context_index: usize) -> Result<&mut CabacContextState> {
+        self.states
+            .get_mut(context_index)
+            .ok_or(H264Error::InvalidSyntax(
+                "CABAC context index exceeds the 8-bit 4:2:0 set",
+            ))
+    }
+
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.states.len()
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.states.is_empty()
     }
 }
 
@@ -371,5 +477,88 @@ mod tests {
                 Err(error) => panic!("unexpected CABAC error: {error}"),
             }
         }
+    }
+
+    #[test]
+    fn initializes_normative_intra_contexts_at_qp_boundaries() {
+        let qp0 = CabacContextSet::new(CabacInitializationTable::Intra, 0).unwrap();
+        assert_eq!(qp0.get(0).unwrap(), CabacContextState::new(62, 0).unwrap());
+        assert_eq!(qp0.get(1).unwrap(), CabacContextState::new(9, 0).unwrap());
+        assert_eq!(qp0.get(2).unwrap(), CabacContextState::new(10, 1).unwrap());
+
+        let qp51 = CabacContextSet::new(CabacInitializationTable::Intra, 51).unwrap();
+        assert_eq!(qp51.get(0).unwrap(), CabacContextState::new(15, 0).unwrap());
+        assert_eq!(
+            qp51.get(459).unwrap(),
+            CabacContextState::new(47, 1).unwrap()
+        );
+    }
+
+    #[test]
+    fn selects_each_inter_initialization_table() {
+        let expected = [
+            (CabacInitializationTable::Inter0, (6, 1), (62, 1)),
+            (CabacInitializationTable::Inter1, (3, 0), (62, 1)),
+            (CabacInitializationTable::Inter2, (0, 0), (32, 1)),
+        ];
+        for (table, first, last) in expected {
+            let contexts = CabacContextSet::new(table, 26).unwrap();
+            assert_eq!(
+                contexts.get(11).unwrap(),
+                CabacContextState::new(first.0, first.1).unwrap()
+            );
+            assert_eq!(
+                contexts.get(459).unwrap(),
+                CabacContextState::new(last.0, last.1).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn validates_context_initialization_inputs_and_indices() {
+        assert!(matches!(
+            CabacContextSet::new(CabacInitializationTable::Intra, 52),
+            Err(H264Error::InvalidSyntax(_))
+        ));
+        let mut contexts = CabacContextSet::new(CabacInitializationTable::Intra, 26).unwrap();
+        assert_eq!(contexts.len(), 460);
+        assert!(!contexts.is_empty());
+        assert!(contexts.get(460).is_err());
+        assert!(contexts.get_mut(460).is_err());
+    }
+
+    #[test]
+    fn maps_slice_headers_to_initialization_tables() {
+        assert_eq!(
+            CabacInitializationTable::for_slice(SliceType::I, None).unwrap(),
+            CabacInitializationTable::Intra
+        );
+        assert_eq!(
+            CabacInitializationTable::for_slice(SliceType::B, Some(2)).unwrap(),
+            CabacInitializationTable::Inter2
+        );
+        assert!(CabacInitializationTable::for_slice(SliceType::P, None).is_err());
+        assert!(CabacInitializationTable::for_slice(SliceType::I, Some(0)).is_err());
+    }
+
+    #[test]
+    fn all_context_tables_match_the_normative_fixed_vector() {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for table in [
+            CabacInitializationTable::Intra,
+            CabacInitializationTable::Inter0,
+            CabacInitializationTable::Inter1,
+            CabacInitializationTable::Inter2,
+        ] {
+            for qp in [0, 26, 51] {
+                let contexts = CabacContextSet::new(table, qp).unwrap();
+                for state in contexts.states {
+                    hash ^=
+                        u64::from((state.probability_state() << 1) | state.most_probable_symbol());
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+        assert_eq!(hash, 0xfc67_0f17_aec4_54d8);
     }
 }

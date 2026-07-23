@@ -748,8 +748,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   CAVLC streams with B pictures, display reordering, multiple references,
   weighted prediction, and 8x8 transforms;
 - a standalone CABAC binary arithmetic core with decision, bypass, terminate,
-  renormalization, probability-state transitions, and atomic truncation
-  handling; CABAC syntax-element context selection is not connected yet;
+  renormalization, probability-state transitions, atomic truncation handling,
+  and all 460 normative 8-bit 4:2:0 context initializers; CABAC syntax-element
+  binarizations and neighbour-based context selection are not connected yet;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
