@@ -769,6 +769,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   macroblocks, including coded-block state and 8x8-to-4x4 interleaving;
 - complete CABAC I-macroblock prediction syntax for I4x4, I8x8, I16x16, and
   the I_PCM transition marker;
+- pixel-producing progressive CABAC I slices for ordinary predicted
+  macroblocks, with end-of-slice termination and quantizer state;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band

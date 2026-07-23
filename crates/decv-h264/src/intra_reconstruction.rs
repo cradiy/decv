@@ -15,7 +15,8 @@ use crate::motion_field::MotionFieldBuilder;
 use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, BSubMacroblockType,
-    CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock,
+    CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary, CabacResidualState,
+    CabacSliceDecoder, CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock,
     DecodedIntraMacroblock, DecodedPSliceMacroblock, DirectMotionContext, DirectReference,
     EntropyCodingMode, H264Error, InterResidual, IntraLumaPrediction, IntraMacroblock,
     IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability,
@@ -190,6 +191,7 @@ pub struct IntraPictureReconstructor {
     width_in_macroblocks: usize,
     picture: Yuv420Picture,
     cavlc: CavlcNeighborState,
+    cabac_residual: CabacResidualState,
     modes: IntraModeState,
     motion: PMotionState,
     b_motion: BMotionState,
@@ -234,6 +236,7 @@ impl IntraPictureReconstructor {
             width_in_macroblocks,
             picture,
             cavlc: CavlcNeighborState::new(coded_size.width / 16, coded_size.height / 16)?,
+            cabac_residual: CabacResidualState::new(width_in_macroblocks, height_in_macroblocks)?,
             modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
             motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
             b_motion: BMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
@@ -319,6 +322,50 @@ impl IntraPictureReconstructor {
             deblocking_filter: header.deblocking_filter.unwrap_or_default(),
         };
         self.decode_cavlc_intra_slice_data(rbsp, config)
+    }
+
+    /// Decodes and reconstructs one progressively scanned CABAC I slice.
+    pub fn decode_cabac_intra_slice(
+        &mut self,
+        rbsp: &[u8],
+        parsed: &ParsedSliceHeader,
+    ) -> Result<usize> {
+        let header = &parsed.header;
+        let sps = &parsed.parameter_sets.sequence;
+        let pps = &parsed.parameter_sets.picture;
+        if header.slice_type != SliceType::I {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC I reconstruction requires an I slice header",
+            ));
+        }
+        if pps.entropy_coding_mode != EntropyCodingMode::Cabac
+            || pps.num_slice_groups != 1
+            || header.field_picture
+            || sps.mb_adaptive_frame_field
+        {
+            return Err(H264Error::UnsupportedFeature(
+                "CABAC I reconstruction currently requires progressive non-FMO input",
+            ));
+        }
+        if sps.coded_size != self.picture.coded_size()
+            || pps.constrained_intra_prediction != self.constrained_intra_prediction
+        {
+            return Err(H264Error::InvalidSyntax(
+                "slice parameter sets do not match the picture reconstructor",
+            ));
+        }
+        let config = IntraSliceConfig {
+            header_bit_size: header.bit_size,
+            first_macroblock: usize::try_from(header.first_mb_in_slice)
+                .map_err(|_| H264Error::IntegerOverflow)?,
+            slice_qp_y: header.slice_qp_y,
+            transform_8x8_mode: pps.transform_8x8_mode,
+            chroma_cb_offset: pps.chroma_qp_index_offset,
+            chroma_cr_offset: pps.second_chroma_qp_index_offset,
+            transform_bypass_enabled: sps.qpprime_y_zero_transform_bypass,
+            deblocking_filter: header.deblocking_filter.unwrap_or_default(),
+        };
+        self.decode_cabac_intra_slice_data(rbsp, config)
     }
 
     /// Decodes one progressive CAVLC P slice against an already constructed
@@ -565,6 +612,128 @@ impl IntraPictureReconstructor {
         }
         consume_rbsp_trailing_bits(&mut reader)?;
         Ok(decoded_count)
+    }
+
+    fn decode_cabac_intra_slice_data(
+        &mut self,
+        rbsp: &[u8],
+        config: IntraSliceConfig,
+    ) -> Result<usize> {
+        self.next_slice_id = self
+            .next_slice_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let slice_id = self.next_slice_id;
+        let mut cabac = CabacSliceDecoder::new(
+            rbsp,
+            config.header_bit_size,
+            SliceType::I,
+            None,
+            config.slice_qp_y,
+        )?;
+        let height_in_macroblocks = self.completed.len() / self.width_in_macroblocks;
+        let mut macroblocks =
+            CabacMacroblockState::new(self.width_in_macroblocks, height_in_macroblocks)?;
+        let mut quantizers = MacroblockQuantizerState::new(
+            config.slice_qp_y,
+            config.chroma_cb_offset,
+            config.chroma_cr_offset,
+            config.transform_bypass_enabled,
+        )?;
+        let pcm_chroma_qp = [
+            derive_chroma_qp(0, config.chroma_cb_offset),
+            derive_chroma_qp(0, config.chroma_cr_offset),
+        ];
+        let mut macroblock_address = config.first_macroblock;
+        let mut decoded_count = 0usize;
+        let mut previous_qp_delta_nonzero = false;
+
+        loop {
+            self.macroblock_coordinates(macroblock_address)?;
+            let syntax = {
+                let mut syntax = cabac.syntax();
+                macroblocks.decode_intra_macroblock_syntax(
+                    &mut syntax,
+                    macroblock_address,
+                    slice_id,
+                    config.transform_8x8_mode,
+                    previous_qp_delta_nonzero,
+                )?
+            };
+            let header = match syntax {
+                CabacIntraMacroblockSyntax::Predicted(header) => header,
+                CabacIntraMacroblockSyntax::Pcm => {
+                    return Err(H264Error::UnsupportedFeature(
+                        "CABAC I_PCM transition and arithmetic reinitialization",
+                    ));
+                }
+            };
+
+            let residual_snapshot = self.cabac_residual.snapshot_macroblock(macroblock_address);
+            let residual = {
+                let mut syntax = cabac.syntax();
+                self.cabac_residual.decode_intra_residual(
+                    &mut syntax,
+                    macroblock_address,
+                    slice_id,
+                    &header,
+                )?
+            };
+            let end_of_slice = {
+                let mut syntax = cabac.syntax();
+                syntax.terminate()? != 0
+            };
+            let decoded = DecodedIntraMacroblock {
+                macroblock: IntraMacroblock::Predicted(header.clone()),
+                residual: Some(residual),
+            };
+            if let Err(error) = quantizers.with_macroblock(header.qp_delta, |quantizer| {
+                self.reconstruct_macroblock_with_deblocking(
+                    macroblock_address,
+                    slice_id,
+                    &decoded,
+                    quantizer,
+                    config.deblocking_filter,
+                    pcm_chroma_qp,
+                )
+            }) {
+                self.cabac_residual
+                    .restore_macroblock(macroblock_address, residual_snapshot);
+                return Err(error);
+            }
+
+            let transform_size_8x8 =
+                matches!(header.luma_prediction, IntraLumaPrediction::EightByEight(_));
+            macroblocks.record_macroblock(
+                macroblock_address,
+                slice_id,
+                CabacMacroblockSummary {
+                    skipped: false,
+                    intra16_or_pcm: matches!(
+                        header.luma_prediction,
+                        IntraLumaPrediction::SixteenBySixteen { .. }
+                    ),
+                    intra_chroma_prediction: Some(header.chroma_prediction_mode),
+                    coded_block_pattern: header.coded_block_pattern,
+                    transform_size_8x8,
+                },
+            )?;
+            previous_qp_delta_nonzero = header.qp_delta != 0;
+            macroblock_address = macroblock_address
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+            decoded_count = decoded_count
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+            if end_of_slice {
+                return Ok(decoded_count);
+            }
+            if macroblock_address >= self.completed.len() {
+                return Err(H264Error::InvalidSyntax(
+                    "CABAC slice has no terminating end_of_slice_flag",
+                ));
+            }
+        }
     }
 
     fn decode_cavlc_p_slice_data(

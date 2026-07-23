@@ -320,7 +320,7 @@ struct BlockState {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MacroblockResidualSnapshot {
+pub(crate) struct MacroblockResidualSnapshot {
     luma: [Option<BlockState>; 16],
     chroma_cb: [Option<BlockState>; 4],
     chroma_cr: [Option<BlockState>; 4],
@@ -789,7 +789,10 @@ impl CabacResidualState {
         Ok(Some(coefficients))
     }
 
-    fn snapshot_macroblock(&self, macroblock_address: usize) -> MacroblockResidualSnapshot {
+    pub(crate) fn snapshot_macroblock(
+        &self,
+        macroblock_address: usize,
+    ) -> MacroblockResidualSnapshot {
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let mut snapshot = MacroblockResidualSnapshot {
@@ -814,7 +817,7 @@ impl CabacResidualState {
         snapshot
     }
 
-    fn restore_macroblock(
+    pub(crate) fn restore_macroblock(
         &mut self,
         macroblock_address: usize,
         snapshot: MacroblockResidualSnapshot,
