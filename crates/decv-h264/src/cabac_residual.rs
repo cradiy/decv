@@ -629,7 +629,13 @@ impl CabacResidualState {
         };
         let transform_size_8x8 =
             matches!(header.luma_prediction, IntraLumaPrediction::EightByEight(_));
-        let luma = self.decode_luma_residual(
+        let mut residual = IntraResidual {
+            luma_dc,
+            luma: [ResidualBlock::empty(if intra_16x16 { 15 } else { 16 }); 16],
+            chroma_dc: [ResidualBlock::empty(4); 2],
+            chroma_ac: [[ResidualBlock::empty(15); 4]; 2],
+        };
+        self.decode_luma_residual_into(
             syntax,
             macroblock_address,
             slice_id,
@@ -637,20 +643,18 @@ impl CabacResidualState {
             header.coded_block_pattern.luma,
             intra_16x16,
             transform_size_8x8,
+            &mut residual.luma,
         )?;
-        let (chroma_dc, chroma_ac) = self.decode_chroma_residual(
+        self.decode_chroma_residual_into(
             syntax,
             macroblock_address,
             slice_id,
             true,
             header.coded_block_pattern.chroma,
+            &mut residual.chroma_dc,
+            &mut residual.chroma_ac,
         )?;
-        Ok(IntraResidual {
-            luma_dc,
-            luma,
-            chroma_dc,
-            chroma_ac,
-        })
+        Ok(residual)
     }
 
     fn decode_inter_residual_inner(
@@ -667,7 +671,12 @@ impl CabacResidualState {
             CabacResidualBlock::LumaDc,
             false,
         )?;
-        let luma = self.decode_luma_residual(
+        let mut residual = InterResidual {
+            luma: [ResidualBlock::empty(16); 16],
+            chroma_dc: [ResidualBlock::empty(4); 2],
+            chroma_ac: [[ResidualBlock::empty(15); 4]; 2],
+        };
+        self.decode_luma_residual_into(
             syntax,
             macroblock_address,
             slice_id,
@@ -675,23 +684,22 @@ impl CabacResidualState {
             coded_block_pattern.luma,
             false,
             transform_size_8x8,
+            &mut residual.luma,
         )?;
-        let (chroma_dc, chroma_ac) = self.decode_chroma_residual(
+        self.decode_chroma_residual_into(
             syntax,
             macroblock_address,
             slice_id,
             false,
             coded_block_pattern.chroma,
+            &mut residual.chroma_dc,
+            &mut residual.chroma_ac,
         )?;
-        Ok(InterResidual {
-            luma,
-            chroma_dc,
-            chroma_ac,
-        })
+        Ok(residual)
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn decode_luma_residual(
+    fn decode_luma_residual_into(
         &mut self,
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
         macroblock_address: usize,
@@ -700,10 +708,8 @@ impl CabacResidualState {
         coded_block_pattern_luma: u8,
         intra_16x16: bool,
         transform_size_8x8: bool,
-    ) -> Result<[ResidualBlock; 16]> {
-        let maximum_coefficients = if intra_16x16 { 15 } else { 16 };
-        let mut luma = [ResidualBlock::empty(maximum_coefficients); 16];
-
+        luma: &mut [ResidualBlock; 16],
+    ) -> Result<()> {
         if transform_size_8x8 {
             for region in 0..4u8 {
                 let block = CabacResidualBlock::Luma8x8(region);
@@ -723,7 +729,7 @@ impl CabacResidualState {
                 let split = split_luma_8x8(coefficients)?;
                 luma[usize::from(region) * 4..usize::from(region + 1) * 4].copy_from_slice(&split);
             }
-            return Ok(luma);
+            return Ok(());
         }
 
         for block_index in 0..16u8 {
@@ -744,18 +750,20 @@ impl CabacResidualState {
                 block,
             )?;
         }
-        Ok(luma)
+        Ok(())
     }
 
-    fn decode_chroma_residual(
+    #[allow(clippy::too_many_arguments)]
+    fn decode_chroma_residual_into(
         &mut self,
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
         macroblock_address: usize,
         slice_id: u32,
         current_is_intra: bool,
         coded_block_pattern_chroma: u8,
-    ) -> Result<([ResidualBlock; 2], [[ResidualBlock; 4]; 2])> {
-        let mut chroma_dc = [ResidualBlock::empty(4); 2];
+        chroma_dc: &mut [ResidualBlock; 2],
+        chroma_ac: &mut [[ResidualBlock; 4]; 2],
+    ) -> Result<()> {
         for plane in 0..2u8 {
             let block = CabacResidualBlock::ChromaDc { plane };
             if coded_block_pattern_chroma == 0 {
@@ -771,7 +779,6 @@ impl CabacResidualState {
             }
         }
 
-        let mut chroma_ac = [[ResidualBlock::empty(15); 4]; 2];
         for plane in 0..2u8 {
             for block_index in 0..4u8 {
                 let block = CabacResidualBlock::ChromaAc {
@@ -792,7 +799,7 @@ impl CabacResidualState {
                 }
             }
         }
-        Ok((chroma_dc, chroma_ac))
+        Ok(())
     }
 
     fn decode_residual_block(

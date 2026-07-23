@@ -40,18 +40,18 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 3.55 s | 3.45 s | 84,776 KiB | 50.7 FPS |
-| decv Auto (2 workers) | NV12 | 3.54 s | 3.86 s | 84,696 KiB | 50.8 FPS |
-| FFmpeg 1 thread | NV12 | 0.60 s | 0.69 s | 152,100 KiB | 300.0 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.42 s | 290,164 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,592 KiB | 315.8 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.95 s | 191,972 KiB | 818.2 FPS |
+| decv Serial | NV12 | 3.47 s | 3.38 s | 84,800 KiB | 51.9 FPS |
+| decv Auto (2 workers) | NV12 | 3.41 s | 3.72 s | 84,504 KiB | 52.8 FPS |
+| FFmpeg 1 thread | NV12 | 0.61 s | 0.69 s | 152,148 KiB | 295.1 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.38 s | 287,188 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,912 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.95 s | 192,852 KiB | 818.2 FPS |
 
 On this workload:
 
-- decv Serial takes about **5.9x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **5.7x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **13.6x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **12.6x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **2.7x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current 3.55-second Serial result is about 0.85x real time, or
-roughly 18% more wall-clock work than the target permits.
+seconds. The current 3.47-second Serial result is about 0.86x real time, or
+roughly 16% more wall-clock work than the target permits.
 
 This snapshot includes the removal of repeated by-value copies of the
 544-byte `MacroblockDeblockInfo` value from the deblocking traversal. Passing
@@ -73,12 +73,15 @@ scratch buffers and removing redundant CABAC rollback snapshots from the
 picture-terminal error path subsequently reduced the measured median to 3.63
 seconds. Replacing tiny integer-motion `memmove` calls with validated unaligned
 fixed-width loads and stores reduced it further to 3.55 seconds. Public
-low-level CABAC APIs retain their transactional rollback semantics.
+low-level CABAC APIs retain their transactional rollback semantics. Decoding
+CABAC luma and chroma residuals directly into their final macroblock object,
+instead of returning two large intermediate arrays, then reduced the median to
+3.47 seconds.
 
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
-FFmpeg is already about 5.9x faster in the comparable NV12 case. FFmpeg then
+FFmpeg is already about 5.7x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
 parallelizes only owned CABAC B-macroblock pixel reconstruction. CABAC parsing,
 residual reconstruction, most P-picture reconstruction, output packaging, and
