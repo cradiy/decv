@@ -32,7 +32,7 @@ Snapshot environment:
 - CPU: AMD Ryzen AI 7 H 350, 8 cores / 16 logical CPUs;
 - FFmpeg 8.1.2;
 - release-mode `decv-cli`;
-- date: 2026-07-23.
+- date: 2026-07-24.
 
 ## Current Results
 
@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 3.31 s | 3.22 s | 84,640 KiB | 54.4 FPS |
-| decv Auto (2 workers) | NV12 | 3.23 s | 3.50 s | 84,572 KiB | 55.7 FPS |
-| FFmpeg 1 thread | NV12 | 0.62 s | 0.71 s | 152,084 KiB | 290.3 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.45 s | 290,132 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,584 KiB | 305.1 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.98 s | 192,216 KiB | 818.2 FPS |
+| decv Serial | NV12 | 3.29 s | 3.19 s | 84,588 KiB | 54.7 FPS |
+| decv Auto (2 workers) | NV12 | 3.36 s | 3.62 s | 84,464 KiB | 53.6 FPS |
+| FFmpeg 1 thread | NV12 | 0.61 s | 0.68 s | 152,200 KiB | 295.1 FPS |
+| FFmpeg Auto | NV12 | 0.25 s | 1.41 s | 290,252 KiB | 720.0 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.56 s | 95,652 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.96 s | 194,980 KiB | 818.2 FPS |
 
 On this workload:
 
-- decv Serial takes about **5.3x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **5.4x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **12.0x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **13.4x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **2.4x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **2.6x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **56%** of FFmpeg single-threaded NV12 peak RSS and about
   **29%** of FFmpeg Auto NV12 peak RSS;
@@ -62,9 +62,11 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current 3.31-second Serial result is about 0.91x real time, or
+seconds. The current 3.29-second Serial result is about 0.91x real time, or
 roughly 10% more wall-clock work than the target permits. The measured
-two-worker Auto median is 3.23 seconds, about 8% over the target.
+two-worker Auto median is 3.36 seconds, about 12% over the target. The ordering
+between Serial and Auto is sensitive to scheduling and thermal state because
+the current parallel region is narrow.
 
 This snapshot includes the removal of repeated by-value copies of the
 544-byte `MacroblockDeblockInfo` value from the deblocking traversal. Passing
@@ -82,12 +84,21 @@ state recording eliminated repeated coordinate and grid validation, reducing
 the measured median to 3.36 seconds. Reusing the fixed-width copy primitive for
 B-partition assembly reduced the current result to 3.34 seconds.
 Applying the same specialization to P-partition assembly reduced it to 3.31
+seconds. Loading 64 bits when the single-bit reservoir is empty and batching
+CABAC renormalization reads reduced the current Serial snapshot to 3.29
 seconds.
+
+A separate alternating A/B run used the same 300-frame stream and pinned CPU
+sets to isolate those two bit-reading changes from run-to-run drift. Serial
+median wall time moved from 5.515 to 5.470 seconds (about 0.8%), while Auto
+moved from 5.375 to 5.290 seconds (about 1.6%). This confirms that bit reading
+has a measurable effect, but is not a dominant explanation for the remaining
+FFmpeg gap.
 
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
-FFmpeg is already about 5.3x faster in the comparable NV12 case. FFmpeg then
+FFmpeg is already about 5.4x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
 parallelizes only owned CABAC B-macroblock pixel reconstruction. CABAC parsing,
 residual reconstruction, most P-picture reconstruction, output packaging, and
