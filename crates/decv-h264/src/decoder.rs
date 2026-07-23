@@ -1303,6 +1303,60 @@ mod tests {
     }
 
     #[test]
+    fn flush_and_discontinuity_discard_all_delayed_old_timeline_frames() {
+        let old_timeline = annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x01, single_macroblock_explicit_b_rbsp()),
+        ]);
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(old_timeline))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::NeedInput
+        ));
+        assert!(decoder.current_picture.is_some());
+        assert_eq!(decoder.reorder.len(), 2);
+
+        decoder.flush();
+        assert!(decoder.current_picture.is_none());
+        assert_eq!(decoder.reorder.len(), 0);
+        assert!(decoder.dpb.is_none());
+
+        let mut new_timeline = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        new_timeline.discontinuity = true;
+        assert!(matches!(
+            decoder.send_packet(new_timeline).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame) if frame.id == 1
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
     fn decodes_annex_b_idr_then_reference_p_picture() {
         let stream = annex_b_stream(&[
             (0x67, single_macroblock_sps_rbsp()),

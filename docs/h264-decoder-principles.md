@@ -884,6 +884,9 @@ error is expected; panicking is a regression.
 An in-process 2,048-frame soak regression drains output after every input and
 asserts bounded DPB, reorder, current-picture, and output-queue state while
 checking every emitted frame ID.
+A separate I/P/B timeline regression fills both the current-picture and
+display-reorder state, applies `flush()` followed by a discontinuity packet,
+and proves that only the new timeline can reach the consumer.
 The benchmark command generates a reproducible 1080p60 High Profile stream,
 drives the decoder incrementally one NAL at a time, and reports wall time, CPU
 time, and peak resident memory. It is a measurement tool rather than a
