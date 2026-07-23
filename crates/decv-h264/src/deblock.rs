@@ -103,69 +103,54 @@ pub fn filter_deblock_edge(
     beta_offset_div2: i8,
     chroma_style: bool,
 ) -> Result<FilteredDeblockEdge> {
-    validate_inputs(
-        boundary_strength,
-        qp_p,
-        qp_q,
-        alpha_offset_div2,
-        beta_offset_div2,
-    )?;
-    Ok(filter_deblock_edge_validated(
-        samples,
+    let parameters = prepare_edge_parameters(EdgeParameters {
         boundary_strength,
         qp_p,
         qp_q,
         alpha_offset_div2,
         beta_offset_div2,
         chroma_style,
+    })?;
+    Ok(parameters.map_or_else(
+        || samples.unchanged(),
+        |parameters| filter_deblock_edge_prepared(samples, parameters),
     ))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn filter_deblock_edge_validated(
+fn filter_deblock_edge_prepared(
     samples: DeblockEdgeSamples,
-    boundary_strength: u8,
-    qp_p: u8,
-    qp_q: u8,
-    alpha_offset_div2: i8,
-    beta_offset_div2: i8,
-    chroma_style: bool,
+    parameters: PreparedEdgeParameters,
 ) -> FilteredDeblockEdge {
     let unchanged = samples.unchanged();
-    if boundary_strength == 0 {
-        return unchanged;
-    }
-
-    let qp_average = (i16::from(qp_p) + i16::from(qp_q) + 1) >> 1;
-    let index_a = (qp_average + i16::from(alpha_offset_div2) * 2).clamp(0, 51) as usize;
-    let index_b = (qp_average + i16::from(beta_offset_div2) * 2).clamp(0, 51) as usize;
-    let alpha = i16::from(ALPHA[index_a]);
-    let beta = i16::from(BETA[index_b]);
 
     let [p0, p1, p2, p3] = samples.p.map(i16::from);
     let [q0, q1, q2, q3] = samples.q.map(i16::from);
-    if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
+    if (p0 - q0).abs() >= parameters.alpha
+        || (p1 - p0).abs() >= parameters.beta
+        || (q1 - q0).abs() >= parameters.beta
+    {
         return unchanged;
     }
 
-    if boundary_strength < 4 {
-        let tc0 = i16::from(TC0[usize::from(boundary_strength - 1)][index_a]);
+    if parameters.boundary_strength < 4 {
         let ap = (p2 - p0).abs();
         let aq = (q2 - q0).abs();
-        let tc = if chroma_style {
-            tc0 + 1
+        let tc = if parameters.chroma_style {
+            parameters.tc0 + 1
         } else {
-            tc0 + i16::from(ap < beta) + i16::from(aq < beta)
+            parameters.tc0 + i16::from(ap < parameters.beta) + i16::from(aq < parameters.beta)
         };
         let delta = ((((q0 - p0) << 2) + (p1 - q1) + 4) >> 3).clamp(-tc, tc);
 
-        let filtered_p1 = if !chroma_style && ap < beta {
-            p1 + ((p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1).clamp(-tc0, tc0)
+        let filtered_p1 = if !parameters.chroma_style && ap < parameters.beta {
+            p1 + ((p2 + ((p0 + q0 + 1) >> 1) - (p1 << 1)) >> 1)
+                .clamp(-parameters.tc0, parameters.tc0)
         } else {
             p1
         };
-        let filtered_q1 = if !chroma_style && aq < beta {
-            q1 + ((q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1).clamp(-tc0, tc0)
+        let filtered_q1 = if !parameters.chroma_style && aq < parameters.beta {
+            q1 + ((q2 + ((p0 + q0 + 1) >> 1) - (q1 << 1)) >> 1)
+                .clamp(-parameters.tc0, parameters.tc0)
         } else {
             q1
         };
@@ -186,8 +171,10 @@ fn filter_deblock_edge_validated(
 
     let ap = (p2 - p0).abs();
     let aq = (q2 - q0).abs();
-    let strong_threshold = (alpha >> 2) + 2;
-    let p = if !chroma_style && ap < beta && (p0 - q0).abs() < strong_threshold {
+    let p = if !parameters.chroma_style
+        && ap < parameters.beta
+        && (p0 - q0).abs() < parameters.strong_threshold
+    {
         [
             clip_sample((p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3),
             clip_sample((p2 + p1 + p0 + q0 + 2) >> 2),
@@ -200,7 +187,10 @@ fn filter_deblock_edge_validated(
             samples.p[2],
         ]
     };
-    let q = if !chroma_style && aq < beta && (p0 - q0).abs() < strong_threshold {
+    let q = if !parameters.chroma_style
+        && aq < parameters.beta
+        && (p0 - q0).abs() < parameters.strong_threshold
+    {
         [
             clip_sample((p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3),
             clip_sample((p0 + q0 + q1 + q2 + 2) >> 2),
@@ -402,6 +392,45 @@ struct EdgeParameters {
     chroma_style: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedEdgeParameters {
+    boundary_strength: u8,
+    alpha: i16,
+    beta: i16,
+    tc0: i16,
+    strong_threshold: i16,
+    chroma_style: bool,
+}
+
+fn prepare_edge_parameters(parameters: EdgeParameters) -> Result<Option<PreparedEdgeParameters>> {
+    validate_edge_parameters(parameters)?;
+    if parameters.boundary_strength == 0 {
+        return Ok(None);
+    }
+
+    let qp_average = (i16::from(parameters.qp_p) + i16::from(parameters.qp_q) + 1) >> 1;
+    let index_a = (qp_average + i16::from(parameters.alpha_offset_div2) * 2).clamp(0, 51) as usize;
+    let index_b = (qp_average + i16::from(parameters.beta_offset_div2) * 2).clamp(0, 51) as usize;
+    let alpha = i16::from(ALPHA[index_a]);
+    let beta = i16::from(BETA[index_b]);
+    if alpha == 0 || beta == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedEdgeParameters {
+        boundary_strength: parameters.boundary_strength,
+        alpha,
+        beta,
+        tc0: if parameters.boundary_strength < 4 {
+            i16::from(TC0[usize::from(parameters.boundary_strength - 1)][index_a])
+        } else {
+            0
+        },
+        strong_threshold: (alpha >> 2) + 2,
+        chroma_style: parameters.chroma_style,
+    }))
+}
+
 fn edge_parameters(
     previous: MacroblockDeblockInfo,
     previous_cell: usize,
@@ -483,10 +512,9 @@ fn filter_vertical_edge(
     length: usize,
     parameters: EdgeParameters,
 ) -> Result<()> {
-    validate_edge_parameters(parameters)?;
-    if parameters.boundary_strength == 0 {
+    let Some(parameters) = prepare_edge_parameters(parameters)? else {
         return Ok(());
-    }
+    };
     for offset in 0..length {
         let q0 = (y + offset) * stride + x;
         let samples = DeblockEdgeSamples {
@@ -510,10 +538,9 @@ fn filter_horizontal_edge(
     length: usize,
     parameters: EdgeParameters,
 ) -> Result<()> {
-    validate_edge_parameters(parameters)?;
-    if parameters.boundary_strength == 0 {
+    let Some(parameters) = prepare_edge_parameters(parameters)? else {
         return Ok(());
-    }
+    };
     for offset in 0..length {
         let q0 = y * stride + x + offset;
         let samples = DeblockEdgeSamples {
@@ -531,17 +558,9 @@ fn filter_horizontal_edge(
 
 fn apply_parameters(
     samples: DeblockEdgeSamples,
-    parameters: EdgeParameters,
+    parameters: PreparedEdgeParameters,
 ) -> FilteredDeblockEdge {
-    filter_deblock_edge_validated(
-        samples,
-        parameters.boundary_strength,
-        parameters.qp_p,
-        parameters.qp_q,
-        parameters.alpha_offset_div2,
-        parameters.beta_offset_div2,
-        parameters.chroma_style,
-    )
+    filter_deblock_edge_prepared(samples, parameters)
 }
 
 fn validate_edge_parameters(parameters: EdgeParameters) -> Result<()> {
