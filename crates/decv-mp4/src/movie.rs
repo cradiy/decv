@@ -1,7 +1,10 @@
 use std::{num::NonZeroU32, sync::Arc};
 
+use decv_core::MediaTime;
+
 use crate::{
     BoxHeader, FourCc, Mp4Error, Mp4File, Result,
+    edit::{EDTS, Edit, linear_timeline_offset, parse_edit_container},
     reader::{BoundedReader, read_full_box},
     sample_table::{Sample, parse_sample_table},
 };
@@ -65,7 +68,7 @@ impl Movie {
         )?;
         let tracks = track_boxes
             .into_iter()
-            .map(|header| Track::parse(file, header))
+            .map(|header| Track::parse(file, header, timescale))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
             timescale,
@@ -94,6 +97,7 @@ impl Movie {
 pub struct Track {
     id: u32,
     flags: u32,
+    movie_timescale: NonZeroU32,
     media_timescale: NonZeroU32,
     media_duration: Option<u64>,
     handler: FourCc,
@@ -101,17 +105,20 @@ pub struct Track {
     display_height_16_16: u32,
     sample_descriptions: Vec<SampleDescription>,
     samples: Vec<Sample>,
+    edits: Vec<Edit>,
 }
 
 impl Track {
-    fn parse(file: Mp4File<'_>, track_box: BoxHeader) -> Result<Self> {
+    fn parse(file: Mp4File<'_>, track_box: BoxHeader, movie_timescale: NonZeroU32) -> Result<Self> {
         let mut track_header = None;
         let mut media_box = None;
+        let mut edit_box = None;
         for child in file.children(track_box)? {
             let child = child?;
             match child.kind() {
                 TKHD => set_once(&mut track_header, child, "duplicate tkhd box")?,
                 MDIA => set_once(&mut media_box, child, "duplicate mdia box")?,
+                EDTS => set_once(&mut edit_box, child, "duplicate edts box")?,
                 _ => {}
             }
         }
@@ -120,6 +127,10 @@ impl Track {
             track_header.ok_or(Mp4Error::InvalidData("trak has no tkhd box"))?,
         )?;
         let media_box = media_box.ok_or(Mp4Error::InvalidData("trak has no mdia box"))?;
+        let edits = edit_box
+            .map(|header| parse_edit_container(file, header))
+            .transpose()?
+            .unwrap_or_default();
 
         let mut media_header = None;
         let mut handler_box = None;
@@ -153,6 +164,7 @@ impl Track {
         Ok(Self {
             id,
             flags,
+            movie_timescale,
             media_timescale,
             media_duration,
             handler,
@@ -160,6 +172,7 @@ impl Track {
             display_height_16_16,
             sample_descriptions,
             samples,
+            edits,
         })
     }
 
@@ -171,6 +184,11 @@ impl Track {
     #[inline]
     pub const fn flags(&self) -> u32 {
         self.flags
+    }
+
+    #[inline]
+    pub const fn movie_timescale(&self) -> NonZeroU32 {
+        self.movie_timescale
     }
 
     #[inline]
@@ -206,6 +224,19 @@ impl Track {
     #[inline]
     pub fn samples(&self) -> &[Sample] {
         &self.samples
+    }
+
+    #[inline]
+    pub fn edits(&self) -> &[Edit] {
+        &self.edits
+    }
+
+    /// Offset that maps raw sample-table times onto the movie presentation
+    /// timeline. Complex edit lists return an explicit unsupported-data error.
+    pub fn presentation_time_offset(&self) -> Result<MediaTime> {
+        let value =
+            linear_timeline_offset(&self.edits, self.movie_timescale, self.media_timescale)?;
+        Ok(MediaTime::new(value, self.media_timescale))
     }
 }
 
@@ -552,7 +583,15 @@ mod tests {
         mdia.extend_from_slice(&boxed(*b"hdlr", &full(0, 0, &hdlr)));
         mdia.extend_from_slice(&minf);
 
+        let mut elst = Vec::from(1u32.to_be_bytes());
+        elst.extend_from_slice(&5_000u32.to_be_bytes());
+        elst.extend_from_slice(&9_000i32.to_be_bytes());
+        elst.extend_from_slice(&1i16.to_be_bytes());
+        elst.extend_from_slice(&0i16.to_be_bytes());
+        let edts = boxed(*b"edts", &boxed(*b"elst", &full(0, 0, &elst)));
+
         let mut trak = boxed(*b"tkhd", &full(0, 3, &tkhd));
+        trak.extend_from_slice(&edts);
         trak.extend_from_slice(&boxed(*b"mdia", &mdia));
 
         let mut moov = boxed(*b"mvhd", &full(0, 0, &mvhd));
@@ -578,6 +617,12 @@ mod tests {
         assert_eq!(track.media_duration(), Some(450_000));
         assert_eq!(track.display_width_16_16(), 1_920 << 16);
         assert_eq!(track.display_height_16_16(), 1_080 << 16);
+        assert_eq!(track.edits().len(), 1);
+        assert_eq!(track.edits()[0].media_time(), Some(9_000));
+        assert_eq!(
+            track.presentation_time_offset().unwrap(),
+            MediaTime::from_parts(-9_000, 90_000).unwrap()
+        );
 
         let SampleDescription::Avc(entry) = &track.sample_descriptions()[0] else {
             panic!("expected AVC sample entry");

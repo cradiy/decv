@@ -52,6 +52,10 @@ impl<'input> BoundedReader<'input> {
         Ok(u16::from_be_bytes(self.read_array()?))
     }
 
+    pub(crate) fn read_i16(&mut self) -> Result<i16> {
+        Ok(i16::from_be_bytes(self.read_array()?))
+    }
+
     pub(crate) fn read_u24(&mut self) -> Result<u32> {
         let bytes = self.read_array::<3>()?;
         Ok(u32::from(bytes[0]) << 16 | u32::from(bytes[1]) << 8 | u32::from(bytes[2]))
@@ -67,6 +71,10 @@ impl<'input> BoundedReader<'input> {
 
     pub(crate) fn read_u64(&mut self) -> Result<u64> {
         Ok(u64::from_be_bytes(self.read_array()?))
+    }
+
+    pub(crate) fn read_i64(&mut self) -> Result<i64> {
+        Ok(i64::from_be_bytes(self.read_array()?))
     }
 
     pub(crate) fn read_fourcc(&mut self) -> Result<FourCc> {

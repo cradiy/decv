@@ -27,6 +27,27 @@ fn main() -> Result<(), Box<dyn Error>> {
             track.media_duration(),
             track.samples().len()
         );
+        match track.presentation_time_offset() {
+            Ok(offset) => println!(
+                "  presentation offset={}/{} edits={}",
+                offset.value,
+                offset.timescale,
+                track.edits().len()
+            ),
+            Err(error) => println!(
+                "  unsupported presentation mapping: {error} edits={}",
+                track.edits().len()
+            ),
+        }
+        for edit in track.edits() {
+            println!(
+                "  edit duration={} media_time={:?} rate={}.{}",
+                edit.segment_duration(),
+                edit.media_time(),
+                edit.media_rate_integer(),
+                edit.media_rate_fraction()
+            );
+        }
         for description in track.sample_descriptions() {
             match description {
                 SampleDescription::Avc(entry) => println!(
