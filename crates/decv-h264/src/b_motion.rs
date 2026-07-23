@@ -194,20 +194,11 @@ impl BMotionState {
             macroblock_partition_index: 0,
         };
         let empty = [None; 16];
-        let mut reference_l0 = self.spatial_direct_reference_index(
-            macroblock_address,
-            slice_id,
-            &empty,
-            geometry,
-            false,
-        );
-        let mut reference_l1 = self.spatial_direct_reference_index(
-            macroblock_address,
-            slice_id,
-            &empty,
-            geometry,
-            true,
-        );
+        let neighbour_cells = self.neighbour_cells(macroblock_address, slice_id, &empty, geometry);
+        let neighbours_l0 = neighbour_motions(neighbour_cells, false);
+        let neighbours_l1 = neighbour_motions(neighbour_cells, true);
+        let mut reference_l0 = spatial_direct_reference_index_from(neighbours_l0);
+        let mut reference_l1 = spatial_direct_reference_index_from(neighbours_l1);
         if reference_l0.is_none() && reference_l1.is_none() {
             reference_l0 = Some(0);
             reference_l1 = Some(0);
@@ -218,28 +209,22 @@ impl BMotionState {
         let predicted_l0 = reference_l0.map(|reference_index| {
             (
                 reference_index,
-                self.predict_motion_vector(
-                    macroblock_address,
-                    slice_id,
-                    &empty,
+                predict_motion_vector_from(
+                    neighbours_l0,
                     geometry,
                     DirectionalMode::None,
                     reference_index,
-                    false,
                 ),
             )
         });
         let predicted_l1 = reference_l1.map(|reference_index| {
             (
                 reference_index,
-                self.predict_motion_vector(
-                    macroblock_address,
-                    slice_id,
-                    &empty,
+                predict_motion_vector_from(
+                    neighbours_l1,
                     geometry,
                     DirectionalMode::None,
                     reference_index,
-                    true,
                 ),
             )
         });
@@ -480,18 +465,13 @@ impl BMotionState {
         geometry: PartitionGeometry,
         list1: bool,
     ) -> Option<u8> {
-        let [a, b, mut c, d] =
-            self.neighbours(macroblock_address, slice_id, local, geometry, list1);
-        if !c.available {
-            c = d;
-        }
-        [a, b, c]
-            .into_iter()
-            .filter_map(|neighbour| {
-                (neighbour.available && neighbour.reference_index >= 0)
-                    .then_some(neighbour.reference_index as u8)
-            })
-            .min()
+        spatial_direct_reference_index_from(self.neighbours(
+            macroblock_address,
+            slice_id,
+            local,
+            geometry,
+            list1,
+        ))
     }
 
     fn resolve_direct_region(
@@ -642,38 +622,12 @@ impl BMotionState {
         reference_index: u8,
         list1: bool,
     ) -> MotionVector {
-        let [a, b, mut c, d] =
-            self.neighbours(macroblock_address, slice_id, local, geometry, list1);
-        if !c.available {
-            c = d;
-        }
-        match mode {
-            DirectionalMode::SixteenByEight
-                if geometry.macroblock_partition_index == 0
-                    && b.reference_index == reference_index as i8 =>
-            {
-                b.vector
-            }
-            DirectionalMode::SixteenByEight
-                if geometry.macroblock_partition_index == 1
-                    && a.reference_index == reference_index as i8 =>
-            {
-                a.vector
-            }
-            DirectionalMode::EightBySixteen
-                if geometry.macroblock_partition_index == 0
-                    && a.reference_index == reference_index as i8 =>
-            {
-                a.vector
-            }
-            DirectionalMode::EightBySixteen
-                if geometry.macroblock_partition_index == 1
-                    && c.reference_index == reference_index as i8 =>
-            {
-                c.vector
-            }
-            _ => median_prediction(a, b, c, reference_index),
-        }
+        predict_motion_vector_from(
+            self.neighbours(macroblock_address, slice_id, local, geometry, list1),
+            geometry,
+            mode,
+            reference_index,
+        )
     }
 
     fn neighbours(
@@ -703,6 +657,31 @@ impl BMotionState {
         ]
     }
 
+    fn neighbour_cells(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+        local: &[Option<MotionCell>; 16],
+        geometry: PartitionGeometry,
+    ) -> [Option<MotionCell>; 4] {
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let x = (macroblock_x * 16 + usize::from(geometry.x)) as isize;
+        let y = (macroblock_y * 16 + usize::from(geometry.y)) as isize;
+        [
+            self.neighbour_cell_at(x - 1, y, macroblock_address, slice_id, local),
+            self.neighbour_cell_at(x, y - 1, macroblock_address, slice_id, local),
+            self.neighbour_cell_at(
+                x + isize::from(geometry.width),
+                y - 1,
+                macroblock_address,
+                slice_id,
+                local,
+            ),
+            self.neighbour_cell_at(x - 1, y - 1, macroblock_address, slice_id, local),
+        ]
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn neighbour_at(
         &self,
@@ -713,12 +692,32 @@ impl BMotionState {
         local: &[Option<MotionCell>; 16],
         list1: bool,
     ) -> NeighbourMotion {
+        let Some(cell) = self.neighbour_cell_at(x, y, current_macroblock_address, slice_id, local)
+        else {
+            return NeighbourMotion::UNAVAILABLE;
+        };
+        let motion = if list1 { cell.list1 } else { cell.list0 };
+        NeighbourMotion {
+            available: true,
+            reference_index: motion.map_or(-1, |motion| motion.reference_index as i8),
+            vector: motion.map_or_else(MotionVector::default, |motion| motion.motion_vector),
+        }
+    }
+
+    fn neighbour_cell_at(
+        &self,
+        x: isize,
+        y: isize,
+        current_macroblock_address: usize,
+        slice_id: u32,
+        local: &[Option<MotionCell>; 16],
+    ) -> Option<MotionCell> {
         if x < 0
             || y < 0
             || x >= (self.width_in_macroblocks * 16) as isize
             || y >= (self.height_in_macroblocks * 16) as isize
         {
-            return NeighbourMotion::UNAVAILABLE;
+            return None;
         }
         let x = x as usize;
         let y = y as usize;
@@ -729,15 +728,7 @@ impl BMotionState {
         } else {
             self.cells[macroblock_address * 16 + local_index]
         };
-        let Some(cell) = cell.filter(|cell| cell.slice_id == slice_id) else {
-            return NeighbourMotion::UNAVAILABLE;
-        };
-        let motion = if list1 { cell.list1 } else { cell.list0 };
-        NeighbourMotion {
-            available: true,
-            reference_index: motion.map_or(-1, |motion| motion.reference_index as i8),
-            vector: motion.map_or_else(MotionVector::default, |motion| motion.motion_vector),
-        }
+        cell.filter(|cell| cell.slice_id == slice_id)
     }
 
     fn ensure_macroblock_available_for_write(&self, macroblock_address: usize) -> Result<()> {
@@ -758,6 +749,71 @@ impl BMotionState {
     fn commit_local_cells(&mut self, macroblock_address: usize, local: [Option<MotionCell>; 16]) {
         let start = macroblock_address * 16;
         self.cells[start..start + 16].copy_from_slice(&local);
+    }
+}
+
+fn neighbour_motions(cells: [Option<MotionCell>; 4], list1: bool) -> [NeighbourMotion; 4] {
+    cells.map(|cell| {
+        let Some(cell) = cell else {
+            return NeighbourMotion::UNAVAILABLE;
+        };
+        let motion = if list1 { cell.list1 } else { cell.list0 };
+        NeighbourMotion {
+            available: true,
+            reference_index: motion.map_or(-1, |motion| motion.reference_index as i8),
+            vector: motion.map_or_else(MotionVector::default, |motion| motion.motion_vector),
+        }
+    })
+}
+
+fn spatial_direct_reference_index_from([a, b, mut c, d]: [NeighbourMotion; 4]) -> Option<u8> {
+    if !c.available {
+        c = d;
+    }
+    [a, b, c]
+        .into_iter()
+        .filter_map(|neighbour| {
+            (neighbour.available && neighbour.reference_index >= 0)
+                .then_some(neighbour.reference_index as u8)
+        })
+        .min()
+}
+
+fn predict_motion_vector_from(
+    [a, b, mut c, d]: [NeighbourMotion; 4],
+    geometry: PartitionGeometry,
+    mode: DirectionalMode,
+    reference_index: u8,
+) -> MotionVector {
+    if !c.available {
+        c = d;
+    }
+    match mode {
+        DirectionalMode::SixteenByEight
+            if geometry.macroblock_partition_index == 0
+                && b.reference_index == reference_index as i8 =>
+        {
+            b.vector
+        }
+        DirectionalMode::SixteenByEight
+            if geometry.macroblock_partition_index == 1
+                && a.reference_index == reference_index as i8 =>
+        {
+            a.vector
+        }
+        DirectionalMode::EightBySixteen
+            if geometry.macroblock_partition_index == 0
+                && a.reference_index == reference_index as i8 =>
+        {
+            a.vector
+        }
+        DirectionalMode::EightBySixteen
+            if geometry.macroblock_partition_index == 1
+                && c.reference_index == reference_index as i8 =>
+        {
+            c.vector
+        }
+        _ => median_prediction(a, b, c, reference_index),
     }
 }
 
