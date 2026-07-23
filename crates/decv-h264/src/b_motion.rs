@@ -146,6 +146,17 @@ impl BMotionState {
         })
     }
 
+    pub(crate) fn clear_macroblock(&mut self, macroblock_address: usize) -> Result<()> {
+        if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
+            return Err(H264Error::InvalidSyntax(
+                "B motion-state macroblock address exceeds the picture",
+            ));
+        }
+        let start = macroblock_address * 16;
+        self.cells[start..start + 16].fill(None);
+        Ok(())
+    }
+
     fn resolve_list(
         &self,
         macroblock_address: usize,

@@ -718,6 +718,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
+- a progressive CAVLC B-slice driver for explicit non-Direct List 0, List 1,
+  and bidirectional macroblocks, including residuals and in-loop deblocking;
 - complete Annex-B SPS/PPS/IDR-to-NV12 and IDR-to-reference-P integration
   tests;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
@@ -741,7 +743,7 @@ This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
 - CABAC slice data;
-- B, SP, and SI macroblock reconstruction;
+- Direct/Skip B, weighted B, SP, and SI macroblock reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;
