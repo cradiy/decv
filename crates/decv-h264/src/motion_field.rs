@@ -98,7 +98,7 @@ impl MotionFieldBuilder {
     }
 
     pub(crate) fn record_intra(&mut self, macroblock_address: usize) -> Result<()> {
-        self.record_macroblock(macroblock_address, [MotionFieldCell::INTRA; 16])
+        self.record_uniform_macroblock(macroblock_address, MotionFieldCell::INTRA)
     }
 
     pub(crate) fn record_p(
@@ -107,6 +107,32 @@ impl MotionFieldBuilder {
         motion: &ResolvedPMacroblock,
         reference_ids_l0: Option<&[Option<ReferenceId>]>,
     ) -> Result<()> {
+        if let [partition] = motion.partitions.as_slice()
+            && is_full_macroblock_partition(
+                partition.x,
+                partition.y,
+                partition.width,
+                partition.height,
+            )
+        {
+            let reference_id = reference_ids_l0
+                .and_then(|ids| ids.get(usize::from(partition.reference_index)))
+                .copied()
+                .flatten();
+            return self.record_uniform_macroblock(
+                macroblock_address,
+                MotionFieldCell {
+                    intra: false,
+                    list0: Some(StoredListMotion {
+                        reference_index: partition.reference_index,
+                        reference_id,
+                        vector: partition.motion_vector,
+                    }),
+                    list1: None,
+                },
+            );
+        }
+
         let mut cells = [MotionFieldCell::INTRA; 16];
         let mut coverage = 0u16;
         for partition in &motion.partitions {
@@ -142,6 +168,40 @@ impl MotionFieldBuilder {
         reference_ids_l0: Option<&[Option<ReferenceId>]>,
         reference_ids_l1: Option<&[Option<ReferenceId>]>,
     ) -> Result<()> {
+        if let [partition] = motion.partitions.as_slice()
+            && is_full_macroblock_partition(
+                partition.x,
+                partition.y,
+                partition.width,
+                partition.height,
+            )
+        {
+            let list0 = partition.list0.map(|list| StoredListMotion {
+                reference_index: list.reference_index,
+                reference_id: reference_ids_l0
+                    .and_then(|ids| ids.get(usize::from(list.reference_index)))
+                    .copied()
+                    .flatten(),
+                vector: list.motion_vector,
+            });
+            let list1 = partition.list1.map(|list| StoredListMotion {
+                reference_index: list.reference_index,
+                reference_id: reference_ids_l1
+                    .and_then(|ids| ids.get(usize::from(list.reference_index)))
+                    .copied()
+                    .flatten(),
+                vector: list.motion_vector,
+            });
+            return self.record_uniform_macroblock(
+                macroblock_address,
+                MotionFieldCell {
+                    intra: false,
+                    list0,
+                    list1,
+                },
+            );
+        }
+
         let mut cells = [MotionFieldCell::INTRA; 16];
         let mut coverage = 0u16;
         for partition in &motion.partitions {
@@ -245,6 +305,24 @@ impl MotionFieldBuilder {
         Ok(())
     }
 
+    fn record_uniform_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        cell: MotionFieldCell,
+    ) -> Result<()> {
+        let indices = self.macroblock_indices(macroblock_address)?;
+        if self.completed[macroblock_address] != 0 {
+            return Err(H264Error::InvalidSyntax(
+                "reference motion-field macroblock was already recorded",
+            ));
+        }
+        for index in indices {
+            self.cells[index].write(cell);
+        }
+        self.completed[macroblock_address] = 1;
+        Ok(())
+    }
+
     fn macroblock_indices(&self, macroblock_address: usize) -> Result<[usize; 16]> {
         let macroblock_count = self.cells.len() / 16;
         if macroblock_address >= macroblock_count {
@@ -261,6 +339,11 @@ impl MotionFieldBuilder {
             y * field_width + x
         }))
     }
+}
+
+#[inline]
+const fn is_full_macroblock_partition(x: u8, y: u8, width: u8, height: u8) -> bool {
+    x == 0 && y == 0 && width == 16 && height == 16
 }
 
 fn field_dimensions(coded_size: Size) -> Result<(usize, usize)> {
