@@ -147,8 +147,7 @@ fn is_mp4(path: &Path) -> Result<bool, Box<dyn Error>> {
 }
 
 fn has_mp4_extension(path: &Path) -> bool {
-    path
-        .extension()
+    path.extension()
         .and_then(|extension| extension.to_str())
         .is_some_and(|extension| {
             extension.eq_ignore_ascii_case("mp4")
@@ -158,10 +157,7 @@ fn has_mp4_extension(path: &Path) -> bool {
 }
 
 fn is_mp4_box_header(header: [u8; 8]) -> bool {
-    matches!(
-        &header[4..],
-        b"ftyp" | b"moov" | b"free" | b"wide"
-    )
+    matches!(&header[4..], b"ftyp" | b"moov" | b"free" | b"wide")
 }
 
 fn receive_available(
