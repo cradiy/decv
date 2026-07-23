@@ -218,7 +218,7 @@ On the current machine, representative Criterion medians are approximately:
 | unsigned Exp-Golomb | 179.7 us | 348 MiB/s |
 | peek and skip | 88.7 us | 704 MiB/s |
 
-Three plausible generic-reader changes were tested and rejected:
+Four plausible reader changes were tested and rejected:
 
 - refilling the generic runtime-width path with 64 bits regressed its mixed
   microbenchmark by about 20%;
@@ -228,7 +228,20 @@ Three plausible generic-reader changes were tested and rejected:
 - eliminating the refill loop in favor of one refill plus one extraction made
   the mixed-field microbenchmark about 5.8% faster, but made the real CAVLC
   decoder about 1.8% slower in cycles, 1.5% slower in wall time, and increased
-  branch misses by about 6%.
+  branch misses by about 6%;
+- outlining the rare 1-to-7-bit CABAC refill path reduced the
+  `decode_decision` machine-code body from 388 to 312-329 bytes and removed
+  about 1.4% to 1.7% of whole-decoder instructions. Despite also reducing
+  branches and sampled cache misses, six alternating pinned runs were
+  consistently about 1% slower because the refill call lengthened the
+  dependency path.
+
+Two adjacent CABAC-core experiments were also rejected. Returning the internal
+decision result through a compact `Option<u8>` reduced instructions by about
+0.3% but made alternating wall-time runs roughly 1% slower. Combining the LPS
+range and both context transitions into one 2 KiB table left instructions
+nearly unchanged while increasing cycles by about 1.6% and wall time by about
+2.5%.
 
 Current `perf` samples do not place a generic BitReader symbol above the 0.5%
 reporting threshold on the CABAC comparison stream. Specialized bit ingestion
