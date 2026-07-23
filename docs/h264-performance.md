@@ -40,31 +40,31 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 3.19 s | 3.10 s | 84,776 KiB | 56.4 FPS |
-| decv Auto (2 workers) | NV12 | 3.37 s | 3.64 s | 83,648 KiB | 53.4 FPS |
-| FFmpeg 1 thread | NV12 | 0.62 s | 0.70 s | 152,008 KiB | 290.3 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 293,400 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,668 KiB | 315.8 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.95 s | 192,960 KiB | 818.2 FPS |
+| decv Serial | NV12 | 3.06 s | 2.98 s | 83,820 KiB | 58.8 FPS |
+| decv Auto (2 workers) | NV12 | 3.04 s | 3.31 s | 84,356 KiB | 59.2 FPS |
+| FFmpeg 1 thread | NV12 | 0.60 s | 0.68 s | 151,904 KiB | 300.0 FPS |
+| FFmpeg Auto | NV12 | 0.28 s | 1.41 s | 278,048 KiB | 642.9 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,892 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.94 s | 192,500 KiB | 818.2 FPS |
 
 On this workload:
 
 - decv Serial takes about **5.1x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **13.0x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **10.9x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **2.5x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **2.3x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
-- decv uses about **56%** of FFmpeg single-threaded NV12 peak RSS and about
-  **29%** of FFmpeg Auto NV12 peak RSS;
+- decv uses about **55%** of FFmpeg single-threaded NV12 peak RSS and about
+  **30%** of FFmpeg Auto NV12 peak RSS;
 - prior measurements with 16 decv workers were slower than the two-worker
   `Auto` policy and consumed far more CPU, confirming that the current parallel
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current 3.19-second Serial result is about 0.94x real time, or
-roughly 6% more wall-clock work than the target permits. The measured
-two-worker Auto median is 3.37 seconds, about 12% over the target. The ordering
+seconds. The current 3.06-second Serial result is about 0.98x real time, or
+roughly 2% more wall-clock work than the target permits. The measured
+two-worker Auto median is 3.04 seconds, about 1.3% over the target. The ordering
 between Serial and Auto is sensitive to scheduling and thermal state because
 the current parallel region is narrow.
 
@@ -88,7 +88,12 @@ seconds. Loading 64 bits when the single-bit reservoir is empty and batching
 CABAC renormalization reads reduced the current Serial snapshot to 3.29
 seconds. Vectorizing single-list prediction weights and compacting each
 deblocking motion cell from 32 to 24 bytes then reduced the current snapshot
-to 3.19 seconds.
+to 3.19 seconds. Replacing pointer-sized deblocking reference identities with
+stable picture-local byte tokens reduced each motion cell from 24 to 10 bytes.
+Fusing B-picture block residuals directly into their prediction matrices with
+SSE2 then removed a 1.5 KiB assembled residual matrix and a second macroblock
+output pass. Together these changes reduced the current snapshot to 3.06
+seconds.
 
 A separate alternating A/B run used the same 300-frame stream and pinned CPU
 sets to isolate those two bit-reading changes from run-to-run drift. Serial
@@ -103,6 +108,13 @@ two reference identities and two motion vectors in each deblocking cell moved
 Serial from 5.420 to 5.260 seconds and Auto from 5.240 to 5.120 seconds. The
 metadata layout change reduces both the per-macroblock copy and the later
 boundary-strength traversal footprint.
+
+The picture-local reference-token change moved the pinned 300-frame Serial
+median from 5.285 to 5.180 seconds (about 2.0%) and Auto from 5.210 to 4.990
+seconds (about 4.2%). Direct B residual fusion moved a separate pinned Serial
+run from 5.430 to 5.305 seconds (about 2.3%) and Auto from 5.120 to 4.970
+seconds (about 2.9%). The residual path is checked against an assembled-matrix
+oracle for both 4x4 and 8x8 transforms, including saturating extreme values.
 
 ## Interpretation
 
