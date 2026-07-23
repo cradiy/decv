@@ -1,5 +1,7 @@
 //! Immutable per-4x4 motion metadata retained with reference pictures.
 
+use std::mem::{ManuallyDrop, MaybeUninit};
+
 use decv_core::Size;
 
 use crate::{
@@ -71,7 +73,7 @@ impl ReferenceMotionField {
 #[derive(Debug, Clone)]
 pub(crate) struct MotionFieldBuilder {
     width_in_macroblocks: usize,
-    cells: Vec<MotionFieldCell>,
+    cells: Vec<MaybeUninit<MotionFieldCell>>,
     completed: Vec<u8>,
 }
 
@@ -81,9 +83,16 @@ impl MotionFieldBuilder {
         let count = width
             .checked_mul(height)
             .ok_or(H264Error::IntegerOverflow)?;
+        let mut cells = Vec::with_capacity(count);
+        // SAFETY: `MaybeUninit<MotionFieldCell>` may hold uninitialized bytes.
+        // No cell is read before its macroblock is recorded, and `finish`
+        // proves every macroblock complete before converting the allocation.
+        unsafe {
+            cells.set_len(count);
+        }
         Ok(Self {
             width_in_macroblocks: width / 4,
-            cells: vec![MotionFieldCell::INTRA; count],
+            cells,
             completed: vec![0; count / 16],
         })
     }
@@ -183,7 +192,20 @@ impl MotionFieldBuilder {
                 "reference motion field is incomplete",
             ));
         }
-        let cells = self.cells;
+        let mut cells = ManuallyDrop::new(self.cells);
+        let cell_len = cells.len();
+        let cell_capacity = cells.capacity();
+        // SAFETY: every macroblock is complete, and every successful record
+        // writes all sixteen of its cells. `MaybeUninit<T>` has the same
+        // layout as `T`; ManuallyDrop transfers allocation ownership exactly
+        // once to the reconstructed Vec.
+        let cells = unsafe {
+            Vec::from_raw_parts(
+                cells.as_mut_ptr().cast::<MotionFieldCell>(),
+                cell_len,
+                cell_capacity,
+            )
+        };
         Ok(ReferenceMotionField {
             width_in_4x4_blocks: self.width_in_macroblocks * 4,
             height_in_4x4_blocks: cells.len() / (self.width_in_macroblocks * 4),
@@ -217,7 +239,7 @@ impl MotionFieldBuilder {
             ));
         }
         for (index, cell) in indices.into_iter().zip(local) {
-            self.cells[index] = cell;
+            self.cells[index].write(cell);
         }
         self.completed[macroblock_address] = 1;
         Ok(())
@@ -407,5 +429,18 @@ mod tests {
         assert!(!cell.intra);
         assert_eq!(cell.list0.unwrap().reference_id, Some(ReferenceId(9)));
         assert_eq!(cell.list0.unwrap().vector, MotionVector { x: 3, y: -2 });
+    }
+
+    #[test]
+    fn cloning_a_partial_builder_preserves_its_initialized_cells() {
+        let mut partial = MotionFieldBuilder::new(Size::new(32, 16)).unwrap();
+        partial.record_intra(0).unwrap();
+
+        let mut completed_clone = partial.clone();
+        completed_clone.record_intra(1).unwrap();
+        let field = completed_clone.finish().unwrap();
+        assert!((0..8).all(|x| field.cell(x, 0).unwrap().intra));
+
+        assert!(partial.finish().is_err());
     }
 }
