@@ -730,6 +730,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   tests;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
+- one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
+  `avcC` SPS/PPS configuration, sharing the same parser and reconstruction
+  pipeline as Annex-B;
 - a synchronous `VideoDecoder` implementation with packet ownership,
   backpressure, `FormatChanged`, timestamps, flush, and drain behavior.
 
@@ -754,7 +757,6 @@ still rejects or has not yet connected:
 - field pictures and MBAFF;
 - FMO slice groups;
 - POC-based display reordering;
-- length-prefixed input and out-of-band `avcC` configuration.
 
 The next dependency chain is:
 

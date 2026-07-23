@@ -8,6 +8,7 @@ use decv_core::{
     MediaTime, PixelFormat, Size, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
 
+use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
 use crate::reorder::PictureReorderBuffer;
 use crate::{
     AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, H264Error, IntraPictureReconstructor,
@@ -45,6 +46,7 @@ struct DpbConfiguration {
 #[derive(Debug)]
 pub struct H264Decoder {
     configured: bool,
+    bitstream_format: BitstreamFormat,
     parser: H264StreamParser,
     current_picture: Option<PendingPicture>,
     dpb: Option<DecodedPictureBuffer>,
@@ -60,6 +62,7 @@ impl Default for H264Decoder {
     fn default() -> Self {
         Self {
             configured: false,
+            bitstream_format: BitstreamFormat::ByteStream,
             parser: H264StreamParser::new(),
             current_picture: None,
             dpb: None,
@@ -79,123 +82,144 @@ impl H264Decoder {
     }
 
     fn process_packet(&mut self, packet: &EncodedVideoPacket) -> Result<()> {
-        for unit in AnnexBReader::new(packet.data.as_ref()) {
-            let event = self.parser.push_annex_b(unit?)?;
-            match event {
-                ParserEvent::SequenceParameterSet(_)
-                | ParserEvent::PictureParameterSet(_)
-                | ParserEvent::Unhandled(_) => {}
-                ParserEvent::Slice {
-                    parsed,
-                    rbsp,
-                    starts_new_picture,
-                    picture_order_count,
-                    nal_header,
-                } => {
-                    if starts_new_picture {
-                        self.finish_current_picture()?;
-                        self.prepare_for_idr(&parsed, nal_header)?;
-                    }
-                    if self.current_picture.is_none() {
-                        self.ensure_dpb(&parsed, nal_header)?;
-                        let format = video_format(&parsed)?;
-                        let reconstructor =
-                            IntraPictureReconstructor::from_parameter_sets(&parsed.parameter_sets)?;
-                        self.current_picture = Some(PendingPicture {
-                            reconstructor,
-                            format,
-                            pts: packet.pts,
-                            duration: packet.duration,
-                            nal_header,
-                            frame_num: parsed.header.frame_num,
-                            picture_order_count,
-                            reference_picture_marking: parsed
-                                .header
-                                .reference_picture_marking
-                                .clone(),
-                        });
-                    }
-                    match parsed.header.slice_type {
-                        SliceType::I => {
-                            self.current_picture
-                                .as_mut()
-                                .expect("the picture is initialized above")
-                                .reconstructor
-                                .decode_cavlc_intra_slice(rbsp.as_ref(), &parsed)?;
-                        }
-                        SliceType::P => {
-                            let references = self
-                                .dpb
-                                .as_ref()
-                                .expect("the DPB is initialized with the picture")
-                                .p_list0(
-                                    parsed.header.frame_num,
-                                    parsed.header.num_ref_idx_l0_active,
-                                    &parsed.header.ref_pic_list_modifications_l0,
-                                )?;
-                            let borrowed = references
-                                .iter()
-                                .map(|picture| picture.as_deref())
-                                .collect::<Vec<_>>();
-                            self.current_picture
-                                .as_mut()
-                                .expect("the picture is initialized above")
-                                .reconstructor
-                                .decode_cavlc_p_slice(rbsp.as_ref(), &parsed, &borrowed)?;
-                        }
-                        SliceType::B => {
-                            let current_poc = picture_order_count.stored.picture_order_count();
-                            let (references_l0, references_l1) = self
-                                .dpb
-                                .as_ref()
-                                .expect("the DPB is initialized with the picture")
-                                .b_lists(
-                                    parsed.header.frame_num,
-                                    current_poc,
-                                    parsed.header.num_ref_idx_l0_active,
-                                    &parsed.header.ref_pic_list_modifications_l0,
-                                    parsed.header.num_ref_idx_l1_active,
-                                    &parsed.header.ref_pic_list_modifications_l1,
-                                )?;
-                            let borrowed_l0 = references_l0
-                                .iter()
-                                .map(|picture| picture.as_deref())
-                                .collect::<Vec<_>>();
-                            let borrowed_l1 = references_l1
-                                .iter()
-                                .map(|picture| picture.as_deref())
-                                .collect::<Vec<_>>();
-                            self.current_picture
-                                .as_mut()
-                                .expect("the picture is initialized above")
-                                .reconstructor
-                                .decode_cavlc_b_slice(
-                                    rbsp.as_ref(),
-                                    &parsed,
-                                    &borrowed_l0,
-                                    &borrowed_l1,
-                                )?;
-                        }
-                        SliceType::Sp | SliceType::Si => {
-                            return Err(H264Error::UnsupportedFeature(
-                                "top-level reconstruction of SP and SI slices",
-                            ));
-                        }
-                    }
+        match self.bitstream_format {
+            BitstreamFormat::ByteStream => {
+                for unit in AnnexBReader::new(packet.data.as_ref()) {
+                    let event = self.parser.push_annex_b(unit?)?;
+                    self.process_parser_event(event, packet)?;
                 }
-                ParserEvent::AccessUnitDelimiter { .. } => {
+            }
+            BitstreamFormat::LengthPrefixed { length_size } => {
+                for nal in LengthPrefixedNalReader::new(packet.data.as_ref(), length_size) {
+                    let event = self.parser.push_nal(nal?)?;
+                    self.process_parser_event(event, packet)?;
+                }
+            }
+            _ => {
+                return Err(H264Error::UnsupportedFeature(
+                    "unknown H.264 bitstream framing",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn process_parser_event(
+        &mut self,
+        event: ParserEvent<'_>,
+        packet: &EncodedVideoPacket,
+    ) -> Result<()> {
+        match event {
+            ParserEvent::SequenceParameterSet(_)
+            | ParserEvent::PictureParameterSet(_)
+            | ParserEvent::Unhandled(_) => {}
+            ParserEvent::Slice {
+                parsed,
+                rbsp,
+                starts_new_picture,
+                picture_order_count,
+                nal_header,
+            } => {
+                if starts_new_picture {
                     self.finish_current_picture()?;
+                    self.prepare_for_idr(&parsed, nal_header)?;
                 }
-                ParserEvent::EndOfSequence => {
-                    self.finish_current_picture()?;
-                    self.drain_reorder();
-                    self.clear_dpb();
+                if self.current_picture.is_none() {
+                    self.ensure_dpb(&parsed, nal_header)?;
+                    let format = video_format(&parsed)?;
+                    let reconstructor =
+                        IntraPictureReconstructor::from_parameter_sets(&parsed.parameter_sets)?;
+                    self.current_picture = Some(PendingPicture {
+                        reconstructor,
+                        format,
+                        pts: packet.pts,
+                        duration: packet.duration,
+                        nal_header,
+                        frame_num: parsed.header.frame_num,
+                        picture_order_count,
+                        reference_picture_marking: parsed.header.reference_picture_marking.clone(),
+                    });
                 }
-                ParserEvent::EndOfStream => {
-                    self.finish_current_picture()?;
-                    self.drain_reorder();
-                    self.draining = true;
+                match parsed.header.slice_type {
+                    SliceType::I => {
+                        self.current_picture
+                            .as_mut()
+                            .expect("the picture is initialized above")
+                            .reconstructor
+                            .decode_cavlc_intra_slice(rbsp.as_ref(), &parsed)?;
+                    }
+                    SliceType::P => {
+                        let references = self
+                            .dpb
+                            .as_ref()
+                            .expect("the DPB is initialized with the picture")
+                            .p_list0(
+                                parsed.header.frame_num,
+                                parsed.header.num_ref_idx_l0_active,
+                                &parsed.header.ref_pic_list_modifications_l0,
+                            )?;
+                        let borrowed = references
+                            .iter()
+                            .map(|picture| picture.as_deref())
+                            .collect::<Vec<_>>();
+                        self.current_picture
+                            .as_mut()
+                            .expect("the picture is initialized above")
+                            .reconstructor
+                            .decode_cavlc_p_slice(rbsp.as_ref(), &parsed, &borrowed)?;
+                    }
+                    SliceType::B => {
+                        let current_poc = picture_order_count.stored.picture_order_count();
+                        let (references_l0, references_l1) = self
+                            .dpb
+                            .as_ref()
+                            .expect("the DPB is initialized with the picture")
+                            .b_lists(
+                                parsed.header.frame_num,
+                                current_poc,
+                                parsed.header.num_ref_idx_l0_active,
+                                &parsed.header.ref_pic_list_modifications_l0,
+                                parsed.header.num_ref_idx_l1_active,
+                                &parsed.header.ref_pic_list_modifications_l1,
+                            )?;
+                        let borrowed_l0 = references_l0
+                            .iter()
+                            .map(|picture| picture.as_deref())
+                            .collect::<Vec<_>>();
+                        let borrowed_l1 = references_l1
+                            .iter()
+                            .map(|picture| picture.as_deref())
+                            .collect::<Vec<_>>();
+                        self.current_picture
+                            .as_mut()
+                            .expect("the picture is initialized above")
+                            .reconstructor
+                            .decode_cavlc_b_slice(
+                                rbsp.as_ref(),
+                                &parsed,
+                                &borrowed_l0,
+                                &borrowed_l1,
+                            )?;
+                    }
+                    SliceType::Sp | SliceType::Si => {
+                        return Err(H264Error::UnsupportedFeature(
+                            "top-level reconstruction of SP and SI slices",
+                        ));
+                    }
                 }
+            }
+            ParserEvent::AccessUnitDelimiter { .. } => {
+                self.finish_current_picture()?;
+            }
+            ParserEvent::EndOfSequence => {
+                self.finish_current_picture()?;
+                self.drain_reorder();
+                self.clear_dpb();
+            }
+            ParserEvent::EndOfStream => {
+                self.finish_current_picture()?;
+                self.drain_reorder();
+                self.draining = true;
             }
         }
         Ok(())
@@ -338,20 +362,39 @@ impl VideoDecoder for H264Decoder {
 
     fn configure(&mut self, config: VideoDecoderConfig) -> Result<()> {
         config.validate()?;
+        self.configured = false;
         if !matches!(config.codec, VideoCodec::H264) {
             return Err(H264Error::UnsupportedFeature(
                 "decoder configuration for a non-H.264 codec",
             ));
         }
-        if !matches!(config.bitstream_format, BitstreamFormat::ByteStream) {
-            return Err(H264Error::UnsupportedFeature("length-prefixed H.264 input"));
-        }
-        if config.codec_data.is_some() {
-            return Err(H264Error::UnsupportedFeature(
-                "out-of-band H.264 codec configuration",
-            ));
-        }
         self.reset_all_state();
+        self.bitstream_format = config.bitstream_format;
+        if let Some(codec_data) = config.codec_data {
+            let avcc = parse_avcc(codec_data.as_ref())?;
+            if let BitstreamFormat::LengthPrefixed { length_size } = self.bitstream_format
+                && length_size != avcc.length_size
+            {
+                return Err(H264Error::InvalidSyntax(
+                    "configured NAL length size does not match avcC",
+                ));
+            }
+            for bytes in &avcc.parameter_sets {
+                let (&header, ebsp) = bytes.split_first().ok_or(H264Error::InvalidNalHeader)?;
+                match self.parser.push_nal(NalUnit {
+                    header: NalHeader::parse(header)?,
+                    ebsp,
+                    stream_offset: 0,
+                })? {
+                    ParserEvent::SequenceParameterSet(_) | ParserEvent::PictureParameterSet(_) => {}
+                    _ => {
+                        return Err(H264Error::InvalidSyntax(
+                            "avcC contains a non-parameter-set NAL",
+                        ));
+                    }
+                }
+            }
+        }
         self.configured = true;
         Ok(())
     }
@@ -1012,14 +1055,41 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unsupported_decoder_framing() {
+    fn decodes_length_prefixed_input_with_avcc_parameter_sets() {
+        let sps = single_macroblock_sps_rbsp();
+        let pps = single_macroblock_pps_rbsp();
+        let codec_data = avcc(&sps, &pps, 4);
+        let packet = length_prefixed_stream(&[(0x65, single_macroblock_idr_rbsp())], 4);
         let mut decoder = H264Decoder::new();
+        decoder
+            .configure(VideoDecoderConfig {
+                codec: VideoCodec::H264,
+                bitstream_format: BitstreamFormat::LengthPrefixed { length_size: 4 },
+                codec_data: Some(codec_data.into()),
+            })
+            .unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(packet))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(_)
+        ));
+
         assert!(
             decoder
                 .configure(VideoDecoderConfig {
                     codec: VideoCodec::H264,
-                    bitstream_format: BitstreamFormat::LengthPrefixed { length_size: 4 },
-                    codec_data: None,
+                    bitstream_format: BitstreamFormat::LengthPrefixed { length_size: 2 },
+                    codec_data: Some(avcc(&sps, &pps, 4).into()),
                 })
                 .is_err()
         );
@@ -1288,6 +1358,33 @@ mod tests {
             stream.extend_from_slice(&encode_ebsp(rbsp));
         }
         stream
+    }
+
+    fn length_prefixed_stream(nals: &[(u8, Vec<u8>)], length_size: usize) -> Vec<u8> {
+        let mut stream = Vec::new();
+        for (header, rbsp) in nals {
+            let ebsp = encode_ebsp(rbsp);
+            let length = ebsp.len() + 1;
+            let length_bytes = (length as u32).to_be_bytes();
+            stream.extend_from_slice(&length_bytes[4 - length_size..]);
+            stream.push(*header);
+            stream.extend_from_slice(&ebsp);
+        }
+        stream
+    }
+
+    fn avcc(sps_rbsp: &[u8], pps_rbsp: &[u8], length_size: u8) -> Vec<u8> {
+        let sps = encode_ebsp(sps_rbsp);
+        let pps = encode_ebsp(pps_rbsp);
+        let mut data = vec![1, sps_rbsp[0], 0, 10, 0xfc | (length_size - 1), 0xe1];
+        data.extend_from_slice(&u16::try_from(sps.len() + 1).unwrap().to_be_bytes());
+        data.push(0x67);
+        data.extend_from_slice(&sps);
+        data.push(1);
+        data.extend_from_slice(&u16::try_from(pps.len() + 1).unwrap().to_be_bytes());
+        data.push(0x68);
+        data.extend_from_slice(&pps);
+        data
     }
 
     fn encode_ebsp(rbsp: &[u8]) -> Vec<u8> {

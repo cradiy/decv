@@ -5,6 +5,7 @@
 //! finally reconstructed pictures.
 
 mod annex_b;
+mod avcc;
 mod b_motion;
 mod cavlc;
 mod cavlc_context;
