@@ -22,6 +22,7 @@ mod sps;
 mod transform;
 
 pub use annex_b::{AnnexBNalUnit, AnnexBReader};
+pub use cavlc::{CoeffToken, CoeffTokenContext, decode_coeff_token};
 pub use decoder::{H264StreamParser, ParserEvent};
 pub use error::{H264Error, Result};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
