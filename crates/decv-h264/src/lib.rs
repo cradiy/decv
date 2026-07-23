@@ -7,7 +7,7 @@
 mod annex_b;
 mod cavlc;
 mod cavlc_context;
-mod deblock;
+pub mod deblock;
 mod decoder;
 mod dpb;
 mod error;
