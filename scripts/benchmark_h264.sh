@@ -3,11 +3,16 @@ set -euo pipefail
 
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 frame_count="${1:-60}"
+parallelism="${2:-auto}"
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
 
 if ! [[ "$frame_count" =~ ^[1-9][0-9]*$ ]]; then
-    echo "usage: $0 [positive-frame-count]" >&2
+    echo "usage: $0 [positive-frame-count] [serial|auto|positive-thread-count]" >&2
+    exit 2
+fi
+if ! [[ "$parallelism" == "serial" || "$parallelism" == "auto" || "$parallelism" =~ ^[1-9][0-9]*$ ]]; then
+    echo "usage: $0 [positive-frame-count] [serial|auto|positive-thread-count]" >&2
     exit 2
 fi
 command -v ffmpeg >/dev/null || {
@@ -34,9 +39,10 @@ ffmpeg -hide_banner -loglevel error \
 cargo build --quiet --manifest-path "$repo_dir/Cargo.toml" \
     -p decv-cli --release
 
-echo "1920x1080 progressive High Profile software decode"
+echo "1920x1080 progressive High Profile software decode parallelism=$parallelism"
 echo "frames=$frame_count input_bytes=$(wc -c <"$work_dir/input.h264")"
 /usr/bin/time \
     -f "elapsed_seconds=%e user_seconds=%U system_seconds=%S max_rss_kb=%M" \
     "$repo_dir/target/release/decv-cli" \
+    --parallelism "$parallelism" \
     "$work_dir/input.h264" /dev/null >/dev/null

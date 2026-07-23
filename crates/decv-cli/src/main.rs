@@ -3,6 +3,7 @@ use std::{
     error::Error,
     fs::{self, File},
     io::{self, Read, Write},
+    num::NonZeroUsize,
     path::Path,
 };
 
@@ -10,11 +11,12 @@ use decv_core::{
     BitstreamFormat, DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket,
     FrameStorage, MediaTime, PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
 };
-use decv_h264::{AnnexBReader, H264Decoder};
+use decv_h264::{AnnexBReader, H264Decoder, H264Parallelism};
 use decv_mp4::{FourCc, Mp4Demuxer};
 
 const VIDE: FourCc = FourCc::new(*b"vide");
-const USAGE: &str = "usage: decv-cli [--seek <seconds>] <input.h264|input.mp4> [output.nv12]";
+const USAGE: &str = "usage: decv-cli [--seek <seconds>] [--parallelism <serial|auto|threads>] \
+                     <input.h264|input.mp4> [output.nv12]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullState {
@@ -27,6 +29,7 @@ struct CliOptions {
     input_path: String,
     output_path: Option<String>,
     seek_target: Option<MediaTime>,
+    parallelism: H264Parallelism,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -34,9 +37,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         input_path: path,
         output_path,
         seek_target,
+        parallelism,
     } = parse_arguments(env::args().skip(1))?;
     let mut raw_output = output_path.as_deref().map(File::create).transpose()?;
     let mut decoder = H264Decoder::new();
+    decoder.set_parallelism(parallelism)?;
     let mut frame_count = 0u64;
     if is_mp4(Path::new(&path))? {
         decode_mp4(
@@ -71,12 +76,20 @@ fn parse_arguments(
 ) -> Result<CliOptions, Box<dyn Error>> {
     let mut positional = Vec::new();
     let mut seek_target = None;
+    let mut parallelism = H264Parallelism::Auto;
+    let mut parallelism_specified = false;
     while let Some(argument) = arguments.next() {
         if argument == "--seek" {
             if seek_target.is_some() {
                 return Err("--seek may only be specified once".into());
             }
             seek_target = Some(parse_seconds(&arguments.next().ok_or(USAGE)?)?);
+        } else if argument == "--parallelism" {
+            if parallelism_specified {
+                return Err("--parallelism may only be specified once".into());
+            }
+            parallelism = parse_parallelism(&arguments.next().ok_or(USAGE)?)?;
+            parallelism_specified = true;
         } else if argument.starts_with('-') {
             return Err(format!("unknown option: {argument}\n{USAGE}").into());
         } else {
@@ -91,7 +104,23 @@ fn parse_arguments(
         input_path: positional.remove(0),
         output_path: output,
         seek_target,
+        parallelism,
     })
+}
+
+fn parse_parallelism(value: &str) -> Result<H264Parallelism, Box<dyn Error>> {
+    match value {
+        "serial" => Ok(H264Parallelism::Serial),
+        "auto" => Ok(H264Parallelism::Auto),
+        value => {
+            let threads = value
+                .parse::<usize>()
+                .ok()
+                .and_then(NonZeroUsize::new)
+                .ok_or("--parallelism must be serial, auto, or a positive thread count")?;
+            Ok(H264Parallelism::Threads(threads))
+        }
+    }
 }
 
 fn parse_seconds(seconds: &str) -> Result<MediaTime, Box<dyn Error>> {
@@ -359,9 +388,11 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        has_mp4_extension, is_mp4_box_header, parse_arguments, parse_seconds, visible_plane_layout,
+        has_mp4_extension, is_mp4_box_header, parse_arguments, parse_parallelism, parse_seconds,
+        visible_plane_layout,
     };
     use decv_core::{MediaTime, PixelFormat, Rect};
+    use decv_h264::H264Parallelism;
 
     #[test]
     fn derives_cropped_plane_layouts() {
@@ -417,13 +448,30 @@ mod tests {
         assert!(parse_seconds("1.1234567890").is_err());
 
         let options = parse_arguments(
-            ["--seek", "1.25", "input.mp4", "output.nv12"]
-                .map(String::from)
-                .into_iter(),
+            [
+                "--seek",
+                "1.25",
+                "--parallelism",
+                "2",
+                "input.mp4",
+                "output.nv12",
+            ]
+            .map(String::from)
+            .into_iter(),
         )
         .unwrap();
         assert_eq!(options.input_path, "input.mp4");
         assert_eq!(options.output_path.as_deref(), Some("output.nv12"));
         assert_eq!(options.seek_target, MediaTime::from_parts(125, 100));
+        assert!(matches!(
+            options.parallelism,
+            H264Parallelism::Threads(threads) if threads.get() == 2
+        ));
+        assert_eq!(
+            parse_parallelism("serial").unwrap(),
+            H264Parallelism::Serial
+        );
+        assert_eq!(parse_parallelism("auto").unwrap(), H264Parallelism::Auto);
+        assert!(parse_parallelism("0").is_err());
     }
 }
