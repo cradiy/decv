@@ -197,6 +197,7 @@ version = "0.1.0"
 dependencies = [
  "decv-core",
  "decv-h264",
+ "decv-mp4",
 ]
 
 [[package]]

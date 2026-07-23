@@ -2,7 +2,8 @@ use std::{
     env,
     error::Error,
     fs::{self, File},
-    io::Write,
+    io::{self, Read, Write},
+    path::Path,
 };
 
 use decv_core::{
@@ -10,6 +11,9 @@ use decv_core::{
     FrameStorage, PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
 };
 use decv_h264::{AnnexBReader, H264Decoder};
+use decv_mp4::{FourCc, Mp4Demuxer};
+
+const VIDE: FourCc = FourCc::new(*b"vide");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullState {
@@ -21,44 +25,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
     let path = arguments
         .next()
-        .ok_or("usage: decv-cli <annex-b.h264> [output.nv12]")?;
+        .ok_or("usage: decv-cli <input.h264|input.mp4> [output.nv12]")?;
     let output_path = arguments.next();
     if arguments.next().is_some() {
-        return Err("usage: decv-cli <annex-b.h264> [output.nv12]".into());
+        return Err("usage: decv-cli <input.h264|input.mp4> [output.nv12]".into());
     }
     let mut raw_output = output_path.as_deref().map(File::create).transpose()?;
-    let data = fs::read(&path)?;
     let mut decoder = H264Decoder::new();
-    decoder.configure(VideoDecoderConfig {
-        codec: VideoCodec::H264,
-        bitstream_format: BitstreamFormat::ByteStream,
-        codec_data: None,
-    })?;
     let mut frame_count = 0u64;
-    for unit in AnnexBReader::new(&data) {
-        let unit = unit?;
-        let mut framed = Vec::with_capacity(4 + unit.bytes().len());
-        framed.extend_from_slice(&[0, 0, 0, 1]);
-        framed.extend_from_slice(unit.bytes());
-        let mut packet = EncodedVideoPacket::new(framed);
-        loop {
-            match decoder.send_packet(packet)? {
-                DecodeInputStatus::Accepted => break,
-                DecodeInputStatus::NeedOutput(unconsumed) => {
-                    packet = unconsumed;
-                    if receive_available(&mut decoder, &mut raw_output, &mut frame_count)?
-                        == PullState::EndOfStream
-                    {
-                        return Err("decoder ended before all input was accepted".into());
-                    }
-                }
-            }
-        }
-        if receive_available(&mut decoder, &mut raw_output, &mut frame_count)?
-            == PullState::EndOfStream
-        {
-            return Err("decoder ended before drain".into());
-        }
+    if is_mp4(Path::new(&path))? {
+        decode_mp4(&path, &mut decoder, &mut raw_output, &mut frame_count)?;
+    } else {
+        decode_annex_b(&path, &mut decoder, &mut raw_output, &mut frame_count)?;
     }
     decoder.drain()?;
     if receive_available(&mut decoder, &mut raw_output, &mut frame_count)? != PullState::EndOfStream
@@ -71,6 +49,119 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     println!("decoded {frame_count} frame(s) from {path}");
     Ok(())
+}
+
+fn decode_annex_b(
+    path: &str,
+    decoder: &mut H264Decoder,
+    raw_output: &mut Option<File>,
+    frame_count: &mut u64,
+) -> Result<(), Box<dyn Error>> {
+    let data = fs::read(path)?;
+    decoder.configure(VideoDecoderConfig {
+        codec: VideoCodec::H264,
+        bitstream_format: BitstreamFormat::ByteStream,
+        codec_data: None,
+    })?;
+    for unit in AnnexBReader::new(&data) {
+        let unit = unit?;
+        let mut framed = Vec::with_capacity(4 + unit.bytes().len());
+        framed.extend_from_slice(&[0, 0, 0, 1]);
+        framed.extend_from_slice(unit.bytes());
+        send_packet(
+            decoder,
+            EncodedVideoPacket::new(framed),
+            raw_output,
+            frame_count,
+        )?;
+    }
+    Ok(())
+}
+
+fn decode_mp4(
+    path: &str,
+    decoder: &mut H264Decoder,
+    raw_output: &mut Option<File>,
+    frame_count: &mut u64,
+) -> Result<(), Box<dyn Error>> {
+    let demuxer = Mp4Demuxer::open(File::open(path)?)?;
+    let (track_index, track) = demuxer
+        .movie()
+        .tracks()
+        .iter()
+        .enumerate()
+        .find(|(_, track)| track.handler() == VIDE && !track.samples().is_empty())
+        .ok_or("MP4 contains no non-empty video track")?;
+    let first_description = track.samples()[0].description_index();
+    decoder.configure(track.decoder_config(first_description)?)?;
+
+    for (sample_index, sample) in track.samples().iter().enumerate() {
+        if sample.description_index() != first_description {
+            return Err("mid-stream MP4 sample-description changes are not supported yet".into());
+        }
+        send_packet(
+            decoder,
+            demuxer.read_packet(track_index, sample_index)?,
+            raw_output,
+            frame_count,
+        )?;
+    }
+    Ok(())
+}
+
+fn send_packet(
+    decoder: &mut H264Decoder,
+    mut packet: EncodedVideoPacket,
+    raw_output: &mut Option<File>,
+    frame_count: &mut u64,
+) -> Result<(), Box<dyn Error>> {
+    loop {
+        match decoder.send_packet(packet)? {
+            DecodeInputStatus::Accepted => break,
+            DecodeInputStatus::NeedOutput(unconsumed) => {
+                packet = unconsumed;
+                if receive_available(decoder, raw_output, frame_count)? == PullState::EndOfStream {
+                    return Err("decoder ended before all input was accepted".into());
+                }
+            }
+        }
+    }
+    if receive_available(decoder, raw_output, frame_count)? == PullState::EndOfStream {
+        return Err("decoder ended before drain".into());
+    }
+    Ok(())
+}
+
+fn is_mp4(path: &Path) -> Result<bool, Box<dyn Error>> {
+    if has_mp4_extension(path) {
+        return Ok(true);
+    }
+
+    let mut input = File::open(path)?;
+    let mut header = [0; 8];
+    match input.read_exact(&mut header) {
+        Ok(()) => Ok(is_mp4_box_header(header)),
+        Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn has_mp4_extension(path: &Path) -> bool {
+    path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("mp4")
+                || extension.eq_ignore_ascii_case("mov")
+                || extension.eq_ignore_ascii_case("m4v")
+        })
+}
+
+fn is_mp4_box_header(header: [u8; 8]) -> bool {
+    matches!(
+        &header[4..],
+        b"ftyp" | b"moov" | b"free" | b"wide"
+    )
 }
 
 fn receive_available(
@@ -165,7 +256,9 @@ fn visible_plane_layout(
 
 #[cfg(test)]
 mod tests {
-    use super::visible_plane_layout;
+    use std::path::Path;
+
+    use super::{has_mp4_extension, is_mp4_box_header, visible_plane_layout};
     use decv_core::{PixelFormat, Rect};
 
     #[test]
@@ -196,5 +289,15 @@ mod tests {
             visible_plane_layout(PixelFormat::Nv12, Rect::new(1, 0, 64, 32), 1),
             None
         );
+    }
+
+    #[test]
+    fn recognizes_mp4_paths_and_initial_boxes() {
+        assert!(has_mp4_extension(Path::new("movie.MP4")));
+        assert!(has_mp4_extension(Path::new("movie.mov")));
+        assert!(!has_mp4_extension(Path::new("stream.h264")));
+        assert!(is_mp4_box_header(*b"\0\0\0\x18ftyp"));
+        assert!(is_mp4_box_header(*b"\0\0\0\x08moov"));
+        assert!(!is_mp4_box_header(*b"\0\0\0\x01\x67\x64\0\x28"));
     }
 }

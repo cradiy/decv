@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 decv-core = { path = "../decv-core" }
 decv-h264 = { path = "../decv-h264" }
+decv-mp4 = { path = "../decv-mp4" }
