@@ -432,30 +432,24 @@ pub(crate) fn filter_420_picture(
                 }
             }
             if filter_top && horizontal_strengths[0] != [0; 4] {
-                for block_column in 0..4 {
-                    filter_horizontal_edge(
-                        plane,
-                        chroma_stride,
-                        chroma_x + block_column * 2,
-                        chroma_y,
-                        2,
-                        horizontal_strengths[0][block_column],
-                        top_thresholds[component],
-                    );
-                }
+                filter_horizontal_chroma_edge(
+                    plane,
+                    chroma_stride,
+                    chroma_x,
+                    chroma_y,
+                    horizontal_strengths[0],
+                    top_thresholds[component],
+                );
             }
             if horizontal_strengths[2] != [0; 4] {
-                for block_column in 0..4 {
-                    filter_horizontal_edge(
-                        plane,
-                        chroma_stride,
-                        chroma_x + block_column * 2,
-                        chroma_y + 4,
-                        2,
-                        horizontal_strengths[2][block_column],
-                        internal_thresholds[component],
-                    );
-                }
+                filter_horizontal_chroma_edge(
+                    plane,
+                    chroma_stride,
+                    chroma_x,
+                    chroma_y + 4,
+                    horizontal_strengths[2],
+                    internal_thresholds[component],
+                );
             }
         }
     }
@@ -704,6 +698,167 @@ fn filter_horizontal_edge_scalar(
             plane[q0 - (index + 1) * stride] = filtered.p[index];
             plane[q0 + index * stride] = filtered.q[index];
         }
+    }
+}
+
+fn filter_horizontal_chroma_edge(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    boundary_strengths: [u8; 4],
+    thresholds: Option<EdgeThresholds>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is part of the x86_64 baseline. Picture traversal
+        // guarantees eight horizontally adjacent chroma samples and two
+        // complete rows on either side of the edge.
+        unsafe {
+            filter_horizontal_chroma_edge_sse2(plane, stride, x, y, boundary_strengths, thresholds);
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        for (block_column, boundary_strength) in boundary_strengths.into_iter().enumerate() {
+            filter_horizontal_edge(
+                plane,
+                stride,
+                x + block_column * 2,
+                y,
+                2,
+                boundary_strength,
+                thresholds,
+            );
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn filter_horizontal_chroma_edge_sse2(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    boundary_strengths: [u8; 4],
+    thresholds: Option<EdgeThresholds>,
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_and_si128, _mm_andnot_si128, _mm_cmplt_epi16,
+        _mm_cvtsi64_si128, _mm_cvtsi128_si64, _mm_loadu_si128, _mm_max_epi16, _mm_min_epi16,
+        _mm_or_si128, _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_slli_epi16,
+        _mm_srai_epi16, _mm_sub_epi16, _mm_unpacklo_epi8,
+    };
+
+    macro_rules! absolute {
+        ($value:expr, $zero:expr) => {{
+            let value = $value;
+            _mm_max_epi16(value, _mm_sub_epi16($zero, value))
+        }};
+    }
+    macro_rules! select {
+        ($mask:expr, $selected:expr, $fallback:expr) => {
+            _mm_or_si128(
+                _mm_and_si128($mask, $selected),
+                _mm_andnot_si128($mask, $fallback),
+            )
+        };
+    }
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load_eight(ptr: *const u8, zero: __m128i) -> __m128i {
+        // SAFETY: The caller proves that the eight-byte row is in-bounds.
+        let packed = unsafe { ptr.cast::<u64>().read_unaligned() };
+        _mm_unpacklo_epi8(_mm_cvtsi64_si128(packed as i64), zero)
+    }
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn store_eight(ptr: *mut u8, values: __m128i, zero: __m128i) {
+        let packed = _mm_cvtsi128_si64(_mm_packus_epi16(values, zero)) as u64;
+        // SAFETY: The caller proves that the eight-byte row is in-bounds.
+        unsafe {
+            ptr.cast::<u64>().write_unaligned(packed);
+        }
+    }
+
+    let Some(thresholds) = thresholds else {
+        return;
+    };
+    debug_assert!(thresholds.chroma_style);
+    let mut active = [0i16; 8];
+    let mut strong = [0i16; 8];
+    let mut tc = [0i16; 8];
+    for (segment, boundary_strength) in boundary_strengths.into_iter().enumerate() {
+        debug_assert!(boundary_strength <= 4);
+        if boundary_strength == 0 {
+            continue;
+        }
+        active[segment * 2..segment * 2 + 2].fill(-1);
+        if boundary_strength == 4 {
+            strong[segment * 2..segment * 2 + 2].fill(-1);
+        } else {
+            tc[segment * 2..segment * 2 + 2]
+                .fill(i16::from(TC0[usize::from(boundary_strength - 1)][thresholds.index_a]) + 1);
+        }
+    }
+
+    let zero = _mm_setzero_si128();
+    // SAFETY: Local arrays contain exactly eight i16 lanes.
+    let active = unsafe { _mm_loadu_si128(active.as_ptr().cast::<__m128i>()) };
+    // SAFETY: Local arrays contain exactly eight i16 lanes.
+    let strong = unsafe { _mm_loadu_si128(strong.as_ptr().cast::<__m128i>()) };
+    // SAFETY: Local arrays contain exactly eight i16 lanes.
+    let tc = unsafe { _mm_loadu_si128(tc.as_ptr().cast::<__m128i>()) };
+    let base = plane.as_mut_ptr().wrapping_add(y * stride + x);
+    // SAFETY: Picture traversal supplies two complete rows on either side.
+    let p0 = unsafe { load_eight(base.wrapping_sub(stride), zero) };
+    // SAFETY: See above.
+    let p1 = unsafe { load_eight(base.wrapping_sub(2 * stride), zero) };
+    // SAFETY: See above.
+    let q0 = unsafe { load_eight(base, zero) };
+    // SAFETY: See above.
+    let q1 = unsafe { load_eight(base.wrapping_add(stride), zero) };
+
+    let alpha = _mm_set1_epi16(thresholds.alpha);
+    let beta = _mm_set1_epi16(thresholds.beta);
+    let valid = _mm_and_si128(
+        active,
+        _mm_and_si128(
+            _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p0, q0), zero), alpha),
+            _mm_and_si128(
+                _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p1, p0), zero), beta),
+                _mm_cmplt_epi16(absolute!(_mm_sub_epi16(q1, q0), zero), beta),
+            ),
+        ),
+    );
+
+    let negative_tc = _mm_sub_epi16(zero, tc);
+    let delta = _mm_srai_epi16::<3>(_mm_add_epi16(
+        _mm_add_epi16(
+            _mm_slli_epi16::<2>(_mm_sub_epi16(q0, p0)),
+            _mm_sub_epi16(p1, q1),
+        ),
+        _mm_set1_epi16(4),
+    ));
+    let delta = _mm_min_epi16(_mm_max_epi16(delta, negative_tc), tc);
+    let weak_p0 = _mm_add_epi16(p0, delta);
+    let weak_q0 = _mm_sub_epi16(q0, delta);
+    let strong_p0 = _mm_srai_epi16::<2>(_mm_add_epi16(
+        _mm_add_epi16(_mm_add_epi16(_mm_slli_epi16::<1>(p1), p0), q1),
+        _mm_set1_epi16(2),
+    ));
+    let strong_q0 = _mm_srai_epi16::<2>(_mm_add_epi16(
+        _mm_add_epi16(_mm_add_epi16(_mm_slli_epi16::<1>(q1), q0), p1),
+        _mm_set1_epi16(2),
+    ));
+    let filtered_p0 = select!(valid, select!(strong, strong_p0, weak_p0), p0);
+    let filtered_q0 = select!(valid, select!(strong, strong_q0, weak_q0), q0);
+
+    // SAFETY: The same validated rows used for the loads are writable.
+    unsafe {
+        store_eight(base.wrapping_sub(stride), filtered_p0, zero);
+        store_eight(base, filtered_q0, zero);
     }
 }
 
@@ -1017,8 +1172,9 @@ mod tests {
     };
     #[cfg(target_arch = "x86_64")]
     use super::{
-        EdgeParameters, filter_horizontal_edge_scalar, filter_horizontal_weak_luma_sse2,
-        filter_vertical_weak_luma_sse2, prepare_edge_parameters,
+        EdgeParameters, filter_horizontal_chroma_edge, filter_horizontal_edge,
+        filter_horizontal_edge_scalar, filter_horizontal_weak_luma_sse2,
+        filter_vertical_weak_luma_sse2, prepare_edge_parameters, prepare_edge_thresholds_unchecked,
     };
     use crate::{DeblockingFilter, H264Error, MotionVector, Yuv420Picture};
 
@@ -1188,6 +1344,53 @@ mod tests {
                         simd, scalar,
                         "vertical qp={qp} boundary_strength={boundary_strength} seed={seed}"
                     );
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn horizontal_chroma_sse2_matches_segmented_scalar_filtering() {
+        const STRENGTHS: [[u8; 4]; 6] = [
+            [0, 0, 0, 0],
+            [1, 2, 3, 4],
+            [4, 3, 2, 1],
+            [1, 1, 2, 2],
+            [4, 4, 4, 4],
+            [0, 3, 0, 4],
+        ];
+        for qp in [18, 24, 32, 40, 51] {
+            let thresholds =
+                prepare_edge_thresholds_unchecked(qp, qp.saturating_sub(2), 0, 0, true);
+            for strengths in STRENGTHS {
+                for seed in 0..16usize {
+                    let original: Vec<u8> = (0..32 * 32)
+                        .map(|index| {
+                            let x = index % 32;
+                            let y = index / 32;
+                            if seed.is_multiple_of(2) {
+                                96 + ((x * 3 + y * 2 + seed) % 13) as u8
+                            } else {
+                                ((index * 73 + index / 11 * 29 + seed * 41) & 0xff) as u8
+                            }
+                        })
+                        .collect();
+                    let mut scalar = original.clone();
+                    for (segment, strength) in strengths.into_iter().enumerate() {
+                        filter_horizontal_edge(
+                            &mut scalar,
+                            32,
+                            8 + segment * 2,
+                            16,
+                            2,
+                            strength,
+                            thresholds,
+                        );
+                    }
+                    let mut simd = original;
+                    filter_horizontal_chroma_edge(&mut simd, 32, 8, 16, strengths, thresholds);
+                    assert_eq!(simd, scalar, "qp={qp} strengths={strengths:?} seed={seed}");
                 }
             }
         }
