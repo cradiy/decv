@@ -59,7 +59,7 @@ pub(crate) struct MacroblockDeblockInfo {
     pub cr_qp: u8,
     pub transform_8x8: bool,
     /// Non-zero luma coefficients at raster-ordered 4x4 granularity.
-    pub luma_nonzero: [bool; 16],
+    pub luma_nonzero: u16,
     /// List-0 reference identity and motion at raster-ordered 4x4 granularity.
     pub motion: [DeblockMotion; 16],
     pub filter: DeblockingFilter,
@@ -277,7 +277,7 @@ pub(crate) fn filter_420_picture(
             }
         }
         let internal_edges_zero = !current.is_intra
-            && !current.luma_nonzero.iter().any(|&nonzero| nonzero)
+            && current.luma_nonzero == 0
             && current.motion[1..]
                 .iter()
                 .all(|&motion| motion == current.motion[0]);
@@ -576,7 +576,9 @@ fn boundary_strength(
     if previous.is_intra || current.is_intra {
         return if external { 4 } else { 3 };
     }
-    if previous.luma_nonzero[previous_cell] || current.luma_nonzero[current_cell] {
+    if previous.luma_nonzero & (1 << previous_cell) != 0
+        || current.luma_nonzero & (1 << current_cell) != 0
+    {
         return 2;
     }
 
@@ -1297,7 +1299,7 @@ mod tests {
             cb_qp: 40,
             cr_qp: 40,
             transform_8x8: false,
-            luma_nonzero: [false; 16],
+            luma_nonzero: 0,
             motion: [DeblockMotion::default(); 16],
             filter: DeblockingFilter {
                 idc,
@@ -1636,7 +1638,7 @@ mod tests {
         assert_eq!(boundary_strength(&same, 3, &different_vector, 0, true), 1);
 
         let mut residual = same;
-        residual.luma_nonzero[3] = true;
+        residual.luma_nonzero |= 1 << 3;
         assert_eq!(boundary_strength(&residual, 3, &same, 0, true), 2);
         assert_eq!(boundary_strength(&macroblock(1, 0), 3, &same, 0, true), 4);
         assert_eq!(boundary_strength(&macroblock(1, 0), 3, &same, 0, false), 3);

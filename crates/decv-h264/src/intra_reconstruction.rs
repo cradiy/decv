@@ -2241,7 +2241,7 @@ impl IntraPictureReconstructor {
                 quantizer.chroma_cr
             },
             transform_8x8,
-            luma_nonzero: [false; 16],
+            luma_nonzero: 0,
             motion: [DeblockMotion::default(); 16],
             filter: deblocking_filter,
         };
@@ -2865,8 +2865,8 @@ fn b_deblock_list_motion(
     })
 }
 
-fn inter_luma_nonzero(transform_8x8: bool, residual: Option<&InterResidual>) -> [bool; 16] {
-    let mut luma_nonzero = [false; 16];
+fn inter_luma_nonzero(transform_8x8: bool, residual: Option<&InterResidual>) -> u16 {
+    let mut luma_nonzero = 0u16;
     let Some(residual) = residual else {
         return luma_nonzero;
     };
@@ -2878,7 +2878,7 @@ fn inter_luma_nonzero(transform_8x8: bool, residual: Option<&InterResidual>) -> 
             {
                 for y in region_y * 2..region_y * 2 + 2 {
                     for x in region_x * 2..region_x * 2 + 2 {
-                        luma_nonzero[y * 4 + x] = true;
+                        luma_nonzero |= 1 << (y * 4 + x);
                     }
                 }
             }
@@ -2886,7 +2886,9 @@ fn inter_luma_nonzero(transform_8x8: bool, residual: Option<&InterResidual>) -> 
     } else {
         for (index, block) in residual.luma.iter().enumerate() {
             let (x, y) = LUMA_4X4_COORDINATES[index];
-            luma_nonzero[y * 4 + x] = block.total_coeff != 0;
+            if block.total_coeff != 0 {
+                luma_nonzero |= 1 << (y * 4 + x);
+            }
         }
     }
     luma_nonzero
