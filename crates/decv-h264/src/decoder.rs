@@ -345,12 +345,12 @@ impl H264Decoder {
             }
             ParserEvent::EndOfSequence => {
                 self.finish_current_picture()?;
-                self.drain_reorder();
+                self.drain_reorder()?;
                 self.clear_dpb();
             }
             ParserEvent::EndOfStream => {
                 self.finish_current_picture()?;
-                self.drain_reorder();
+                self.drain_reorder()?;
                 self.draining = true;
             }
         }
@@ -361,19 +361,10 @@ impl H264Decoder {
         let Some(picture) = self.current_picture.take() else {
             return Ok(());
         };
-        self.next_frame_id = self
-            .next_frame_id
-            .checked_add(1)
-            .ok_or(H264Error::IntegerOverflow)?;
         let (decoded, motion) = picture.reconstructor.into_deblocked_reference_picture()?;
         let decoded = Arc::new(decoded);
         let motion = Arc::new(motion);
-        let frame = decoded.to_nv12_frame(
-            self.next_frame_id,
-            picture.pts,
-            picture.duration,
-            picture.format,
-        )?;
+        let frame = decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format)?;
         if picture.nal_header.nal_ref_idc != 0 {
             let picture_order_count = picture.picture_order_count.stored.picture_order_count();
             let dpb = self
@@ -410,14 +401,9 @@ impl H264Decoder {
                 }
             }
         }
-        if self.announced_format != Some(picture.format) {
-            self.outputs
-                .push_back(DecodeOutput::FormatChanged(picture.format));
-            self.announced_format = Some(picture.format);
-        }
         let picture_order_count = picture.picture_order_count.stored.picture_order_count();
         if let Some(frame) = self.reorder.push(picture_order_count, frame)? {
-            self.outputs.push_back(DecodeOutput::Frame(frame));
+            self.queue_output_frame(frame)?;
         }
         Ok(())
     }
@@ -431,7 +417,7 @@ impl H264Decoder {
                 no_output_of_prior_pictures: true,
                 ..
             } => self.reorder.clear(),
-            ReferencePictureMarking::Idr { .. } => self.drain_reorder(),
+            ReferencePictureMarking::Idr { .. } => self.drain_reorder()?,
             _ => {
                 return Err(H264Error::InvalidSyntax(
                     "IDR slice is missing IDR reference-picture marking",
@@ -441,9 +427,27 @@ impl H264Decoder {
         Ok(())
     }
 
-    fn drain_reorder(&mut self) {
-        self.outputs
-            .extend(self.reorder.drain().into_iter().map(DecodeOutput::Frame));
+    fn queue_output_frame(&mut self, mut frame: DecodedVideoFrame) -> Result<()> {
+        self.next_frame_id = self
+            .next_frame_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
+        frame.id = self.next_frame_id;
+        if self.announced_format != Some(frame.format) {
+            self.outputs
+                .push_back(DecodeOutput::FormatChanged(frame.format));
+            self.announced_format = Some(frame.format);
+        }
+        self.outputs.push_back(DecodeOutput::Frame(frame));
+        Ok(())
+    }
+
+    fn drain_reorder(&mut self) -> Result<()> {
+        let frames = self.reorder.drain();
+        for frame in frames {
+            self.queue_output_frame(frame)?;
+        }
+        Ok(())
     }
 
     fn reset_all_state(&mut self) {
@@ -585,7 +589,7 @@ impl VideoDecoder for H264Decoder {
             ));
         }
         self.finish_current_picture()?;
-        self.drain_reorder();
+        self.drain_reorder()?;
         self.draining = true;
         Ok(())
     }
@@ -1244,6 +1248,61 @@ mod tests {
     }
 
     #[test]
+    fn long_playback_keeps_decoder_state_bounded() {
+        const FRAME_COUNT: u64 = 2_048;
+
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        let parameter_sets = annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+        ]);
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(parameter_sets))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+
+        let picture = annex_b_stream(&[(0x65, single_macroblock_idr_rbsp()), (0x09, vec![0x10])]);
+        let mut next_frame_id = 1;
+        let mut format_events = 0;
+        for _ in 0..FRAME_COUNT {
+            assert!(matches!(
+                decoder
+                    .send_packet(EncodedVideoPacket::new(picture.clone()))
+                    .unwrap(),
+                DecodeInputStatus::Accepted
+            ));
+            assert!(decoder.outputs.len() <= 2);
+            assert!(decoder.current_picture.is_none());
+            assert!(decoder.dpb.as_ref().is_some_and(|dpb| dpb.len() <= 1));
+            assert_eq!(decoder.reorder.len(), 0);
+
+            loop {
+                match decoder.receive_frame().unwrap() {
+                    DecodeOutput::FormatChanged(_) => format_events += 1,
+                    DecodeOutput::Frame(frame) => {
+                        assert_eq!(frame.id, next_frame_id);
+                        next_frame_id += 1;
+                    }
+                    DecodeOutput::NeedInput => break,
+                    DecodeOutput::EndOfStream => panic!("decoder ended before drain"),
+                }
+            }
+            assert!(decoder.outputs.is_empty());
+        }
+
+        assert_eq!(format_events, 1);
+        assert_eq!(next_frame_id, FRAME_COUNT + 1);
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
     fn decodes_annex_b_idr_then_reference_p_picture() {
         let stream = annex_b_stream(&[
             (0x67, single_macroblock_sps_rbsp()),
@@ -1316,8 +1375,8 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(_)
         ));
-        // Decode order is I(1), P(2), B(3); POC display order is I, B, P.
-        for expected_id in [1, 3, 2] {
+        // Decode order is I, P, B; output order and IDs are I(1), B(2), P(3).
+        for expected_id in [1, 2, 3] {
             let frame = match decoder.receive_frame().unwrap() {
                 DecodeOutput::Frame(frame) => frame,
                 output => panic!("expected decoded frame, got {output:?}"),
@@ -1357,7 +1416,7 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(_)
         ));
-        for expected_id in [1, 3, 2] {
+        for expected_id in [1, 2, 3] {
             let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
                 panic!("expected a decoded frame");
             };
@@ -1392,7 +1451,7 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(_)
         ));
-        for expected_id in [1, 3, 2] {
+        for expected_id in [1, 2, 3] {
             let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
                 panic!("expected a decoded frame");
             };
@@ -1427,7 +1486,7 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(_)
         ));
-        for expected_id in [1, 3, 2] {
+        for expected_id in [1, 2, 3] {
             let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
                 panic!("expected a decoded frame");
             };
@@ -1462,7 +1521,7 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(_)
         ));
-        for expected_id in [1, 3, 2] {
+        for expected_id in [1, 2, 3] {
             let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
                 panic!("expected a decoded frame");
             };
@@ -1493,7 +1552,7 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(_)
         ));
-        for expected_id in [1, 3, 2] {
+        for expected_id in [1, 2, 3] {
             let DecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
                 panic!("expected a decoded frame");
             };
@@ -1537,7 +1596,7 @@ mod tests {
         }
         assert_eq!(
             frames.iter().map(|frame| frame.id).collect::<Vec<_>>(),
-            [1, 3, 2]
+            [1, 2, 3]
         );
         let FrameStorage::Cpu(weighted_b) = &frames[1].storage else {
             panic!("expected CPU frame");
@@ -1583,7 +1642,7 @@ mod tests {
         }
         assert_eq!(
             frames.iter().map(|frame| frame.id).collect::<Vec<_>>(),
-            [1, 3, 2]
+            [1, 2, 3]
         );
         let FrameStorage::Cpu(weighted_b) = &frames[1].storage else {
             panic!("expected CPU frame");

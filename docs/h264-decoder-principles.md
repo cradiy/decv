@@ -717,6 +717,10 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   identity, motion-vector thresholds, and equivalent swapped-list handling;
 - a bounded POC output-reorder buffer kept separate from the reference DPB,
   with stable equal-POC ordering, drain, and discontinuity discard semantics;
+- frame IDs assigned only when pictures leave that reorder buffer, making IDs
+  strictly monotonic in consumer-visible display order; `FormatChanged` is
+  likewise emitted immediately before the first output frame using that
+  format, rather than prematurely in decode order;
 - top-level B-slice dispatch that derives both active reference lists from the
   DPB at the current POC and queues the decoded picture for display reordering;
 - stable DPB reference identities plus active-list POC and short/long-term
@@ -877,6 +881,9 @@ temporary directory so stale output cannot produce a false pass.
 Unit tests additionally run a complete decodable stream through every prefix
 truncation and deterministic single-byte corruptions. Returning a structured
 error is expected; panicking is a regression.
+An in-process 2,048-frame soak regression drains output after every input and
+asserts bounded DPB, reorder, current-picture, and output-queue state while
+checking every emitted frame ID.
 The benchmark command generates a reproducible 1080p60 High Profile stream,
 drives the decoder incrementally one NAL at a time, and reports wall time, CPU
 time, and peak resident memory. It is a measurement tool rather than a

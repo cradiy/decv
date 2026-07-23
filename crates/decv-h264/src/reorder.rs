@@ -64,6 +64,11 @@ impl<T> PictureReorderBuffer<T> {
         self.next_decode_index = 0;
     }
 
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
     fn remove_lowest_poc(&mut self) -> T {
         let index = self
             .pending
