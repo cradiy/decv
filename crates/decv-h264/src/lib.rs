@@ -23,4 +23,12 @@ mod transform;
 pub use annex_b::{AnnexBNalUnit, AnnexBReader};
 pub use error::{H264Error, Result};
 pub use nal::{NalHeader, NalUnit, NalUnitType};
+pub use pps::{
+    EntropyCodingMode, PictureParameterSet, SliceGroupMap, SliceGroupRectangle,
+    WeightedBiprediction,
+};
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};
+pub use sps::{
+    BitstreamRestrictions, PicOrderCount, Profile, SampleAspectRatio, ScalingList, ScalingMatrices,
+    SequenceParameterSet, TimingInfo, VuiParameters,
+};

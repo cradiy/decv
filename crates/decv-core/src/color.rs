@@ -16,8 +16,13 @@ pub enum ColorMatrix {
     Unspecified,
     Identity,
     Bt601,
+    Bt470Bg,
+    Smpte170M,
     Bt709,
     Bt2020NonConstantLuminance,
+    Bt2020ConstantLuminance,
+    /// A standardized matrix-coefficient number not otherwise named here.
+    Other(u8),
 }
 
 /// Chromaticity coordinates of the source primaries.
@@ -30,6 +35,8 @@ pub enum ColorPrimaries {
     Bt601_625,
     Bt709,
     Bt2020,
+    /// A standardized colour-primaries number not otherwise named here.
+    Other(u8),
 }
 
 /// Transfer function used to encode component values.
@@ -41,8 +48,12 @@ pub enum TransferFunction {
     Linear,
     Srgb,
     Bt709,
+    Bt470Bg,
+    Smpte170M,
     Bt2020TenBit,
     Bt2020TwelveBit,
+    /// A standardized transfer-characteristics number not otherwise named.
+    Other(u8),
 }
 
 /// Color metadata retained from codec configuration and VUI syntax.

@@ -87,13 +87,36 @@ pub fn consume_rbsp_trailing_bits(reader: &mut BitReader<'_>) -> Result<()> {
     Ok(())
 }
 
+/// Returns whether syntax data remains before `rbsp_trailing_bits()`.
+///
+/// The reader is not advanced. A malformed or missing tail is left for
+/// [`consume_rbsp_trailing_bits`] to diagnose after the caller finishes
+/// parsing its optional syntax.
+pub(crate) fn more_rbsp_data(reader: &BitReader<'_>) -> bool {
+    let mut probe = *reader;
+
+    match probe.read_bit() {
+        Some(1) => {
+            while let Some(bit) = probe.read_bit() {
+                if bit != 0 {
+                    return true;
+                }
+            }
+            false
+        }
+        Some(0) => true,
+        Some(_) => unreachable!("BitReader returns only zero or one"),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
 
     use bit_readers::BitReader;
 
-    use super::{consume_rbsp_trailing_bits, decode_rbsp};
+    use super::{consume_rbsp_trailing_bits, decode_rbsp, more_rbsp_data};
     use crate::H264Error;
 
     #[test]
@@ -164,5 +187,18 @@ mod tests {
             consume_rbsp_trailing_bits(&mut empty),
             Err(H264Error::UnexpectedEof)
         );
+    }
+
+    #[test]
+    fn distinguishes_payload_from_rbsp_trailing_bits() {
+        let trailing_only = BitReader::new(&[0x80]);
+        assert!(!more_rbsp_data(&trailing_only));
+
+        let mut unaligned_tail = BitReader::new(&[0b1011_0000]);
+        assert_eq!(unaligned_tail.read_bits_const::<3>(), Some(0b101));
+        assert!(!more_rbsp_data(&unaligned_tail));
+
+        let payload_then_tail = BitReader::new(&[0b0100_0000]);
+        assert!(more_rbsp_data(&payload_then_tail));
     }
 }
