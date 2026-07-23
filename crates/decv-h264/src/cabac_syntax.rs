@@ -4,8 +4,16 @@ use bit_readers::BitReader;
 
 use crate::{
     CabacContextSet, CabacDecoder, CabacInitializationTable, CodedBlockPattern, H264Error,
-    IntraPredictionModeSyntax, Result, SliceType, consume_cabac_alignment,
+    IntraLumaPrediction, IntraMacroblockHeader, IntraPredictionModeSyntax, Result, SliceType,
+    consume_cabac_alignment,
 };
+
+/// CABAC-decoded I-macroblock syntax before residual or I_PCM sample decoding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CabacIntraMacroblockSyntax {
+    Predicted(IntraMacroblockHeader),
+    Pcm,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CabacMacroblockSummary {
@@ -93,6 +101,75 @@ impl CabacMacroblockState {
         macroblock_type += 2 * syntax.decision(9)?;
         macroblock_type += syntax.decision(10)?;
         Ok(macroblock_type)
+    }
+
+    /// Decodes the complete prediction/header syntax of one I macroblock.
+    ///
+    /// I_PCM sample extraction is deliberately left to the slice layer because
+    /// it temporarily leaves arithmetic coding and then reinitializes CABAC.
+    pub fn decode_intra_macroblock_syntax(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        transform_8x8_mode_enabled: bool,
+        previous_qp_delta_nonzero: bool,
+    ) -> Result<CabacIntraMacroblockSyntax> {
+        let macroblock_type =
+            self.decode_intra_macroblock_type(syntax, macroblock_address, slice_id, SliceType::I)?;
+        match macroblock_type {
+            0 => {
+                let transform_size_8x8 = transform_8x8_mode_enabled
+                    && self.decode_transform_size_8x8_flag(syntax, macroblock_address, slice_id)?;
+                let luma_prediction = if transform_size_8x8 {
+                    let mut modes = [empty_intra_prediction_mode(); 4];
+                    for mode in &mut modes {
+                        *mode = syntax.intra_prediction_mode()?;
+                    }
+                    IntraLumaPrediction::EightByEight(modes)
+                } else {
+                    let mut modes = [empty_intra_prediction_mode(); 16];
+                    for mode in &mut modes {
+                        *mode = syntax.intra_prediction_mode()?;
+                    }
+                    IntraLumaPrediction::FourByFour(modes)
+                };
+                let chroma_prediction_mode =
+                    self.decode_intra_chroma_prediction_mode(syntax, macroblock_address, slice_id)?;
+                let coded_block_pattern =
+                    self.decode_coded_block_pattern(syntax, macroblock_address, slice_id)?;
+                let qp_delta = if coded_block_pattern.has_residual() {
+                    syntax.macroblock_qp_delta(previous_qp_delta_nonzero)?
+                } else {
+                    0
+                };
+                Ok(CabacIntraMacroblockSyntax::Predicted(
+                    IntraMacroblockHeader {
+                        luma_prediction,
+                        chroma_prediction_mode,
+                        coded_block_pattern,
+                        qp_delta,
+                    },
+                ))
+            }
+            1..=24 => {
+                let (mode, coded_block_pattern) =
+                    intra16x16_fields_from_macroblock_type(macroblock_type);
+                let chroma_prediction_mode =
+                    self.decode_intra_chroma_prediction_mode(syntax, macroblock_address, slice_id)?;
+                let qp_delta = syntax.macroblock_qp_delta(previous_qp_delta_nonzero)?;
+                Ok(CabacIntraMacroblockSyntax::Predicted(
+                    IntraMacroblockHeader {
+                        luma_prediction: IntraLumaPrediction::SixteenBySixteen { mode },
+                        chroma_prediction_mode,
+                        coded_block_pattern,
+                        qp_delta,
+                    },
+                ))
+            }
+            25 => Ok(CabacIntraMacroblockSyntax::Pcm),
+            _ => unreachable!("the CABAC I mb_type decoder returns 0..=25"),
+        }
     }
 
     pub fn decode_intra_chroma_prediction_mode(
@@ -227,6 +304,25 @@ impl CabacMacroblockState {
         };
         Ok([left, top])
     }
+}
+
+const fn empty_intra_prediction_mode() -> IntraPredictionModeSyntax {
+    IntraPredictionModeSyntax {
+        use_predicted: false,
+        remaining_mode: None,
+    }
+}
+
+const fn intra16x16_fields_from_macroblock_type(macroblock_type: u8) -> (u8, CodedBlockPattern) {
+    debug_assert!(macroblock_type >= 1 && macroblock_type <= 24);
+    let type_index = macroblock_type - 1;
+    (
+        type_index % 4,
+        CodedBlockPattern {
+            luma: if type_index >= 12 { 15 } else { 0 },
+            chroma: (type_index / 4) % 3,
+        },
+    )
 }
 
 /// Long-lived arithmetic and probability state for one CABAC slice.
@@ -817,6 +913,21 @@ mod tests {
             2
         );
         assert_eq!(visited, [66, 67, 67]);
+    }
+
+    #[test]
+    fn derives_every_intra16x16_header_field_from_mb_type() {
+        for macroblock_type in 1..=24 {
+            let (mode, coded_block_pattern) =
+                intra16x16_fields_from_macroblock_type(macroblock_type);
+            let type_index = macroblock_type - 1;
+            assert_eq!(mode, type_index % 4);
+            assert_eq!(coded_block_pattern.chroma, (type_index / 4) % 3);
+            assert_eq!(
+                coded_block_pattern.luma,
+                if macroblock_type >= 13 { 15 } else { 0 }
+            );
+        }
     }
 
     #[test]
