@@ -747,6 +747,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - byte-exact FFmpeg regressions for encoder-generated Main and High Profile
   CAVLC streams with B pictures, display reordering, multiple references,
   weighted prediction, and 8x8 transforms;
+- a standalone CABAC binary arithmetic core with decision, bypass, terminate,
+  renormalization, probability-state transitions, and atomic truncation
+  handling; CABAC syntax-element context selection is not connected yet;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
