@@ -282,6 +282,35 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists(
     residual: &ReconstructedInterResidual,
     weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<MacroblockPixels> {
+    let mut prediction_l0 = InterPrediction420::empty();
+    let mut prediction_l1 = InterPrediction420::empty();
+    reconstruct_b_macroblock_pixels_from_lists_with_scratch(
+        current_size,
+        references_l0,
+        references_l1,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        weight_mode,
+        &mut prediction_l0,
+        &mut prediction_l1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
+    current_size: Size,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: &ResolvedBMacroblock,
+    residual: &ReconstructedInterResidual,
+    weight_mode: BPredictionWeightMode<'_>,
+    prediction_l0: &mut InterPrediction420,
+    prediction_l1: &mut InterPrediction420,
+) -> Result<MacroblockPixels> {
     let luma_x = macroblock_x
         .checked_mul(16)
         .ok_or(H264Error::IntegerOverflow)?;
@@ -302,8 +331,6 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists(
     let mut predicted_cb = [[0u8; 8]; 8];
     let mut predicted_cr = [[0u8; 8]; 8];
     let mut covered = [[false; 4]; 4];
-    let mut prediction_l0 = InterPrediction420::empty();
-    let mut prediction_l1 = InterPrediction420::empty();
     for partition in &motion.partitions {
         let has_l0 = predict_b_partition_list_into(
             references_l0,
@@ -313,7 +340,7 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists(
             *partition,
             partition.list0,
             "B partition selects no reference picture in List 0",
-            &mut prediction_l0,
+            prediction_l0,
         )?;
         let has_l1 = predict_b_partition_list_into(
             references_l1,
@@ -323,11 +350,11 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists(
             *partition,
             partition.list1,
             "B partition selects no reference picture in List 1",
-            &mut prediction_l1,
+            prediction_l1,
         )?;
         let prediction = merge_b_predictions(
-            has_l0.then_some(&mut prediction_l0),
-            has_l1.then_some(&mut prediction_l1),
+            has_l0.then_some(&mut *prediction_l0),
+            has_l1.then_some(&mut *prediction_l1),
             partition.list0.map(|motion| motion.reference_index),
             partition.list1.map(|motion| motion.reference_index),
             weight_mode,

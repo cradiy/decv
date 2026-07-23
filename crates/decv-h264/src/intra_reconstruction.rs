@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
     BPredictionWeightMode, ImplicitWeightReference, reconstruct_b_macroblock_from_lists_420,
-    reconstruct_b_macroblock_pixels_from_lists,
+    reconstruct_b_macroblock_pixels_from_lists_with_scratch,
     reconstruct_implicitly_weighted_b_macroblock_from_lists_420,
     reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_b_macroblock_from_lists_420,
     reconstruct_weighted_p_macroblock_from_list_420,
@@ -23,8 +23,8 @@ use crate::{
     CabacMacroblockState, CabacMacroblockSummary, CabacPMacroblock, CabacPMacroblockContext,
     CabacPMacroblockState, CabacResidualState, CabacSliceDecoder, CavlcNeighborState, ChromaPlane,
     DeblockingFilter, DecodedBSliceMacroblock, DecodedIntraMacroblock, DecodedPSliceMacroblock,
-    DirectMotionContext, DirectReference, EntropyCodingMode, H264Error, InterResidual,
-    IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraModeState,
+    DirectMotionContext, DirectReference, EntropyCodingMode, H264Error, InterPrediction420,
+    InterResidual, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraModeState,
     IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
     MacroblockQuantizerState, PMacroblockContext, PMotionState, ParsedSliceHeader,
     PredictionWeightTable, ReconstructedInterResidual, ReconstructedIntraResidual,
@@ -1909,30 +1909,42 @@ impl IntraPictureReconstructor {
             },
         };
         let coded_size = self.picture.coded_size();
-        let reconstruct = |job: &PendingBInterMacroblock| {
-            reconstruct_b_macroblock_pixels_from_lists(
-                coded_size,
-                references_l0,
-                references_l1,
-                job.macroblock_x,
-                job.macroblock_y,
-                &job.motion,
-                &job.residual,
-                weight_mode,
-            )
-            .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
-        };
+        let reconstruct =
+            |job: &PendingBInterMacroblock,
+             scratch: &mut (InterPrediction420, InterPrediction420)| {
+                let (prediction_l0, prediction_l1) = scratch;
+                reconstruct_b_macroblock_pixels_from_lists_with_scratch(
+                    coded_size,
+                    references_l0,
+                    references_l1,
+                    job.macroblock_x,
+                    job.macroblock_y,
+                    &job.motion,
+                    &job.residual,
+                    weight_mode,
+                    prediction_l0,
+                    prediction_l1,
+                )
+                .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
+            };
         let staged = if jobs.len() > 1
             && let Some(pool) = self.reconstruction_executor.pool()
         {
-            let reconstructed: Vec<Result<StagedMacroblockPixels>> =
-                pool.install(|| jobs.par_iter().map(&reconstruct).collect());
+            let reconstructed: Vec<Result<StagedMacroblockPixels>> = pool.install(|| {
+                jobs.par_iter()
+                    .map_init(
+                        || (InterPrediction420::empty(), InterPrediction420::empty()),
+                        |scratch, job| reconstruct(job, scratch),
+                    )
+                    .collect()
+            });
             reconstructed
                 .into_iter()
                 .collect::<Result<Vec<StagedMacroblockPixels>>>()?
         } else {
+            let mut scratch = (InterPrediction420::empty(), InterPrediction420::empty());
             jobs.iter()
-                .map(&reconstruct)
+                .map(|job| reconstruct(job, &mut scratch))
                 .collect::<Result<Vec<StagedMacroblockPixels>>>()?
         };
 
