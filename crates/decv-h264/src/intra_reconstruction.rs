@@ -3,20 +3,20 @@
 use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 
-use crate::deblock::{MacroblockDeblockInfo, filter_intra_420_picture};
+use crate::deblock::{DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::reconstruct_p_skip_macroblock_from_list_420;
 use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedIntraMacroblock,
-    DecodedPSliceMacroblock, EntropyCodingMode, H264Error, IntraLumaPrediction, IntraMacroblock,
-    IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability,
-    MacroblockQuantizer, MacroblockQuantizerState, PMacroblockContext, PMotionState,
-    ParsedSliceHeader, ReconstructedIntraResidual, ReconstructedLumaResidual,
-    ResolvedScalingLists4x4, ResolvedScalingLists8x8, Result, ScanMode, SliceType, Yuv420Picture,
-    consume_rbsp_trailing_bits, derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4,
-    predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420, reconstruct_inter_residual,
-    reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4,
-    resolve_scaling_lists_8x8,
+    DecodedPSliceMacroblock, EntropyCodingMode, H264Error, InterResidual, IntraLumaPrediction,
+    IntraMacroblock, IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax,
+    IntraReferenceAvailability, MacroblockQuantizer, MacroblockQuantizerState, PMacroblockContext,
+    PMotionState, ParsedSliceHeader, ReconstructedIntraResidual, ReconstructedLumaResidual,
+    ResolvedPMacroblock, ResolvedScalingLists4x4, ResolvedScalingLists8x8, Result, ScanMode,
+    SliceType, Yuv420Picture, consume_rbsp_trailing_bits, derive_chroma_qp,
+    parse_cavlc_mb_skip_run, predict_intra_4x4, predict_intra_8x8, predict_intra_16x16,
+    predict_intra_chroma_420, reconstruct_inter_residual, reconstruct_intra_residual,
+    reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -381,10 +381,15 @@ impl IntraPictureReconstructor {
                 }
                 self.complete_inter_macroblock(
                     macroblock_address,
-                    slice_id,
-                    quantizers.derive(0)?,
-                    false,
-                    config.deblocking_filter,
+                    inter_deblock_info(
+                        slice_id,
+                        quantizers.derive(0)?,
+                        false,
+                        config.deblocking_filter,
+                        &motion,
+                        None,
+                        references_l0,
+                    )?,
                 );
                 macroblock_address += 1;
                 decoded_count += 1;
@@ -443,10 +448,15 @@ impl IntraPictureReconstructor {
                     }
                     self.complete_inter_macroblock(
                         macroblock_address,
-                        slice_id,
-                        quantizer,
-                        header.transform_size_8x8,
-                        config.deblocking_filter,
+                        inter_deblock_info(
+                            slice_id,
+                            quantizer,
+                            header.transform_size_8x8,
+                            config.deblocking_filter,
+                            &motion,
+                            Some(residual),
+                            references_l0,
+                        )?,
                     );
                     Ok(())
                 }
@@ -482,22 +492,12 @@ impl IntraPictureReconstructor {
     fn complete_inter_macroblock(
         &mut self,
         macroblock_address: usize,
-        slice_id: u32,
-        quantizer: MacroblockQuantizer,
-        transform_8x8: bool,
-        filter: DeblockingFilter,
+        deblock: MacroblockDeblockInfo,
     ) {
         self.completed[macroblock_address] = Some(CompletedMacroblock {
-            slice_id,
+            slice_id: deblock.slice_id,
             is_intra: false,
-            deblock: MacroblockDeblockInfo {
-                slice_id,
-                luma_qp: quantizer.luma,
-                cb_qp: quantizer.chroma_cb,
-                cr_qp: quantizer.chroma_cr,
-                transform_8x8,
-                filter,
-            },
+            deblock,
         });
     }
 
@@ -628,6 +628,7 @@ impl IntraPictureReconstructor {
             is_intra: true,
             deblock: MacroblockDeblockInfo {
                 slice_id,
+                is_intra: true,
                 luma_qp: if is_pcm { 0 } else { quantizer.luma },
                 cb_qp: if is_pcm {
                     pcm_chroma_qp[0]
@@ -640,6 +641,8 @@ impl IntraPictureReconstructor {
                     quantizer.chroma_cr
                 },
                 transform_8x8,
+                luma_nonzero: [false; 16],
+                motion: [DeblockMotion::default(); 16],
                 filter: deblocking_filter,
             },
         });
@@ -792,16 +795,6 @@ impl IntraPictureReconstructor {
                 "cannot output an incomplete reconstructed picture",
             ));
         }
-        if self
-            .completed
-            .iter()
-            .flatten()
-            .any(|macroblock| !macroblock.is_intra)
-        {
-            return Err(H264Error::UnsupportedFeature(
-                "inter-picture deblocking before output",
-            ));
-        }
         let macroblocks = self
             .completed
             .iter()
@@ -811,7 +804,7 @@ impl IntraPictureReconstructor {
                     .deblock
             })
             .collect::<Vec<_>>();
-        filter_intra_420_picture(&mut self.picture, &macroblocks, self.width_in_macroblocks)?;
+        filter_420_picture(&mut self.picture, &macroblocks, self.width_in_macroblocks)?;
         self.picture.into_nv12_frame(id, pts, duration, format)
     }
 
@@ -883,10 +876,10 @@ impl IntraPictureReconstructor {
     ) -> IntraReferenceAvailability {
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
-        let top = (macroblock_y > 0).then_some(macroblock_address - self.width_in_macroblocks);
-        let left = (macroblock_x > 0).then_some(macroblock_address - 1);
+        let top = (macroblock_y > 0).then(|| macroblock_address - self.width_in_macroblocks);
+        let left = (macroblock_x > 0).then(|| macroblock_address - 1);
         let top_left = (macroblock_x > 0 && macroblock_y > 0)
-            .then_some(macroblock_address - self.width_in_macroblocks - 1);
+            .then(|| macroblock_address - self.width_in_macroblocks - 1);
         IntraReferenceAvailability {
             top: top.is_some_and(|address| self.is_available(address, slice_id)),
             left: left.is_some_and(|address| self.is_available(address, slice_id)),
@@ -1081,6 +1074,85 @@ impl IntraPictureReconstructor {
             address / self.width_in_macroblocks,
         ))
     }
+}
+
+fn inter_deblock_info(
+    slice_id: u32,
+    quantizer: MacroblockQuantizer,
+    transform_8x8: bool,
+    filter: DeblockingFilter,
+    resolved: &ResolvedPMacroblock,
+    residual: Option<&InterResidual>,
+    references_l0: &[Option<&Yuv420Picture>],
+) -> Result<MacroblockDeblockInfo> {
+    let mut motion = [DeblockMotion::default(); 16];
+    for partition in &resolved.partitions {
+        let reference = references_l0
+            .get(usize::from(partition.reference_index))
+            .copied()
+            .flatten()
+            .ok_or(H264Error::InvalidSyntax(
+                "P macroblock selects a missing List-0 reference picture",
+            ))?;
+        let reference_id = std::ptr::from_ref(reference).addr();
+        let start_x = usize::from(partition.x) / 4;
+        let start_y = usize::from(partition.y) / 4;
+        let end_x = usize::from(partition.x + partition.width) / 4;
+        let end_y = usize::from(partition.y + partition.height) / 4;
+        if !partition.x.is_multiple_of(4)
+            || !partition.y.is_multiple_of(4)
+            || !partition.width.is_multiple_of(4)
+            || !partition.height.is_multiple_of(4)
+            || end_x > 4
+            || end_y > 4
+        {
+            return Err(H264Error::InvalidSyntax(
+                "P partition is not aligned to the deblocking grid",
+            ));
+        }
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                motion[y * 4 + x] = DeblockMotion {
+                    reference_id,
+                    vector: partition.motion_vector,
+                };
+            }
+        }
+    }
+
+    let mut luma_nonzero = [false; 16];
+    if let Some(residual) = residual {
+        if transform_8x8 {
+            for (block_8x8, &(region_x, region_y)) in LUMA_8X8_COORDINATES.iter().enumerate() {
+                if residual.luma[block_8x8 * 4..block_8x8 * 4 + 4]
+                    .iter()
+                    .any(|block| block.total_coeff != 0)
+                {
+                    for y in region_y * 2..region_y * 2 + 2 {
+                        for x in region_x * 2..region_x * 2 + 2 {
+                            luma_nonzero[y * 4 + x] = true;
+                        }
+                    }
+                }
+            }
+        } else {
+            for (index, block) in residual.luma.iter().enumerate() {
+                let (x, y) = LUMA_4X4_COORDINATES[index];
+                luma_nonzero[y * 4 + x] = block.total_coeff != 0;
+            }
+        }
+    }
+    Ok(MacroblockDeblockInfo {
+        slice_id,
+        is_intra: false,
+        luma_qp: quantizer.luma,
+        cb_qp: quantizer.chroma_cb,
+        cr_qp: quantizer.chroma_cr,
+        transform_8x8,
+        luma_nonzero,
+        motion,
+        filter,
+    })
 }
 
 fn luma4x4_index(cell_x: usize, cell_y: usize) -> usize {
@@ -1278,6 +1350,11 @@ mod tests {
         assert!(luma.iter().all(|&sample| sample == 70));
         assert!(cb.iter().all(|&sample| sample == 71));
         assert!(cr.iter().all(|&sample| sample == 72));
+        assert!(
+            inter
+                .into_nv12_frame(1, None, None, format(Size::new(16, 16)))
+                .is_ok()
+        );
 
         // mb_skip_run=1 followed directly by rbsp_trailing_bits.
         let mut skipped = reconstructor(Size::new(16, 16));
@@ -1297,6 +1374,11 @@ mod tests {
                 .0
                 .iter()
                 .all(|&sample| sample == 70)
+        );
+        assert!(
+            skipped
+                .into_nv12_frame(2, None, None, format(Size::new(16, 16)))
+                .is_ok()
         );
     }
 

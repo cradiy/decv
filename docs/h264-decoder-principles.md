@@ -665,7 +665,7 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   I_PCM macroblock types;
 - a progressive CAVLC P-slice driver joining skip runs, QP state, CAVLC
   neighbours, motion state, embedded Intra, List-0 prediction, transforms, and
-  picture writes; P-picture output remains gated on inter deblocking;
+  picture writes;
 - transactional default-weight P macroblock pixel reconstruction with
   per-partition List-0 reference selection, complete coverage validation, and
   saturating prediction-plus-residual writes;
@@ -689,8 +689,10 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - a mutable planar 4:2:0 reconstruction picture surface;
 - 384-byte macroblock snapshots for rollback without copying a whole picture;
 - prediction-plus-residual reconstruction for I_4x4, I_8x8, I_16x16, and I_PCM;
-- normative 8-bit 4:2:0 intra deblocking, including slice-controlled offsets
-  and cross-slice edge suppression;
+- normative progressive 8-bit 4:2:0 I/P deblocking, including per-4x4
+  boundary strength from Intra/Inter mode, luma coefficients, reference-picture
+  identity, and motion-vector differences; chroma-to-luma boundary mapping;
+  slice-controlled offsets; and cross-slice edge suppression;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
@@ -712,12 +714,14 @@ This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
 - CABAC slice data;
-- P, B, SP, and SI macroblock reconstruction;
+- B, SP, and SI macroblock reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;
-- motion compensation and weighted prediction;
-- decoded-picture-buffer marking, reference lifetime, and display reordering;
+- weighted prediction;
+- the implemented P-slice reconstruction and DPB reference marking to the
+  access-unit decoder;
+- POC-based display reordering;
 - length-prefixed input and out-of-band `avcC` configuration.
 
 The next dependency chain is:

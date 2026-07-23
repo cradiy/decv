@@ -5,7 +5,7 @@
 //! are deliberately kept separate: callers provide the already-derived
 //! boundary strength and the QPs on both sides of one edge.
 
-use crate::{DeblockingFilter, H264Error, Result, Yuv420Picture};
+use crate::{DeblockingFilter, H264Error, MotionVector, Result, Yuv420Picture};
 
 const ALPHA: [u8; 52] = [
     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 4, 4, 5, 6, 7, 8, 9, 10, 12, 13, 15, 17, 20,
@@ -53,11 +53,23 @@ pub struct FilteredDeblockEdge {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MacroblockDeblockInfo {
     pub slice_id: u32,
+    pub is_intra: bool,
     pub luma_qp: u8,
     pub cb_qp: u8,
     pub cr_qp: u8,
     pub transform_8x8: bool,
+    /// Non-zero luma coefficients at raster-ordered 4x4 granularity.
+    pub luma_nonzero: [bool; 16],
+    /// List-0 reference identity and motion at raster-ordered 4x4 granularity.
+    pub motion: [DeblockMotion; 16],
     pub filter: DeblockingFilter,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DeblockMotion {
+    /// Stable for the lifetime of the active reference list. Zero means absent.
+    pub reference_id: usize,
+    pub vector: MotionVector,
 }
 
 impl DeblockEdgeSamples {
@@ -178,7 +190,7 @@ pub fn filter_deblock_edge(
     Ok(FilteredDeblockEdge { p, q })
 }
 
-pub(crate) fn filter_intra_420_picture(
+pub(crate) fn filter_420_picture(
     picture: &mut Yuv420Picture,
     macroblocks: &[MacroblockDeblockInfo],
     width_in_macroblocks: usize,
@@ -216,52 +228,59 @@ pub(crate) fn filter_intra_420_picture(
         let luma_x = macroblock_x * 16;
         let luma_y = macroblock_y * 16;
         if filter_left {
-            filter_vertical_edge(
-                luma,
-                width,
-                luma_x,
-                luma_y,
-                16,
-                edge_parameters(
-                    left.expect("filter_left requires a neighbor"),
-                    current,
-                    4,
-                    0,
-                ),
-            )?;
-        }
-        for edge in [4, 8, 12] {
-            if edge == 8 || !current.transform_8x8 {
+            let previous = left.expect("filter_left requires a neighbor");
+            for block_row in 0..4 {
                 filter_vertical_edge(
                     luma,
                     width,
-                    luma_x + edge,
-                    luma_y,
-                    16,
-                    edge_parameters(current, current, 3, 0),
+                    luma_x,
+                    luma_y + block_row * 4,
+                    4,
+                    edge_parameters(previous, block_row * 4 + 3, current, block_row * 4, true, 0),
                 )?;
             }
         }
-        if filter_top {
-            filter_horizontal_edge(
-                luma,
-                width,
-                luma_x,
-                luma_y,
-                16,
-                edge_parameters(top.expect("filter_top requires a neighbor"), current, 4, 0),
-            )?;
+        for block_column in 1..4 {
+            if block_column == 2 || !current.transform_8x8 {
+                for block_row in 0..4 {
+                    let q = block_row * 4 + block_column;
+                    filter_vertical_edge(
+                        luma,
+                        width,
+                        luma_x + block_column * 4,
+                        luma_y + block_row * 4,
+                        4,
+                        edge_parameters(current, q - 1, current, q, false, 0),
+                    )?;
+                }
+            }
         }
-        for edge in [4, 8, 12] {
-            if edge == 8 || !current.transform_8x8 {
+        if filter_top {
+            let previous = top.expect("filter_top requires a neighbor");
+            for block_column in 0..4 {
                 filter_horizontal_edge(
                     luma,
                     width,
-                    luma_x,
-                    luma_y + edge,
-                    16,
-                    edge_parameters(current, current, 3, 0),
+                    luma_x + block_column * 4,
+                    luma_y,
+                    4,
+                    edge_parameters(previous, 12 + block_column, current, block_column, true, 0),
                 )?;
+            }
+        }
+        for block_row in 1..4 {
+            if block_row == 2 || !current.transform_8x8 {
+                for block_column in 0..4 {
+                    let q = block_row * 4 + block_column;
+                    filter_horizontal_edge(
+                        luma,
+                        width,
+                        luma_x + block_column * 4,
+                        luma_y + block_row * 4,
+                        4,
+                        edge_parameters(current, q - 4, current, q, false, 0),
+                    )?;
+                }
             }
         }
 
@@ -269,51 +288,79 @@ pub(crate) fn filter_intra_420_picture(
         let chroma_y = macroblock_y * 8;
         for (plane, component) in [(&mut *cb, 1), (&mut *cr, 2)] {
             if filter_left {
+                let previous = left.expect("filter_left requires a neighbor");
+                for block_row in 0..4 {
+                    filter_vertical_edge(
+                        plane,
+                        chroma_stride,
+                        chroma_x,
+                        chroma_y + block_row * 2,
+                        2,
+                        edge_parameters(
+                            previous,
+                            block_row * 4 + 3,
+                            current,
+                            block_row * 4,
+                            true,
+                            component,
+                        ),
+                    )?;
+                }
+            }
+            for block_row in 0..4 {
                 filter_vertical_edge(
                     plane,
                     chroma_stride,
-                    chroma_x,
-                    chroma_y,
-                    8,
+                    chroma_x + 4,
+                    chroma_y + block_row * 2,
+                    2,
                     edge_parameters(
-                        left.expect("filter_left requires a neighbor"),
                         current,
-                        4,
+                        block_row * 4 + 1,
+                        current,
+                        block_row * 4 + 2,
+                        false,
                         component,
                     ),
                 )?;
             }
-            filter_vertical_edge(
-                plane,
-                chroma_stride,
-                chroma_x + 4,
-                chroma_y,
-                8,
-                edge_parameters(current, current, 3, component),
-            )?;
             if filter_top {
+                let previous = top.expect("filter_top requires a neighbor");
+                for block_column in 0..4 {
+                    filter_horizontal_edge(
+                        plane,
+                        chroma_stride,
+                        chroma_x + block_column * 2,
+                        chroma_y,
+                        2,
+                        edge_parameters(
+                            previous,
+                            12 + block_column,
+                            current,
+                            block_column,
+                            true,
+                            component,
+                        ),
+                    )?;
+                }
+            }
+            for block_column in 0..4 {
                 filter_horizontal_edge(
                     plane,
                     chroma_stride,
-                    chroma_x,
-                    chroma_y,
-                    8,
+                    chroma_x + block_column * 2,
+                    chroma_y + 4,
+                    2,
                     edge_parameters(
-                        top.expect("filter_top requires a neighbor"),
                         current,
-                        4,
+                        4 + block_column,
+                        current,
+                        8 + block_column,
+                        false,
                         component,
                     ),
                 )?;
             }
-            filter_horizontal_edge(
-                plane,
-                chroma_stride,
-                chroma_x,
-                chroma_y + 4,
-                8,
-                edge_parameters(current, current, 3, component),
-            )?;
         }
     }
     Ok(())
@@ -331,8 +378,10 @@ struct EdgeParameters {
 
 fn edge_parameters(
     previous: MacroblockDeblockInfo,
+    previous_cell: usize,
     current: MacroblockDeblockInfo,
-    boundary_strength: u8,
+    current_cell: usize,
+    external: bool,
     component: u8,
 ) -> EdgeParameters {
     let qp = |macroblock: MacroblockDeblockInfo| match component {
@@ -341,13 +390,42 @@ fn edge_parameters(
         _ => macroblock.cr_qp,
     };
     EdgeParameters {
-        boundary_strength,
+        boundary_strength: boundary_strength(
+            previous,
+            previous_cell,
+            current,
+            current_cell,
+            external,
+        ),
         qp_p: qp(previous),
         qp_q: qp(current),
         alpha_offset_div2: current.filter.alpha_c0_offset_div2,
         beta_offset_div2: current.filter.beta_offset_div2,
         chroma_style: component != 0,
     }
+}
+
+fn boundary_strength(
+    previous: MacroblockDeblockInfo,
+    previous_cell: usize,
+    current: MacroblockDeblockInfo,
+    current_cell: usize,
+    external: bool,
+) -> u8 {
+    if previous.is_intra || current.is_intra {
+        return if external { 4 } else { 3 };
+    }
+    if previous.luma_nonzero[previous_cell] || current.luma_nonzero[current_cell] {
+        return 2;
+    }
+
+    let previous_motion = previous.motion[previous_cell];
+    let current_motion = current.motion[current_cell];
+    let vector_differs = (i32::from(previous_motion.vector.x) - i32::from(current_motion.vector.x))
+        .abs()
+        >= 4
+        || (i32::from(previous_motion.vector.y) - i32::from(current_motion.vector.y)).abs() >= 4;
+    u8::from(previous_motion.reference_id != current_motion.reference_id || vector_differs)
 }
 
 fn filter_vertical_edge(
@@ -444,10 +522,10 @@ mod tests {
     use decv_core::Size;
 
     use super::{
-        ALPHA, BETA, DeblockEdgeSamples, FilteredDeblockEdge, MacroblockDeblockInfo, TC0,
-        filter_deblock_edge, filter_intra_420_picture,
+        ALPHA, BETA, DeblockEdgeSamples, DeblockMotion, FilteredDeblockEdge, MacroblockDeblockInfo,
+        TC0, boundary_strength, filter_420_picture, filter_deblock_edge,
     };
-    use crate::{DeblockingFilter, H264Error, Yuv420Picture};
+    use crate::{DeblockingFilter, H264Error, MotionVector, Yuv420Picture};
 
     const SMOOTH_EDGE: DeblockEdgeSamples = DeblockEdgeSamples {
         p: [100, 99, 98, 97],
@@ -457,15 +535,29 @@ mod tests {
     fn macroblock(slice_id: u32, idc: u8) -> MacroblockDeblockInfo {
         MacroblockDeblockInfo {
             slice_id,
+            is_intra: true,
             luma_qp: 40,
             cb_qp: 40,
             cr_qp: 40,
             transform_8x8: false,
+            luma_nonzero: [false; 16],
+            motion: [DeblockMotion::default(); 16],
             filter: DeblockingFilter {
                 idc,
                 alpha_c0_offset_div2: 0,
                 beta_offset_div2: 0,
             },
+        }
+    }
+
+    fn inter_macroblock(reference_id: usize, vector: MotionVector) -> MacroblockDeblockInfo {
+        MacroblockDeblockInfo {
+            is_intra: false,
+            motion: [DeblockMotion {
+                reference_id,
+                vector,
+            }; 16],
+            ..macroblock(1, 0)
         }
     }
 
@@ -568,7 +660,7 @@ mod tests {
             }
         }
 
-        filter_intra_420_picture(&mut picture, &[macroblock(1, 0), macroblock(1, 0)], 2).unwrap();
+        filter_420_picture(&mut picture, &[macroblock(1, 0), macroblock(1, 0)], 2).unwrap();
 
         let (luma, cb, cr) = picture.planes_mut();
         assert_eq!(&luma[12..20], &[100, 101, 103, 104, 106, 108, 109, 110]);
@@ -585,9 +677,27 @@ mod tests {
             row[16..].fill(110);
         }
 
-        filter_intra_420_picture(&mut picture, &[macroblock(1, 0), macroblock(2, 2)], 2).unwrap();
+        filter_420_picture(&mut picture, &[macroblock(1, 0), macroblock(2, 2)], 2).unwrap();
 
         let (luma, _, _) = picture.planes_mut();
         assert_eq!(&luma[12..20], &[100, 100, 100, 100, 110, 110, 110, 110]);
+    }
+
+    #[test]
+    fn derives_progressive_p_boundary_strengths() {
+        let same = inter_macroblock(7, MotionVector { x: 3, y: -2 });
+        assert_eq!(boundary_strength(same, 3, same, 0, true), 0);
+
+        let different_reference = inter_macroblock(8, same.motion[0].vector);
+        assert_eq!(boundary_strength(same, 3, different_reference, 0, true), 1);
+
+        let different_vector = inter_macroblock(7, MotionVector { x: 7, y: -2 });
+        assert_eq!(boundary_strength(same, 3, different_vector, 0, true), 1);
+
+        let mut residual = same;
+        residual.luma_nonzero[3] = true;
+        assert_eq!(boundary_strength(residual, 3, same, 0, true), 2);
+        assert_eq!(boundary_strength(macroblock(1, 0), 3, same, 0, true), 4);
+        assert_eq!(boundary_strength(macroblock(1, 0), 3, same, 0, false), 3);
     }
 }
