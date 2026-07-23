@@ -303,7 +303,11 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
     let mut predicted_cb = [[0u8; 8]; 8];
     let mut predicted_cr = [[0u8; 8]; 8];
     let mut covered = [[false; 4]; 4];
-    for partition in &motion.partitions {
+    let uniform_direct = uniform_direct_partition(motion);
+    let partitions = uniform_direct
+        .as_ref()
+        .map_or(motion.partitions.as_slice(), std::slice::from_ref);
+    for partition in partitions {
         let has_l0 = predict_b_partition_list_into(
             references_l0,
             current_size,
@@ -398,6 +402,54 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
         predicted_cb,
         predicted_cr,
     ))
+}
+
+/// Coalesces an internally resolved Direct grid when every cell uses the same
+/// pair of reference motions. The original grid remains available to motion
+/// recording and deblocking; only pixel prediction uses the larger partition.
+fn uniform_direct_partition(motion: &ResolvedBMacroblock) -> Option<ResolvedBPartition> {
+    if !motion.direct || motion.partitions.len() < 2 {
+        return None;
+    }
+    let first = *motion.partitions.first()?;
+    let mut covered = 0u16;
+    for partition in &motion.partitions {
+        if partition.list0 != first.list0
+            || partition.list1 != first.list1
+            || !partition.x.is_multiple_of(4)
+            || !partition.y.is_multiple_of(4)
+            || !partition.width.is_multiple_of(4)
+            || !partition.height.is_multiple_of(4)
+            || partition.width == 0
+            || partition.height == 0
+        {
+            return None;
+        }
+        let start_x = usize::from(partition.x / 4);
+        let start_y = usize::from(partition.y / 4);
+        let end_x = start_x + usize::from(partition.width / 4);
+        let end_y = start_y + usize::from(partition.height / 4);
+        if end_x > 4 || end_y > 4 {
+            return None;
+        }
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let cell = 1u16 << (y * 4 + x);
+                if covered & cell != 0 {
+                    return None;
+                }
+                covered |= cell;
+            }
+        }
+    }
+    (covered == u16::MAX).then_some(ResolvedBPartition {
+        x: 0,
+        y: 0,
+        width: 16,
+        height: 16,
+        list0: first.list0,
+        list1: first.list1,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1690,6 +1742,62 @@ mod tests {
             list0,
             list1,
         }
+    }
+
+    #[test]
+    fn uniform_direct_grid_matches_partitioned_prediction() {
+        let mut first = picture(0);
+        let mut second = picture(0);
+        for (index, sample) in first.planes_mut().0.iter_mut().enumerate() {
+            *sample = (index * 31 + index / 16 * 7) as u8;
+        }
+        for (index, sample) in second.planes_mut().0.iter_mut().enumerate() {
+            *sample = (index * 13 + index / 16 * 29) as u8;
+        }
+        let list0 = Some(ResolvedBListMotion {
+            reference_index: 0,
+            motion_vector: MotionVector { x: 3, y: -5 },
+        });
+        let list1 = Some(ResolvedBListMotion {
+            reference_index: 0,
+            motion_vector: MotionVector { x: -7, y: 2 },
+        });
+        let partitions: smallvec::SmallVec<[ResolvedBPartition; 4]> = vec![
+            b_partition(0, 0, 8, 8, list0, list1),
+            b_partition(8, 0, 8, 8, list0, list1),
+            b_partition(0, 8, 8, 8, list0, list1),
+            b_partition(8, 8, 8, 8, list0, list1),
+        ]
+        .into();
+        let mut coalesced = picture(0);
+        reconstruct_b_macroblock_from_lists_420(
+            &mut coalesced,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: true,
+                partitions: partitions.clone(),
+            },
+            &zero_residual(),
+        )
+        .unwrap();
+        let mut partitioned = picture(0);
+        reconstruct_b_macroblock_from_lists_420(
+            &mut partitioned,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions,
+            },
+            &zero_residual(),
+        )
+        .unwrap();
+        assert_eq!(coalesced, partitioned);
     }
 
     #[test]
