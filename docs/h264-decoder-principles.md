@@ -651,15 +651,18 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - slice-aware Y/Cb/Cr `nC` neighbour state;
 - transactional CAVLC I_4x4, I_8x8, I_16x16, and I_PCM macroblocks;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
+- 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
-- SPS/PPS 4x4 scaling-list fallback resolution;
+- SPS/PPS 4x4 and 8x8 scaling-list fallback resolution;
 - transactional macroblock QP derivation with independent Cb and Cr offsets;
 - all 8-bit Intra4x4, Intra8x8, Intra16x16, and 4:2:0 chroma prediction modes;
 - the normative Intra8x8 reference-sample filter;
 - stateful Intra4x4/Intra8x8 mode derivation across block and slice boundaries;
-- a mutable planar 4:2:0 pre-deblocking picture surface;
+- a mutable planar 4:2:0 reconstruction picture surface;
 - 384-byte macroblock snapshots for rollback without copying a whole picture;
-- prediction-plus-residual reconstruction for I_4x4, I_16x16, and I_PCM;
+- prediction-plus-residual reconstruction for I_4x4, I_8x8, I_16x16, and I_PCM;
+- normative 8-bit 4:2:0 intra deblocking, including slice-controlled offsets
+  and cross-slice edge suppression;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
@@ -671,23 +674,17 @@ The first pixel-producing path is therefore real, but deliberately narrow:
 
 ```text
 Annex-B CAVLC progressive 8-bit 4:2:0 I/IDR
-    -> I_4x4, I_16x16, or I_PCM macroblocks
-    -> pre-deblocking planar reconstruction
+    -> I_4x4, I_8x8, I_16x16, or I_PCM macroblocks
+    -> planar reconstruction and in-loop deblocking
     -> immutable CPU NV12 frame
     -> synchronous pull output
 ```
 
-This is not yet a generally conforming H.264 decoder. In particular, the
-current output has not passed through the normative deblocking filter. That
-does not change a completely flat test image, but it changes real pictures and
-the samples that later reference pictures must use. The decoder must not be
-described as production-ready until that stage is connected.
-
-The current implementation also rejects or has not yet connected:
+This is not yet a generally conforming H.264 decoder. The current implementation
+still rejects or has not yet connected:
 
 - CABAC slice data;
 - P, B, SP, and SI macroblock reconstruction;
-- the 8x8 inverse transform used by High Profile Intra8x8 blocks;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
 - FMO slice groups;
@@ -698,9 +695,7 @@ The current implementation also rejects or has not yet connected:
 The next dependency chain is:
 
 ```text
-normative deblocking
-    -> 8x8 inverse transform / complete High intra path
-    -> inter macroblock syntax and motion vectors
+inter macroblock syntax and motion vectors
     -> fractional-sample motion compensation
     -> DPB reference marking and POC-based output
     -> CABAC

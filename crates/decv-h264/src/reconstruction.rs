@@ -1,9 +1,10 @@
 //! Conversion from decoded transform coefficients to spatial residual samples.
 
 use crate::{
-    Block4x4, ColorComponent, H264Error, IntraLumaPrediction, IntraMacroblockHeader, IntraResidual,
-    MacroblockQuantizer, PredictionClass, ResolvedScalingLists4x4, Result, ScanMode,
-    inverse_transform_chroma_dc_420, inverse_transform_luma_dc_4x4, reconstruct_residual_4x4,
+    Block4x4, Block8x8, ColorComponent, H264Error, IntraLumaPrediction, IntraMacroblockHeader,
+    IntraResidual, MacroblockQuantizer, PredictionClass, ResolvedScalingLists4x4,
+    ResolvedScalingLists8x8, Result, ScanMode, inverse_transform_chroma_dc_420,
+    inverse_transform_luma_dc_4x4, reconstruct_residual_4x4, reconstruct_residual_8x8,
 };
 
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
@@ -28,19 +29,26 @@ const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
 const CHROMA_BLOCK_COORDINATES: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReconstructedLumaResidual {
+    FourByFour(Box<[Block4x4; 16]>),
+    EightByEight(Box<[Block8x8; 4]>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconstructedIntraResidual {
-    pub luma: [Block4x4; 16],
+    pub luma: ReconstructedLumaResidual,
     pub chroma_cb: [Block4x4; 4],
     pub chroma_cr: [Block4x4; 4],
 }
 
-/// Applies the 8-bit 4x4 inverse-scan, inverse-scaling, and inverse-transform
-/// pipeline for one intra macroblock.
+/// Applies the 8-bit 4x4 or 8x8 inverse transform pipeline for one intra
+/// macroblock, including CAVLC coefficient interleaving for 8x8 blocks.
 pub fn reconstruct_intra_residual(
     header: &IntraMacroblockHeader,
     residual: &IntraResidual,
     quantizer: MacroblockQuantizer,
     scaling_lists: &ResolvedScalingLists4x4,
+    scaling_lists_8x8: &ResolvedScalingLists8x8,
     scan_mode: ScanMode,
 ) -> Result<ReconstructedIntraResidual> {
     if quantizer.transform_bypass {
@@ -48,16 +56,10 @@ pub fn reconstruct_intra_residual(
             "transform-bypass macroblock reconstruction",
         ));
     }
-    if matches!(header.luma_prediction, IntraLumaPrediction::EightByEight(_)) {
-        return Err(H264Error::UnsupportedFeature(
-            "8x8 inverse transform reconstruction",
-        ));
-    }
-
     let luma_scaling = scaling_lists.get(PredictionClass::Intra, ColorComponent::Luma);
-    let mut luma = [[[0; 4]; 4]; 16];
-    match header.luma_prediction {
+    let luma = match header.luma_prediction {
         IntraLumaPrediction::SixteenBySixteen { .. } => {
+            let mut luma = [[[0; 4]; 4]; 16];
             let dc = residual.luma_dc.as_ref().ok_or(H264Error::InvalidSyntax(
                 "Intra16x16 residual is missing its luma DC block",
             ))?;
@@ -81,8 +83,10 @@ pub fn reconstruct_intra_residual(
                     true,
                 )?;
             }
+            ReconstructedLumaResidual::FourByFour(Box::new(luma))
         }
         IntraLumaPrediction::FourByFour(_) => {
+            let mut luma = [[[0; 4]; 4]; 16];
             if residual.luma_dc.is_some() {
                 return Err(H264Error::InvalidSyntax(
                     "Intra4x4 residual unexpectedly contains luma DC",
@@ -98,9 +102,34 @@ pub fn reconstruct_intra_residual(
                     false,
                 )?;
             }
+            ReconstructedLumaResidual::FourByFour(Box::new(luma))
         }
-        IntraLumaPrediction::EightByEight(_) => unreachable!("rejected above"),
-    }
+        IntraLumaPrediction::EightByEight(_) => {
+            if residual.luma_dc.is_some() {
+                return Err(H264Error::InvalidSyntax(
+                    "Intra8x8 residual unexpectedly contains luma DC",
+                ));
+            }
+            let mut luma = [[[0; 8]; 8]; 4];
+            for (block_8x8, output) in luma.iter_mut().enumerate() {
+                let mut coefficients = [0; 64];
+                for block_4x4 in 0..4 {
+                    let source = &residual.luma[block_8x8 * 4 + block_4x4];
+                    ensure_block_size(source.max_num_coeff, 16)?;
+                    for index in 0..16 {
+                        coefficients[4 * index + block_4x4] = source.coefficients[index];
+                    }
+                }
+                *output = reconstruct_residual_8x8(
+                    &coefficients,
+                    scan_mode,
+                    quantizer.luma,
+                    scaling_lists_8x8.get(PredictionClass::Intra),
+                )?;
+            }
+            ReconstructedLumaResidual::EightByEight(Box::new(luma))
+        }
+    };
 
     let chroma_cb = reconstruct_chroma(
         &residual.chroma_dc[0],
@@ -164,12 +193,38 @@ fn ensure_block_size(actual: u8, expected: u8) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReconstructedIntraResidual, reconstruct_intra_residual};
+    use super::{ReconstructedIntraResidual, ReconstructedLumaResidual};
     use crate::{
-        CodedBlockPattern, H264Error, IntraLumaPrediction, IntraMacroblockHeader,
-        IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer, ResidualBlock, ScanMode,
-        reconstruct_residual_4x4, resolve_scaling_lists_4x4,
+        CodedBlockPattern, FLAT_SCALING_LIST_8X8, H264Error, IntraLumaPrediction,
+        IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer,
+        ResidualBlock, ScanMode, reconstruct_residual_4x4, reconstruct_residual_8x8,
+        resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
     };
+
+    fn reconstruct_intra_residual(
+        header: &IntraMacroblockHeader,
+        residual: &IntraResidual,
+        quantizer: MacroblockQuantizer,
+        scaling_lists: &crate::ResolvedScalingLists4x4,
+        scan_mode: ScanMode,
+    ) -> crate::Result<ReconstructedIntraResidual> {
+        let scaling_lists_8x8 = resolve_scaling_lists_8x8(None, None)?;
+        super::reconstruct_intra_residual(
+            header,
+            residual,
+            quantizer,
+            scaling_lists,
+            &scaling_lists_8x8,
+            scan_mode,
+        )
+    }
+
+    fn luma_4x4(residual: &ReconstructedIntraResidual) -> &[[[i32; 4]; 4]; 16] {
+        let ReconstructedLumaResidual::FourByFour(blocks) = &residual.luma else {
+            panic!("expected 4x4 luma residual");
+        };
+        blocks
+    }
 
     fn header(luma_prediction: IntraLumaPrediction) -> IntraMacroblockHeader {
         IntraMacroblockHeader {
@@ -218,7 +273,7 @@ mod tests {
         assert_eq!(
             zero,
             ReconstructedIntraResidual {
-                luma: [[[0; 4]; 4]; 16],
+                luma: ReconstructedLumaResidual::FourByFour(Box::new([[[0; 4]; 4]; 16])),
                 chroma_cb: [[[0; 4]; 4]; 4],
                 chroma_cr: [[[0; 4]; 4]; 4],
             }
@@ -230,8 +285,8 @@ mod tests {
         let reconstructed =
             reconstruct_intra_residual(&header, &impulse, quantizer(), &scaling, ScanMode::Frame)
                 .unwrap();
-        assert_eq!(reconstructed.luma[0], [[10; 4]; 4]);
-        assert_eq!(reconstructed.luma[1], [[0; 4]; 4]);
+        assert_eq!(luma_4x4(&reconstructed)[0], [[10; 4]; 4]);
+        assert_eq!(luma_4x4(&reconstructed)[1], [[0; 4]; 4]);
     }
 
     #[test]
@@ -248,7 +303,11 @@ mod tests {
             ScanMode::Frame,
         )
         .unwrap();
-        assert!(reconstructed.luma.iter().all(|block| block == &[[3; 4]; 4]));
+        assert!(
+            luma_4x4(&reconstructed)
+                .iter()
+                .all(|block| block == &[[3; 4]; 4])
+        );
 
         let mut ac_only = residual(15, Some(ResidualBlock::empty(16)));
         ac_only.luma[0].coefficients[0] = 64;
@@ -265,7 +324,7 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(reconstructed.luma[0], expected);
+        assert_eq!(luma_4x4(&reconstructed)[0], expected);
     }
 
     #[test]
@@ -302,6 +361,37 @@ mod tests {
     }
 
     #[test]
+    fn reconstructs_interleaved_cavlc_8x8_coefficients() {
+        let scaling = resolve_scaling_lists_4x4(None, None).unwrap();
+        let eight = header(IntraLumaPrediction::EightByEight(
+            [IntraPredictionModeSyntax {
+                use_predicted: true,
+                remaining_mode: None,
+            }; 4],
+        ));
+        let mut coefficients = residual(16, None);
+        coefficients.luma[3].coefficients[2] = 64;
+        let reconstructed = reconstruct_intra_residual(
+            &eight,
+            &coefficients,
+            quantizer(),
+            &scaling,
+            ScanMode::Frame,
+        );
+        let ReconstructedLumaResidual::EightByEight(blocks) = reconstructed.unwrap().luma else {
+            panic!("expected 8x8 luma residual");
+        };
+        let mut interleaved = [0; 64];
+        interleaved[11] = 64;
+        assert_eq!(
+            blocks[0],
+            reconstruct_residual_8x8(&interleaved, ScanMode::Frame, 0, &FLAT_SCALING_LIST_8X8,)
+                .unwrap()
+        );
+        assert!(blocks[1..].iter().all(|block| block == &[[0; 8]; 8]));
+    }
+
+    #[test]
     fn rejects_mismatched_or_unsupported_transform_paths() {
         let scaling = resolve_scaling_lists_4x4(None, None).unwrap();
         let four = header(IntraLumaPrediction::FourByFour(
@@ -322,23 +412,6 @@ mod tests {
                 "residual block size does not match its transform path"
             ))
         );
-
-        let eight = header(IntraLumaPrediction::EightByEight(
-            [IntraPredictionModeSyntax {
-                use_predicted: true,
-                remaining_mode: None,
-            }; 4],
-        ));
-        assert!(matches!(
-            reconstruct_intra_residual(
-                &eight,
-                &residual(16, None),
-                quantizer(),
-                &scaling,
-                ScanMode::Frame,
-            ),
-            Err(H264Error::UnsupportedFeature(_))
-        ));
 
         let bypass = MacroblockQuantizer {
             transform_bypass: true,

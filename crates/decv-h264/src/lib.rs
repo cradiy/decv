@@ -56,7 +56,9 @@ pub use prediction::{
 };
 pub use quantization::{MacroblockQuantizer, MacroblockQuantizerState, derive_chroma_qp};
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};
-pub use reconstruction::{ReconstructedIntraResidual, reconstruct_intra_residual};
+pub use reconstruction::{
+    ReconstructedIntraResidual, ReconstructedLumaResidual, reconstruct_intra_residual,
+};
 pub use slice::{
     DeblockingFilter, MemoryManagementOperation, ParsedSliceHeader, PredictionWeight,
     PredictionWeightTable, ReferenceListModification, ReferencePictureMarking, SliceHeader,
