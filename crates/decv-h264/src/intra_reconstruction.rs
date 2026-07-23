@@ -1,17 +1,22 @@
 //! Stateful reconstruction of progressive 8-bit 4:2:0 intra pictures.
 
+use std::sync::OnceLock;
+
 use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
+use rayon::prelude::*;
 
 use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
-    ImplicitWeightReference, reconstruct_b_macroblock_from_lists_420,
+    BPredictionWeightMode, ImplicitWeightReference, reconstruct_b_macroblock_from_lists_420,
+    reconstruct_b_macroblock_pixels_from_lists,
     reconstruct_implicitly_weighted_b_macroblock_from_lists_420,
     reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_b_macroblock_from_lists_420,
     reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
 };
 use crate::motion_field::MotionFieldBuilder;
+use crate::picture_surface::StagedMacroblockPixels;
 use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, BSubMacroblockType,
@@ -132,6 +137,29 @@ impl<'a> BDirectPrediction<'a> {
 struct BReconstructionModes<'a> {
     weights: BSlicePredictionWeights<'a>,
     direct: BDirectPrediction<'a>,
+}
+
+#[derive(Debug)]
+struct PendingBInterMacroblock {
+    address: usize,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    motion: ResolvedBMacroblock,
+    residual: ReconstructedInterResidual,
+    deblock: MacroblockDeblockInfo,
+}
+
+fn b_reconstruction_pool() -> Result<&'static rayon::ThreadPool> {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    if let Some(pool) = POOL.get() {
+        return Ok(pool);
+    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(2)
+        .thread_name(|index| format!("decv-h264-b-{index}"))
+        .build()
+        .map_err(|_| H264Error::UnsupportedFeature("failed to create H.264 worker pool"))?;
+    Ok(POOL.get_or_init(|| pool))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1398,6 +1426,11 @@ impl IntraPictureReconstructor {
         ];
         let mut macroblock_address = config.first_macroblock;
         let mut decoded_count = 0usize;
+        let mut pending_inter = Vec::new();
+        let inter_batch_limit = self
+            .width_in_macroblocks
+            .checked_mul(4)
+            .ok_or(H264Error::IntegerOverflow)?;
 
         loop {
             let (macroblock_x, macroblock_y) = self.macroblock_coordinates(macroblock_address)?;
@@ -1444,33 +1477,15 @@ impl IntraPictureReconstructor {
                                 return Err(error);
                             }
                         };
-                        let picture_snapshot = self
-                            .picture
-                            .snapshot_macroblock(macroblock_x, macroblock_y)?;
                         let residual = zero_inter_residual();
-                        let result = reconstruct_b_prediction(
-                            &mut self.picture,
-                            references_l0,
-                            references_l1,
+                        pending_inter.push(PendingBInterMacroblock {
+                            address: macroblock_address,
                             macroblock_x,
                             macroblock_y,
-                            &motion,
-                            &residual,
-                            modes.weights,
-                        )
-                        .and_then(|()| self.modes.record_inter(macroblock_address, slice_id));
-                        if let Err(error) = result {
-                            self.picture.restore_macroblock(
-                                macroblock_x,
-                                macroblock_y,
-                                &picture_snapshot,
-                            );
-                            self.b_motion.clear_macroblock(macroblock_address)?;
-                            self.reference_motion.clear_macroblock(macroblock_address)?;
-                            self.modes.clear_macroblock(macroblock_address)?;
-                            return Err(error);
-                        }
-                        self.complete_inter_macroblock(macroblock_address, deblock);
+                            motion,
+                            residual,
+                            deblock,
+                        });
                         Ok(())
                     }
                     CabacBMacroblock::Decoded(decoded) => match decoded.as_ref() {
@@ -1529,50 +1544,48 @@ impl IntraPictureReconstructor {
                                     return Err(error);
                                 }
                             };
-                            let picture_snapshot = self
-                                .picture
-                                .snapshot_macroblock(macroblock_x, macroblock_y)?;
-                            let reconstruction = reconstruct_b_prediction(
-                                &mut self.picture,
-                                references_l0,
-                                references_l1,
+                            pending_inter.push(PendingBInterMacroblock {
+                                address: macroblock_address,
                                 macroblock_x,
                                 macroblock_y,
-                                &motion,
-                                &reconstructed,
-                                modes.weights,
-                            );
-                            if let Err(error) = reconstruction.and_then(|()| {
-                                self.modes.record_inter(macroblock_address, slice_id)
-                            }) {
-                                self.picture.restore_macroblock(
-                                    macroblock_x,
-                                    macroblock_y,
-                                    &picture_snapshot,
-                                );
-                                self.b_motion.clear_macroblock(macroblock_address)?;
-                                self.reference_motion.clear_macroblock(macroblock_address)?;
-                                self.modes.clear_macroblock(macroblock_address)?;
-                                return Err(error);
-                            }
-                            self.complete_inter_macroblock(macroblock_address, deblock);
+                                motion,
+                                residual: reconstructed,
+                                deblock,
+                            });
                             Ok(())
                         }
-                        DecodedBSliceMacroblock::Intra(decoded) => self
-                            .reconstruct_macroblock_with_deblocking(
+                        DecodedBSliceMacroblock::Intra(decoded) => {
+                            self.finish_pending_b_inter(
+                                &mut pending_inter,
+                                references_l0,
+                                references_l1,
+                                modes.weights,
+                                slice_id,
+                            )?;
+                            self.reconstruct_macroblock_with_deblocking(
                                 macroblock_address,
                                 slice_id,
                                 decoded,
                                 quantizer,
                                 config.deblocking_filter,
                                 pcm_chroma_qp,
-                            ),
+                            )
+                        }
                     },
                 });
             if let Err(error) = reconstruction {
                 self.cabac_residual
                     .restore_macroblock(macroblock_address, residual_snapshot);
                 return Err(error);
+            }
+            if pending_inter.len() >= inter_batch_limit {
+                self.finish_pending_b_inter(
+                    &mut pending_inter,
+                    references_l0,
+                    references_l1,
+                    modes.weights,
+                    slice_id,
+                )?;
             }
 
             context.previous_qp_delta_nonzero = qp_delta != 0;
@@ -1583,6 +1596,13 @@ impl IntraPictureReconstructor {
                 .checked_add(1)
                 .ok_or(H264Error::IntegerOverflow)?;
             if decoded.end_of_slice {
+                self.finish_pending_b_inter(
+                    &mut pending_inter,
+                    references_l0,
+                    references_l1,
+                    modes.weights,
+                    slice_id,
+                )?;
                 return Ok(decoded_count);
             }
             if macroblock_address >= self.completed.len() {
@@ -1850,6 +1870,73 @@ impl IntraPictureReconstructor {
     ) {
         self.deblock[macroblock_address] = deblock;
         self.completed[macroblock_address] = true;
+    }
+
+    fn finish_pending_b_inter(
+        &mut self,
+        jobs: &mut Vec<PendingBInterMacroblock>,
+        references_l0: &[Option<&Yuv420Picture>],
+        references_l1: &[Option<&Yuv420Picture>],
+        weights: BSlicePredictionWeights<'_>,
+        slice_id: u32,
+    ) -> Result<()> {
+        if jobs.is_empty() {
+            return Ok(());
+        }
+        let weight_mode = match weights {
+            BSlicePredictionWeights::Default => BPredictionWeightMode::Default,
+            BSlicePredictionWeights::Explicit(table) => BPredictionWeightMode::Explicit(table),
+            BSlicePredictionWeights::Implicit {
+                current_picture_order_count,
+                list0,
+                list1,
+            } => BPredictionWeightMode::Implicit {
+                current_picture_order_count,
+                list0,
+                list1,
+            },
+        };
+        let coded_size = self.picture.coded_size();
+        let reconstructed: Vec<Result<StagedMacroblockPixels>> =
+            b_reconstruction_pool()?.install(|| {
+                jobs.par_iter()
+                    .map(|job| {
+                        reconstruct_b_macroblock_pixels_from_lists(
+                            coded_size,
+                            references_l0,
+                            references_l1,
+                            job.macroblock_x,
+                            job.macroblock_y,
+                            &job.motion,
+                            &job.residual,
+                            weight_mode,
+                        )
+                        .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
+                    })
+                    .collect()
+            });
+        let staged = reconstructed
+            .into_iter()
+            .collect::<Result<Vec<StagedMacroblockPixels>>>()?;
+
+        for (recorded_modes, job) in jobs.iter().enumerate() {
+            if let Err(error) = self.modes.record_inter(job.address, slice_id) {
+                for recorded in &jobs[..recorded_modes] {
+                    self.modes.clear_macroblock(recorded.address)?;
+                }
+                return Err(error);
+            }
+        }
+        if let Err(error) = self.picture.commit_macroblock_batch(&staged) {
+            for job in jobs.iter() {
+                self.modes.clear_macroblock(job.address)?;
+            }
+            return Err(error);
+        }
+        for job in jobs.drain(..) {
+            self.complete_inter_macroblock(job.address, job.deblock);
+        }
+        Ok(())
     }
 
     /// Reconstructs one decoded CAVLC intra macroblock.

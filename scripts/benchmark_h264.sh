@@ -34,7 +34,7 @@ ffmpeg -hide_banner -loglevel error \
 cargo build --quiet --manifest-path "$repo_dir/Cargo.toml" \
     -p decv-cli --release
 
-echo "single-threaded 1920x1080 progressive High Profile decode"
+echo "1920x1080 progressive High Profile software decode"
 echo "frames=$frame_count input_bytes=$(wc -c <"$work_dir/input.h264")"
 /usr/bin/time \
     -f "elapsed_seconds=%e user_seconds=%U system_seconds=%S max_rss_kb=%M" \

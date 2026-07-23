@@ -171,10 +171,13 @@ does not justify a thread-pool dependency.
 7. Design deblocking wavefront scheduling only if reconstruction parallelism
    still leaves 1080p60 below target.
 
-Current status: stages 1 and 2 are implemented for B macroblocks.
-Reconstruction first produces an owned `MacroblockPixels` value. Batch commit
-validates every address and strict address ordering before touching the
-picture, so an invalid or failed batch leaves all pixels unchanged.
+Current status: stages 1 through 3 are implemented for CABAC B inter
+macroblocks. Syntax, QP, residual transform, Direct motion, and metadata
+derivation remain serial. Four macroblock rows of owned jobs are reconstructed
+on a persistent two-thread pool, results are collected in address order, and
+batch commit validates all addresses before touching the picture. Intra/PCM
+macroblocks flush the pending batch before using current-picture neighbours.
+Configurable serial/auto/thread-count policy remains to be implemented.
 
 ## Acceptance Checks
 

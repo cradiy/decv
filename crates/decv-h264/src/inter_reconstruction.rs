@@ -248,7 +248,7 @@ fn reconstruct_b_macroblock_from_lists_inner(
     residual: &ReconstructedInterResidual,
     weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<()> {
-    let pixels = reconstruct_b_macroblock_pixels_from_lists_inner(
+    let pixels = reconstruct_b_macroblock_pixels_from_lists(
         current.coded_size(),
         references_l0,
         references_l1,
@@ -267,8 +267,12 @@ fn reconstruct_b_macroblock_from_lists_inner(
     current.commit_macroblock_batch(&[StagedMacroblockPixels::new(address, pixels)])
 }
 
+/// Reconstructs one resolved B macroblock into owned pixels without mutating
+/// decoder-visible picture state.
+///
+/// This is the worker-side boundary for deterministic batch reconstruction.
 #[allow(clippy::too_many_arguments)]
-fn reconstruct_b_macroblock_pixels_from_lists_inner(
+pub(crate) fn reconstruct_b_macroblock_pixels_from_lists(
     current_size: Size,
     references_l0: &[Option<&Yuv420Picture>],
     references_l1: &[Option<&Yuv420Picture>],
