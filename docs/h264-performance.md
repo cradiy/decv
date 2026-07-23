@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 3.06 s | 2.98 s | 83,820 KiB | 58.8 FPS |
-| decv Auto (2 workers) | NV12 | 3.04 s | 3.31 s | 84,356 KiB | 59.2 FPS |
-| FFmpeg 1 thread | NV12 | 0.60 s | 0.68 s | 151,904 KiB | 300.0 FPS |
-| FFmpeg Auto | NV12 | 0.28 s | 1.41 s | 278,048 KiB | 642.9 FPS |
-| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,892 KiB | 315.8 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.94 s | 192,500 KiB | 818.2 FPS |
+| decv Serial | NV12 | 2.79 s | 2.71 s | 83,060 KiB | 64.5 FPS |
+| decv Auto (2 workers) | NV12 | 2.78 s | 2.99 s | 84,172 KiB | 64.7 FPS |
+| FFmpeg 1 thread | NV12 | 0.62 s | 0.70 s | 152,252 KiB | 290.3 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.45 s | 287,344 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.61 s | 0.59 s | 95,644 KiB | 295.1 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 0.99 s | 195,672 KiB | 782.6 FPS |
 
 On this workload:
 
-- decv Serial takes about **5.1x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **4.5x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **10.9x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **10.3x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **2.3x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **2.1x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **55%** of FFmpeg single-threaded NV12 peak RSS and about
   **30%** of FFmpeg Auto NV12 peak RSS;
@@ -62,11 +62,10 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current 3.06-second Serial result is about 0.98x real time, or
-roughly 2% more wall-clock work than the target permits. The measured
-two-worker Auto median is 3.04 seconds, about 1.3% over the target. The ordering
-between Serial and Auto is sensitive to scheduling and thermal state because
-the current parallel region is narrow.
+seconds. The current Serial result has about 7.5% throughput headroom over that
+line, and the measured two-worker Auto result has about 7.9%. The ordering
+between Serial and Auto remains sensitive to scheduling and thermal state
+because the current parallel region is narrow.
 
 This snapshot includes the removal of repeated by-value copies of the
 544-byte `MacroblockDeblockInfo` value from the deblocking traversal. Passing
@@ -93,7 +92,11 @@ stable picture-local byte tokens reduced each motion cell from 24 to 10 bytes.
 Fusing B-picture block residuals directly into their prediction matrices with
 SSE2 then removed a 1.5 KiB assembled residual matrix and a second macroblock
 output pass. Together these changes reduced the current snapshot to 3.06
-seconds.
+seconds. Packing CABAC decision state, vectorizing two-dimensional luma and
+chroma fractional interpolation, and building reference motion fields directly
+in their final storage subsequently reduced the fixed result to 2.94 seconds.
+Representing B-skip residuals as absent, rather than allocating and traversing
+an explicit all-zero residual, reduced it further to 2.79 seconds.
 
 A separate alternating A/B run used the same 300-frame stream and pinned CPU
 sets to isolate those two bit-reading changes from run-to-run drift. Serial
@@ -116,10 +119,20 @@ run from 5.430 to 5.305 seconds (about 2.3%) and Auto from 5.120 to 4.970
 seconds (about 2.9%). The residual path is checked against an assembled-matrix
 oracle for both 4x4 and 8x8 transforms, including saturating extreme values.
 
+Packing each CABAC context into one byte moved a pinned 300-frame Serial median
+from 5.295 to 5.180 seconds (about 2.2%) and Auto from 5.070 to 4.945 seconds
+(about 2.5%). The combined fractional-motion SIMD change moved Serial from
+5.120 to 4.990 seconds (about 2.5%) and Auto from 4.935 to 4.895 seconds (about
+0.8%). Building motion fields in final storage removed a whole-picture
+`Option<Cell>` conversion; its Serial wall time was noise-level, but sampled
+cycles fell about 1.0% and Auto wall time fell about 1.0%. Finally, omitting
+all-zero B-skip residual objects moved Serial from 4.89 to 4.67 seconds (about
+4.5%) and Auto from 4.80 to 4.52 seconds (about 5.8%).
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
-FFmpeg is already about 5.1x faster in the comparable NV12 case. FFmpeg then
+FFmpeg is already about 4.5x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
 parallelizes only owned CABAC B-macroblock pixel reconstruction. CABAC parsing,
 residual reconstruction, most P-picture reconstruction, output packaging, and
