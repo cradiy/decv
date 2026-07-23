@@ -40,18 +40,18 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 2.00 s | 1.92 s | 80,216 KiB | 90.0 FPS |
-| decv Auto (2 workers) | NV12 | 2.08 s | 2.29 s | 78,960 KiB | 86.5 FPS |
-| FFmpeg 1 thread | NV12 | 0.63 s | 0.70 s | 152,240 KiB | 285.7 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.50 s | 293,132 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,404 KiB | 305.1 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.98 s | 192,428 KiB | 782.6 FPS |
+| decv Serial | NV12 | 1.99 s | 1.90 s | 80,108 KiB | 90.5 FPS |
+| decv Auto (2 workers) | NV12 | 2.06 s | 2.24 s | 78,980 KiB | 87.4 FPS |
+| FFmpeg 1 thread | NV12 | 0.64 s | 0.73 s | 152,384 KiB | 281.3 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.53 s | 283,904 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.58 s | 0.56 s | 95,892 KiB | 310.3 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 1.00 s | 192,376 KiB | 782.6 FPS |
 
 On this workload:
 
-- decv Serial takes about **3.2x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **3.1x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **7.7x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **7.6x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.5x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 50.0% throughput headroom over that
-line, and the measured two-worker Auto result has about 44.2%. The ordering
+seconds. The current Serial result has about 50.8% throughput headroom over that
+line, and the measured two-worker Auto result has about 45.6%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -278,6 +278,24 @@ macroblock was parsed removed a later 188-byte copy, but worsened the
 eight-pair pinned median by about 1.2%. It likely displaced hotter entropy and
 reconstruction state before the batch completed, so that write-timing change
 was rejected.
+
+Strong luma deblocking now evaluates four adjacent sample sets with SSE2 in
+both orientations. The shared vector kernel retains the normative narrow
+`p0/q0` path and independently selects the wide three-sample tap set on each
+side of each lane. A scalar-oracle test covers strengths 1 through 4, five QP
+regions, horizontal and vertical traversal, smooth edges, and threshold
+rejection. Pinned CABAC wall time improved about 1.8%, instructions and
+branches about 0.7%, and branch misses about 1.8%. Seven-run CAVLC invariant
+cycles were neutral to slightly lower, with instructions down about 0.4%. The
+fixed benchmark now measures 1.99 seconds in Serial mode and 2.06 seconds in
+Auto mode.
+
+Inlining the small luma edge wrappers looked attractive after SIMD moved the
+large kernels out of line. It improved CABAC wall time by about 2.1%, but
+increased CAVLC invariant cycles about 1.2% when both orientations were
+inlined. Vertical-only and horizontal-only variants were also slower on CAVLC,
+by about 2.0% and 0.5%, respectively. The resulting picture-traversal code
+layout is workload-sensitive, so all wrapper-inline variants were rejected.
 
 ## BitReader Checkpoint
 
