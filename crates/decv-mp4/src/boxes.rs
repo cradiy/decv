@@ -143,10 +143,19 @@ impl<'input> Mp4File<'input> {
 
     pub fn children(self, parent: BoxHeader) -> Result<BoxIter<'input>> {
         let range = parent.payload_range()?;
-        if range.end > self.length {
-            return Err(Mp4Error::InvalidData("parent box exceeds the input"));
+        self.boxes_in(range)
+    }
+
+    pub(crate) fn boxes_in(self, range: Range<u64>) -> Result<BoxIter<'input>> {
+        if range.start > range.end || range.end > self.length {
+            return Err(Mp4Error::InvalidData("box range exceeds the input"));
         }
         Ok(BoxIter::new(self.input, range.start, range.end))
+    }
+
+    #[inline]
+    pub(crate) const fn input(self) -> &'input dyn MediaInput {
+        self.input
     }
 }
 

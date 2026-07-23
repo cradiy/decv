@@ -7,7 +7,10 @@
 mod boxes;
 mod error;
 mod fourcc;
+mod movie;
+mod reader;
 
 pub use boxes::{BoxHeader, BoxIter, Mp4File};
 pub use error::{Mp4Error, Result};
 pub use fourcc::FourCc;
+pub use movie::{AvcSampleEntry, Movie, SampleDescription, Track};
