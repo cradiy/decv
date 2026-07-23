@@ -1998,9 +1998,10 @@ impl IntraPictureReconstructor {
             }
             return Err(error);
         }
-        for job in jobs.drain(..) {
+        for job in jobs.iter() {
             self.complete_inter_macroblock(job.address, job.deblock);
         }
+        jobs.clear();
         Ok(())
     }
 
@@ -2082,9 +2083,10 @@ impl IntraPictureReconstructor {
             }
             return Err(error);
         }
-        for job in jobs.drain(..) {
+        for job in jobs.iter() {
             self.complete_inter_macroblock(job.address, job.deblock);
         }
+        jobs.clear();
         Ok(())
     }
 
