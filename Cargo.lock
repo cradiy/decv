@@ -213,6 +213,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "decv-mp4"
+version = "0.1.0"
+dependencies = [
+ "decv-core",
+]
+
+[[package]]
 name = "either"
 version = "1.16.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,13 @@
+//! Synchronous, random-access ISO Base Media File Format demuxing.
+//!
+//! The parser starts with a bounded box layer. Higher-level movie, track, and
+//! sample-table readers build on these offsets without loading the whole file
+//! or depending on a particular storage/network implementation.
+
+mod boxes;
+mod error;
+mod fourcc;
+
+pub use boxes::{BoxHeader, BoxIter, Mp4File};
+pub use error::{Mp4Error, Result};
+pub use fourcc::FourCc;
