@@ -655,6 +655,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - slice-aware frame-coded P motion-vector prediction at 4x4 granularity,
   including A/B/C/D lookup, C-to-D fallback, directional 16x8/8x16 rules,
   median prediction, P_Skip inference, and transactional state updates;
+- allocation-free progressive 8-bit 4:2:0 inter prediction blocks with
+  normative quarter-sample luma six-tap filtering, eighth-sample chroma
+  bilinear filtering, negative-vector decomposition, and edge extension;
 - 4x4 inverse scan, inverse scaling, and inverse integer transform;
 - 8x8 frame/field inverse scan, inverse scaling, and inverse integer transform;
 - I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
@@ -701,7 +704,7 @@ The next dependency chain is:
 
 ```text
 inter residual decoding and reference-picture storage
-    -> fractional-sample motion compensation
+    -> connect fractional-sample prediction to P-picture reconstruction
     -> DPB reference marking and POC-based output
     -> CABAC
 ```

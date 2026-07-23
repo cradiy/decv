@@ -94,6 +94,11 @@ impl Yuv420Picture {
         (&mut self.luma, &mut self.cb, &mut self.cr)
     }
 
+    #[inline]
+    pub(crate) fn planes(&self) -> (&[u8], &[u8], &[u8]) {
+        (&self.luma, &self.cb, &self.cr)
+    }
+
     pub fn intra4x4_references(
         &self,
         x: usize,
