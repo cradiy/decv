@@ -42,7 +42,7 @@ struct BlockGrid {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct MacroblockSnapshot {
+pub(crate) struct MacroblockSnapshot {
     luma: [u32; 16],
     chroma_cb: [u32; 4],
     chroma_cr: [u32; 4],
@@ -474,7 +474,7 @@ impl CavlcNeighborState {
         Ok(())
     }
 
-    fn snapshot_macroblock(&self, mb_x: u32, mb_y: u32) -> Result<MacroblockSnapshot> {
+    pub(crate) fn snapshot_macroblock(&self, mb_x: u32, mb_y: u32) -> Result<MacroblockSnapshot> {
         self.ensure_macroblock(mb_x, mb_y)?;
         let mut snapshot = MacroblockSnapshot {
             luma: [0; 16],
@@ -494,7 +494,12 @@ impl CavlcNeighborState {
         Ok(snapshot)
     }
 
-    fn restore_macroblock(&mut self, mb_x: u32, mb_y: u32, snapshot: MacroblockSnapshot) {
+    pub(crate) fn restore_macroblock(
+        &mut self,
+        mb_x: u32,
+        mb_y: u32,
+        snapshot: MacroblockSnapshot,
+    ) {
         for block_index in 0..16u8 {
             let (x, y) = self
                 .luma_position(mb_x, mb_y, block_index)

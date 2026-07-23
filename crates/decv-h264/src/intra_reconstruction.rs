@@ -1,12 +1,17 @@
 //! Stateful reconstruction of progressive 8-bit 4:2:0 intra pictures.
 
+use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
 
+use crate::rbsp::more_rbsp_data;
 use crate::{
-    ChromaPlane, DecodedIntraMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
-    IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
-    ReconstructedIntraResidual, ResolvedScalingLists4x4, Result, ScanMode, Yuv420Picture,
-    predict_intra_4x4, predict_intra_16x16, predict_intra_chroma_420, reconstruct_intra_residual,
+    ActiveParameterSets, CavlcNeighborState, ChromaPlane, DecodedIntraMacroblock,
+    EntropyCodingMode, H264Error, IntraLumaPrediction, IntraMacroblock, IntraModeState,
+    IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
+    MacroblockQuantizerState, ParsedSliceHeader, ReconstructedIntraResidual,
+    ResolvedScalingLists4x4, Result, ScanMode, SliceType, Yuv420Picture,
+    consume_rbsp_trailing_bits, predict_intra_4x4, predict_intra_16x16, predict_intra_chroma_420,
+    reconstruct_intra_residual, resolve_scaling_lists_4x4,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -34,16 +39,29 @@ struct CompletedMacroblock {
     is_intra: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct IntraSliceConfig {
+    header_bit_size: usize,
+    first_macroblock: usize,
+    slice_qp_y: u8,
+    transform_8x8_mode: bool,
+    chroma_cb_offset: i8,
+    chroma_cr_offset: i8,
+    transform_bypass_enabled: bool,
+}
+
 /// Reconstructs one progressively scanned intra picture in macroblock order.
 #[derive(Debug, Clone)]
 pub struct IntraPictureReconstructor {
     width_in_macroblocks: usize,
     picture: Yuv420Picture,
+    cavlc: CavlcNeighborState,
     modes: IntraModeState,
     completed: Vec<Option<CompletedMacroblock>>,
     scaling_lists: ResolvedScalingLists4x4,
     scan_mode: ScanMode,
     constrained_intra_prediction: bool,
+    next_slice_id: u32,
 }
 
 impl IntraPictureReconstructor {
@@ -63,17 +81,144 @@ impl IntraPictureReconstructor {
         Ok(Self {
             width_in_macroblocks,
             picture,
+            cavlc: CavlcNeighborState::new(coded_size.width / 16, coded_size.height / 16)?,
             modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
             completed: vec![None; macroblock_count],
             scaling_lists,
             scan_mode: ScanMode::Frame,
             constrained_intra_prediction,
+            next_slice_id: 0,
         })
+    }
+
+    pub fn from_parameter_sets(parameter_sets: &ActiveParameterSets) -> Result<Self> {
+        let sps = &parameter_sets.sequence;
+        let pps = &parameter_sets.picture;
+        let scaling_lists = resolve_scaling_lists_4x4(
+            sps.scaling_matrices.as_ref(),
+            pps.scaling_matrices.as_ref(),
+        )?;
+        Self::new(
+            sps.coded_size,
+            scaling_lists,
+            pps.constrained_intra_prediction,
+        )
     }
 
     #[inline]
     pub fn picture(&self) -> &Yuv420Picture {
         &self.picture
+    }
+
+    /// Decodes and reconstructs one progressively scanned CAVLC I slice.
+    pub fn decode_cavlc_intra_slice(
+        &mut self,
+        rbsp: &[u8],
+        parsed: &ParsedSliceHeader,
+    ) -> Result<usize> {
+        let header = &parsed.header;
+        let sps = &parsed.parameter_sets.sequence;
+        let pps = &parsed.parameter_sets.picture;
+        if header.slice_type != SliceType::I {
+            return Err(H264Error::UnsupportedFeature(
+                "slice-data reconstruction currently requires an I slice",
+            ));
+        }
+        if pps.entropy_coding_mode != EntropyCodingMode::Cavlc {
+            return Err(H264Error::UnsupportedFeature(
+                "CABAC slice-data reconstruction",
+            ));
+        }
+        if pps.num_slice_groups != 1 {
+            return Err(H264Error::UnsupportedFeature(
+                "FMO slice-data reconstruction",
+            ));
+        }
+        if header.field_picture || sps.mb_adaptive_frame_field {
+            return Err(H264Error::UnsupportedFeature(
+                "field and MBAFF slice-data reconstruction",
+            ));
+        }
+        if sps.coded_size != self.picture.coded_size()
+            || pps.constrained_intra_prediction != self.constrained_intra_prediction
+        {
+            return Err(H264Error::InvalidSyntax(
+                "slice parameter sets do not match the picture reconstructor",
+            ));
+        }
+        let config = IntraSliceConfig {
+            header_bit_size: header.bit_size,
+            first_macroblock: usize::try_from(header.first_mb_in_slice)
+                .map_err(|_| H264Error::IntegerOverflow)?,
+            slice_qp_y: header.slice_qp_y,
+            transform_8x8_mode: pps.transform_8x8_mode,
+            chroma_cb_offset: pps.chroma_qp_index_offset,
+            chroma_cr_offset: pps.second_chroma_qp_index_offset,
+            transform_bypass_enabled: sps.qpprime_y_zero_transform_bypass,
+        };
+        self.decode_cavlc_intra_slice_data(rbsp, config)
+    }
+
+    fn decode_cavlc_intra_slice_data(
+        &mut self,
+        rbsp: &[u8],
+        config: IntraSliceConfig,
+    ) -> Result<usize> {
+        let mut reader = BitReader::new(rbsp);
+        if !reader.skip_bits(config.header_bit_size) {
+            return Err(H264Error::UnexpectedEof);
+        }
+        self.next_slice_id = self
+            .next_slice_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let slice_id = self.next_slice_id;
+        self.cavlc.begin_slice();
+        let mut quantizers = MacroblockQuantizerState::new(
+            config.slice_qp_y,
+            config.chroma_cb_offset,
+            config.chroma_cr_offset,
+            config.transform_bypass_enabled,
+        )?;
+        let mut macroblock_address = config.first_macroblock;
+        let mut decoded_count = 0usize;
+        while more_rbsp_data(&reader) {
+            if macroblock_address >= self.completed.len() {
+                return Err(H264Error::InvalidSyntax(
+                    "slice data exceeds the reconstructed picture",
+                ));
+            }
+            let macroblock_x = u32::try_from(macroblock_address % self.width_in_macroblocks)
+                .map_err(|_| H264Error::IntegerOverflow)?;
+            let macroblock_y = u32::try_from(macroblock_address / self.width_in_macroblocks)
+                .map_err(|_| H264Error::IntegerOverflow)?;
+            let cavlc_snapshot = self.cavlc.snapshot_macroblock(macroblock_x, macroblock_y)?;
+            let decoded = self.cavlc.decode_intra_macroblock(
+                &mut reader,
+                macroblock_x,
+                macroblock_y,
+                config.transform_8x8_mode,
+            )?;
+            let qp_delta = match &decoded.macroblock {
+                IntraMacroblock::Predicted(header) => header.qp_delta,
+                IntraMacroblock::Pcm(_) => 0,
+            };
+            if let Err(error) = quantizers.with_macroblock(qp_delta, |quantizer| {
+                self.reconstruct_macroblock(macroblock_address, slice_id, &decoded, quantizer)
+            }) {
+                self.cavlc
+                    .restore_macroblock(macroblock_x, macroblock_y, cavlc_snapshot);
+                return Err(error);
+            }
+            macroblock_address = macroblock_address
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+            decoded_count = decoded_count
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+        }
+        consume_rbsp_trailing_bits(&mut reader)?;
+        Ok(decoded_count)
     }
 
     /// Reconstructs one decoded CAVLC intra macroblock.
@@ -465,7 +610,7 @@ fn assemble_chroma_residual(blocks: &[[[i32; 4]; 4]; 4]) -> [[i32; 8]; 8] {
 mod tests {
     use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
 
-    use super::IntraPictureReconstructor;
+    use super::{IntraPictureReconstructor, IntraSliceConfig};
     use crate::{
         CodedBlockPattern, DecodedIntraMacroblock, IntraLumaPrediction, IntraMacroblock,
         IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer,
@@ -557,6 +702,38 @@ mod tests {
         reconstructor
             .reconstruct_macroblock(0, 1, &predicted(2, 0), quantizer())
             .unwrap();
+        let frame = reconstructor
+            .into_nv12_frame(1, None, None, format(size))
+            .unwrap();
+        let cpu = match frame.storage {
+            FrameStorage::Cpu(cpu) => cpu,
+            _ => panic!("expected CPU frame"),
+        };
+        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+    }
+
+    #[test]
+    fn decodes_one_complete_cavlc_intra_slice_from_rbsp_bits() {
+        // mb_type=I_NxN; sixteen predicted-mode flags; chroma mode=DC;
+        // coded_block_pattern codeNum=3 (no residual); rbsp_trailing_bits.
+        let rbsp = [0xff, 0xff, 0xc9];
+        let size = Size::new(16, 16);
+        let mut reconstructor = reconstructor(size);
+        assert_eq!(
+            reconstructor.decode_cavlc_intra_slice_data(
+                &rbsp,
+                IntraSliceConfig {
+                    header_bit_size: 0,
+                    first_macroblock: 0,
+                    slice_qp_y: 26,
+                    transform_8x8_mode: false,
+                    chroma_cb_offset: 0,
+                    chroma_cr_offset: 0,
+                    transform_bypass_enabled: false,
+                }
+            ),
+            Ok(1)
+        );
         let frame = reconstructor
             .into_nv12_frame(1, None, None, format(size))
             .unwrap();
