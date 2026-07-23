@@ -671,6 +671,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   motion compensation uses a bounds-check-free specialization, while the
   clipped edge path preserves normative sample replication; integer interior
   motion uses row copies instead of entering the per-sample interpolator;
+- B prediction reuses one fixed-capacity buffer per reference list across all
+  partitions of a macroblock, avoiding repeated zero-initialization and
+  full-buffer moves while retaining the allocation-free public prediction API;
 - transactional CAVLC inter residual decoding plus 4x4/8x8 inverse transform
   paths using the Inter scaling lists;
 - a transactional complete non-skipped CAVLC P-macroblock entry point that

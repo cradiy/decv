@@ -264,8 +264,10 @@ fn reconstruct_b_macroblock_from_lists_inner(
     let mut predicted_cb = [[0u8; 8]; 8];
     let mut predicted_cr = [[0u8; 8]; 8];
     let mut covered = [[false; 4]; 4];
+    let mut prediction_l0 = InterPrediction420::empty();
+    let mut prediction_l1 = InterPrediction420::empty();
     for partition in &motion.partitions {
-        let prediction_l0 = predict_b_partition_list(
+        let has_l0 = predict_b_partition_list_into(
             references_l0,
             current.coded_size(),
             macroblock_x,
@@ -273,8 +275,9 @@ fn reconstruct_b_macroblock_from_lists_inner(
             *partition,
             partition.list0,
             "B partition selects no reference picture in List 0",
+            &mut prediction_l0,
         )?;
-        let prediction_l1 = predict_b_partition_list(
+        let has_l1 = predict_b_partition_list_into(
             references_l1,
             current.coded_size(),
             macroblock_x,
@@ -282,10 +285,11 @@ fn reconstruct_b_macroblock_from_lists_inner(
             *partition,
             partition.list1,
             "B partition selects no reference picture in List 1",
+            &mut prediction_l1,
         )?;
         let prediction = merge_b_predictions(
-            prediction_l0,
-            prediction_l1,
+            has_l0.then_some(&mut prediction_l0),
+            has_l1.then_some(&mut prediction_l1),
             partition.list0.map(|motion| motion.reference_index),
             partition.list1.map(|motion| motion.reference_index),
             weight_mode,
@@ -349,7 +353,8 @@ fn reconstruct_b_macroblock_from_lists_inner(
     Ok(())
 }
 
-fn predict_b_partition_list(
+#[allow(clippy::too_many_arguments)]
+fn predict_b_partition_list_into(
     references: &[Option<&Yuv420Picture>],
     expected_size: decv_core::Size,
     macroblock_x: usize,
@@ -357,9 +362,10 @@ fn predict_b_partition_list(
     partition: ResolvedBPartition,
     list_motion: Option<ResolvedBListMotion>,
     missing_reference: &'static str,
-) -> Result<Option<InterPrediction420>> {
+    prediction: &mut InterPrediction420,
+) -> Result<bool> {
     let Some(list_motion) = list_motion else {
-        return Ok(None);
+        return Ok(false);
     };
     let reference = references
         .get(usize::from(list_motion.reference_index))
@@ -371,7 +377,7 @@ fn predict_b_partition_list(
             "B reference picture coded size does not match",
         ));
     }
-    Ok(Some(reference.predict_inter_420(
+    reference.predict_inter_420_into(
         macroblock_x,
         macroblock_y,
         ResolvedPPartition {
@@ -382,21 +388,23 @@ fn predict_b_partition_list(
             reference_index: list_motion.reference_index,
             motion_vector: list_motion.motion_vector,
         },
-    )?))
+        prediction,
+    )?;
+    Ok(true)
 }
 
-fn merge_b_predictions(
-    list0: Option<InterPrediction420>,
-    list1: Option<InterPrediction420>,
+fn merge_b_predictions<'a>(
+    list0: Option<&'a mut InterPrediction420>,
+    list1: Option<&'a mut InterPrediction420>,
     reference_index_l0: Option<u8>,
     reference_index_l1: Option<u8>,
     weight_mode: BPredictionWeightMode<'_>,
-) -> Result<InterPrediction420> {
+) -> Result<&'a InterPrediction420> {
     match (list0, list1) {
-        (Some(mut prediction), None) => {
+        (Some(prediction), None) => {
             if let BPredictionWeightMode::Explicit(weights) = weight_mode {
                 apply_prediction_weights_for_list(
-                    &mut prediction,
+                    prediction,
                     reference_index_l0.ok_or(H264Error::InvalidSyntax(
                         "List-0 B prediction is missing its reference index",
                     ))?,
@@ -406,10 +414,10 @@ fn merge_b_predictions(
             }
             Ok(prediction)
         }
-        (None, Some(mut prediction)) => {
+        (None, Some(prediction)) => {
             if let BPredictionWeightMode::Explicit(weights) = weight_mode {
                 apply_prediction_weights_for_list(
-                    &mut prediction,
+                    prediction,
                     reference_index_l1.ok_or(H264Error::InvalidSyntax(
                         "List-1 B prediction is missing its reference index",
                     ))?,
@@ -419,7 +427,7 @@ fn merge_b_predictions(
             }
             Ok(prediction)
         }
-        (Some(mut list0), Some(list1)) => {
+        (Some(list0), Some(list1)) => {
             if list0.width != list1.width || list0.height != list1.height {
                 return Err(H264Error::InvalidSyntax(
                     "bidirectional prediction dimensions do not match",
@@ -434,8 +442,8 @@ fn merge_b_predictions(
             match weight_mode {
                 BPredictionWeightMode::Explicit(weights) => {
                     apply_explicit_bipred_weights(
-                        &mut list0,
-                        &list1,
+                        list0,
+                        list1,
                         reference_index_l0,
                         reference_index_l1,
                         weights,
@@ -452,8 +460,8 @@ fn merge_b_predictions(
                     let reference_l1 =
                         implicit_weight_reference(implicit_l1, reference_index_l1, "List 1")?;
                     apply_implicit_bipred_weights(
-                        &mut list0,
-                        &list1,
+                        list0,
+                        list1,
                         current_picture_order_count,
                         reference_l0,
                         reference_l1,

@@ -16,6 +16,18 @@ pub struct InterPrediction420 {
     pub cr: [[u8; 8]; 8],
 }
 
+impl InterPrediction420 {
+    pub(crate) const fn empty() -> Self {
+        Self {
+            width: 0,
+            height: 0,
+            luma: [[0; 16]; 16],
+            cb: [[0; 8]; 8],
+            cr: [[0; 8]; 8],
+        }
+    }
+}
+
 impl Yuv420Picture {
     /// Predicts one partition from this already reconstructed reference
     /// picture using normative H.264 luma and 4:2:0 chroma interpolation.
@@ -25,6 +37,18 @@ impl Yuv420Picture {
         macroblock_y: usize,
         partition: ResolvedPPartition,
     ) -> Result<InterPrediction420> {
+        let mut prediction = InterPrediction420::empty();
+        self.predict_inter_420_into(macroblock_x, macroblock_y, partition, &mut prediction)?;
+        Ok(prediction)
+    }
+
+    pub(crate) fn predict_inter_420_into(
+        &self,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        partition: ResolvedPPartition,
+        prediction: &mut InterPrediction420,
+    ) -> Result<()> {
         validate_partition(partition)?;
         let current_x = macroblock_x
             .checked_mul(16)
@@ -53,13 +77,8 @@ impl Yuv420Picture {
         let integer_motion_y = i32::from(motion.y).div_euclid(4);
         let fractional_motion_x = i32::from(motion.x).rem_euclid(4) as u8;
         let fractional_motion_y = i32::from(motion.y).rem_euclid(4) as u8;
-        let mut prediction = InterPrediction420 {
-            width: partition.width,
-            height: partition.height,
-            luma: [[0; 16]; 16],
-            cb: [[0; 8]; 8],
-            cr: [[0; 8]; 8],
-        };
+        prediction.width = partition.width;
+        prediction.height = partition.height;
 
         let reference_luma_x = usize_to_i32(current_x)? + integer_motion_x;
         let reference_luma_y = usize_to_i32(current_y)? + integer_motion_y;
@@ -75,7 +94,7 @@ impl Yuv420Picture {
         );
         if luma_is_interior {
             predict_luma::<false>(
-                &mut prediction,
+                prediction,
                 luma,
                 picture_width,
                 picture_height,
@@ -86,7 +105,7 @@ impl Yuv420Picture {
             );
         } else {
             predict_luma::<true>(
-                &mut prediction,
+                prediction,
                 luma,
                 picture_width,
                 picture_height,
@@ -119,7 +138,7 @@ impl Yuv420Picture {
         );
         if chroma_is_interior {
             predict_chroma::<false>(
-                &mut prediction,
+                prediction,
                 cb,
                 cr,
                 chroma_width,
@@ -131,7 +150,7 @@ impl Yuv420Picture {
             );
         } else {
             predict_chroma::<true>(
-                &mut prediction,
+                prediction,
                 cb,
                 cr,
                 chroma_width,
@@ -142,7 +161,7 @@ impl Yuv420Picture {
                 fractional_chroma_y,
             );
         }
-        Ok(prediction)
+        Ok(())
     }
 }
 
