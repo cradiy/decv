@@ -3,9 +3,9 @@
 use bit_readers::BitReader;
 
 use crate::{
-    CabacContextSet, CabacDecoder, CabacInitializationTable, CodedBlockPattern, H264Error,
-    IntraLumaPrediction, IntraMacroblockHeader, IntraPredictionModeSyntax, PSubMacroblockType,
-    PcmMacroblock, Result, SliceType, consume_cabac_alignment,
+    BSubMacroblockType, CabacContextSet, CabacDecoder, CabacInitializationTable, CodedBlockPattern,
+    H264Error, IntraLumaPrediction, IntraMacroblockHeader, IntraPredictionModeSyntax,
+    PSubMacroblockType, PcmMacroblock, Result, SliceType, consume_cabac_alignment,
 };
 
 /// CABAC-decoded `mb_type` for a P slice.
@@ -15,6 +15,15 @@ pub enum CabacPMacroblockType {
     L0_16x8,
     L0_8x16,
     EightByEight,
+    /// Embedded I macroblock type in the ordinary I table's 0..=25 range.
+    Intra(u8),
+}
+
+/// CABAC-decoded `mb_type` for a B slice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CabacBMacroblockType {
+    /// Index in the ordinary B inter table, in the range 0..=22.
+    Inter(u8),
     /// Embedded I macroblock type in the ordinary I table's 0..=25 range.
     Intra(u8),
 }
@@ -29,6 +38,8 @@ pub enum CabacIntraMacroblockSyntax {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CabacMacroblockSummary {
     pub skipped: bool,
+    /// B_Direct or B_Skip. False for P and intra macroblocks.
+    pub direct: bool,
     pub intra16_or_pcm: bool,
     pub intra_chroma_prediction: Option<u8>,
     pub coded_block_pattern: CodedBlockPattern,
@@ -131,6 +142,29 @@ impl CabacMacroblockState {
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
     ) -> Result<PSubMacroblockType> {
         decode_p_sub_macroblock_type_with(|context_index| syntax.decision(context_index))
+    }
+
+    /// Decodes one non-skipped progressive B-slice `mb_type`.
+    pub fn decode_b_macroblock_type(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<CabacBMacroblockType> {
+        let context_increment =
+            self.b_macroblock_type_context_increment(macroblock_address, slice_id)?;
+        decode_b_macroblock_type_with(context_increment, |request| match request {
+            CabacBinRequest::Decision(context_index) => syntax.decision(context_index),
+            CabacBinRequest::Terminate => syntax.terminate(),
+        })
+    }
+
+    /// Decodes one B-slice `sub_mb_type`.
+    pub fn decode_b_sub_macroblock_type(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+    ) -> Result<BSubMacroblockType> {
+        decode_b_sub_macroblock_type_with(|context_index| syntax.decision(context_index))
     }
 
     /// Decodes the complete prediction/header syntax of one I macroblock.
@@ -331,6 +365,18 @@ impl CabacMacroblockState {
             .filter(|neighbour| neighbour.is_some_and(|macroblock| !macroblock.summary.skipped))
             .count();
         Ok(base + context_increment)
+    }
+
+    fn b_macroblock_type_context_increment(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<usize> {
+        Ok(self
+            .left_and_top(macroblock_address, slice_id)?
+            .into_iter()
+            .filter(|neighbour| neighbour.is_some_and(|macroblock| !macroblock.summary.direct))
+            .count())
     }
 
     fn left_and_top(
@@ -552,26 +598,27 @@ fn decode_p_macroblock_type_with(
     }
 
     Ok(CabacPMacroblockType::Intra(
-        decode_embedded_intra_macroblock_type(&mut decode)?,
+        decode_embedded_intra_macroblock_type(17, &mut decode)?,
     ))
 }
 
 fn decode_embedded_intra_macroblock_type(
+    context_base: usize,
     mut decode: impl FnMut(CabacBinRequest) -> Result<u8>,
 ) -> Result<u8> {
-    if decode(CabacBinRequest::Decision(17))? == 0 {
+    if decode(CabacBinRequest::Decision(context_base))? == 0 {
         return Ok(0);
     }
     if decode(CabacBinRequest::Terminate)? != 0 {
         return Ok(25);
     }
     let mut macroblock_type = 1;
-    macroblock_type += 12 * decode(CabacBinRequest::Decision(18))?;
-    if decode(CabacBinRequest::Decision(19))? != 0 {
-        macroblock_type += 4 + 4 * decode(CabacBinRequest::Decision(19))?;
+    macroblock_type += 12 * decode(CabacBinRequest::Decision(context_base + 1))?;
+    if decode(CabacBinRequest::Decision(context_base + 2))? != 0 {
+        macroblock_type += 4 + 4 * decode(CabacBinRequest::Decision(context_base + 2))?;
     }
-    macroblock_type += 2 * decode(CabacBinRequest::Decision(20))?;
-    macroblock_type += decode(CabacBinRequest::Decision(20))?;
+    macroblock_type += 2 * decode(CabacBinRequest::Decision(context_base + 3))?;
+    macroblock_type += decode(CabacBinRequest::Decision(context_base + 3))?;
     Ok(macroblock_type)
 }
 
@@ -589,6 +636,80 @@ fn decode_p_sub_macroblock_type_with(
     } else {
         PSubMacroblockType::L0_4x4
     })
+}
+
+fn decode_b_macroblock_type_with(
+    context_increment: usize,
+    mut decode: impl FnMut(CabacBinRequest) -> Result<u8>,
+) -> Result<CabacBMacroblockType> {
+    if context_increment > 2 {
+        return Err(H264Error::InvalidSyntax(
+            "CABAC B mb_type context increment exceeds 2",
+        ));
+    }
+    if decode(CabacBinRequest::Decision(27 + context_increment))? == 0 {
+        return Ok(CabacBMacroblockType::Inter(0));
+    }
+    if decode(CabacBinRequest::Decision(30))? == 0 {
+        return Ok(CabacBMacroblockType::Inter(
+            1 + decode(CabacBinRequest::Decision(32))?,
+        ));
+    }
+
+    let mut bits = decode(CabacBinRequest::Decision(31))? << 3;
+    bits |= decode(CabacBinRequest::Decision(32))? << 2;
+    bits |= decode(CabacBinRequest::Decision(32))? << 1;
+    bits |= decode(CabacBinRequest::Decision(32))?;
+    match bits {
+        0..=7 => Ok(CabacBMacroblockType::Inter(bits + 3)),
+        13 => Ok(CabacBMacroblockType::Intra(
+            decode_embedded_intra_macroblock_type(32, decode)?,
+        )),
+        14 => Ok(CabacBMacroblockType::Inter(11)),
+        15 => Ok(CabacBMacroblockType::Inter(22)),
+        8..=12 => Ok(CabacBMacroblockType::Inter(
+            (bits << 1) + decode(CabacBinRequest::Decision(32))? - 4,
+        )),
+        _ => unreachable!("four decoded bins fit in 0..=15"),
+    }
+}
+
+fn decode_b_sub_macroblock_type_with(
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<BSubMacroblockType> {
+    if decision(36)? == 0 {
+        return Ok(BSubMacroblockType::Direct8x8);
+    }
+    if decision(37)? == 0 {
+        return Ok(if decision(39)? == 0 {
+            BSubMacroblockType::List0_8x8
+        } else {
+            BSubMacroblockType::List1_8x8
+        });
+    }
+
+    let index = if decision(38)? == 0 {
+        3 + 2 * decision(39)? + decision(39)?
+    } else if decision(39)? != 0 {
+        11 + decision(39)?
+    } else {
+        7 + 2 * decision(39)? + decision(39)?
+    };
+    Ok([
+        BSubMacroblockType::Direct8x8,
+        BSubMacroblockType::List0_8x8,
+        BSubMacroblockType::List1_8x8,
+        BSubMacroblockType::Bi8x8,
+        BSubMacroblockType::List0_8x4,
+        BSubMacroblockType::List0_4x8,
+        BSubMacroblockType::List1_8x4,
+        BSubMacroblockType::List1_4x8,
+        BSubMacroblockType::Bi8x4,
+        BSubMacroblockType::Bi4x8,
+        BSubMacroblockType::List0_4x4,
+        BSubMacroblockType::List1_4x4,
+        BSubMacroblockType::Bi4x4,
+    ][usize::from(index)])
 }
 
 fn decode_truncated_unary(
@@ -769,6 +890,7 @@ mod tests {
     ) -> CabacMacroblockSummary {
         CabacMacroblockSummary {
             skipped,
+            direct: false,
             intra16_or_pcm,
             intra_chroma_prediction,
             coded_block_pattern: CodedBlockPattern { luma, chroma },
@@ -1128,6 +1250,125 @@ mod tests {
             );
             assert!(bins.is_empty());
         }
+    }
+
+    #[test]
+    fn decodes_every_b_inter_macroblock_type() {
+        for expected_type in 0..=22u8 {
+            let mut bins = match expected_type {
+                0 => vec![0],
+                1 | 2 => vec![1, 0, expected_type - 1],
+                3..=10 => {
+                    let bits = expected_type - 3;
+                    vec![
+                        1,
+                        1,
+                        (bits >> 3) & 1,
+                        (bits >> 2) & 1,
+                        (bits >> 1) & 1,
+                        bits & 1,
+                    ]
+                }
+                11 => vec![1, 1, 1, 1, 1, 0],
+                12..=21 => {
+                    let code = expected_type + 4;
+                    let bits = code >> 1;
+                    vec![
+                        1,
+                        1,
+                        (bits >> 3) & 1,
+                        (bits >> 2) & 1,
+                        (bits >> 1) & 1,
+                        bits & 1,
+                        code & 1,
+                    ]
+                }
+                22 => vec![1, 1, 1, 1, 1, 1],
+                _ => unreachable!(),
+            };
+            let mut visited = Vec::new();
+            let actual = decode_b_macroblock_type_with(usize::from(expected_type % 3), |request| {
+                match request {
+                    CabacBinRequest::Decision(context_index) => {
+                        visited.push(context_index);
+                        Ok(bins.remove(0))
+                    }
+                    CabacBinRequest::Terminate => {
+                        unreachable!("inter B types do not use termination")
+                    }
+                }
+            })
+            .unwrap();
+            assert_eq!(actual, CabacBMacroblockType::Inter(expected_type));
+            assert_eq!(visited[0], 27 + usize::from(expected_type % 3));
+            assert!(bins.is_empty());
+        }
+    }
+
+    #[test]
+    fn decodes_embedded_b_intra_and_pcm_types() {
+        let mut nxn_bins = VecDeque::from([1, 1, 1, 1, 0, 1, 0]);
+        assert_eq!(
+            decode_b_macroblock_type_with(0, |request| match request {
+                CabacBinRequest::Decision(_) => Ok(nxn_bins.pop_front().unwrap()),
+                CabacBinRequest::Terminate => unreachable!(),
+            })
+            .unwrap(),
+            CabacBMacroblockType::Intra(0)
+        );
+        assert!(nxn_bins.is_empty());
+
+        let mut pcm_bins = VecDeque::from([1, 1, 1, 1, 0, 1, 1]);
+        assert_eq!(
+            decode_b_macroblock_type_with(0, |request| match request {
+                CabacBinRequest::Decision(_) => Ok(pcm_bins.pop_front().unwrap()),
+                CabacBinRequest::Terminate => Ok(1),
+            })
+            .unwrap(),
+            CabacBMacroblockType::Intra(25)
+        );
+        assert!(pcm_bins.is_empty());
+    }
+
+    #[test]
+    fn decodes_every_b_sub_macroblock_shape() {
+        let cases: &[(&[u8], BSubMacroblockType)] = &[
+            (&[0], BSubMacroblockType::Direct8x8),
+            (&[1, 0, 0], BSubMacroblockType::List0_8x8),
+            (&[1, 0, 1], BSubMacroblockType::List1_8x8),
+            (&[1, 1, 0, 0, 0], BSubMacroblockType::Bi8x8),
+            (&[1, 1, 0, 0, 1], BSubMacroblockType::List0_8x4),
+            (&[1, 1, 0, 1, 0], BSubMacroblockType::List0_4x8),
+            (&[1, 1, 0, 1, 1], BSubMacroblockType::List1_8x4),
+            (&[1, 1, 1, 0, 0, 0], BSubMacroblockType::List1_4x8),
+            (&[1, 1, 1, 0, 0, 1], BSubMacroblockType::Bi8x4),
+            (&[1, 1, 1, 0, 1, 0], BSubMacroblockType::Bi4x8),
+            (&[1, 1, 1, 0, 1, 1], BSubMacroblockType::List0_4x4),
+            (&[1, 1, 1, 1, 0], BSubMacroblockType::List1_4x4),
+            (&[1, 1, 1, 1, 1], BSubMacroblockType::Bi4x4),
+        ];
+        for &(bins, expected) in cases {
+            let mut bins: VecDeque<_> = bins.iter().copied().collect();
+            assert_eq!(
+                decode_b_sub_macroblock_type_with(|_| Ok(bins.pop_front().unwrap())).unwrap(),
+                expected
+            );
+            assert!(bins.is_empty());
+        }
+    }
+
+    #[test]
+    fn derives_b_type_context_from_non_direct_neighbours() {
+        let mut state = CabacMacroblockState::new(2, 2).unwrap();
+        let mut direct = summary(true, false, None, 0, 0);
+        direct.direct = true;
+        state.record_macroblock(0, 9, direct).unwrap();
+        state
+            .record_macroblock(1, 9, summary(false, false, None, 0, 0))
+            .unwrap();
+        assert_eq!(state.b_macroblock_type_context_increment(2, 9), Ok(0));
+        assert_eq!(state.b_macroblock_type_context_increment(3, 9), Ok(1));
+        assert_eq!(state.b_macroblock_type_context_increment(3, 10), Ok(0));
     }
 
     #[test]

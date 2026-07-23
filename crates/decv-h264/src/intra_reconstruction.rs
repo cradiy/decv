@@ -728,6 +728,7 @@ impl IntraPictureReconstructor {
                     };
                     let summary = CabacMacroblockSummary {
                         skipped: false,
+                        direct: false,
                         intra16_or_pcm: matches!(
                             header.luma_prediction,
                             IntraLumaPrediction::SixteenBySixteen { .. }
@@ -761,6 +762,7 @@ impl IntraPictureReconstructor {
                         0,
                         CabacMacroblockSummary {
                             skipped: false,
+                            direct: false,
                             intra16_or_pcm: true,
                             intra_chroma_prediction: None,
                             coded_block_pattern: crate::CodedBlockPattern {

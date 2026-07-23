@@ -131,6 +131,7 @@ impl CabacPMacroblockState {
                 slice_id,
                 CabacMacroblockSummary {
                     skipped: true,
+                    direct: false,
                     intra16_or_pcm: false,
                     intra_chroma_prediction: None,
                     coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
@@ -210,6 +211,7 @@ impl CabacPMacroblockState {
                 };
                 let summary = CabacMacroblockSummary {
                     skipped: false,
+                    direct: false,
                     intra16_or_pcm: matches!(
                         header.luma_prediction,
                         IntraLumaPrediction::SixteenBySixteen { .. }
@@ -239,6 +241,7 @@ impl CabacPMacroblockState {
                     }),
                     CabacMacroblockSummary {
                         skipped: false,
+                        direct: false,
                         intra16_or_pcm: true,
                         intra_chroma_prediction: None,
                         coded_block_pattern: CodedBlockPattern {
@@ -348,6 +351,7 @@ impl CabacPMacroblockState {
             DecodedPSliceMacroblock::Inter { header, residual },
             CabacMacroblockSummary {
                 skipped: false,
+                direct: false,
                 intra16_or_pcm: false,
                 intra_chroma_prediction: None,
                 coded_block_pattern,
