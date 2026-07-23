@@ -356,6 +356,57 @@ H.264 defines two important entropy-coding systems.
 - Is used by Baseline-profile streams.
 - Is the better first implementation target.
 
+A residual block is not decoded as a flat list of signed integers. The CAVLC
+pipeline is:
+
+```text
+coeff_token
+    -> TotalCoeff + TrailingOnes
+    -> trailing-one sign bits
+    -> remaining level prefixes and suffixes
+    -> total_zeros
+    -> run_before values
+    -> coefficients in scan order
+```
+
+`TotalCoeff` says how many non-zero coefficients exist. `TrailingOnes` says how
+many of the last non-zero coefficients have magnitude one. `total_zeros` and
+`run_before` then place those non-zero levels back among the zero coefficients.
+
+The `coeff_token` table is chosen from `nC`, which is derived from the decoded
+non-zero coefficient counts of the left and top transform blocks:
+
+```text
+left and top available -> nC = (nA + nB + 1) >> 1
+only one available     -> nC = that neighbour's count
+neither available      -> nC = 0
+```
+
+An unavailable block and an available block with `TotalCoeff == 0` are not the
+same state. If the top count is six:
+
+```text
+left unavailable -> nC = 6
+left available 0  -> nC = (0 + 6 + 1) >> 1 = 3
+```
+
+Slice boundaries also affect availability. A geometrically adjacent block in
+another slice is unavailable for this derivation. I_PCM neighbours contribute
+a count of 16, while skipped and coefficient-free blocks contribute an
+available count of zero.
+
+This is why CAVLC cannot be implemented as a stateless function over bytes.
+The code should make the state transition explicit:
+
+```text
+derive nC
+    -> decode complete residual block
+    -> record TotalCoeff
+```
+
+If decoding fails, neither the bit position nor the stored neighbour count may
+advance.
+
 ### CABAC
 
 - Uses context-adaptive binary arithmetic coding.
@@ -376,6 +427,39 @@ IDR/I slices first
 
 This postpones CABAC, B slices, complex reference reordering, and most
 inter-picture prediction.
+
+### Macroblock transactions
+
+A CAVLC I macroblock contains conditional syntax before its coefficients:
+
+```text
+mb_type
+    -> intra prediction modes
+    -> coded_block_pattern
+    -> mb_qp_delta when required
+    -> luma and chroma residual blocks
+```
+
+For an I_4x4 or I_8x8 macroblock, the coded block pattern selects which luma
+8x8 regions and which chroma coefficient classes are present. For an
+I_16x16 macroblock, prediction mode and coded block pattern are partly encoded
+inside `mb_type`, and a separate luma DC block is always decoded.
+
+Treat the complete macroblock as a transaction. A malformed coefficient near
+the end must roll back:
+
+- syntax bits read for the macroblock;
+- earlier residual blocks from the same macroblock;
+- `nC` entries written while decoding those blocks.
+
+Copying the entire picture's neighbour grid per macroblock would be correct
+but expensive. Snapshotting only the 16 luma and eight chroma entries touched
+by the current 4:2:0 macroblock gives bounded rollback without a per-macroblock
+heap allocation.
+
+I_PCM is a separate path. For the current 8-bit 4:2:0 scope it byte-aligns,
+reads 256 luma samples and 128 chroma samples, and records neighbour counts of
+16.
 
 ## 9. Reconstructing the First Picture
 
@@ -423,6 +507,48 @@ Output or inspect the YUV frame
 
 Deblocking is part of normative reconstruction. A reference picture must
 contain the filtered samples expected by subsequent pictures.
+
+### 9.1 Scan, scale, and transform are different operations
+
+Entropy decoding produces a one-dimensional coefficient list. Reconstruction
+first maps that list into matrix positions. H.264 defines different 4x4 scans
+for frame and field macroblocks; scaling lists always use the zig-zag mapping.
+
+Inverse quantization then applies a position-dependent scale:
+
+```text
+LevelScale4x4 =
+    scaling_list_weight * norm_adjust[QP % 6][position_class]
+```
+
+The shift and rounding depend on `QP / 6`. Their exact order matters,
+especially for negative coefficients.
+
+The final 4x4 inverse transform is a separable integer transform:
+
+```text
+four horizontal 1-D transforms
+    -> four vertical 1-D transforms
+    -> add 32 and arithmetic-shift right by 6
+```
+
+This is not a floating-point IDCT. Using floating point, changing a rounding
+point, or replacing an arithmetic shift with truncating division can produce
+different reference pixels.
+
+Two DC paths are special:
+
+- I_16x16 luma uses a 4x4 inverse Hadamard transform before DC scaling.
+- 4:2:0 chroma uses a 2x2 inverse Hadamard transform before DC scaling.
+
+Those transformed DC values become coefficient zero of the individual 4x4
+blocks. Their AC lists occupy coefficient positions 1 through 15, so the
+ordinary 4x4 scaling stage preserves the already-scaled DC value.
+
+Scaling-list selection is also stateful. SPS lists use fallback rule set A.
+PPS lists either inherit the effective SPS anchor list or use rule set A,
+then later component lists can inherit the preceding list. Resolve these rules
+once into six concrete 4x4 lists rather than branching for every coefficient.
 
 ## 10. Picture Order and Reference State
 
@@ -510,4 +636,45 @@ Maintain explicit decoder state.
 Reconstruct prediction plus residual.
 Validate every boundary before trusting the stream.
 Measure performance in the real decoding pipeline.
+```
+
+## 14. Current Implementation Checkpoint
+
+At the checkpoint recorded by this document, the Rust implementation includes:
+
+- an optimized MSB-first `BitReader` with atomic failure semantics;
+- Annex-B splitting, NAL parsing, EBSP-to-RBSP conversion, and trailing bits;
+- SPS, PPS, parameter-set resolution, and ordinary slice-header parsing;
+- picture-boundary detection and picture-order-count types 0, 1, and 2;
+- complete 4:2:0 CAVLC residual-block decoding;
+- lookup-table acceleration plus Criterion benchmarks for CAVLC;
+- slice-aware Y/Cb/Cr `nC` neighbour state;
+- transactional CAVLC I_4x4, I_8x8, I_16x16, and I_PCM macroblocks;
+- 4x4 inverse scan, inverse scaling, and inverse integer transform;
+- I_16x16 luma DC and 4:2:0 chroma DC inverse Hadamard paths;
+- SPS/PPS 4x4 scaling-list fallback resolution.
+
+The project is not yet a pixel-producing video decoder. The next dependency
+chain is:
+
+```text
+derive macroblock QP
+    -> resolve actual intra prediction modes from neighbours
+    -> generate luma/chroma prediction samples
+    -> combine transformed DC and AC coefficients
+    -> add residuals and clip into a picture surface
+    -> deblock the completed picture
+```
+
+P slices, motion compensation, decoded-picture-buffer reference marking,
+CABAC, and production container integration remain later stages. The existing
+POC code is necessary state preparation, but it does not by itself make
+inter-picture decoding complete.
+
+Useful verification commands are:
+
+```bash
+cargo test --workspace --release
+cargo clippy -p decv-h264 --all-targets -- -D warnings
+cargo bench -p decv-h264 --bench cavlc
 ```
