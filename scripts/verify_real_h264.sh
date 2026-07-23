@@ -44,3 +44,19 @@ ffmpeg -hide_banner -loglevel error \
     "cabac=0:bframes=0:keyint=30:min-keyint=30:scenecut=0:ref=1:weightp=0:8x8dct=0" \
     -f h264 -y "$work_dir/testsrc2.h264"
 verify_stream testsrc2
+
+ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=64x48:rate=24" \
+    -frames:v 16 -pix_fmt yuv420p -c:v libx264 -profile:v main \
+    -x264-params \
+    "cabac=0:bframes=2:b-adapt=0:keyint=30:min-keyint=30:scenecut=0:ref=1:weightp=0:weightb=0:8x8dct=0:direct=spatial" \
+    -f h264 -y "$work_dir/main-b.h264"
+verify_stream main-b
+
+ffmpeg -hide_banner -loglevel error \
+    -f lavfi -i "testsrc2=size=64x48:rate=24" \
+    -frames:v 24 -pix_fmt yuv420p -c:v libx264 -profile:v high \
+    -x264-params \
+    "cabac=0:bframes=3:b-adapt=0:keyint=48:min-keyint=48:scenecut=0:ref=2:weightp=2:weightb=1:8x8dct=1:direct=auto" \
+    -f h264 -y "$work_dir/high-b.h264"
+verify_stream high-b

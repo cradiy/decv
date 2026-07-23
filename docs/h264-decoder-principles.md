@@ -744,6 +744,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   and reference POCs, including long-term, zero-distance, and range fallbacks;
 - complete Annex-B SPS/PPS/IDR-to-NV12 and IDR-to-reference-P integration
   tests;
+- byte-exact FFmpeg regressions for encoder-generated Main and High Profile
+  CAVLC streams with B pictures, display reordering, multiple references,
+  weighted prediction, and 8x8 transforms;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
