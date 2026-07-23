@@ -733,6 +733,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - each macroblock derives its 32 luma-grid boundary strengths once and reuses
   them for Y, Cb, and Cr filtering, avoiding repeated reference-identity and
   motion-vector comparisons for the two chroma planes;
+- on x86-64, SSE2 filters the four horizontally adjacent samples of a weak
+  luma edge together, with the scalar path retained for strong, chroma, and
+  non-x86-64 filtering;
 - structure-of-arrays reconstruction bookkeeping keeps completion flags
   separate from deblocking metadata, so picture finalization filters the
   in-place metadata instead of allocating and copying one large record per
