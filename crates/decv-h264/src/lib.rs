@@ -9,6 +9,7 @@ mod avcc;
 mod b_motion;
 mod cabac;
 mod cabac_context_tables;
+mod cabac_syntax;
 mod cavlc;
 mod cavlc_context;
 pub mod deblock;
@@ -44,6 +45,7 @@ pub use cabac::{
     CabacContextSet, CabacContextState, CabacDecoder, CabacInitializationTable,
     consume_cabac_alignment,
 };
+pub use cabac_syntax::CabacSyntaxDecoder;
 pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
 };
