@@ -4,14 +4,15 @@ use std::{borrow::Cow, collections::VecDeque, sync::Arc};
 
 use bit_readers::BitReader;
 use decv_core::{
-    BitstreamFormat, DecodeInputStatus, DecodeOutput, EncodedVideoPacket, MediaTime, PixelFormat,
-    Size, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+    BitstreamFormat, DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket,
+    MediaTime, PixelFormat, Size, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
 
+use crate::reorder::PictureReorderBuffer;
 use crate::{
     AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, H264Error, IntraPictureReconstructor,
     NalHeader, NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader, PictureOrderCount,
-    PictureParameterSet, ReferencePictureMarking, Result, SequenceParameterSet, SliceType,
+    PictureParameterSet, Profile, ReferencePictureMarking, Result, SequenceParameterSet, SliceType,
     consume_rbsp_trailing_bits, decode_rbsp,
 };
 
@@ -30,6 +31,7 @@ struct PendingPicture {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DpbConfiguration {
     max_num_ref_frames: u32,
+    max_num_reorder_frames: u32,
     log2_max_frame_num: u8,
     coded_size: Size,
 }
@@ -47,6 +49,7 @@ pub struct H264Decoder {
     current_picture: Option<PendingPicture>,
     dpb: Option<DecodedPictureBuffer>,
     dpb_configuration: Option<DpbConfiguration>,
+    reorder: PictureReorderBuffer<DecodedVideoFrame>,
     outputs: VecDeque<DecodeOutput>,
     announced_format: Option<VideoFormat>,
     next_frame_id: u64,
@@ -61,6 +64,7 @@ impl Default for H264Decoder {
             current_picture: None,
             dpb: None,
             dpb_configuration: None,
+            reorder: PictureReorderBuffer::new(0),
             outputs: VecDeque::new(),
             announced_format: None,
             next_frame_id: 0,
@@ -90,6 +94,7 @@ impl H264Decoder {
                 } => {
                     if starts_new_picture {
                         self.finish_current_picture()?;
+                        self.prepare_for_idr(&parsed, nal_header)?;
                     }
                     if self.current_picture.is_none() {
                         self.ensure_dpb(&parsed, nal_header)?;
@@ -150,10 +155,12 @@ impl H264Decoder {
                 }
                 ParserEvent::EndOfSequence => {
                     self.finish_current_picture()?;
+                    self.drain_reorder();
                     self.clear_dpb();
                 }
                 ParserEvent::EndOfStream => {
                     self.finish_current_picture()?;
+                    self.drain_reorder();
                     self.draining = true;
                 }
             }
@@ -208,8 +215,35 @@ impl H264Decoder {
                 .push_back(DecodeOutput::FormatChanged(picture.format));
             self.announced_format = Some(picture.format);
         }
-        self.outputs.push_back(DecodeOutput::Frame(frame));
+        let picture_order_count = picture.picture_order_count.stored.picture_order_count();
+        if let Some(frame) = self.reorder.push(picture_order_count, frame)? {
+            self.outputs.push_back(DecodeOutput::Frame(frame));
+        }
         Ok(())
+    }
+
+    fn prepare_for_idr(&mut self, parsed: &ParsedSliceHeader, nal_header: NalHeader) -> Result<()> {
+        if nal_header.unit_type != NalUnitType::IdrSlice {
+            return Ok(());
+        }
+        match parsed.header.reference_picture_marking {
+            ReferencePictureMarking::Idr {
+                no_output_of_prior_pictures: true,
+                ..
+            } => self.reorder.clear(),
+            ReferencePictureMarking::Idr { .. } => self.drain_reorder(),
+            _ => {
+                return Err(H264Error::InvalidSyntax(
+                    "IDR slice is missing IDR reference-picture marking",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn drain_reorder(&mut self) {
+        self.outputs
+            .extend(self.reorder.drain().into_iter().map(DecodeOutput::Frame));
     }
 
     fn reset_all_state(&mut self) {
@@ -217,6 +251,7 @@ impl H264Decoder {
         self.current_picture = None;
         self.clear_dpb();
         self.outputs.clear();
+        self.reorder.clear();
         self.announced_format = None;
         self.next_frame_id = 0;
         self.draining = false;
@@ -227,6 +262,7 @@ impl H264Decoder {
         self.current_picture = None;
         self.clear_dpb();
         self.outputs.clear();
+        self.reorder.clear();
         self.draining = false;
     }
 
@@ -234,6 +270,7 @@ impl H264Decoder {
         let sps = &parsed.parameter_sets.sequence;
         let configuration = DpbConfiguration {
             max_num_ref_frames: sps.max_num_ref_frames,
+            max_num_reorder_frames: inferred_max_num_reorder_frames(sps),
             log2_max_frame_num: sps.log2_max_frame_num,
             coded_size: sps.coded_size,
         };
@@ -249,6 +286,10 @@ impl H264Decoder {
             configuration.max_num_ref_frames,
             configuration.log2_max_frame_num,
         )?);
+        self.reorder = PictureReorderBuffer::new(
+            usize::try_from(configuration.max_num_reorder_frames)
+                .map_err(|_| H264Error::IntegerOverflow)?,
+        );
         self.dpb_configuration = Some(configuration);
         Ok(())
     }
@@ -325,9 +366,23 @@ impl VideoDecoder for H264Decoder {
             ));
         }
         self.finish_current_picture()?;
+        self.drain_reorder();
         self.draining = true;
         Ok(())
     }
+}
+
+fn inferred_max_num_reorder_frames(sps: &SequenceParameterSet) -> u32 {
+    sps.vui
+        .as_ref()
+        .and_then(|vui| vui.bitstream_restrictions)
+        .map_or_else(
+            || match sps.profile {
+                Profile::Baseline => 0,
+                Profile::Main | Profile::High => sps.max_num_ref_frames,
+            },
+            |restrictions| restrictions.max_num_reorder_frames,
+        )
 }
 
 fn video_format(parsed: &ParsedSliceHeader) -> Result<VideoFormat> {

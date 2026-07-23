@@ -27,6 +27,7 @@ mod prediction;
 mod quantization;
 mod rbsp;
 mod reconstruction;
+mod reorder;
 mod slice;
 mod sps;
 mod transform;
