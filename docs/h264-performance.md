@@ -40,12 +40,12 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 2.79 s | 2.71 s | 83,060 KiB | 64.5 FPS |
-| decv Auto (2 workers) | NV12 | 2.78 s | 2.99 s | 84,172 KiB | 64.7 FPS |
-| FFmpeg 1 thread | NV12 | 0.62 s | 0.70 s | 152,252 KiB | 290.3 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.45 s | 287,344 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.61 s | 0.59 s | 95,644 KiB | 295.1 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.99 s | 195,672 KiB | 782.6 FPS |
+| decv Serial | NV12 | 2.81 s | 2.73 s | 79,912 KiB | 64.1 FPS |
+| decv Auto (2 workers) | NV12 | 2.77 s | 3.00 s | 79,408 KiB | 65.0 FPS |
+| FFmpeg 1 thread | NV12 | 0.63 s | 0.70 s | 152,064 KiB | 285.7 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.46 s | 286,612 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.58 s | 0.57 s | 95,748 KiB | 310.3 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 1.00 s | 192,096 KiB | 782.6 FPS |
 
 On this workload:
 
@@ -55,15 +55,15 @@ On this workload:
   produce NV12;
 - decv Auto does about **2.1x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
-- decv uses about **55%** of FFmpeg single-threaded NV12 peak RSS and about
-  **30%** of FFmpeg Auto NV12 peak RSS;
+- decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
+  **28%** of FFmpeg Auto NV12 peak RSS;
 - prior measurements with 16 decv workers were slower than the two-worker
   `Auto` policy and consumed far more CPU, confirming that the current parallel
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 7.5% throughput headroom over that
-line, and the measured two-worker Auto result has about 7.9%. The ordering
+seconds. The current Serial result has about 6.8% throughput headroom over that
+line, and the measured two-worker Auto result has about 8.3%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -128,6 +128,13 @@ from 5.295 to 5.180 seconds (about 2.2%) and Auto from 5.070 to 4.945 seconds
 cycles fell about 1.0% and Auto wall time fell about 1.0%. Finally, omitting
 all-zero B-skip residual objects moved Serial from 4.89 to 4.67 seconds (about
 4.5%) and Auto from 4.80 to 4.52 seconds (about 5.8%).
+
+Sharing the immutable planar luma allocation with the NV12 output frame avoids
+one full-resolution Y-plane copy. A pinned 300-frame Serial A/B moved from 4.66
+to 4.60 seconds (about 1.3%) while peak RSS fell by about 4.6 MiB. Auto wall
+time remained noise-level in that run, while user CPU fell about 1.2% and peak
+RSS fell about 2 MiB. NV12 planes now carry independent immutable backing
+allocations, which the `CpuFrame` contract already permits.
 
 ## Interpretation
 
