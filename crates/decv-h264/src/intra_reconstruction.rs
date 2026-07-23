@@ -2818,9 +2818,18 @@ fn inter_deblock_info(
         } else {
             first_motion = Some(partition_motion);
         }
-        for y in start_y..end_y {
-            for x in start_x..end_x {
-                motion[y * 4 + x] = partition_motion;
+        if resolved.partitions.len() == 1
+            && start_x == 0
+            && start_y == 0
+            && end_x == 4
+            && end_y == 4
+        {
+            motion.fill(partition_motion);
+        } else {
+            for y in start_y..end_y {
+                for x in start_x..end_x {
+                    motion[y * 4 + x] = partition_motion;
+                }
             }
         }
     }
@@ -2878,9 +2887,18 @@ fn b_inter_deblock_info(
         } else {
             first_motion = Some(partition_motion);
         }
-        for y in start_y..end_y {
-            for x in start_x..end_x {
-                motion[y * 4 + x] = partition_motion;
+        if resolved.partitions.len() == 1
+            && start_x == 0
+            && start_y == 0
+            && end_x == 4
+            && end_y == 4
+        {
+            motion.fill(partition_motion);
+        } else {
+            for y in start_y..end_y {
+                for x in start_x..end_x {
+                    motion[y * 4 + x] = partition_motion;
+                }
             }
         }
     }
