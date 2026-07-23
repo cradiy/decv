@@ -4,8 +4,8 @@ use bit_readers::BitReader;
 
 use crate::{
     CabacContextSet, CabacDecoder, CabacInitializationTable, CodedBlockPattern, H264Error,
-    IntraLumaPrediction, IntraMacroblockHeader, IntraPredictionModeSyntax, Result, SliceType,
-    consume_cabac_alignment,
+    IntraLumaPrediction, IntraMacroblockHeader, IntraPredictionModeSyntax, PcmMacroblock, Result,
+    SliceType, consume_cabac_alignment,
 };
 
 /// CABAC-decoded I-macroblock syntax before residual or I_PCM sample decoding.
@@ -365,6 +365,12 @@ impl<'data> CabacSliceDecoder<'data> {
     #[inline]
     pub const fn contexts(&self) -> &CabacContextSet {
         &self.contexts
+    }
+
+    /// Reads one raw I_PCM macroblock and restarts arithmetic decoding while
+    /// preserving the adaptive probability contexts.
+    pub fn decode_pcm_420_8bit_and_restart(&mut self) -> Result<PcmMacroblock> {
+        self.arithmetic.decode_pcm_420_8bit_and_restart()
     }
 
     pub fn into_parts(self) -> (CabacDecoder<'data>, CabacContextSet) {

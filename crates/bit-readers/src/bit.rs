@@ -67,6 +67,18 @@ impl<'a> BitReader<'a> {
         self.remaining_bits() == 0
     }
 
+    /// Creates a reader positioned `count` bits before the current logical
+    /// position.
+    ///
+    /// This is intended for formats whose entropy decoder keeps a fixed
+    /// lookahead window beyond the syntax position. It is a cold-path
+    /// operation and does not modify the original reader.
+    pub fn rewound_by(&self, count: usize) -> Option<Self> {
+        let target = self.bit_position().checked_sub(count)?;
+        let mut reader = Self::new(self.data);
+        reader.skip_bits(target).then_some(reader)
+    }
+
     /// Reads one bit.
     ///
     /// Returns `None` at the end of the input without changing the reader.
@@ -537,6 +549,18 @@ mod tests {
         assert_eq!(reader.byte_position(), 1);
         assert_eq!(reader.bit_offset(), 3);
         assert_eq!(reader.remaining_bits(), 13);
+    }
+
+    #[test]
+    fn creates_a_reader_before_the_current_lookahead_position() {
+        let data = [0b1011_0010, 0b0110_1001, 0xff];
+        let mut reader = BitReader::new(&data);
+        assert_eq!(reader.read_bits(13), Some(0b1_0110_0100_1101));
+        let mut rewound = reader.rewound_by(9).unwrap();
+        assert_eq!(rewound.bit_position(), 4);
+        assert_eq!(rewound.read_bits(8), Some(0b0010_0110));
+        assert!(reader.rewound_by(14).is_none());
+        assert_eq!(reader.bit_position(), 13);
     }
 
     #[test]

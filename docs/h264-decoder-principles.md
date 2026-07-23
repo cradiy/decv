@@ -771,6 +771,10 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   the I_PCM transition marker;
 - pixel-producing progressive CABAC I slices for ordinary predicted
   macroblocks, with end-of-slice termination and quantizer state;
+- CABAC I_PCM lookahead recovery, raw 8-bit 4:2:0 sample extraction, and
+  arithmetic-engine restart without resetting adaptive contexts;
+- pixel-producing CABAC I_PCM macroblocks with neighbour-state propagation and
+  post-PCM end-of-slice decoding;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band

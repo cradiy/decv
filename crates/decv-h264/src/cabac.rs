@@ -3,7 +3,7 @@
 use bit_readers::BitReader;
 
 use crate::cabac_context_tables::{CABAC_CONTEXT_COUNT, CABAC_INIT_I, CABAC_INIT_PB};
-use crate::{H264Error, Result, SliceType};
+use crate::{H264Error, PcmMacroblock, Result, SliceType};
 
 const INITIAL_RANGE: u16 = 510;
 
@@ -255,6 +255,7 @@ pub struct CabacDecoder<'data> {
     reader: BitReader<'data>,
     range: u16,
     offset: u16,
+    terminated: bool,
 }
 
 impl<'data> CabacDecoder<'data> {
@@ -282,6 +283,7 @@ impl<'data> CabacDecoder<'data> {
             reader,
             range: INITIAL_RANGE,
             offset,
+            terminated: false,
         })
     }
 
@@ -345,6 +347,7 @@ impl<'data> CabacDecoder<'data> {
         let mut offset = self.offset;
         if offset >= range {
             self.range = range;
+            self.terminated = true;
             return Ok(1);
         }
 
@@ -353,6 +356,46 @@ impl<'data> CabacDecoder<'data> {
         self.range = range;
         self.offset = offset;
         Ok(0)
+    }
+
+    /// Leaves arithmetic coding for one 8-bit 4:2:0 I_PCM macroblock, reads
+    /// its raw samples, and restarts the arithmetic engine after the samples.
+    ///
+    /// CABAC keeps nine lookahead bits in `codIOffset`. Rewinding those bits
+    /// recovers the syntax position at which `pcm_alignment_zero_bit` begins.
+    pub fn decode_pcm_420_8bit_and_restart(&mut self) -> Result<PcmMacroblock> {
+        if !self.terminated {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC I_PCM transition requires a terminating bin",
+            ));
+        }
+        let mut reader = self
+            .reader
+            .rewound_by(9)
+            .ok_or(H264Error::IntegerOverflow)?;
+        while reader.bit_offset() != 0 {
+            if reader.read_bit().ok_or(H264Error::UnexpectedEof)? != 0 {
+                return Err(H264Error::InvalidSyntax(
+                    "CABAC pcm_alignment_zero_bit is not zero",
+                ));
+            }
+        }
+
+        let mut luma = Box::new([0; 256]);
+        for sample in luma.iter_mut() {
+            *sample = reader
+                .read_bits_const::<8>()
+                .ok_or(H264Error::UnexpectedEof)? as u8;
+        }
+        let mut chroma = Box::new([0; 128]);
+        for sample in chroma.iter_mut() {
+            *sample = reader
+                .read_bits_const::<8>()
+                .ok_or(H264Error::UnexpectedEof)? as u8;
+        }
+        let restarted = Self::new(reader)?;
+        *self = restarted;
+        Ok(PcmMacroblock { luma, chroma })
     }
 
     #[inline]
@@ -468,6 +511,28 @@ mod tests {
         let mut one = CabacDecoder::new(one_reader).unwrap();
         assert_eq!(one.decode_terminate().unwrap(), 1);
         assert_eq!((one.range(), one.offset()), (508, 509));
+    }
+
+    #[test]
+    fn reads_pcm_samples_from_before_the_nine_bit_lookahead_and_restarts() {
+        let mut data = vec![0; 386];
+        data[0] = 0xfe;
+        for (index, byte) in data[..384].iter_mut().enumerate().skip(2) {
+            *byte = index as u8;
+        }
+        let mut decoder = CabacDecoder::new(BitReader::new(&data)).unwrap();
+        assert_eq!(decoder.decode_terminate().unwrap(), 1);
+
+        let pcm = decoder.decode_pcm_420_8bit_and_restart().unwrap();
+
+        assert_eq!(pcm.luma[0], 0xfe);
+        assert_eq!(pcm.luma[1], 0);
+        assert_eq!(pcm.luma[255], 255);
+        assert_eq!(pcm.chroma[0], 0);
+        assert_eq!(pcm.chroma[127], 127);
+        assert_eq!(decoder.range(), 510);
+        assert_eq!(decoder.offset(), 0);
+        assert_eq!(decoder.bit_position(), 384 * 8 + 9);
     }
 
     #[test]

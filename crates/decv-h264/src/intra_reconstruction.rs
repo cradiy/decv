@@ -660,34 +660,69 @@ impl IntraPictureReconstructor {
                     previous_qp_delta_nonzero,
                 )?
             };
-            let header = match syntax {
-                CabacIntraMacroblockSyntax::Predicted(header) => header,
-                CabacIntraMacroblockSyntax::Pcm => {
-                    return Err(H264Error::UnsupportedFeature(
-                        "CABAC I_PCM transition and arithmetic reinitialization",
-                    ));
-                }
-            };
-
             let residual_snapshot = self.cabac_residual.snapshot_macroblock(macroblock_address);
-            let residual = {
-                let mut syntax = cabac.syntax();
-                self.cabac_residual.decode_intra_residual(
-                    &mut syntax,
-                    macroblock_address,
-                    slice_id,
-                    &header,
-                )?
+            let (decoded, qp_delta, summary) = match syntax {
+                CabacIntraMacroblockSyntax::Predicted(header) => {
+                    let residual = {
+                        let mut syntax = cabac.syntax();
+                        self.cabac_residual.decode_intra_residual(
+                            &mut syntax,
+                            macroblock_address,
+                            slice_id,
+                            &header,
+                        )?
+                    };
+                    let summary = CabacMacroblockSummary {
+                        skipped: false,
+                        intra16_or_pcm: matches!(
+                            header.luma_prediction,
+                            IntraLumaPrediction::SixteenBySixteen { .. }
+                        ),
+                        intra_chroma_prediction: Some(header.chroma_prediction_mode),
+                        coded_block_pattern: header.coded_block_pattern,
+                        transform_size_8x8: matches!(
+                            header.luma_prediction,
+                            IntraLumaPrediction::EightByEight(_)
+                        ),
+                    };
+                    let qp_delta = header.qp_delta;
+                    (
+                        DecodedIntraMacroblock {
+                            macroblock: IntraMacroblock::Predicted(header),
+                            residual: Some(residual),
+                        },
+                        qp_delta,
+                        summary,
+                    )
+                }
+                CabacIntraMacroblockSyntax::Pcm => {
+                    let pcm = cabac.decode_pcm_420_8bit_and_restart()?;
+                    self.cabac_residual
+                        .record_pcm_macroblock(macroblock_address, slice_id)?;
+                    (
+                        DecodedIntraMacroblock {
+                            macroblock: IntraMacroblock::Pcm(pcm),
+                            residual: None,
+                        },
+                        0,
+                        CabacMacroblockSummary {
+                            skipped: false,
+                            intra16_or_pcm: true,
+                            intra_chroma_prediction: None,
+                            coded_block_pattern: crate::CodedBlockPattern {
+                                luma: 15,
+                                chroma: 2,
+                            },
+                            transform_size_8x8: false,
+                        },
+                    )
+                }
             };
             let end_of_slice = {
                 let mut syntax = cabac.syntax();
                 syntax.terminate()? != 0
             };
-            let decoded = DecodedIntraMacroblock {
-                macroblock: IntraMacroblock::Predicted(header.clone()),
-                residual: Some(residual),
-            };
-            if let Err(error) = quantizers.with_macroblock(header.qp_delta, |quantizer| {
+            if let Err(error) = quantizers.with_macroblock(qp_delta, |quantizer| {
                 self.reconstruct_macroblock_with_deblocking(
                     macroblock_address,
                     slice_id,
@@ -702,23 +737,8 @@ impl IntraPictureReconstructor {
                 return Err(error);
             }
 
-            let transform_size_8x8 =
-                matches!(header.luma_prediction, IntraLumaPrediction::EightByEight(_));
-            macroblocks.record_macroblock(
-                macroblock_address,
-                slice_id,
-                CabacMacroblockSummary {
-                    skipped: false,
-                    intra16_or_pcm: matches!(
-                        header.luma_prediction,
-                        IntraLumaPrediction::SixteenBySixteen { .. }
-                    ),
-                    intra_chroma_prediction: Some(header.chroma_prediction_mode),
-                    coded_block_pattern: header.coded_block_pattern,
-                    transform_size_8x8,
-                },
-            )?;
-            previous_qp_delta_nonzero = header.qp_delta != 0;
+            macroblocks.record_macroblock(macroblock_address, slice_id, summary)?;
+            previous_qp_delta_nonzero = qp_delta != 0;
             macroblock_address = macroblock_address
                 .checked_add(1)
                 .ok_or(H264Error::IntegerOverflow)?;
