@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 2.81 s | 2.73 s | 79,912 KiB | 64.1 FPS |
-| decv Auto (2 workers) | NV12 | 2.77 s | 3.00 s | 79,408 KiB | 65.0 FPS |
-| FFmpeg 1 thread | NV12 | 0.63 s | 0.70 s | 152,064 KiB | 285.7 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.46 s | 286,612 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.58 s | 0.57 s | 95,748 KiB | 310.3 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 1.00 s | 192,096 KiB | 782.6 FPS |
+| decv Serial | NV12 | 2.66 s | 2.57 s | 79,992 KiB | 67.7 FPS |
+| decv Auto (2 workers) | NV12 | 2.68 s | 2.87 s | 79,520 KiB | 67.2 FPS |
+| FFmpeg 1 thread | NV12 | 0.63 s | 0.71 s | 152,084 KiB | 285.7 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.50 s | 281,652 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.60 s | 0.57 s | 95,452 KiB | 300.0 FPS |
+| FFmpeg Auto | decode-only | 0.24 s | 1.01 s | 192,316 KiB | 750.0 FPS |
 
 On this workload:
 
-- decv Serial takes about **4.5x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **4.2x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **10.3x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **9.9x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **2.1x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.9x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
   **28%** of FFmpeg Auto NV12 peak RSS;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 6.8% throughput headroom over that
-line, and the measured two-worker Auto result has about 8.3%. The ordering
+seconds. The current Serial result has about 12.8% throughput headroom over that
+line, and the measured two-worker Auto result has about 11.9%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -136,10 +136,54 @@ time remained noise-level in that run, while user CPU fell about 1.2% and peak
 RSS fell about 2 MiB. NV12 planes now carry independent immutable backing
 allocations, which the `CpuFrame` contract already permits.
 
+Batching the copy-on-write uniqueness check for completed B macroblocks moved
+the pinned 300-frame Serial median from about 4.67 to 4.56 seconds. Processing
+implicit bidirectional weights per plane rather than per row subsequently
+reduced whole-decoder instructions by about 3.2%. Reusing the four spatial
+Direct neighbour cells for both reference lists reduced instructions by a
+further 2.9% and moved an Auto run from about 5.06 to 4.83 seconds. Finally,
+using the construction guarantees of the Direct partition grid when recording
+motion cells, and explicitly expanding a four-element neighbour conversion
+that LLVM otherwise lowered through `array::try_map`, each reduced pinned
+Serial cycles by about 1%. Together, the current fixed benchmark is 2.66
+seconds, down from the preceding 2.81-second snapshot.
+
+## BitReader Checkpoint
+
+The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
+On the current machine, representative Criterion medians are approximately:
+
+| Workload | Median | Effective throughput |
+| --- | ---: | ---: |
+| mixed runtime-width fields | 45.6 us | 1.34 GiB/s |
+| mixed compile-time-width fields | 29.1 us | 2.10 GiB/s |
+| unsigned Exp-Golomb | 179.7 us | 348 MiB/s |
+| peek and skip | 88.7 us | 704 MiB/s |
+
+Three plausible generic-reader changes were tested and rejected:
+
+- refilling the generic runtime-width path with 64 bits regressed its mixed
+  microbenchmark by about 20%;
+- reordering the cached-bit bound check improved isolated microbenchmarks by
+  roughly 0.5% to 1.3%, but did not reduce real decoder hardware work and
+  increased branch misses;
+- eliminating the refill loop in favor of one refill plus one extraction made
+  the mixed-field microbenchmark about 5.8% faster, but made the real CAVLC
+  decoder about 1.8% slower in cycles, 1.5% slower in wall time, and increased
+  branch misses by about 6%.
+
+Current `perf` samples do not place a generic BitReader symbol above the 0.5%
+reporting threshold on the CABAC comparison stream. Specialized bit ingestion
+inside CABAC has produced measurable gains before, but optimizing the generic
+reader solely from its microbenchmark would currently trade whole-decoder
+performance for a better synthetic number. A future padded/trusted H.264 reader
+could remove some atomic end-of-input checks, but it should be attempted only
+with exact A/B decoder binaries and both CABAC and CAVLC inputs.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
-FFmpeg is already about 4.5x faster in the comparable NV12 case. FFmpeg then
+FFmpeg is already about 4.2x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
 parallelizes only owned CABAC B-macroblock pixel reconstruction. CABAC parsing,
 residual reconstruction, most P-picture reconstruction, output packaging, and
