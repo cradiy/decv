@@ -33,6 +33,12 @@ pub struct TemporalDirectContext<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub enum DirectMotionContext<'a> {
+    Spatial(SpatialDirectContext<'a>),
+    Temporal(TemporalDirectContext<'a>),
+}
+
+#[derive(Debug, Clone, Copy)]
 struct MotionCell {
     slice_id: u32,
     list0: Option<ResolvedBListMotion>,
@@ -84,12 +90,11 @@ struct PartitionPlan {
     list1: Option<ListPlan>,
 }
 
-/// Per-picture spatial motion state for explicit frame-coded B partitions.
+/// Per-picture spatial motion state for frame-coded B partitions.
 ///
-/// Direct prediction is deliberately rejected here because it additionally
-/// requires co-located motion and POC-distance scaling. List0, List1, and Bi
-/// partitions use the same A/B/C/D spatial prediction rules independently for
-/// each list.
+/// List0, List1, and Bi partitions use the same A/B/C/D spatial prediction
+/// rules independently for each list. Direct partitions additionally consume
+/// co-located motion and, for temporal Direct, POC-distance scaling metadata.
 #[derive(Debug, Clone)]
 pub struct BMotionState {
     width_in_macroblocks: usize,
@@ -332,6 +337,101 @@ impl BMotionState {
         })
     }
 
+    pub fn resolve_mixed_direct_8x8_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        header: &BInterMacroblockHeader,
+        direct_context: DirectMotionContext<'_>,
+    ) -> Result<ResolvedBMacroblock> {
+        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        let BPartitionMode::EightByEight { sub_macroblocks } = &header.partition_mode else {
+            return Err(H264Error::InvalidSyntax(
+                "mixed Direct resolution requires a B_8x8 macroblock",
+            ));
+        };
+        if header.partitions.len() != 4 {
+            return Err(H264Error::InvalidSyntax(
+                "B_8x8 partition count is inconsistent",
+            ));
+        }
+        let mut local = [None; 16];
+        let mut resolved = Vec::new();
+        for (index, (&sub_type, syntax)) in
+            sub_macroblocks.iter().zip(&header.partitions).enumerate()
+        {
+            let base_x = (index % 2 * 8) as u8;
+            let base_y = (index / 2 * 8) as u8;
+            if sub_type == BSubMacroblockType::Direct8x8 {
+                for partition in self.resolve_direct_region(
+                    macroblock_address,
+                    slice_id,
+                    base_x,
+                    base_y,
+                    direct_context,
+                )? {
+                    fill_partition_cells(&mut local, slice_id, partition)?;
+                    resolved.push(partition);
+                }
+                continue;
+            }
+
+            if syntax.prediction != sub_type.prediction() {
+                return Err(H264Error::InvalidSyntax(
+                    "B sub-macroblock prediction mode is inconsistent",
+                ));
+            }
+            validate_motion_syntax(syntax, sub_type.partition_count())?;
+            let (width, height) = sub_type.partition_size();
+            for sub_index in 0..sub_type.partition_count() {
+                let (offset_x, offset_y) = sub_partition_offset(sub_type, sub_index);
+                let plan = make_plan(
+                    syntax,
+                    sub_index,
+                    PartitionGeometry {
+                        x: base_x + offset_x,
+                        y: base_y + offset_y,
+                        width,
+                        height,
+                        macroblock_partition_index: index,
+                    },
+                    DirectionalMode::None,
+                )?;
+                let list0 = self.resolve_list(
+                    macroblock_address,
+                    slice_id,
+                    &local,
+                    plan,
+                    plan.list0,
+                    false,
+                )?;
+                let list1 = self.resolve_list(
+                    macroblock_address,
+                    slice_id,
+                    &local,
+                    plan,
+                    plan.list1,
+                    true,
+                )?;
+                let partition = ResolvedBPartition {
+                    x: plan.geometry.x,
+                    y: plan.geometry.y,
+                    width: plan.geometry.width,
+                    height: plan.geometry.height,
+                    list0,
+                    list1,
+                };
+                fill_partition_cells(&mut local, slice_id, partition)?;
+                resolved.push(partition);
+            }
+        }
+        self.commit_local_cells(macroblock_address, local);
+        Ok(ResolvedBMacroblock {
+            direct: true,
+            partitions: resolved,
+        })
+    }
+
     pub(crate) fn clear_macroblock(&mut self, macroblock_address: usize) -> Result<()> {
         if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
             return Err(H264Error::InvalidSyntax(
@@ -390,6 +490,143 @@ impl BMotionState {
                     .then_some(neighbour.reference_index as u8)
             })
             .min()
+    }
+
+    fn resolve_direct_region(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+        base_x: u8,
+        base_y: u8,
+        context: DirectMotionContext<'_>,
+    ) -> Result<Vec<ResolvedBPartition>> {
+        let partition_size = match context {
+            DirectMotionContext::Spatial(context) if context.direct_8x8_inference => 8,
+            DirectMotionContext::Temporal(context) if context.direct_8x8_inference => 8,
+            DirectMotionContext::Spatial(_) | DirectMotionContext::Temporal(_) => 4,
+        };
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let mut partitions = Vec::with_capacity((8 / partition_size) * (8 / partition_size));
+
+        let spatial_prediction = if let DirectMotionContext::Spatial(context) = context {
+            let geometry = PartitionGeometry {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                macroblock_partition_index: 0,
+            };
+            let empty = [None; 16];
+            let mut reference_l0 = self.spatial_direct_reference_index(
+                macroblock_address,
+                slice_id,
+                &empty,
+                geometry,
+                false,
+            );
+            let mut reference_l1 = self.spatial_direct_reference_index(
+                macroblock_address,
+                slice_id,
+                &empty,
+                geometry,
+                true,
+            );
+            if reference_l0.is_none() && reference_l1.is_none() {
+                reference_l0 = Some(0);
+                reference_l1 = Some(0);
+            }
+            validate_direct_reference(reference_l0, context.num_ref_idx_l0_active, "List 0")?;
+            validate_direct_reference(reference_l1, context.num_ref_idx_l1_active, "List 1")?;
+            Some((
+                reference_l0.map(|reference_index| {
+                    (
+                        reference_index,
+                        self.predict_motion_vector(
+                            macroblock_address,
+                            slice_id,
+                            &empty,
+                            geometry,
+                            DirectionalMode::None,
+                            reference_index,
+                            false,
+                        ),
+                    )
+                }),
+                reference_l1.map(|reference_index| {
+                    (
+                        reference_index,
+                        self.predict_motion_vector(
+                            macroblock_address,
+                            slice_id,
+                            &empty,
+                            geometry,
+                            DirectionalMode::None,
+                            reference_index,
+                            true,
+                        ),
+                    )
+                }),
+            ))
+        } else {
+            None
+        };
+
+        for y in (usize::from(base_y)..usize::from(base_y) + 8).step_by(partition_size) {
+            for x in (usize::from(base_x)..usize::from(base_x) + 8).step_by(partition_size) {
+                let (list0, list1) = match context {
+                    DirectMotionContext::Spatial(context) => {
+                        let colocated = context
+                            .colocated_motion
+                            .cell(macroblock_x * 4 + x / 4, macroblock_y * 4 + y / 4)
+                            .ok_or(H264Error::InvalidSyntax(
+                                "spatial Direct co-located block lies outside the reference motion field",
+                            ))?;
+                        let col_zero = colocated_zero_flag(colocated, context.colocated_long_term);
+                        let (predicted_l0, predicted_l1) =
+                            spatial_prediction.expect("spatial prediction is prepared above");
+                        (
+                            predicted_l0.map(|(reference_index, vector)| ResolvedBListMotion {
+                                reference_index,
+                                motion_vector: if col_zero && reference_index == 0 {
+                                    MotionVector::default()
+                                } else {
+                                    vector
+                                },
+                            }),
+                            predicted_l1.map(|(reference_index, vector)| ResolvedBListMotion {
+                                reference_index,
+                                motion_vector: if col_zero && reference_index == 0 {
+                                    MotionVector::default()
+                                } else {
+                                    vector
+                                },
+                            }),
+                        )
+                    }
+                    DirectMotionContext::Temporal(context) => {
+                        let colocated = context
+                            .colocated
+                            .motion
+                            .cell(macroblock_x * 4 + x / 4, macroblock_y * 4 + y / 4)
+                            .ok_or(H264Error::InvalidSyntax(
+                                "temporal Direct co-located block lies outside the reference motion field",
+                            ))?;
+                        let (list0, list1) = temporal_direct_motion(colocated, context)?;
+                        (Some(list0), Some(list1))
+                    }
+                };
+                partitions.push(ResolvedBPartition {
+                    x: x as u8,
+                    y: y as u8,
+                    width: partition_size as u8,
+                    height: partition_size as u8,
+                    list0,
+                    list1,
+                });
+            }
+        }
+        Ok(partitions)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1068,6 +1305,87 @@ mod tests {
                 (4, 4)
             ]
         );
+    }
+
+    #[test]
+    fn resolves_mixed_direct_and_explicit_eight_by_eight_partitions() {
+        let colocated = ReferenceMotionField::all_intra(Size::new(16, 16)).unwrap();
+        let mut state = BMotionState::new(1, 1).unwrap();
+        let resolved = state
+            .resolve_mixed_direct_8x8_macroblock(
+                0,
+                1,
+                &header(
+                    BPartitionMode::EightByEight {
+                        sub_macroblocks: [
+                            BSubMacroblockType::Direct8x8,
+                            BSubMacroblockType::List0_8x8,
+                            BSubMacroblockType::List1_8x8,
+                            BSubMacroblockType::Bi8x8,
+                        ],
+                    },
+                    vec![
+                        partition(BPredictionMode::Direct, None, None, Vec::new(), Vec::new()),
+                        partition(
+                            BPredictionMode::List0,
+                            Some(0),
+                            None,
+                            vec![difference(4, 0)],
+                            Vec::new(),
+                        ),
+                        partition(
+                            BPredictionMode::List1,
+                            None,
+                            Some(0),
+                            Vec::new(),
+                            vec![difference(0, 4)],
+                        ),
+                        partition(
+                            BPredictionMode::Bi,
+                            Some(0),
+                            Some(0),
+                            vec![difference(0, 0)],
+                            vec![difference(0, 0)],
+                        ),
+                    ],
+                ),
+                DirectMotionContext::Spatial(SpatialDirectContext {
+                    colocated_motion: &colocated,
+                    colocated_long_term: false,
+                    direct_8x8_inference: true,
+                    num_ref_idx_l0_active: 1,
+                    num_ref_idx_l1_active: 1,
+                }),
+            )
+            .unwrap();
+
+        assert!(resolved.direct);
+        assert_eq!(resolved.partitions.len(), 4);
+        assert_eq!(
+            (resolved.partitions[0].list0, resolved.partitions[0].list1),
+            (
+                Some(ResolvedBListMotion {
+                    reference_index: 0,
+                    motion_vector: MotionVector::default(),
+                }),
+                Some(ResolvedBListMotion {
+                    reference_index: 0,
+                    motion_vector: MotionVector::default(),
+                }),
+            )
+        );
+        assert_eq!(
+            resolved.partitions[1].list0.unwrap().motion_vector,
+            MotionVector { x: 4, y: 0 }
+        );
+        assert!(resolved.partitions[1].list1.is_none());
+        assert!(resolved.partitions[2].list0.is_none());
+        assert_eq!(
+            resolved.partitions[2].list1.unwrap().motion_vector,
+            MotionVector { x: 0, y: 4 }
+        );
+        assert!(resolved.partitions[3].list0.is_some());
+        assert!(resolved.partitions[3].list1.is_some());
     }
 
     #[test]

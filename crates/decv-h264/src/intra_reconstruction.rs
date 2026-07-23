@@ -16,18 +16,19 @@ use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, BSubMacroblockType,
     CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock,
-    DecodedIntraMacroblock, DecodedPSliceMacroblock, DirectReference, EntropyCodingMode, H264Error,
-    InterResidual, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraModeState,
-    IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
-    MacroblockQuantizerState, PMacroblockContext, PMotionState, ParsedSliceHeader,
-    PredictionWeightTable, ReconstructedInterResidual, ReconstructedIntraResidual,
-    ReconstructedLumaResidual, ReferenceId, ReferenceMotionField, ResolvedBListMotion,
-    ResolvedBMacroblock, ResolvedPMacroblock, ResolvedScalingLists4x4, ResolvedScalingLists8x8,
-    Result, ScanMode, SliceType, SpatialDirectContext, TemporalDirectContext, WeightedBiprediction,
-    Yuv420Picture, consume_rbsp_trailing_bits, derive_chroma_qp, parse_cavlc_mb_skip_run,
-    predict_intra_4x4, predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420,
-    reconstruct_b_inter_residual, reconstruct_inter_residual, reconstruct_intra_residual,
-    reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
+    DecodedIntraMacroblock, DecodedPSliceMacroblock, DirectMotionContext, DirectReference,
+    EntropyCodingMode, H264Error, InterResidual, IntraLumaPrediction, IntraMacroblock,
+    IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability,
+    MacroblockQuantizer, MacroblockQuantizerState, PMacroblockContext, PMotionState,
+    ParsedSliceHeader, PredictionWeightTable, ReconstructedInterResidual,
+    ReconstructedIntraResidual, ReconstructedLumaResidual, ReferenceId, ReferenceMotionField,
+    ResolvedBListMotion, ResolvedBMacroblock, ResolvedPMacroblock, ResolvedScalingLists4x4,
+    ResolvedScalingLists8x8, Result, ScanMode, SliceType, SpatialDirectContext,
+    TemporalDirectContext, WeightedBiprediction, Yuv420Picture, consume_rbsp_trailing_bits,
+    derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4, predict_intra_8x8,
+    predict_intra_16x16, predict_intra_chroma_420, reconstruct_b_inter_residual,
+    reconstruct_inter_residual, reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420,
+    resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -86,27 +87,49 @@ enum BDirectPrediction<'a> {
     Temporal(Option<TemporalDirectContext<'a>>),
 }
 
-impl BDirectPrediction<'_> {
+impl<'a> BDirectPrediction<'a> {
+    fn context(self) -> Result<DirectMotionContext<'a>> {
+        match self {
+            Self::Spatial(Some(context)) => Ok(DirectMotionContext::Spatial(context)),
+            Self::Spatial(None) => Err(H264Error::InvalidSyntax(
+                "spatial Direct requires active List 1 reference metadata",
+            )),
+            Self::Temporal(Some(context)) => Ok(DirectMotionContext::Temporal(context)),
+            Self::Temporal(None) => Err(H264Error::InvalidSyntax(
+                "temporal Direct requires active reference metadata",
+            )),
+        }
+    }
+
     fn resolve(
         self,
         state: &mut BMotionState,
         macroblock_address: usize,
         slice_id: u32,
     ) -> Result<ResolvedBMacroblock> {
-        match self {
-            Self::Spatial(Some(context)) => {
+        match self.context()? {
+            DirectMotionContext::Spatial(context) => {
                 state.resolve_spatial_direct_macroblock(macroblock_address, slice_id, context)
             }
-            Self::Spatial(None) => Err(H264Error::InvalidSyntax(
-                "spatial Direct requires active List 1 reference metadata",
-            )),
-            Self::Temporal(Some(context)) => {
+            DirectMotionContext::Temporal(context) => {
                 state.resolve_temporal_direct_macroblock(macroblock_address, slice_id, context)
             }
-            Self::Temporal(None) => Err(H264Error::InvalidSyntax(
-                "temporal Direct requires active reference metadata",
-            )),
         }
+    }
+
+    fn resolve_mixed(
+        self,
+        state: &mut BMotionState,
+        macroblock_address: usize,
+        slice_id: u32,
+        header: &crate::BInterMacroblockHeader,
+    ) -> Result<ResolvedBMacroblock> {
+        state.resolve_mixed_direct_8x8_macroblock(
+            macroblock_address,
+            slice_id,
+            header,
+            self.context()?,
+        )
     }
 }
 
@@ -918,6 +941,13 @@ impl IntraPictureReconstructor {
                         modes
                             .direct
                             .resolve(&mut self.b_motion, macroblock_address, slice_id)?
+                    } else if has_direct_b_sub_macroblock(header) {
+                        modes.direct.resolve_mixed(
+                            &mut self.b_motion,
+                            macroblock_address,
+                            slice_id,
+                            header,
+                        )?
                     } else {
                         self.b_motion.resolve_inter_macroblock(
                             macroblock_address,
@@ -1684,6 +1714,14 @@ fn is_fully_direct_b_macroblock(header: &crate::BInterMacroblockHeader) -> bool 
         | BPartitionMode::SixteenByEight
         | BPartitionMode::EightBySixteen => false,
     }
+}
+
+fn has_direct_b_sub_macroblock(header: &crate::BInterMacroblockHeader) -> bool {
+    matches!(
+        &header.partition_mode,
+        BPartitionMode::EightByEight { sub_macroblocks }
+            if sub_macroblocks.contains(&BSubMacroblockType::Direct8x8)
+    )
 }
 
 fn zero_inter_residual() -> ReconstructedInterResidual {

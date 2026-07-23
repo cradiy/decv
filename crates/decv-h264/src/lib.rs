@@ -35,7 +35,9 @@ mod sps;
 mod transform;
 
 pub use annex_b::{AnnexBNalUnit, AnnexBReader};
-pub use b_motion::{BMotionState, DirectReference, SpatialDirectContext, TemporalDirectContext};
+pub use b_motion::{
+    BMotionState, DirectMotionContext, DirectReference, SpatialDirectContext, TemporalDirectContext,
+};
 pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
 };
