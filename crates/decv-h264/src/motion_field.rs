@@ -310,14 +310,26 @@ impl MotionFieldBuilder {
         macroblock_address: usize,
         cell: MotionFieldCell,
     ) -> Result<()> {
-        let indices = self.macroblock_indices(macroblock_address)?;
+        let macroblock_count = self.cells.len() / 16;
+        if macroblock_address >= macroblock_count {
+            return Err(H264Error::InvalidSyntax(
+                "reference motion-field macroblock exceeds the picture",
+            ));
+        }
         if self.completed[macroblock_address] != 0 {
             return Err(H264Error::InvalidSyntax(
                 "reference motion-field macroblock was already recorded",
             ));
         }
-        for index in indices {
-            self.cells[index].write(cell);
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let field_width = self.width_in_macroblocks * 4;
+        let first = macroblock_y * 4 * field_width + macroblock_x * 4;
+        for row in 0..4 {
+            let row_start = first + row * field_width;
+            for destination in &mut self.cells[row_start..row_start + 4] {
+                destination.write(cell);
+            }
         }
         self.completed[macroblock_address] = 1;
         Ok(())
