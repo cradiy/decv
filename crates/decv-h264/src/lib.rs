@@ -52,6 +52,9 @@ pub use sps::{
     SequenceParameterSet, TimingInfo, VuiParameters,
 };
 pub use transform::{
-    Block4x4, FLAT_SCALING_LIST_4X4, ScanMode, inverse_scale_4x4, inverse_scan_4x4,
-    inverse_scan_scaling_list_4x4, inverse_transform_4x4, reconstruct_residual_4x4,
+    Block4x4, ColorComponent, DEFAULT_SCALING_LIST_4X4_INTER, DEFAULT_SCALING_LIST_4X4_INTRA,
+    FLAT_SCALING_LIST_4X4, PredictionClass, ResolvedScalingLists4x4, ScanMode, inverse_scale_4x4,
+    inverse_scan_4x4, inverse_scan_scaling_list_4x4, inverse_transform_4x4,
+    inverse_transform_chroma_dc_420, inverse_transform_luma_dc_4x4, reconstruct_residual_4x4,
+    resolve_scaling_lists_4x4,
 };
