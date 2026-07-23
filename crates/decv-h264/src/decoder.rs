@@ -296,27 +296,42 @@ impl H264Decoder {
                                 })
                             })
                             .collect::<Vec<_>>();
-                        self.current_picture
+                        let picture = self
+                            .current_picture
                             .as_mut()
-                            .expect("the picture is initialized above")
-                            .reconstructor
-                            .decode_cavlc_b_slice(
-                                rbsp.as_ref(),
-                                &parsed,
-                                ReconstructionReferenceList::with_metadata(
-                                    &borrowed_l0,
-                                    &reference_ids_l0,
-                                    &implicit_l0,
-                                    &direct_l0,
-                                ),
-                                ReconstructionReferenceList::with_metadata(
-                                    &borrowed_l1,
-                                    &reference_ids_l1,
-                                    &implicit_l1,
-                                    &direct_l1,
-                                ),
-                                current_poc,
-                            )?;
+                            .expect("the picture is initialized above");
+                        let list0 = ReconstructionReferenceList::with_metadata(
+                            &borrowed_l0,
+                            &reference_ids_l0,
+                            &implicit_l0,
+                            &direct_l0,
+                        );
+                        let list1 = ReconstructionReferenceList::with_metadata(
+                            &borrowed_l1,
+                            &reference_ids_l1,
+                            &implicit_l1,
+                            &direct_l1,
+                        );
+                        match parsed.parameter_sets.picture.entropy_coding_mode {
+                            EntropyCodingMode::Cavlc => {
+                                picture.reconstructor.decode_cavlc_b_slice(
+                                    rbsp.as_ref(),
+                                    &parsed,
+                                    list0,
+                                    list1,
+                                    current_poc,
+                                )?;
+                            }
+                            EntropyCodingMode::Cabac => {
+                                picture.reconstructor.decode_cabac_b_slice(
+                                    rbsp.as_ref(),
+                                    &parsed,
+                                    list0,
+                                    list1,
+                                    current_poc,
+                                )?;
+                            }
+                        }
                     }
                     SliceType::Sp | SliceType::Si => {
                         return Err(H264Error::UnsupportedFeature(
@@ -1005,6 +1020,64 @@ mod tests {
             let frame = match decoder.receive_frame().unwrap() {
                 DecodeOutput::Frame(frame) => frame,
                 output => panic!("expected CABAC P frame, got {output:?}"),
+            };
+            let FrameStorage::Cpu(cpu) = frame.storage else {
+                panic!("expected CPU frame");
+            };
+            assert_eq!(cpu.planes[0].bytes.len(), 768);
+            assert_eq!(crc32(cpu.planes[0].bytes.as_ref()), expected_crc);
+        }
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn decodes_real_x264_cabac_b_pictures_byte_exactly() {
+        // Six 32x16 gradient pictures encoded by x264 with CABAC, two B
+        // pictures per reference interval, two references, and spatial Direct.
+        // The SEI was removed and every NV12 CRC was checked against FFmpeg.
+        let stream = [
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x64, 0x00, 0x0a, 0xac, 0xd9, 0x4b, 0xb0, 0x11, 0x00,
+            0x00, 0x03, 0x00, 0x01, 0x00, 0x00, 0x03, 0x00, 0x04, 0x0f, 0x12, 0x25, 0x96, 0x00,
+            0x00, 0x00, 0x01, 0x68, 0xea, 0x83, 0xcb, 0x22, 0xc0, 0x00, 0x00, 0x01, 0x65, 0x88,
+            0x84, 0x00, 0x5f, 0xf4, 0x5e, 0x28, 0xef, 0xde, 0x02, 0x2f, 0x2c, 0x4e, 0xe9, 0x77,
+            0x4c, 0x7e, 0x55, 0xb1, 0xd4, 0xe5, 0xc9, 0x7f, 0x47, 0x65, 0xd9, 0x00, 0x00, 0x00,
+            0x01, 0x41, 0x9a, 0x23, 0x64, 0x6f, 0x64, 0x7a, 0xce, 0xb4, 0xe1, 0xfd, 0x36, 0x98,
+            0x7d, 0x6a, 0xfe, 0x58, 0x4b, 0x4b, 0xfb, 0xd2, 0x7f, 0x3a, 0x48, 0x7e, 0xdc, 0xf7,
+            0x80, 0x00, 0x00, 0x00, 0x01, 0x41, 0x9e, 0x41, 0x78, 0x8d, 0xff, 0xf7, 0xf3, 0x01,
+            0xcd, 0xad, 0x3f, 0x85, 0xea, 0x33, 0x47, 0xff, 0xf9, 0x00, 0x00, 0x00, 0x01, 0x01,
+            0x9e, 0x62, 0x44, 0x5f, 0xb0, 0x80, 0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x65, 0x34,
+            0xa4, 0xa7, 0x8b, 0xff, 0x60, 0xf4, 0xe1, 0x39, 0xfd, 0x00, 0xa3, 0xe5, 0xe0, 0x42,
+            0xc9, 0x9a, 0x73, 0x35, 0x56, 0x66, 0x5f, 0xe1, 0x00, 0x00, 0x00, 0x01, 0x01, 0x9e,
+            0x84, 0x44, 0x5f, 0xb0, 0x81,
+        ];
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(stream))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+
+        for expected_crc in [
+            2_233_814_414,
+            1_801_912_313,
+            3_452_851_269,
+            2_181_253_705,
+            1_436_501_184,
+            1_038_502_273,
+        ] {
+            let frame = match decoder.receive_frame().unwrap() {
+                DecodeOutput::Frame(frame) => frame,
+                output => panic!("expected CABAC B frame, got {output:?}"),
             };
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");

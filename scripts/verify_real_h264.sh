@@ -55,6 +55,15 @@ ffmpeg -hide_banner -loglevel error \
 verify_stream cabac-p
 
 ffmpeg -hide_banner -loglevel error \
+    -f lavfi \
+    -i "nullsrc=size=32x16:rate=2,geq=lum='40+8*N+X':cb='90+N':cr='150-N'" \
+    -frames:v 6 -pix_fmt yuv420p -c:v libx264 -profile:v high \
+    -x264-params \
+    "cabac=1:bframes=2:b-adapt=0:keyint=30:min-keyint=30:scenecut=0:ref=2:weightp=0:weightb=0:8x8dct=1:deblock=0:direct=spatial:no-fast-pskip=1" \
+    -f h264 -y "$work_dir/cabac-b.h264"
+verify_stream cabac-b
+
+ffmpeg -hide_banner -loglevel error \
     -f lavfi -i "testsrc2=size=64x48:rate=24" \
     -frames:v 16 -pix_fmt yuv420p -c:v libx264 -profile:v main \
     -x264-params \

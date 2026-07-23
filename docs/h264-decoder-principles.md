@@ -793,6 +793,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - transactional CABAC B-macroblock assembly in normative four-pass List 0/List
   1 reference/MVD order, including B_Skip, Direct, every ordinary and 8x8
   partition shape, embedded Intra/I_PCM, QP, transform, and residual syntax;
+- pixel-producing progressive CABAC B slices with spatial/temporal Direct,
+  explicit and weighted bidirectional prediction, residual reconstruction,
+  deblocking, output reordering, and byte-exact x264/FFmpeg regression;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
@@ -816,7 +819,6 @@ Annex-B CAVLC or CABAC progressive 8-bit 4:2:0 I/IDR -> P
 This is not yet a generally conforming H.264 decoder. The current implementation
 still rejects or has not yet connected:
 
-- CABAC B-slice pixel reconstruction;
 - SP and SI reconstruction;
 - transform-bypass reconstruction;
 - field pictures and MBAFF;
@@ -825,9 +827,9 @@ still rejects or has not yet connected:
 The next dependency chain is:
 
 ```text
-CABAC B macroblock syntax
-    -> CABAC List 0/List 1 and Direct motion syntax
-    -> CABAC B-slice pixel reconstruction
+broader CABAC I/P/B stream corpus
+    -> isolate unsupported syntax combinations
+    -> extend profiles, fields, and transform-bypass coverage
 ```
 
 The synchronous decoder currently keeps an unfinished picture across packets.

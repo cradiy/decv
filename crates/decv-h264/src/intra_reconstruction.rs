@@ -15,22 +15,22 @@ use crate::motion_field::MotionFieldBuilder;
 use crate::rbsp::more_rbsp_data;
 use crate::{
     ActiveParameterSets, BMacroblockContext, BMotionState, BPartitionMode, BSubMacroblockType,
-    CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary, CabacPMacroblock,
-    CabacPMacroblockContext, CabacPMacroblockState, CabacResidualState, CabacSliceDecoder,
-    CavlcNeighborState, ChromaPlane, DeblockingFilter, DecodedBSliceMacroblock,
-    DecodedIntraMacroblock, DecodedPSliceMacroblock, DirectMotionContext, DirectReference,
-    EntropyCodingMode, H264Error, InterResidual, IntraLumaPrediction, IntraMacroblock,
-    IntraMacroblockHeader, IntraModeState, IntraPredictionModeSyntax, IntraReferenceAvailability,
-    MacroblockQuantizer, MacroblockQuantizerState, PMacroblockContext, PMotionState,
-    ParsedSliceHeader, PredictionWeightTable, ReconstructedInterResidual,
-    ReconstructedIntraResidual, ReconstructedLumaResidual, ReferenceId, ReferenceMotionField,
-    ResolvedBListMotion, ResolvedBMacroblock, ResolvedPMacroblock, ResolvedScalingLists4x4,
-    ResolvedScalingLists8x8, Result, ScanMode, SliceType, SpatialDirectContext,
-    TemporalDirectContext, WeightedBiprediction, Yuv420Picture, consume_rbsp_trailing_bits,
-    derive_chroma_qp, parse_cavlc_mb_skip_run, predict_intra_4x4, predict_intra_8x8,
-    predict_intra_16x16, predict_intra_chroma_420, reconstruct_b_inter_residual,
-    reconstruct_inter_residual, reconstruct_intra_residual, reconstruct_p_macroblock_from_list_420,
-    resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
+    CabacBMacroblock, CabacBMacroblockContext, CabacBMacroblockState, CabacIntraMacroblockSyntax,
+    CabacMacroblockState, CabacMacroblockSummary, CabacPMacroblock, CabacPMacroblockContext,
+    CabacPMacroblockState, CabacResidualState, CabacSliceDecoder, CavlcNeighborState, ChromaPlane,
+    DeblockingFilter, DecodedBSliceMacroblock, DecodedIntraMacroblock, DecodedPSliceMacroblock,
+    DirectMotionContext, DirectReference, EntropyCodingMode, H264Error, InterResidual,
+    IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraModeState,
+    IntraPredictionModeSyntax, IntraReferenceAvailability, MacroblockQuantizer,
+    MacroblockQuantizerState, PMacroblockContext, PMotionState, ParsedSliceHeader,
+    PredictionWeightTable, ReconstructedInterResidual, ReconstructedIntraResidual,
+    ReconstructedLumaResidual, ReferenceId, ReferenceMotionField, ResolvedBListMotion,
+    ResolvedBMacroblock, ResolvedPMacroblock, ResolvedScalingLists4x4, ResolvedScalingLists8x8,
+    Result, ScanMode, SliceType, SpatialDirectContext, TemporalDirectContext, WeightedBiprediction,
+    Yuv420Picture, consume_rbsp_trailing_bits, derive_chroma_qp, parse_cavlc_mb_skip_run,
+    predict_intra_4x4, predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420,
+    reconstruct_b_inter_residual, reconstruct_inter_residual, reconstruct_intra_residual,
+    reconstruct_p_macroblock_from_list_420, resolve_scaling_lists_4x4, resolve_scaling_lists_8x8,
 };
 
 const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
@@ -585,6 +585,125 @@ impl IntraPictureReconstructor {
                 num_ref_idx_l1_active: header.num_ref_idx_l1_active,
                 transform_8x8_mode_enabled: pps.transform_8x8_mode,
                 direct_8x8_inference: sps.direct_8x8_inference,
+            },
+            references_l0,
+            references_l1,
+            BReconstructionModes {
+                weights: prediction_weights,
+                direct: direct_prediction,
+            },
+        )
+    }
+
+    /// Decodes one progressive CABAC B slice using the active reference lists.
+    pub fn decode_cabac_b_slice(
+        &mut self,
+        rbsp: &[u8],
+        parsed: &ParsedSliceHeader,
+        references_l0: ReconstructionReferenceList<'_>,
+        references_l1: ReconstructionReferenceList<'_>,
+        current_picture_order_count: i32,
+    ) -> Result<usize> {
+        let header = &parsed.header;
+        let sps = &parsed.parameter_sets.sequence;
+        let pps = &parsed.parameter_sets.picture;
+        if header.slice_type != SliceType::B {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC B reconstruction requires a B slice header",
+            ));
+        }
+        if pps.entropy_coding_mode != EntropyCodingMode::Cabac
+            || pps.num_slice_groups != 1
+            || header.field_picture
+            || sps.mb_adaptive_frame_field
+        {
+            return Err(H264Error::UnsupportedFeature(
+                "CABAC B reconstruction currently requires progressive non-FMO input",
+            ));
+        }
+        let prediction_weights = match pps.weighted_biprediction {
+            WeightedBiprediction::Default => BSlicePredictionWeights::Default,
+            WeightedBiprediction::Explicit => {
+                BSlicePredictionWeights::Explicit(header.prediction_weights.as_ref().ok_or(
+                    H264Error::InvalidSyntax(
+                        "explicit weighted B slice is missing pred_weight_table",
+                    ),
+                )?)
+            }
+            WeightedBiprediction::Implicit => BSlicePredictionWeights::Implicit {
+                current_picture_order_count,
+                list0: references_l0
+                    .implicit_weights
+                    .ok_or(H264Error::InvalidSyntax(
+                        "implicit weighted B List 0 is missing reference metadata",
+                    ))?,
+                list1: references_l1
+                    .implicit_weights
+                    .ok_or(H264Error::InvalidSyntax(
+                        "implicit weighted B List 1 is missing reference metadata",
+                    ))?,
+            },
+        };
+        let direct_prediction = if header.direct_spatial_mv_prediction == Some(true) {
+            let colocated = references_l1
+                .direct_references
+                .and_then(|references| references.first())
+                .copied()
+                .flatten();
+            BDirectPrediction::Spatial(colocated.map(|colocated| SpatialDirectContext {
+                colocated_motion: colocated.motion,
+                colocated_long_term: colocated.long_term,
+                direct_8x8_inference: sps.direct_8x8_inference,
+                num_ref_idx_l0_active: header.num_ref_idx_l0_active,
+                num_ref_idx_l1_active: header.num_ref_idx_l1_active,
+            }))
+        } else {
+            let context = references_l0
+                .direct_references
+                .zip(references_l1.direct_references)
+                .and_then(|(list0, list1)| {
+                    list1
+                        .first()
+                        .copied()
+                        .flatten()
+                        .map(|colocated| TemporalDirectContext {
+                            current_picture_order_count,
+                            colocated,
+                            references_l0: list0,
+                            direct_8x8_inference: sps.direct_8x8_inference,
+                            num_ref_idx_l1_active: header.num_ref_idx_l1_active,
+                        })
+                });
+            BDirectPrediction::Temporal(context)
+        };
+        if sps.coded_size != self.picture.coded_size()
+            || pps.constrained_intra_prediction != self.constrained_intra_prediction
+        {
+            return Err(H264Error::InvalidSyntax(
+                "slice parameter sets do not match the picture reconstructor",
+            ));
+        }
+        let config = IntraSliceConfig {
+            header_bit_size: header.bit_size,
+            first_macroblock: usize::try_from(header.first_mb_in_slice)
+                .map_err(|_| H264Error::IntegerOverflow)?,
+            slice_qp_y: header.slice_qp_y,
+            transform_8x8_mode: pps.transform_8x8_mode,
+            chroma_cb_offset: pps.chroma_qp_index_offset,
+            chroma_cr_offset: pps.second_chroma_qp_index_offset,
+            transform_bypass_enabled: sps.qpprime_y_zero_transform_bypass,
+            deblocking_filter: header.deblocking_filter.unwrap_or_default(),
+        };
+        self.decode_cabac_b_slice_data(
+            rbsp,
+            config,
+            header.cabac_init_idc,
+            CabacBMacroblockContext {
+                num_ref_idx_l0_active: header.num_ref_idx_l0_active,
+                num_ref_idx_l1_active: header.num_ref_idx_l1_active,
+                transform_8x8_mode_enabled: pps.transform_8x8_mode,
+                direct_8x8_inference: sps.direct_8x8_inference,
+                previous_qp_delta_nonzero: false,
             },
             references_l0,
             references_l1,
@@ -1240,6 +1359,243 @@ impl IntraPictureReconstructor {
         }
         consume_rbsp_trailing_bits(&mut reader)?;
         Ok(decoded_count)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_cabac_b_slice_data(
+        &mut self,
+        rbsp: &[u8],
+        config: IntraSliceConfig,
+        cabac_init_idc: Option<u8>,
+        mut context: CabacBMacroblockContext,
+        references_l0: ReconstructionReferenceList<'_>,
+        references_l1: ReconstructionReferenceList<'_>,
+        modes: BReconstructionModes<'_>,
+    ) -> Result<usize> {
+        let reference_ids_l0 = references_l0.reference_ids;
+        let reference_ids_l1 = references_l1.reference_ids;
+        let references_l0 = references_l0.pictures;
+        let references_l1 = references_l1.pictures;
+        self.next_slice_id = self
+            .next_slice_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let slice_id = self.next_slice_id;
+        let mut cabac = CabacSliceDecoder::new(
+            rbsp,
+            config.header_bit_size,
+            SliceType::B,
+            cabac_init_idc,
+            config.slice_qp_y,
+        )?;
+        let height_in_macroblocks = self.completed.len() / self.width_in_macroblocks;
+        let mut macroblocks =
+            CabacBMacroblockState::new(self.width_in_macroblocks, height_in_macroblocks)?;
+        let mut quantizers = MacroblockQuantizerState::new(
+            config.slice_qp_y,
+            config.chroma_cb_offset,
+            config.chroma_cr_offset,
+            config.transform_bypass_enabled,
+        )?;
+        let pcm_chroma_qp = [
+            derive_chroma_qp(0, config.chroma_cb_offset),
+            derive_chroma_qp(0, config.chroma_cr_offset),
+        ];
+        let mut macroblock_address = config.first_macroblock;
+        let mut decoded_count = 0usize;
+
+        loop {
+            let (macroblock_x, macroblock_y) = self.macroblock_coordinates(macroblock_address)?;
+            let residual_snapshot = self.cabac_residual.snapshot_macroblock(macroblock_address);
+            let decoded = macroblocks.decode_macroblock(
+                &mut cabac,
+                &mut self.cabac_residual,
+                macroblock_address,
+                slice_id,
+                context,
+            )?;
+            let qp_delta = decoded.macroblock.qp_delta();
+            let reconstruction =
+                quantizers.with_macroblock(qp_delta, |quantizer| match &decoded.macroblock {
+                    CabacBMacroblock::Skip => {
+                        let motion = modes.direct.resolve(
+                            &mut self.b_motion,
+                            macroblock_address,
+                            slice_id,
+                        )?;
+                        if let Err(error) = self.reference_motion.record_b(
+                            macroblock_address,
+                            &motion,
+                            reference_ids_l0,
+                            reference_ids_l1,
+                        ) {
+                            self.b_motion.clear_macroblock(macroblock_address)?;
+                            return Err(error);
+                        }
+                        let deblock = match b_inter_deblock_info(
+                            slice_id,
+                            quantizer,
+                            false,
+                            config.deblocking_filter,
+                            &motion,
+                            None,
+                            references_l0,
+                            references_l1,
+                        ) {
+                            Ok(deblock) => deblock,
+                            Err(error) => {
+                                self.b_motion.clear_macroblock(macroblock_address)?;
+                                self.reference_motion.clear_macroblock(macroblock_address)?;
+                                return Err(error);
+                            }
+                        };
+                        let picture_snapshot = self
+                            .picture
+                            .snapshot_macroblock(macroblock_x, macroblock_y)?;
+                        let residual = zero_inter_residual();
+                        let result = reconstruct_b_prediction(
+                            &mut self.picture,
+                            references_l0,
+                            references_l1,
+                            macroblock_x,
+                            macroblock_y,
+                            &motion,
+                            &residual,
+                            modes.weights,
+                        )
+                        .and_then(|()| self.modes.record_inter(macroblock_address, slice_id));
+                        if let Err(error) = result {
+                            self.picture.restore_macroblock(
+                                macroblock_x,
+                                macroblock_y,
+                                &picture_snapshot,
+                            );
+                            self.b_motion.clear_macroblock(macroblock_address)?;
+                            self.reference_motion.clear_macroblock(macroblock_address)?;
+                            self.modes.clear_macroblock(macroblock_address)?;
+                            return Err(error);
+                        }
+                        self.complete_inter_macroblock(macroblock_address, deblock);
+                        Ok(())
+                    }
+                    CabacBMacroblock::Decoded(decoded) => match decoded.as_ref() {
+                        DecodedBSliceMacroblock::Inter { header, residual } => {
+                            let reconstructed = reconstruct_b_inter_residual(
+                                header,
+                                residual,
+                                quantizer,
+                                &self.scaling_lists,
+                                &self.scaling_lists_8x8,
+                                self.scan_mode,
+                            )?;
+                            let motion = if is_fully_direct_b_macroblock(header) {
+                                modes.direct.resolve(
+                                    &mut self.b_motion,
+                                    macroblock_address,
+                                    slice_id,
+                                )?
+                            } else if has_direct_b_sub_macroblock(header) {
+                                modes.direct.resolve_mixed(
+                                    &mut self.b_motion,
+                                    macroblock_address,
+                                    slice_id,
+                                    header,
+                                )?
+                            } else {
+                                self.b_motion.resolve_inter_macroblock(
+                                    macroblock_address,
+                                    slice_id,
+                                    header,
+                                )?
+                            };
+                            if let Err(error) = self.reference_motion.record_b(
+                                macroblock_address,
+                                &motion,
+                                reference_ids_l0,
+                                reference_ids_l1,
+                            ) {
+                                self.b_motion.clear_macroblock(macroblock_address)?;
+                                return Err(error);
+                            }
+                            let deblock = match b_inter_deblock_info(
+                                slice_id,
+                                quantizer,
+                                header.transform_size_8x8,
+                                config.deblocking_filter,
+                                &motion,
+                                Some(residual),
+                                references_l0,
+                                references_l1,
+                            ) {
+                                Ok(deblock) => deblock,
+                                Err(error) => {
+                                    self.b_motion.clear_macroblock(macroblock_address)?;
+                                    self.reference_motion.clear_macroblock(macroblock_address)?;
+                                    return Err(error);
+                                }
+                            };
+                            let picture_snapshot = self
+                                .picture
+                                .snapshot_macroblock(macroblock_x, macroblock_y)?;
+                            let reconstruction = reconstruct_b_prediction(
+                                &mut self.picture,
+                                references_l0,
+                                references_l1,
+                                macroblock_x,
+                                macroblock_y,
+                                &motion,
+                                &reconstructed,
+                                modes.weights,
+                            );
+                            if let Err(error) = reconstruction.and_then(|()| {
+                                self.modes.record_inter(macroblock_address, slice_id)
+                            }) {
+                                self.picture.restore_macroblock(
+                                    macroblock_x,
+                                    macroblock_y,
+                                    &picture_snapshot,
+                                );
+                                self.b_motion.clear_macroblock(macroblock_address)?;
+                                self.reference_motion.clear_macroblock(macroblock_address)?;
+                                self.modes.clear_macroblock(macroblock_address)?;
+                                return Err(error);
+                            }
+                            self.complete_inter_macroblock(macroblock_address, deblock);
+                            Ok(())
+                        }
+                        DecodedBSliceMacroblock::Intra(decoded) => self
+                            .reconstruct_macroblock_with_deblocking(
+                                macroblock_address,
+                                slice_id,
+                                decoded,
+                                quantizer,
+                                config.deblocking_filter,
+                                pcm_chroma_qp,
+                            ),
+                    },
+                });
+            if let Err(error) = reconstruction {
+                self.cabac_residual
+                    .restore_macroblock(macroblock_address, residual_snapshot);
+                return Err(error);
+            }
+
+            context.previous_qp_delta_nonzero = qp_delta != 0;
+            macroblock_address = macroblock_address
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+            decoded_count = decoded_count
+                .checked_add(1)
+                .ok_or(H264Error::IntegerOverflow)?;
+            if decoded.end_of_slice {
+                return Ok(decoded_count);
+            }
+            if macroblock_address >= self.completed.len() {
+                return Err(H264Error::InvalidSyntax(
+                    "CABAC B slice has no terminating end_of_slice_flag",
+                ));
+            }
+        }
     }
 
     fn decode_cavlc_b_slice_data(
