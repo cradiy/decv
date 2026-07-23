@@ -7,6 +7,162 @@ use crate::{
     consume_cabac_alignment,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletedCabacMacroblock {
+    slice_id: u32,
+    skipped: bool,
+    intra16_or_pcm: bool,
+}
+
+/// Completed-neighbour state used for macroblock-level CABAC contexts.
+#[derive(Debug, Clone)]
+pub struct CabacMacroblockState {
+    width_in_macroblocks: usize,
+    height_in_macroblocks: usize,
+    completed: Vec<Option<CompletedCabacMacroblock>>,
+}
+
+impl CabacMacroblockState {
+    pub fn new(width_in_macroblocks: usize, height_in_macroblocks: usize) -> Result<Self> {
+        if width_in_macroblocks == 0 || height_in_macroblocks == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC macroblock-state dimensions must be non-zero",
+            ));
+        }
+        let macroblock_count = width_in_macroblocks
+            .checked_mul(height_in_macroblocks)
+            .ok_or(H264Error::IntegerOverflow)?;
+        Ok(Self {
+            width_in_macroblocks,
+            height_in_macroblocks,
+            completed: vec![None; macroblock_count],
+        })
+    }
+
+    /// Decodes progressive-frame `mb_skip_flag` for a P/SP or B slice.
+    pub fn decode_skip_flag(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        slice_type: SliceType,
+    ) -> Result<bool> {
+        let context_index =
+            self.skip_flag_context_index(macroblock_address, slice_id, slice_type)?;
+        Ok(syntax.decision(context_index)? != 0)
+    }
+
+    /// Decodes an I/SI-slice `mb_type` value in the range 0..=25.
+    pub fn decode_intra_macroblock_type(
+        &self,
+        syntax: &mut CabacSyntaxDecoder<'_, '_>,
+        macroblock_address: usize,
+        slice_id: u32,
+        slice_type: SliceType,
+    ) -> Result<u8> {
+        if !slice_type.is_intra() {
+            return Err(H264Error::InvalidSyntax(
+                "intra CABAC mb_type requested for an inter slice",
+            ));
+        }
+        let mut context_index = 3;
+        for neighbour in self.left_and_top(macroblock_address, slice_id)? {
+            if neighbour.is_some_and(|macroblock| macroblock.intra16_or_pcm) {
+                context_index += 1;
+            }
+        }
+        if syntax.decision(context_index)? == 0 {
+            return Ok(0);
+        }
+        if syntax.terminate()? != 0 {
+            return Ok(25);
+        }
+        let mut macroblock_type = 1;
+        macroblock_type += 12 * syntax.decision(6)?;
+        if syntax.decision(7)? != 0 {
+            macroblock_type += 4 + 4 * syntax.decision(8)?;
+        }
+        macroblock_type += 2 * syntax.decision(9)?;
+        macroblock_type += syntax.decision(10)?;
+        Ok(macroblock_type)
+    }
+
+    /// Records the properties needed by later macroblocks in the same slice.
+    pub fn record_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        skipped: bool,
+        intra16_or_pcm: bool,
+    ) -> Result<()> {
+        let slot = self
+            .completed
+            .get_mut(macroblock_address)
+            .ok_or(H264Error::InvalidSyntax(
+                "CABAC macroblock address exceeds the picture",
+            ))?;
+        if slot.is_some() {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC macroblock was already completed",
+            ));
+        }
+        *slot = Some(CompletedCabacMacroblock {
+            slice_id,
+            skipped,
+            intra16_or_pcm,
+        });
+        Ok(())
+    }
+
+    fn skip_flag_context_index(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+        slice_type: SliceType,
+    ) -> Result<usize> {
+        let base = match slice_type {
+            SliceType::P | SliceType::Sp => 11,
+            SliceType::B => 24,
+            SliceType::I | SliceType::Si => {
+                return Err(H264Error::InvalidSyntax(
+                    "intra slices do not carry mb_skip_flag",
+                ));
+            }
+        };
+        let context_increment = self
+            .left_and_top(macroblock_address, slice_id)?
+            .into_iter()
+            .filter(|neighbour| neighbour.is_some_and(|macroblock| !macroblock.skipped))
+            .count();
+        Ok(base + context_increment)
+    }
+
+    fn left_and_top(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<[Option<CompletedCabacMacroblock>; 2]> {
+        if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC macroblock address exceeds the picture",
+            ));
+        }
+        let left = if !macroblock_address.is_multiple_of(self.width_in_macroblocks) {
+            self.completed[macroblock_address - 1]
+                .filter(|macroblock| macroblock.slice_id == slice_id)
+        } else {
+            None
+        };
+        let top = if macroblock_address >= self.width_in_macroblocks {
+            self.completed[macroblock_address - self.width_in_macroblocks]
+                .filter(|macroblock| macroblock.slice_id == slice_id)
+        } else {
+            None
+        };
+        Ok([left, top])
+    }
+}
+
 /// Long-lived arithmetic and probability state for one CABAC slice.
 #[derive(Debug, Clone)]
 pub struct CabacSliceDecoder<'data> {
@@ -191,6 +347,29 @@ fn progressing_context_index(context_indices: &[usize], bin_index: u32) -> usize
 }
 
 #[cfg(test)]
+fn decode_intra_macroblock_type(
+    first_context_index: usize,
+    mut decision: impl FnMut(usize) -> Result<u8>,
+    mut terminate: impl FnMut() -> Result<u8>,
+) -> Result<u8> {
+    if decision(first_context_index)? == 0 {
+        return Ok(0);
+    }
+    if terminate()? != 0 {
+        return Ok(25);
+    }
+
+    let mut macroblock_type = 1;
+    macroblock_type += 12 * decision(6)?;
+    if decision(7)? != 0 {
+        macroblock_type += 4 + 4 * decision(8)?;
+    }
+    macroblock_type += 2 * decision(9)?;
+    macroblock_type += decision(10)?;
+    Ok(macroblock_type)
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
@@ -274,5 +453,90 @@ mod tests {
             CabacSliceDecoder::new(&[0], 9, SliceType::I, None, 26),
             Err(H264Error::UnexpectedEof)
         ));
+    }
+
+    #[test]
+    fn derives_skip_contexts_from_completed_same_slice_neighbours() {
+        let mut state = CabacMacroblockState::new(2, 2).unwrap();
+        assert_eq!(
+            state.skip_flag_context_index(0, 1, SliceType::P).unwrap(),
+            11
+        );
+        state.record_macroblock(0, 1, false, false).unwrap();
+        assert_eq!(
+            state.skip_flag_context_index(1, 1, SliceType::P).unwrap(),
+            12
+        );
+        state.record_macroblock(1, 1, true, false).unwrap();
+        assert_eq!(
+            state.skip_flag_context_index(2, 1, SliceType::P).unwrap(),
+            12
+        );
+        assert_eq!(
+            state.skip_flag_context_index(2, 2, SliceType::P).unwrap(),
+            11
+        );
+        assert_eq!(
+            state.skip_flag_context_index(2, 1, SliceType::B).unwrap(),
+            25
+        );
+        assert!(state.skip_flag_context_index(2, 1, SliceType::I).is_err());
+        assert!(state.record_macroblock(0, 1, false, false).is_err());
+        assert!(state.skip_flag_context_index(4, 1, SliceType::P).is_err());
+    }
+
+    #[test]
+    fn decodes_intra_macroblock_type_binarizations() {
+        let mut visited = Vec::new();
+        assert_eq!(
+            decode_intra_macroblock_type(
+                5,
+                |context_index| {
+                    visited.push(context_index);
+                    Ok(0)
+                },
+                || unreachable!(),
+            )
+            .unwrap(),
+            0
+        );
+        assert_eq!(visited, [5]);
+
+        let mut bins = VecDeque::from([1]);
+        assert_eq!(
+            decode_intra_macroblock_type(3, |_| Ok(bins.pop_front().unwrap()), || Ok(1)).unwrap(),
+            25
+        );
+
+        let mut bins = VecDeque::from([1, 1, 1, 1, 1, 0]);
+        let mut visited = Vec::new();
+        assert_eq!(
+            decode_intra_macroblock_type(
+                3,
+                |context_index| {
+                    visited.push(context_index);
+                    Ok(bins.pop_front().unwrap())
+                },
+                || Ok(0),
+            )
+            .unwrap(),
+            23
+        );
+        assert_eq!(visited, [3, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn intra_macroblock_context_counts_only_intra16_and_pcm_neighbours() {
+        let mut state = CabacMacroblockState::new(2, 2).unwrap();
+        state.record_macroblock(0, 7, false, true).unwrap();
+        state.record_macroblock(1, 7, false, false).unwrap();
+        let neighbours = state.left_and_top(2, 7).unwrap();
+        assert_eq!(
+            neighbours
+                .into_iter()
+                .filter(|entry| entry.is_some_and(|macroblock| macroblock.intra16_or_pcm))
+                .count(),
+            1
+        );
     }
 }

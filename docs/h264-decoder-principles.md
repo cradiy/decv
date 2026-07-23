@@ -753,8 +753,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   integration also has reusable indexed decision, fixed-length bypass, unary,
   and truncated-unary binarization readers plus a long-lived slice session
   that consumes alignment and preserves arithmetic/context state across
-  macroblocks; macroblock-specific neighbour-based selection is not connected
-  yet;
+  macroblocks; progressive-frame P/B `mb_skip_flag` and I/SI `mb_type` now
+  derive their contexts from completed same-slice neighbours;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band
