@@ -40,18 +40,18 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.99 s | 1.90 s | 80,108 KiB | 90.5 FPS |
-| decv Auto (2 workers) | NV12 | 2.06 s | 2.24 s | 78,980 KiB | 87.4 FPS |
-| FFmpeg 1 thread | NV12 | 0.64 s | 0.73 s | 152,384 KiB | 281.3 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.53 s | 283,904 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.58 s | 0.56 s | 95,892 KiB | 310.3 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 1.00 s | 192,376 KiB | 782.6 FPS |
+| decv Serial | NV12 | 1.92 s | 1.83 s | 80,028 KiB | 93.8 FPS |
+| decv Auto (2 workers) | NV12 | 2.09 s | 2.25 s | 79,800 KiB | 86.1 FPS |
+| FFmpeg 1 thread | NV12 | 0.63 s | 0.72 s | 152,348 KiB | 285.7 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.47 s | 290,580 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,556 KiB | 305.1 FPS |
+| FFmpeg Auto | decode-only | 0.24 s | 0.98 s | 192,348 KiB | 750.0 FPS |
 
 On this workload:
 
-- decv Serial takes about **3.1x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **3.0x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **7.6x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **7.7x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.5x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 50.8% throughput headroom over that
-line, and the measured two-worker Auto result has about 45.6%. The ordering
+seconds. The current Serial result has about 56.3% throughput headroom over that
+line, and the measured two-worker Auto result has about 43.5%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -296,6 +296,27 @@ increased CAVLC invariant cycles about 1.2% when both orientations were
 inlined. Vertical-only and horizontal-only variants were also slower on CAVLC,
 by about 2.0% and 0.5%, respectively. The resulting picture-traversal code
 layout is workload-sensitive, so all wrapper-inline variants were rejected.
+
+Building the serial CABAC P- and B-reconstruction batches with explicit
+preallocated loops instead of fallible iterator collection stopped
+`Iterator::try_process` from repeatedly moving the 392-byte staged macroblock
+value. On the pinned CABAC stream, the median improved about 1.4% while
+instructions and branches fell about 0.6%; sampled `memmove` overhead fell
+from roughly 11% to 8.4%. CAVLC does not use this owned pending-job pipeline
+and was unaffected.
+
+The 4x4 partition-coverage grid used by inter prediction is now one `u16`
+instead of sixteen booleans. CABAC reference cycles were neutral while
+branches fell about 1.1%; CAVLC reference cycles improved about 1.6% with a
+similar branch reduction. More importantly, the serial CABAC path now
+constructs each 384-byte macroblock pixel result directly inside its
+preallocated staged slot. The owned return-value API remains in place for
+parallel workers, but serial reconstruction no longer returns and wraps that
+large value before pushing it into the batch. Alternating pinned samples
+reduced CABAC reference cycles about 3.0%, instructions about 0.9%, and
+branches about 1.1%; CAVLC remained neutral to slightly faster. Sampled
+`memmove` overhead fell further to about 7.8%. The fixed benchmark now measures
+1.92 seconds in Serial mode and 2.09 seconds in Auto mode.
 
 ## BitReader Checkpoint
 
