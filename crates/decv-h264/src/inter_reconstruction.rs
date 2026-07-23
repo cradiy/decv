@@ -783,20 +783,152 @@ fn apply_implicit_bipred_weights(
         weight: weight_l1,
         offset: 0,
     };
+    let luma_width = usize::from(list0.width);
     for y in 0..usize::from(list0.height) {
-        for x in 0..usize::from(list0.width) {
-            list0.luma[y][x] =
-                weighted_bipred_sample(list0.luma[y][x], list1.luma[y][x], weight_l0, weight_l1, 5);
-        }
+        implicit_bipred_row(
+            &mut list0.luma[y][..luma_width],
+            &list1.luma[y][..luma_width],
+            weight_l0,
+            weight_l1,
+        );
     }
+    let chroma_width = usize::from(list0.width / 2);
     for y in 0..usize::from(list0.height / 2) {
-        for x in 0..usize::from(list0.width / 2) {
-            list0.cb[y][x] =
-                weighted_bipred_sample(list0.cb[y][x], list1.cb[y][x], weight_l0, weight_l1, 5);
-            list0.cr[y][x] =
-                weighted_bipred_sample(list0.cr[y][x], list1.cr[y][x], weight_l0, weight_l1, 5);
+        implicit_bipred_row(
+            &mut list0.cb[y][..chroma_width],
+            &list1.cb[y][..chroma_width],
+            weight_l0,
+            weight_l1,
+        );
+        implicit_bipred_row(
+            &mut list0.cr[y][..chroma_width],
+            &list1.cr[y][..chroma_width],
+            weight_l0,
+            weight_l1,
+        );
+    }
+}
+
+#[inline]
+fn implicit_bipred_row(
+    list0: &mut [u8],
+    list1: &[u8],
+    weight_l0: WeightOffset,
+    weight_l1: WeightOffset,
+) {
+    debug_assert_eq!(list0.len(), list1.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        // SAFETY: SSE2 is part of the x86_64 baseline. Both slices have equal
+        // lengths, and the helper only loads/stores complete 8- or 16-byte
+        // chunks before returning the scalar tail offset.
+        let offset =
+            unsafe { implicit_bipred_row_sse2(list0, list1, weight_l0.weight, weight_l1.weight) };
+        for index in offset..list0.len() {
+            list0[index] =
+                weighted_bipred_sample(list0[index], list1[index], weight_l0, weight_l1, 5);
         }
     }
+    #[cfg(not(target_arch = "x86_64"))]
+    for (sample_l0, &sample_l1) in list0.iter_mut().zip(list1) {
+        *sample_l0 = weighted_bipred_sample(*sample_l0, sample_l1, weight_l0, weight_l1, 5);
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn implicit_bipred_row_sse2(
+    list0: &mut [u8],
+    list1: &[u8],
+    weight_l0: i32,
+    weight_l1: i32,
+) -> usize {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_loadl_epi64, _mm_loadu_si128, _mm_mullo_epi16,
+        _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_srai_epi16, _mm_storel_epi64,
+        _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
+    };
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn merge(
+        list0: __m128i,
+        list1: __m128i,
+        weight_l0: __m128i,
+        weight_l1: __m128i,
+        rounding: __m128i,
+    ) -> __m128i {
+        let weighted = _mm_add_epi16(
+            _mm_mullo_epi16(list0, weight_l0),
+            _mm_mullo_epi16(list1, weight_l1),
+        );
+        _mm_srai_epi16::<6>(_mm_add_epi16(weighted, rounding))
+    }
+
+    let zero = _mm_setzero_si128();
+    let weight_l0 = _mm_set1_epi16(weight_l0 as i16);
+    let weight_l1 = _mm_set1_epi16(weight_l1 as i16);
+    let rounding = _mm_set1_epi16(32);
+    let mut offset = 0usize;
+    while list0.len() - offset >= 16 {
+        // SAFETY: The loop condition proves both 16-byte ranges are in-bounds.
+        let samples_l0 = unsafe { _mm_loadu_si128(list0.as_ptr().add(offset).cast::<__m128i>()) };
+        // SAFETY: `list1` has the same length as `list0`.
+        let samples_l1 = unsafe { _mm_loadu_si128(list1.as_ptr().add(offset).cast::<__m128i>()) };
+        // SAFETY: This function is compiled with SSE2 enabled.
+        let low = unsafe {
+            merge(
+                _mm_unpacklo_epi8(samples_l0, zero),
+                _mm_unpacklo_epi8(samples_l1, zero),
+                weight_l0,
+                weight_l1,
+                rounding,
+            )
+        };
+        // SAFETY: This function is compiled with SSE2 enabled.
+        let high = unsafe {
+            merge(
+                _mm_unpackhi_epi8(samples_l0, zero),
+                _mm_unpackhi_epi8(samples_l1, zero),
+                weight_l0,
+                weight_l1,
+                rounding,
+            )
+        };
+        // SAFETY: The loop condition proves the 16-byte destination is valid.
+        unsafe {
+            _mm_storeu_si128(
+                list0.as_mut_ptr().add(offset).cast::<__m128i>(),
+                _mm_packus_epi16(low, high),
+            );
+        }
+        offset += 16;
+    }
+    if list0.len() - offset >= 8 {
+        // SAFETY: The branch proves both 8-byte ranges are in-bounds.
+        let samples_l0 = unsafe { _mm_loadl_epi64(list0.as_ptr().add(offset).cast::<__m128i>()) };
+        // SAFETY: `list1` has the same length as `list0`.
+        let samples_l1 = unsafe { _mm_loadl_epi64(list1.as_ptr().add(offset).cast::<__m128i>()) };
+        // SAFETY: This function is compiled with SSE2 enabled.
+        let low = unsafe {
+            merge(
+                _mm_unpacklo_epi8(samples_l0, zero),
+                _mm_unpacklo_epi8(samples_l1, zero),
+                weight_l0,
+                weight_l1,
+                rounding,
+            )
+        };
+        // SAFETY: The branch proves the 8-byte destination is valid.
+        unsafe {
+            _mm_storel_epi64(
+                list0.as_mut_ptr().add(offset).cast::<__m128i>(),
+                _mm_packus_epi16(low, zero),
+            );
+        }
+        offset += 8;
+    }
+    offset
 }
 
 pub fn derive_implicit_bipred_weights(
@@ -1196,6 +1328,46 @@ mod tests {
             derive_implicit_bipred_weights(127, short(0), short(1)),
             (32, 32)
         );
+    }
+
+    #[test]
+    fn simd_implicit_biprediction_matches_the_scalar_equation() {
+        let source_l0 = [
+            0, 1, 17, 31, 63, 64, 95, 127, 128, 159, 191, 223, 239, 253, 254, 255,
+        ];
+        let source_l1 = [
+            255, 254, 240, 224, 192, 191, 160, 128, 127, 96, 65, 32, 16, 2, 1, 0,
+        ];
+        for length in [4, 8, 16] {
+            for (weight_l0, weight_l1) in [(48, 16), (32, 32), (128, -64), (-64, 128)] {
+                let weight_l0 = WeightOffset {
+                    weight: weight_l0,
+                    offset: 0,
+                };
+                let weight_l1 = WeightOffset {
+                    weight: weight_l1,
+                    offset: 0,
+                };
+                let mut actual = source_l0;
+                let mut expected = source_l0;
+                for index in 0..length {
+                    expected[index] = weighted_bipred_sample(
+                        expected[index],
+                        source_l1[index],
+                        weight_l0,
+                        weight_l1,
+                        5,
+                    );
+                }
+                implicit_bipred_row(
+                    &mut actual[..length],
+                    &source_l1[..length],
+                    weight_l0,
+                    weight_l1,
+                );
+                assert_eq!(&actual[..length], &expected[..length]);
+            }
+        }
     }
 
     #[test]

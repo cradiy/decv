@@ -674,6 +674,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - B prediction reuses one fixed-capacity buffer per reference list across all
   partitions of a macroblock, avoiding repeated zero-initialization and
   full-buffer moves while retaining the allocation-free public prediction API;
+- implicit B weighting uses a byte-exact SSE2 row kernel on x86_64 for 8- and
+  16-sample spans, including signed exceptional weights and saturating output,
+  with a scalar tail and a fully scalar fallback on other architectures;
 - transactional CAVLC inter residual decoding plus 4x4/8x8 inverse transform
   paths using the Inter scaling lists;
 - a transactional complete non-skipped CAVLC P-macroblock entry point that
