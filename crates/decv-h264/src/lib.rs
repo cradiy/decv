@@ -41,8 +41,9 @@ pub use cavlc::{
 pub use cavlc_context::CavlcNeighborState;
 pub use decoder::{H264Decoder, H264StreamParser, ParserEvent};
 pub use dpb::{
-    ActiveBReferenceLists, ActiveReferenceList, DecodedPictureBuffer, DefaultBReferenceLists,
-    DefaultReferenceList, DpbReference, ReferenceKind, ReferencePicture,
+    ActiveBReferenceInfoLists, ActiveBReferenceLists, ActiveReferenceInfo, ActiveReferenceInfoList,
+    ActiveReferenceList, DecodedPictureBuffer, DefaultBReferenceLists, DefaultReferenceList,
+    DpbReference, ReferenceId, ReferenceKind, ReferencePicture,
 };
 pub use error::{H264Error, Result};
 pub use inter_prediction::InterPrediction420;

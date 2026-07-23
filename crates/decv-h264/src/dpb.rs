@@ -11,6 +11,18 @@ pub type DefaultReferenceList = Vec<ReferencePicture>;
 pub type ActiveReferenceList = Vec<Option<ReferencePicture>>;
 pub type DefaultBReferenceLists = (DefaultReferenceList, DefaultReferenceList);
 pub type ActiveBReferenceLists = (ActiveReferenceList, ActiveReferenceList);
+pub type ActiveReferenceInfoList = Vec<Option<ActiveReferenceInfo>>;
+pub type ActiveBReferenceInfoLists = (ActiveReferenceInfoList, ActiveReferenceInfoList);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ReferenceId(u64);
+
+impl ReferenceId {
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReferenceKind {
@@ -20,7 +32,16 @@ pub enum ReferenceKind {
 
 #[derive(Debug, Clone)]
 pub struct DpbReference {
+    pub id: ReferenceId,
     pub frame_num: u32,
+    pub picture_order_count: i32,
+    pub kind: ReferenceKind,
+    pub picture: ReferencePicture,
+}
+
+#[derive(Debug, Clone)]
+pub struct ActiveReferenceInfo {
+    pub id: ReferenceId,
     pub picture_order_count: i32,
     pub kind: ReferenceKind,
     pub picture: ReferencePicture,
@@ -36,6 +57,7 @@ pub struct DecodedPictureBuffer {
     max_num_ref_frames: usize,
     max_frame_num: u32,
     max_long_term_frame_idx: Option<u32>,
+    next_reference_id: u64,
     references: Vec<DpbReference>,
 }
 
@@ -52,6 +74,7 @@ impl DecodedPictureBuffer {
             max_num_ref_frames,
             max_frame_num: 1u32 << log2_max_frame_num,
             max_long_term_frame_idx: None,
+            next_reference_id: 1,
             references: Vec::with_capacity(max_num_ref_frames.max(1)),
         })
     }
@@ -69,6 +92,7 @@ impl DecodedPictureBuffer {
     pub fn clear(&mut self) {
         self.references.clear();
         self.max_long_term_frame_idx = None;
+        self.next_reference_id = 1;
     }
 
     /// Builds the default reference picture List 0 for a progressive P slice:
@@ -147,6 +171,58 @@ impl DecodedPictureBuffer {
                 ordered_l1,
             )?,
         ))
+    }
+
+    /// Builds active B lists while retaining stable DPB identity, POC, and
+    /// short/long-term classification for Direct and implicit weighting.
+    pub fn b_reference_info_lists(
+        &self,
+        current_frame_num: u32,
+        current_picture_order_count: i32,
+        active_count_l0: u8,
+        modifications_l0: &[ReferenceListModification],
+        active_count_l1: u8,
+        modifications_l1: &[ReferenceListModification],
+    ) -> Result<ActiveBReferenceInfoLists> {
+        let (list0, list1) = self.b_lists(
+            current_frame_num,
+            current_picture_order_count,
+            active_count_l0,
+            modifications_l0,
+            active_count_l1,
+            modifications_l1,
+        )?;
+        Ok((
+            self.reference_info_for_active_list(list0)?,
+            self.reference_info_for_active_list(list1)?,
+        ))
+    }
+
+    fn reference_info_for_active_list(
+        &self,
+        list: ActiveReferenceList,
+    ) -> Result<ActiveReferenceInfoList> {
+        list.into_iter()
+            .map(|picture| {
+                picture
+                    .map(|picture| {
+                        let reference = self
+                            .references
+                            .iter()
+                            .find(|reference| Arc::ptr_eq(&reference.picture, &picture))
+                            .ok_or(H264Error::InvalidSyntax(
+                                "active reference is not present in the DPB",
+                            ))?;
+                        Ok(ActiveReferenceInfo {
+                            id: reference.id,
+                            picture_order_count: reference.picture_order_count,
+                            kind: reference.kind,
+                            picture,
+                        })
+                    })
+                    .transpose()
+            })
+            .collect()
     }
 
     fn active_reference_list<'a>(
@@ -236,7 +312,10 @@ impl DecodedPictureBuffer {
             ReferenceKind::ShortTerm
         };
         self.references.clear();
+        self.next_reference_id = 1;
+        let id = self.allocate_reference_id()?;
         self.references.push(DpbReference {
+            id,
             frame_num: 0,
             picture_order_count,
             kind,
@@ -277,7 +356,9 @@ impl DecodedPictureBuffer {
                 ))?;
             self.references.remove(oldest);
         }
+        let id = self.allocate_reference_id()?;
         self.references.push(DpbReference {
+            id,
             frame_num,
             picture_order_count,
             kind: ReferenceKind::ShortTerm,
@@ -381,7 +462,13 @@ impl DecodedPictureBuffer {
                 "adaptive memory control exceeds max_num_ref_frames",
             ));
         }
+        let id = ReferenceId(self.next_reference_id);
+        let next_reference_id = self
+            .next_reference_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
         references.push(DpbReference {
+            id,
             frame_num,
             picture_order_count,
             kind: current_kind,
@@ -389,7 +476,17 @@ impl DecodedPictureBuffer {
         });
         self.references = references;
         self.max_long_term_frame_idx = max_long_term_frame_idx;
+        self.next_reference_id = next_reference_id;
         Ok(())
+    }
+
+    fn allocate_reference_id(&mut self) -> Result<ReferenceId> {
+        let id = ReferenceId(self.next_reference_id);
+        self.next_reference_id = self
+            .next_reference_id
+            .checked_add(1)
+            .ok_or(H264Error::IntegerOverflow)?;
+        Ok(id)
     }
 
     fn ensure_frame_num(&self, frame_num: u32) -> Result<()> {
@@ -673,6 +770,37 @@ mod tests {
                 .collect::<Vec<_>>(),
             [Some(10), Some(12), Some(9), None]
         );
+    }
+
+    #[test]
+    fn retains_reference_identity_poc_and_kind_in_active_b_lists() {
+        let mut dpb = DecodedPictureBuffer::new(3, 4).unwrap();
+        dpb.store_idr(0, picture(9), true).unwrap();
+        dpb.store_short_term(1, 4, picture(10)).unwrap();
+
+        let (list0, list1) = dpb.b_reference_info_lists(2, 2, 2, &[], 2, &[]).unwrap();
+        let list0 = list0.into_iter().flatten().collect::<Vec<_>>();
+        let list1 = list1.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(
+            list0
+                .iter()
+                .map(|reference| (reference.picture_order_count, reference.kind))
+                .collect::<Vec<_>>(),
+            [
+                (4, ReferenceKind::ShortTerm),
+                (0, ReferenceKind::LongTerm { frame_index: 0 })
+            ]
+        );
+        assert_eq!(
+            list1
+                .iter()
+                .map(|reference| reference.picture_order_count)
+                .collect::<Vec<_>>(),
+            [0, 4]
+        );
+        assert_eq!(list0[0].id, list1[1].id);
+        assert_eq!(list0[1].id, list1[0].id);
+        assert_ne!(list0[0].id, list0[1].id);
     }
 
     #[test]

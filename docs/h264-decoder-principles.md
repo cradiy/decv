@@ -719,6 +719,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   with stable equal-POC ordering, drain, and discontinuity discard semantics;
 - top-level B-slice dispatch that derives both active reference lists from the
   DPB at the current POC and queues the decoded picture for display reordering;
+- stable DPB reference identities plus active-list POC and short/long-term
+  metadata, ready for temporal Direct mapping and implicit B weighting;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
