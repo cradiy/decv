@@ -6,11 +6,9 @@ use rayon::prelude::*;
 
 use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
-    BPredictionWeightMode, ImplicitWeightReference, reconstruct_b_macroblock_from_lists_420,
+    BPredictionWeightMode, ImplicitWeightReference, reconstruct_b_macroblock_from_lists_with_mode,
     reconstruct_b_macroblock_pixels_from_lists_with_scratch,
-    reconstruct_implicitly_weighted_b_macroblock_from_lists_420,
-    reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_b_macroblock_from_lists_420,
-    reconstruct_weighted_p_macroblock_from_list_420,
+    reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
 };
 use crate::motion_field::MotionFieldBuilder;
@@ -144,7 +142,7 @@ struct PendingBInterMacroblock {
     macroblock_x: usize,
     macroblock_y: usize,
     motion: ResolvedBMacroblock,
-    residual: ReconstructedInterResidual,
+    residual: Option<ReconstructedInterResidual>,
     deblock: MacroblockDeblockInfo,
 }
 
@@ -1503,13 +1501,12 @@ impl IntraPictureReconstructor {
                                 return Err(error);
                             }
                         };
-                        let residual = zero_inter_residual();
                         pending_inter.push(PendingBInterMacroblock {
                             address: macroblock_address,
                             macroblock_x,
                             macroblock_y,
                             motion,
-                            residual,
+                            residual: None,
                             deblock,
                         });
                         Ok(())
@@ -1575,7 +1572,7 @@ impl IntraPictureReconstructor {
                                 macroblock_x,
                                 macroblock_y,
                                 motion,
-                                residual: reconstructed,
+                                residual: Some(reconstructed),
                                 deblock,
                             });
                             Ok(())
@@ -1728,7 +1725,6 @@ impl IntraPictureReconstructor {
                 let picture_snapshot = self
                     .picture
                     .snapshot_macroblock(macroblock_x, macroblock_y)?;
-                let residual = zero_inter_residual();
                 let result = reconstruct_b_prediction(
                     &mut self.picture,
                     references_l0,
@@ -1736,7 +1732,7 @@ impl IntraPictureReconstructor {
                     macroblock_x,
                     macroblock_y,
                     &motion,
-                    &residual,
+                    None,
                     modes.weights,
                 )
                 .and_then(|()| self.modes.record_inter(macroblock_address, slice_id));
@@ -1839,7 +1835,7 @@ impl IntraPictureReconstructor {
                         macroblock_x,
                         macroblock_y,
                         &motion,
-                        &reconstructed,
+                        Some(&reconstructed),
                         modes.weights,
                     );
                     if let Err(error) = reconstruction
@@ -1971,7 +1967,7 @@ impl IntraPictureReconstructor {
                     job.macroblock_x,
                     job.macroblock_y,
                     &job.motion,
-                    &job.residual,
+                    job.residual.as_ref(),
                     weight_mode,
                     prediction_l0,
                     prediction_l1,
@@ -2615,48 +2611,32 @@ fn reconstruct_b_prediction(
     macroblock_x: usize,
     macroblock_y: usize,
     motion: &ResolvedBMacroblock,
-    residual: &ReconstructedInterResidual,
+    residual: Option<&ReconstructedInterResidual>,
     weights: BSlicePredictionWeights<'_>,
 ) -> Result<()> {
-    match weights {
-        BSlicePredictionWeights::Default => reconstruct_b_macroblock_from_lists_420(
-            picture,
-            references_l0,
-            references_l1,
-            macroblock_x,
-            macroblock_y,
-            motion,
-            residual,
-        ),
-        BSlicePredictionWeights::Explicit(weights) => {
-            reconstruct_weighted_b_macroblock_from_lists_420(
-                picture,
-                references_l0,
-                references_l1,
-                macroblock_x,
-                macroblock_y,
-                motion,
-                residual,
-                weights,
-            )
-        }
+    let weight_mode = match weights {
+        BSlicePredictionWeights::Default => BPredictionWeightMode::Default,
+        BSlicePredictionWeights::Explicit(weights) => BPredictionWeightMode::Explicit(weights),
         BSlicePredictionWeights::Implicit {
             current_picture_order_count,
             list0,
             list1,
-        } => reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
-            picture,
-            references_l0,
-            references_l1,
-            macroblock_x,
-            macroblock_y,
-            motion,
-            residual,
+        } => BPredictionWeightMode::Implicit {
             current_picture_order_count,
             list0,
             list1,
-        ),
-    }
+        },
+    };
+    reconstruct_b_macroblock_from_lists_with_mode(
+        picture,
+        references_l0,
+        references_l1,
+        macroblock_x,
+        macroblock_y,
+        motion,
+        residual,
+        weight_mode,
+    )
 }
 
 fn is_fully_direct_b_macroblock(header: &crate::BInterMacroblockHeader) -> bool {
@@ -2677,14 +2657,6 @@ fn has_direct_b_sub_macroblock(header: &crate::BInterMacroblockHeader) -> bool {
         BPartitionMode::EightByEight { sub_macroblocks }
             if sub_macroblocks.contains(&BSubMacroblockType::Direct8x8)
     )
-}
-
-fn zero_inter_residual() -> ReconstructedInterResidual {
-    ReconstructedInterResidual {
-        luma: ReconstructedLumaResidual::FourByFour(Box::new([[[0; 4]; 4]; 16])),
-        chroma_cb: [[[0; 4]; 4]; 4],
-        chroma_cr: [[[0; 4]; 4]; 4],
-    }
 }
 
 fn inter_deblock_info(

@@ -172,14 +172,14 @@ pub fn reconstruct_b_macroblock_from_lists_420(
     motion: &ResolvedBMacroblock,
     residual: &ReconstructedInterResidual,
 ) -> Result<()> {
-    reconstruct_b_macroblock_from_lists_inner(
+    reconstruct_b_macroblock_from_lists_with_mode(
         current,
         references_l0,
         references_l1,
         macroblock_x,
         macroblock_y,
         motion,
-        residual,
+        Some(residual),
         BPredictionWeightMode::Default,
     )
 }
@@ -197,56 +197,27 @@ pub fn reconstruct_weighted_b_macroblock_from_lists_420(
     residual: &ReconstructedInterResidual,
     weights: &PredictionWeightTable,
 ) -> Result<()> {
-    reconstruct_b_macroblock_from_lists_inner(
+    reconstruct_b_macroblock_from_lists_with_mode(
         current,
         references_l0,
         references_l1,
         macroblock_x,
         macroblock_y,
         motion,
-        residual,
+        Some(residual),
         BPredictionWeightMode::Explicit(weights),
     )
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
+pub(crate) fn reconstruct_b_macroblock_from_lists_with_mode(
     current: &mut Yuv420Picture,
     references_l0: &[Option<&Yuv420Picture>],
     references_l1: &[Option<&Yuv420Picture>],
     macroblock_x: usize,
     macroblock_y: usize,
     motion: &ResolvedBMacroblock,
-    residual: &ReconstructedInterResidual,
-    current_picture_order_count: i32,
-    implicit_references_l0: &[Option<ImplicitWeightReference>],
-    implicit_references_l1: &[Option<ImplicitWeightReference>],
-) -> Result<()> {
-    reconstruct_b_macroblock_from_lists_inner(
-        current,
-        references_l0,
-        references_l1,
-        macroblock_x,
-        macroblock_y,
-        motion,
-        residual,
-        BPredictionWeightMode::Implicit {
-            current_picture_order_count,
-            list0: implicit_references_l0,
-            list1: implicit_references_l1,
-        },
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn reconstruct_b_macroblock_from_lists_inner(
-    current: &mut Yuv420Picture,
-    references_l0: &[Option<&Yuv420Picture>],
-    references_l1: &[Option<&Yuv420Picture>],
-    macroblock_x: usize,
-    macroblock_y: usize,
-    motion: &ResolvedBMacroblock,
-    residual: &ReconstructedInterResidual,
+    residual: Option<&ReconstructedInterResidual>,
     weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<()> {
     let pixels = reconstruct_b_macroblock_pixels_from_lists(
@@ -280,7 +251,7 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists(
     macroblock_x: usize,
     macroblock_y: usize,
     motion: &ResolvedBMacroblock,
-    residual: &ReconstructedInterResidual,
+    residual: Option<&ReconstructedInterResidual>,
     weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<MacroblockPixels> {
     let mut prediction_l0 = InterPrediction420::empty();
@@ -307,7 +278,7 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
     macroblock_x: usize,
     macroblock_y: usize,
     motion: &ResolvedBMacroblock,
-    residual: &ReconstructedInterResidual,
+    residual: Option<&ReconstructedInterResidual>,
     weight_mode: BPredictionWeightMode<'_>,
     prediction_l0: &mut InterPrediction420,
     prediction_l1: &mut InterPrediction420,
@@ -414,12 +385,14 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_with_scratch(
         ));
     }
 
-    add_inter_residual_to_prediction(
-        &mut predicted_luma,
-        &mut predicted_cb,
-        &mut predicted_cr,
-        residual,
-    );
+    if let Some(residual) = residual {
+        add_inter_residual_to_prediction(
+            &mut predicted_luma,
+            &mut predicted_cb,
+            &mut predicted_cr,
+            residual,
+        );
+    }
     Ok(MacroblockPixels::new(
         predicted_luma,
         predicted_cb,
@@ -1783,6 +1756,41 @@ mod tests {
     }
 
     #[test]
+    fn omitted_b_residual_matches_explicit_zero_residual() {
+        let first = picture(20);
+        let second = picture(80);
+        let motion = ResolvedBMacroblock {
+            direct: true,
+            partitions: vec![b_partition(0, 0, 16, 16, Some(b_list(0)), Some(b_list(0)))].into(),
+        };
+        let mut omitted = picture(0);
+        reconstruct_b_macroblock_from_lists_with_mode(
+            &mut omitted,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &motion,
+            None,
+            BPredictionWeightMode::Default,
+        )
+        .unwrap();
+
+        let mut explicit = picture(0);
+        reconstruct_b_macroblock_from_lists_420(
+            &mut explicit,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &motion,
+            &zero_residual(),
+        )
+        .unwrap();
+        assert_eq!(omitted, explicit);
+    }
+
+    #[test]
     fn applies_explicit_weights_to_each_b_prediction_mode() {
         let first = picture(20);
         let second = picture(80);
@@ -2023,7 +2031,15 @@ mod tests {
         let first = picture(20);
         let second = picture(80);
         let mut current = picture(0);
-        reconstruct_implicitly_weighted_b_macroblock_from_lists_420(
+        let list0 = [Some(ImplicitWeightReference {
+            picture_order_count: 0,
+            long_term: false,
+        })];
+        let list1 = [Some(ImplicitWeightReference {
+            picture_order_count: 8,
+            long_term: false,
+        })];
+        reconstruct_b_macroblock_from_lists_with_mode(
             &mut current,
             &[Some(&first)],
             &[Some(&second)],
@@ -2038,16 +2054,12 @@ mod tests {
                 ]
                 .into(),
             },
-            &zero_residual(),
-            2,
-            &[Some(ImplicitWeightReference {
-                picture_order_count: 0,
-                long_term: false,
-            })],
-            &[Some(ImplicitWeightReference {
-                picture_order_count: 8,
-                long_term: false,
-            })],
+            Some(&zero_residual()),
+            BPredictionWeightMode::Implicit {
+                current_picture_order_count: 2,
+                list0: &list0,
+                list1: &list1,
+            },
         )
         .unwrap();
         let (luma, cb, cr) = current.planes();
