@@ -788,6 +788,8 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   motion metadata, and byte-exact x264/FFmpeg regression coverage;
 - CABAC B-slice `mb_type` and `sub_mb_type` decision trees for all 23 inter
   macroblock types, all 13 sub-macroblock types, and embedded Intra/I_PCM;
+- per-list CABAC B motion-cell states that distinguish Direct, unused-list,
+  and explicit-reference partitions for later `ref_idx_lX`/`mvd_lX` contexts;
 - a small `decv-cli` executable that decodes Annex-B H.264, reports frames,
   and optionally writes tightly packed raw NV12 output;
 - one-to-four-byte big-endian length-prefixed NAL input plus out-of-band

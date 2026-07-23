@@ -150,6 +150,62 @@ impl CabacMotionSyntaxState {
         )
     }
 
+    /// Records a B_Direct partition. Reference-index context derivation can
+    /// explicitly ignore these cells while their inferred MVD remains zero.
+    pub fn record_direct_partition(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        partition: CabacMotionPartition,
+    ) -> Result<()> {
+        self.fill_partition(
+            macroblock_address,
+            partition,
+            MotionSyntaxCell {
+                slice_id,
+                reference_index: 0,
+                direct: true,
+                mvd_absolute: [0; 2],
+            },
+        )
+    }
+
+    pub fn record_direct_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<()> {
+        self.record_direct_partition(
+            macroblock_address,
+            slice_id,
+            CabacMotionPartition {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+            },
+        )
+    }
+
+    /// Records a partition that does not use this reference list.
+    pub fn record_unused_partition(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        partition: CabacMotionPartition,
+    ) -> Result<()> {
+        self.fill_partition(
+            macroblock_address,
+            partition,
+            MotionSyntaxCell {
+                slice_id,
+                reference_index: -1,
+                direct: false,
+                mvd_absolute: [0; 2],
+            },
+        )
+    }
+
     pub(crate) fn snapshot_macroblock(
         &self,
         macroblock_address: usize,
@@ -555,6 +611,51 @@ mod tests {
         assert_eq!(
             state.snapshot_macroblock(1).unwrap().cells,
             second_before.cells
+        );
+    }
+
+    #[test]
+    fn distinguishes_direct_and_unused_list_cells() {
+        let mut state = CabacMotionSyntaxState::new(2, 1).unwrap();
+        let whole = CabacMotionPartition {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        };
+        state.record_direct_partition(0, 4, whole).unwrap();
+        let current = CabacMotionPartition {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 16,
+        };
+        assert_eq!(
+            state.reference_context_increment(1, 4, current, true),
+            Ok(0)
+        );
+        assert_eq!(state.neighbour_mvd_sums(1, 4, current), Ok([0, 0]));
+        assert!(
+            state
+                .snapshot_macroblock(0)
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.is_some_and(|cell| cell.direct && cell.reference_index == 0))
+        );
+
+        state.record_unused_partition(0, 5, whole).unwrap();
+        assert_eq!(
+            state.reference_context_increment(1, 5, current, false),
+            Ok(0)
+        );
+        assert!(
+            state
+                .snapshot_macroblock(0)
+                .unwrap()
+                .cells
+                .iter()
+                .all(|cell| cell.is_some_and(|cell| !cell.direct && cell.reference_index == -1))
         );
     }
 }
