@@ -2,7 +2,7 @@
 
 use bit_readers::BitReader;
 
-use crate::{H264Error, Result};
+use crate::{H264Error, ResidualBlock, Result};
 
 const INTRA_CODED_BLOCK_PATTERNS_420: [u8; 48] = [
     47, 31, 15, 0, 23, 27, 29, 30, 7, 11, 13, 14, 39, 43, 45, 46, 16, 3, 5, 10, 12, 19, 21, 26, 28,
@@ -69,6 +69,21 @@ pub struct PcmMacroblock {
 pub enum IntraMacroblock {
     Predicted(IntraMacroblockHeader),
     Pcm(PcmMacroblock),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntraResidual {
+    pub luma_dc: Option<ResidualBlock>,
+    pub luma: [ResidualBlock; 16],
+    pub chroma_dc: [ResidualBlock; 2],
+    pub chroma_ac: [[ResidualBlock; 4]; 2],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedIntraMacroblock {
+    pub macroblock: IntraMacroblock,
+    /// Present for predicted macroblocks and absent for I_PCM.
+    pub residual: Option<IntraResidual>,
 }
 
 /// Parses the non-residual portion of one CAVLC I-slice macroblock.

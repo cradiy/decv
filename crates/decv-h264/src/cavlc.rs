@@ -40,6 +40,17 @@ pub struct ResidualBlock {
     pub max_num_coeff: u8,
 }
 
+impl ResidualBlock {
+    #[inline]
+    pub const fn empty(max_num_coeff: u8) -> Self {
+        Self {
+            coefficients: [0; 16],
+            total_coeff: 0,
+            max_num_coeff,
+        }
+    }
+}
+
 /// Decodes `coeff_token` while preserving the reader on any failure.
 pub fn decode_coeff_token(
     reader: &mut BitReader<'_>,

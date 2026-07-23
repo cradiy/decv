@@ -2,7 +2,11 @@
 
 use bit_readers::BitReader;
 
-use crate::{CoeffTokenContext, H264Error, ResidualBlock, Result, decode_residual_block};
+use crate::{
+    CoeffTokenContext, DecodedIntraMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
+    IntraMacroblockHeader, IntraResidual, ResidualBlock, Result, decode_residual_block,
+    parse_cavlc_intra_macroblock,
+};
 
 const DECODED_BIT: u32 = 1 << 5;
 const SLICE_SHIFT: u32 = 6;
@@ -35,6 +39,13 @@ struct BlockGrid {
     width: usize,
     height: usize,
     entries: Vec<u32>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MacroblockSnapshot {
+    luma: [u32; 16],
+    chroma_cb: [u32; 4],
+    chroma_cr: [u32; 4],
 }
 
 impl BlockGrid {
@@ -147,6 +158,41 @@ impl CavlcNeighborState {
         }
     }
 
+    /// Parses and coefficient-decodes one complete CAVLC I macroblock.
+    ///
+    /// This is the transactional entry point intended for slice decoding:
+    /// syntax bits and neighbour state are committed only after the whole
+    /// macroblock succeeds.
+    pub fn decode_intra_macroblock(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        transform_8x8_mode_enabled: bool,
+    ) -> Result<DecodedIntraMacroblock> {
+        self.ensure_slice_started()?;
+        self.ensure_macroblock(mb_x, mb_y)?;
+        let mut probe = *reader;
+        let decoded = match parse_cavlc_intra_macroblock(&mut probe, transform_8x8_mode_enabled)? {
+            IntraMacroblock::Predicted(header) => {
+                let residual = self.decode_intra_residual(&mut probe, mb_x, mb_y, &header)?;
+                DecodedIntraMacroblock {
+                    macroblock: IntraMacroblock::Predicted(header),
+                    residual: Some(residual),
+                }
+            }
+            IntraMacroblock::Pcm(pcm) => {
+                self.record_pcm_macroblock(mb_x, mb_y)?;
+                DecodedIntraMacroblock {
+                    macroblock: IntraMacroblock::Pcm(pcm),
+                    residual: None,
+                }
+            }
+        };
+        *reader = probe;
+        Ok(decoded)
+    }
+
     #[inline]
     pub fn luma_context(&self, mb_x: u32, mb_y: u32, block_index: u8) -> Result<CoeffTokenContext> {
         self.ensure_slice_started()?;
@@ -200,6 +246,37 @@ impl CavlcNeighborState {
     ) -> Result<ResidualBlock> {
         let context = self.luma_context(mb_x, mb_y, 0)?;
         decode_residual_block(reader, context, 16)
+    }
+
+    /// Decodes all residual blocks of one predicted 4:2:0 intra macroblock.
+    ///
+    /// The bit reader and every neighbour-state entry touched by the
+    /// macroblock are committed together. Both are restored on failure.
+    pub fn decode_intra_residual(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        header: &IntraMacroblockHeader,
+    ) -> Result<IntraResidual> {
+        self.ensure_slice_started()?;
+        if header.coded_block_pattern.luma > 15 || header.coded_block_pattern.chroma > 2 {
+            return Err(H264Error::InvalidSyntax(
+                "coded block pattern exceeds 4:2:0 macroblock bounds",
+            ));
+        }
+        let snapshot = self.snapshot_macroblock(mb_x, mb_y)?;
+        let mut probe = *reader;
+        match self.decode_intra_residual_inner(&mut probe, mb_x, mb_y, header) {
+            Ok(residual) => {
+                *reader = probe;
+                Ok(residual)
+            }
+            Err(error) => {
+                self.restore_macroblock(mb_x, mb_y, snapshot);
+                Err(error)
+            }
+        }
     }
 
     #[inline]
@@ -283,6 +360,68 @@ impl CavlcNeighborState {
         self.record_uniform_macroblock(mb_x, mb_y, 16)
     }
 
+    fn decode_intra_residual_inner(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        header: &IntraMacroblockHeader,
+    ) -> Result<IntraResidual> {
+        let intra_16x16 = matches!(
+            header.luma_prediction,
+            IntraLumaPrediction::SixteenBySixteen { .. }
+        );
+        let luma_max_num_coeff = if intra_16x16 { 15 } else { 16 };
+        let luma_dc = if intra_16x16 {
+            Some(self.decode_intra16x16_dc(reader, mb_x, mb_y)?)
+        } else {
+            None
+        };
+
+        let mut luma = [ResidualBlock::empty(16); 16];
+        for block_index in 0..16u8 {
+            let region_8x8 = block_index / 4;
+            if header.coded_block_pattern.luma & (1 << region_8x8) != 0 {
+                luma[usize::from(block_index)] =
+                    self.decode_luma_block(reader, mb_x, mb_y, block_index, luma_max_num_coeff)?;
+            } else {
+                luma[usize::from(block_index)] = ResidualBlock::empty(luma_max_num_coeff);
+                self.record_luma(mb_x, mb_y, block_index, 0)?;
+            }
+        }
+
+        let mut chroma_dc = [ResidualBlock::empty(4); 2];
+        if header.coded_block_pattern.chroma != 0 {
+            for block in &mut chroma_dc {
+                *block = decode_residual_block(reader, CoeffTokenContext::ChromaDc420, 4)?;
+            }
+        }
+
+        let mut chroma_ac = [[ResidualBlock::empty(15); 4]; 2];
+        if header.coded_block_pattern.chroma == 2 {
+            for block_index in 0..4u8 {
+                chroma_ac[0][usize::from(block_index)] =
+                    self.decode_chroma_cb_ac(reader, mb_x, mb_y, block_index)?;
+            }
+            for block_index in 0..4u8 {
+                chroma_ac[1][usize::from(block_index)] =
+                    self.decode_chroma_cr_ac(reader, mb_x, mb_y, block_index)?;
+            }
+        } else {
+            for block_index in 0..4u8 {
+                self.record_chroma_cb(mb_x, mb_y, block_index, 0)?;
+                self.record_chroma_cr(mb_x, mb_y, block_index, 0)?;
+            }
+        }
+
+        Ok(IntraResidual {
+            luma_dc,
+            luma,
+            chroma_dc,
+            chroma_ac,
+        })
+    }
+
     fn chroma_context(
         &self,
         grid: &BlockGrid,
@@ -333,6 +472,43 @@ impl CavlcNeighborState {
             self.chroma_cr.record(x, y, self.slice_id, total_coeff);
         }
         Ok(())
+    }
+
+    fn snapshot_macroblock(&self, mb_x: u32, mb_y: u32) -> Result<MacroblockSnapshot> {
+        self.ensure_macroblock(mb_x, mb_y)?;
+        let mut snapshot = MacroblockSnapshot {
+            luma: [0; 16],
+            chroma_cb: [0; 4],
+            chroma_cr: [0; 4],
+        };
+        for block_index in 0..16u8 {
+            let (x, y) = self.luma_position(mb_x, mb_y, block_index)?;
+            snapshot.luma[usize::from(block_index)] = self.luma.entries[y * self.luma.width + x];
+        }
+        for block_index in 0..4u8 {
+            let (x, y) = self.chroma_position(mb_x, mb_y, block_index)?;
+            let index = usize::from(block_index);
+            snapshot.chroma_cb[index] = self.chroma_cb.entries[y * self.chroma_cb.width + x];
+            snapshot.chroma_cr[index] = self.chroma_cr.entries[y * self.chroma_cr.width + x];
+        }
+        Ok(snapshot)
+    }
+
+    fn restore_macroblock(&mut self, mb_x: u32, mb_y: u32, snapshot: MacroblockSnapshot) {
+        for block_index in 0..16u8 {
+            let (x, y) = self
+                .luma_position(mb_x, mb_y, block_index)
+                .expect("snapshot coordinates were already validated");
+            self.luma.entries[y * self.luma.width + x] = snapshot.luma[usize::from(block_index)];
+        }
+        for block_index in 0..4u8 {
+            let (x, y) = self
+                .chroma_position(mb_x, mb_y, block_index)
+                .expect("snapshot coordinates were already validated");
+            let index = usize::from(block_index);
+            self.chroma_cb.entries[y * self.chroma_cb.width + x] = snapshot.chroma_cb[index];
+            self.chroma_cr.entries[y * self.chroma_cr.width + x] = snapshot.chroma_cr[index];
+        }
     }
 
     #[inline]
@@ -395,7 +571,10 @@ mod tests {
     use bit_readers::BitReader;
 
     use super::CavlcNeighborState;
-    use crate::{CoeffTokenContext, H264Error};
+    use crate::{
+        CodedBlockPattern, CoeffTokenContext, H264Error, IntraLumaPrediction, IntraMacroblock,
+        IntraMacroblockHeader, IntraPredictionModeSyntax,
+    };
 
     #[test]
     fn derives_none_one_and_two_neighbour_contexts_in_scan_order() {
@@ -542,6 +721,153 @@ mod tests {
             clean_state.luma_context(0, 0, 1),
             Ok(CoeffTokenContext::NeighborTotal(0))
         );
+    }
+
+    #[test]
+    fn decodes_intra_macroblock_residual_layouts() {
+        let mut state = CavlcNeighborState::new(3, 1).unwrap();
+        state.begin_slice();
+
+        // One coded 8x8 luma region contains four empty 4x4 blocks.
+        let data = bit_string("1111");
+        let mut reader = BitReader::new(&data);
+        let residual = state
+            .decode_intra_residual(&mut reader, 0, 0, &header_4x4(1, 0))
+            .unwrap();
+        assert!(residual.luma_dc.is_none());
+        assert!(residual.luma.iter().all(|block| block.total_coeff == 0));
+        assert_eq!(reader.bit_position(), 4);
+
+        // Intra16x16 always carries a separately decoded DC block.
+        let data = bit_string("1");
+        let mut reader = BitReader::new(&data);
+        let residual = state
+            .decode_intra_residual(&mut reader, 1, 0, &header_16x16(0, 0))
+            .unwrap();
+        assert_eq!(residual.luma_dc.unwrap().total_coeff, 0);
+        assert!(residual.luma.iter().all(|block| block.max_num_coeff == 15));
+        assert_eq!(reader.bit_position(), 1);
+
+        // Chroma pattern one carries Cb and Cr DC but no chroma AC.
+        let data = bit_string("0101");
+        let mut reader = BitReader::new(&data);
+        let residual = state
+            .decode_intra_residual(&mut reader, 2, 0, &header_4x4(0, 1))
+            .unwrap();
+        assert!(
+            residual
+                .chroma_dc
+                .iter()
+                .all(|block| block.total_coeff == 0)
+        );
+        assert!(
+            residual
+                .chroma_ac
+                .iter()
+                .flatten()
+                .all(|block| block.total_coeff == 0)
+        );
+        assert_eq!(reader.bit_position(), 4);
+    }
+
+    #[test]
+    fn rolls_back_reader_and_neighbours_on_macroblock_failure() {
+        let mut state = CavlcNeighborState::new(1, 1).unwrap();
+        state.begin_slice();
+        state.record_luma(0, 0, 0, 6).unwrap();
+
+        // The first block succeeds and overwrites block zero, then the second
+        // coeff_token runs out of input.
+        let mut reader = BitReader::new(&[0b1000_0000]);
+        assert!(
+            state
+                .decode_intra_residual(&mut reader, 0, 0, &header_4x4(1, 0))
+                .is_err()
+        );
+        assert_eq!(reader.bit_position(), 0);
+        assert_eq!(
+            state.luma_context(0, 0, 1),
+            Ok(CoeffTokenContext::NeighborTotal(6))
+        );
+    }
+
+    #[test]
+    fn parses_and_decodes_complete_intra_macroblocks_transactionally() {
+        let bits = format!("1{}100100", "1".repeat(16));
+        let data = bit_string(&bits);
+        let mut reader = BitReader::new(&data);
+        let mut state = CavlcNeighborState::new(2, 1).unwrap();
+        state.begin_slice();
+        let decoded = state
+            .decode_intra_macroblock(&mut reader, 0, 0, false)
+            .unwrap();
+        let IntraMacroblock::Predicted(header) = decoded.macroblock else {
+            panic!("expected predicted macroblock");
+        };
+        let residual = decoded.residual.unwrap();
+        assert!(matches!(
+            header.luma_prediction,
+            IntraLumaPrediction::FourByFour(_)
+        ));
+        assert!(!header.has_residual());
+        assert!(residual.luma.iter().all(|block| block.total_coeff == 0));
+        assert_eq!(reader.bit_position(), bits.len());
+
+        // mb_type=1, chroma mode=0, qp_delta=0, and an empty luma DC block.
+        let data = bit_string("010111");
+        let mut reader = BitReader::new(&data);
+        let decoded = state
+            .decode_intra_macroblock(&mut reader, 1, 0, false)
+            .unwrap();
+        let IntraMacroblock::Predicted(_) = decoded.macroblock else {
+            panic!("expected predicted macroblock");
+        };
+        let residual = decoded.residual.unwrap();
+        assert_eq!(residual.luma_dc.unwrap().total_coeff, 0);
+        assert_eq!(reader.bit_position(), 6);
+    }
+
+    #[test]
+    fn complete_macroblock_failure_restores_header_bits_and_state() {
+        let mut state = CavlcNeighborState::new(1, 1).unwrap();
+        state.begin_slice();
+        state.record_luma(0, 0, 0, 6).unwrap();
+
+        // A valid Intra16x16 header is followed by a truncated DC coeff_token.
+        let mut reader = BitReader::new(&[0b0101_1000]);
+        assert!(
+            state
+                .decode_intra_macroblock(&mut reader, 0, 0, false)
+                .is_err()
+        );
+        assert_eq!(reader.bit_position(), 0);
+        assert_eq!(
+            state.luma_context(0, 0, 1),
+            Ok(CoeffTokenContext::NeighborTotal(6))
+        );
+    }
+
+    fn header_4x4(luma: u8, chroma: u8) -> IntraMacroblockHeader {
+        IntraMacroblockHeader {
+            luma_prediction: IntraLumaPrediction::FourByFour(
+                [IntraPredictionModeSyntax {
+                    use_predicted: true,
+                    remaining_mode: None,
+                }; 16],
+            ),
+            chroma_prediction_mode: 0,
+            coded_block_pattern: CodedBlockPattern { luma, chroma },
+            qp_delta: 0,
+        }
+    }
+
+    fn header_16x16(luma: u8, chroma: u8) -> IntraMacroblockHeader {
+        IntraMacroblockHeader {
+            luma_prediction: IntraLumaPrediction::SixteenBySixteen { mode: 0 },
+            chroma_prediction_mode: 0,
+            coded_block_pattern: CodedBlockPattern { luma, chroma },
+            qp_delta: 0,
+        }
     }
 
     fn bit_string(bits: &str) -> Vec<u8> {
