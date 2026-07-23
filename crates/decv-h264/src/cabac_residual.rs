@@ -30,6 +30,11 @@ const LAST_SIGNIFICANT_COEFF_OFFSETS_8X8: [u8; 63] = [
     0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
     3, 3, 3, 3, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7, 8, 8, 8,
 ];
+const COEFFICIENT_LEVEL_ONE_CONTEXTS: [usize; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+const COEFFICIENT_LEVEL_GREATER_THAN_ONE_CONTEXTS: [usize; 8] = [5, 5, 5, 5, 6, 7, 8, 9];
+const LEVEL_ONE_TRANSITIONS: [usize; 8] = [1, 2, 3, 3, 4, 5, 6, 7];
+const LEVEL_GREATER_THAN_ONE_TRANSITIONS: [usize; 8] = [4, 4, 4, 4, 5, 6, 7, 7];
+const MAXIMUM_COEFFICIENT_ESCAPE_PREFIX: u8 = 23;
 
 /// The six residual block categories used by progressive 8-bit 4:2:0 CABAC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +153,30 @@ impl CabacSignificanceMap {
     }
 }
 
+/// Decoded transform coefficients in scan order.
+///
+/// Only the prefix returned by [`Self::coefficients`] belongs to the selected
+/// residual category. The fixed backing storage also accommodates one complete
+/// 8x8 transform block without allocating.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CabacCoefficientBlock {
+    coefficients: [i32; 64],
+    coefficient_count: u8,
+    maximum_coefficients: u8,
+}
+
+impl CabacCoefficientBlock {
+    #[inline]
+    pub const fn coefficient_count(self) -> u8 {
+        self.coefficient_count
+    }
+
+    #[inline]
+    pub fn coefficients(&self) -> &[i32] {
+        &self.coefficients[..usize::from(self.maximum_coefficients)]
+    }
+}
+
 /// Decodes `significant_coeff_flag` and `last_significant_coeff_flag` for one
 /// block whose coded-block flag is already known to be one.
 pub fn decode_cabac_significance_map(
@@ -193,6 +222,91 @@ fn decode_significance_map_with(
     Ok(CabacSignificanceMap {
         indices,
         count: u8::try_from(count).map_err(|_| H264Error::IntegerOverflow)?,
+    })
+}
+
+/// Decodes coefficient magnitudes and signs for an existing significance map.
+pub fn decode_cabac_coefficient_levels(
+    syntax: &mut CabacSyntaxDecoder<'_, '_>,
+    category: CabacResidualCategory,
+    significance_map: CabacSignificanceMap,
+) -> Result<CabacCoefficientBlock> {
+    decode_coefficient_levels_with(category, significance_map, |context_index| {
+        if let Some(context_index) = context_index {
+            syntax.decision(context_index)
+        } else {
+            syntax.bypass()
+        }
+    })
+}
+
+/// Decodes a complete coded CABAC residual block.
+pub fn decode_cabac_coefficient_block(
+    syntax: &mut CabacSyntaxDecoder<'_, '_>,
+    category: CabacResidualCategory,
+) -> Result<CabacCoefficientBlock> {
+    let significance_map = decode_cabac_significance_map(syntax, category)?;
+    decode_cabac_coefficient_levels(syntax, category, significance_map)
+}
+
+fn decode_coefficient_levels_with(
+    category: CabacResidualCategory,
+    significance_map: CabacSignificanceMap,
+    mut decode: impl FnMut(Option<usize>) -> Result<u8>,
+) -> Result<CabacCoefficientBlock> {
+    let context_base = category.coefficient_level_context_base();
+    let mut coefficients = [0; 64];
+    let mut node_context = 0usize;
+
+    for &coefficient_index in significance_map.indices().iter().rev() {
+        let first_context = context_base + COEFFICIENT_LEVEL_ONE_CONTEXTS[node_context];
+        let magnitude = if decode(Some(first_context))? == 0 {
+            node_context = LEVEL_ONE_TRANSITIONS[node_context];
+            1
+        } else {
+            let repeated_context =
+                context_base + COEFFICIENT_LEVEL_GREATER_THAN_ONE_CONTEXTS[node_context];
+            node_context = LEVEL_GREATER_THAN_ONE_TRANSITIONS[node_context];
+            let mut magnitude = 2u32;
+            while magnitude < 15 && decode(Some(repeated_context))? != 0 {
+                magnitude += 1;
+            }
+            if magnitude == 15 {
+                let mut prefix = 0u8;
+                while decode(None)? != 0 {
+                    prefix = prefix.checked_add(1).ok_or(H264Error::IntegerOverflow)?;
+                    if prefix > MAXIMUM_COEFFICIENT_ESCAPE_PREFIX {
+                        return Err(H264Error::InvalidSyntax(
+                            "CABAC coefficient escape prefix is too long",
+                        ));
+                    }
+                }
+                let mut suffix = 0u32;
+                for _ in 0..prefix {
+                    suffix = (suffix << 1) | u32::from(decode(None)?);
+                }
+                (1u32 << prefix)
+                    .checked_add(suffix)
+                    .and_then(|value| value.checked_add(14))
+                    .ok_or(H264Error::IntegerOverflow)?
+            } else {
+                magnitude
+            }
+        };
+
+        let magnitude = i32::try_from(magnitude).map_err(|_| H264Error::IntegerOverflow)?;
+        let coefficient = if decode(None)? == 0 {
+            magnitude
+        } else {
+            -magnitude
+        };
+        coefficients[usize::from(coefficient_index)] = coefficient;
+    }
+
+    Ok(CabacCoefficientBlock {
+        coefficients,
+        coefficient_count: significance_map.count,
+        maximum_coefficients: category.maximum_coefficients(),
     })
 }
 
@@ -644,5 +758,89 @@ mod tests {
         .unwrap();
         assert_eq!(map.indices(), [6]);
         assert_eq!(visited, [402, 403, 404, 405, 406, 407, 407, 418]);
+    }
+
+    #[test]
+    fn decodes_coefficient_levels_in_reverse_scan_order() {
+        let map = CabacSignificanceMap {
+            indices: {
+                let mut indices = [0; 64];
+                indices[..3].copy_from_slice(&[1, 3, 6]);
+                indices
+            },
+            count: 3,
+        };
+        let mut bins = VecDeque::from([0, 0, 1, 1, 1, 0, 1, 0, 1]);
+        let mut visited = Vec::new();
+        let block =
+            decode_coefficient_levels_with(CabacResidualCategory::Luma4x4, map, |context| {
+                visited.push(context);
+                Ok(bins.pop_front().unwrap())
+            })
+            .unwrap();
+
+        assert_eq!(block.coefficient_count(), 3);
+        assert_eq!(&block.coefficients()[..7], [0, -1, 0, -4, 0, 0, 1]);
+        assert_eq!(
+            visited,
+            [
+                Some(248),
+                None,
+                Some(249),
+                Some(252),
+                Some(252),
+                Some(252),
+                None,
+                Some(247),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn decodes_coefficient_escape_prefix_and_suffix() {
+        let map = CabacSignificanceMap {
+            indices: [0; 64],
+            count: 1,
+        };
+        let mut bins = VecDeque::from(
+            [1].into_iter()
+                .chain(std::iter::repeat_n(1, 13))
+                .chain([1, 1, 0, 1, 0, 0])
+                .collect::<Vec<_>>(),
+        );
+        let block = decode_coefficient_levels_with(CabacResidualCategory::LumaDc, map, |_| {
+            Ok(bins.pop_front().unwrap())
+        })
+        .unwrap();
+
+        assert_eq!(block.coefficient_count(), 1);
+        assert_eq!(block.coefficients()[0], 20);
+        assert!(bins.is_empty());
+    }
+
+    #[test]
+    fn rejects_unbounded_coefficient_escape_prefixes() {
+        let map = CabacSignificanceMap {
+            indices: [0; 64],
+            count: 1,
+        };
+        let mut decision_count = 0;
+        let error =
+            decode_coefficient_levels_with(CabacResidualCategory::ChromaDc, map, |context| {
+                if context.is_some() {
+                    decision_count += 1;
+                    Ok(1)
+                } else {
+                    Ok(1)
+                }
+            })
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            H264Error::InvalidSyntax("CABAC coefficient escape prefix is too long")
+        );
+        assert_eq!(decision_count, 14);
     }
 }

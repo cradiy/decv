@@ -47,7 +47,8 @@ pub use cabac::{
     consume_cabac_alignment,
 };
 pub use cabac_residual::{
-    CabacResidualBlock, CabacResidualCategory, CabacResidualState, CabacSignificanceMap,
+    CabacCoefficientBlock, CabacResidualBlock, CabacResidualCategory, CabacResidualState,
+    CabacSignificanceMap, decode_cabac_coefficient_block, decode_cabac_coefficient_levels,
     decode_cabac_significance_map,
 };
 pub use cabac_syntax::{
