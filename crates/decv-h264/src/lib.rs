@@ -50,12 +50,13 @@ pub use intra_modes::IntraModeState;
 pub use intra_reconstruction::IntraPictureReconstructor;
 pub use macroblock::{
     BInterMacroblockHeader, BMacroblockContext, BPartitionMode, BPartitionMotion, BPredictionMode,
-    BSliceMacroblock, BSubMacroblockType, CodedBlockPattern, DecodedIntraMacroblock,
-    DecodedPSliceMacroblock, InterResidual, IntraLumaPrediction, IntraMacroblock,
-    IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MotionVectorDifference,
-    PInterMacroblockHeader, PMacroblockContext, PPartitionMode, PPartitionMotion, PSliceMacroblock,
-    PSubMacroblockType, PcmMacroblock, parse_cavlc_b_macroblock, parse_cavlc_intra_macroblock,
-    parse_cavlc_mb_skip_run, parse_cavlc_p_macroblock,
+    BSliceMacroblock, BSubMacroblockType, CodedBlockPattern, DecodedBSliceMacroblock,
+    DecodedIntraMacroblock, DecodedPSliceMacroblock, InterResidual, IntraLumaPrediction,
+    IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual,
+    MotionVectorDifference, PInterMacroblockHeader, PMacroblockContext, PPartitionMode,
+    PPartitionMotion, PSliceMacroblock, PSubMacroblockType, PcmMacroblock,
+    parse_cavlc_b_macroblock, parse_cavlc_intra_macroblock, parse_cavlc_mb_skip_run,
+    parse_cavlc_p_macroblock,
 };
 pub use motion::{MotionVector, PMotionState, ResolvedPMacroblock, ResolvedPPartition};
 pub use nal::{NalHeader, NalUnit, NalUnitType};

@@ -3,10 +3,12 @@
 use bit_readers::BitReader;
 
 use crate::{
-    CoeffTokenContext, DecodedIntraMacroblock, DecodedPSliceMacroblock, H264Error, InterResidual,
-    IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraResidual,
+    BMacroblockContext, BSliceMacroblock, CodedBlockPattern, CoeffTokenContext,
+    DecodedBSliceMacroblock, DecodedIntraMacroblock, DecodedPSliceMacroblock, H264Error,
+    InterResidual, IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraResidual,
     PInterMacroblockHeader, PMacroblockContext, PSliceMacroblock, ResidualBlock, Result,
-    decode_residual_block, parse_cavlc_intra_macroblock, parse_cavlc_p_macroblock,
+    decode_residual_block, parse_cavlc_b_macroblock, parse_cavlc_intra_macroblock,
+    parse_cavlc_p_macroblock,
 };
 
 const DECODED_BIT: u32 = 1 << 5;
@@ -241,6 +243,58 @@ impl CavlcNeighborState {
         }
     }
 
+    /// Parses and coefficient-decodes one complete non-skipped CAVLC B-slice
+    /// macroblock, including embedded Intra macroblock types.
+    pub fn decode_b_macroblock(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        context: BMacroblockContext,
+    ) -> Result<DecodedBSliceMacroblock> {
+        self.ensure_slice_started()?;
+        self.ensure_macroblock(mb_x, mb_y)?;
+        let snapshot = self.snapshot_macroblock(mb_x, mb_y)?;
+        let mut probe = *reader;
+        let result = (|| {
+            Ok(match parse_cavlc_b_macroblock(&mut probe, context)? {
+                BSliceMacroblock::Inter(header) => {
+                    let residual = self.decode_inter_residual_pattern(
+                        &mut probe,
+                        mb_x,
+                        mb_y,
+                        header.coded_block_pattern,
+                    )?;
+                    DecodedBSliceMacroblock::Inter { header, residual }
+                }
+                BSliceMacroblock::Intra(IntraMacroblock::Predicted(header)) => {
+                    let residual = self.decode_intra_residual(&mut probe, mb_x, mb_y, &header)?;
+                    DecodedBSliceMacroblock::Intra(DecodedIntraMacroblock {
+                        macroblock: IntraMacroblock::Predicted(header),
+                        residual: Some(residual),
+                    })
+                }
+                BSliceMacroblock::Intra(IntraMacroblock::Pcm(pcm)) => {
+                    self.record_pcm_macroblock(mb_x, mb_y)?;
+                    DecodedBSliceMacroblock::Intra(DecodedIntraMacroblock {
+                        macroblock: IntraMacroblock::Pcm(pcm),
+                        residual: None,
+                    })
+                }
+            })
+        })();
+        match result {
+            Ok(decoded) => {
+                *reader = probe;
+                Ok(decoded)
+            }
+            Err(error) => {
+                self.restore_macroblock(mb_x, mb_y, snapshot);
+                Err(error)
+            }
+        }
+    }
+
     #[inline]
     pub fn luma_context(&self, mb_x: u32, mb_y: u32, block_index: u8) -> Result<CoeffTokenContext> {
         self.ensure_slice_started()?;
@@ -336,15 +390,25 @@ impl CavlcNeighborState {
         mb_y: u32,
         header: &PInterMacroblockHeader,
     ) -> Result<InterResidual> {
+        self.decode_inter_residual_pattern(reader, mb_x, mb_y, header.coded_block_pattern)
+    }
+
+    fn decode_inter_residual_pattern(
+        &mut self,
+        reader: &mut BitReader<'_>,
+        mb_x: u32,
+        mb_y: u32,
+        coded_block_pattern: CodedBlockPattern,
+    ) -> Result<InterResidual> {
         self.ensure_slice_started()?;
-        if header.coded_block_pattern.luma > 15 || header.coded_block_pattern.chroma > 2 {
+        if coded_block_pattern.luma > 15 || coded_block_pattern.chroma > 2 {
             return Err(H264Error::InvalidSyntax(
                 "coded block pattern exceeds 4:2:0 macroblock bounds",
             ));
         }
         let snapshot = self.snapshot_macroblock(mb_x, mb_y)?;
         let mut probe = *reader;
-        match self.decode_inter_residual_inner(&mut probe, mb_x, mb_y, header) {
+        match self.decode_inter_residual_inner(&mut probe, mb_x, mb_y, coded_block_pattern) {
             Ok(residual) => {
                 *reader = probe;
                 Ok(residual)
@@ -504,12 +568,12 @@ impl CavlcNeighborState {
         reader: &mut BitReader<'_>,
         mb_x: u32,
         mb_y: u32,
-        header: &PInterMacroblockHeader,
+        coded_block_pattern: CodedBlockPattern,
     ) -> Result<InterResidual> {
         let mut luma = [ResidualBlock::empty(16); 16];
         for block_index in 0..16u8 {
             let region_8x8 = block_index / 4;
-            if header.coded_block_pattern.luma & (1 << region_8x8) != 0 {
+            if coded_block_pattern.luma & (1 << region_8x8) != 0 {
                 luma[usize::from(block_index)] =
                     self.decode_luma_block(reader, mb_x, mb_y, block_index, 16)?;
             } else {
@@ -518,14 +582,14 @@ impl CavlcNeighborState {
         }
 
         let mut chroma_dc = [ResidualBlock::empty(4); 2];
-        if header.coded_block_pattern.chroma != 0 {
+        if coded_block_pattern.chroma != 0 {
             for block in &mut chroma_dc {
                 *block = decode_residual_block(reader, CoeffTokenContext::ChromaDc420, 4)?;
             }
         }
 
         let mut chroma_ac = [[ResidualBlock::empty(15); 4]; 2];
-        if header.coded_block_pattern.chroma == 2 {
+        if coded_block_pattern.chroma == 2 {
             for block_index in 0..4u8 {
                 chroma_ac[0][usize::from(block_index)] =
                     self.decode_chroma_cb_ac(reader, mb_x, mb_y, block_index)?;
@@ -703,9 +767,10 @@ mod tests {
 
     use super::CavlcNeighborState;
     use crate::{
-        CodedBlockPattern, CoeffTokenContext, DecodedPSliceMacroblock, H264Error,
-        IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax,
-        PInterMacroblockHeader, PMacroblockContext, PPartitionMode, PPartitionMotion,
+        BMacroblockContext, CodedBlockPattern, CoeffTokenContext, DecodedBSliceMacroblock,
+        DecodedPSliceMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
+        IntraMacroblockHeader, IntraPredictionModeSyntax, PInterMacroblockHeader,
+        PMacroblockContext, PPartitionMode, PPartitionMotion,
     };
 
     #[test]
@@ -1074,6 +1139,67 @@ mod tests {
         );
     }
 
+    #[test]
+    fn decodes_complete_inter_and_embedded_intra_b_macroblocks() {
+        let mut state = CavlcNeighborState::new(2, 1).unwrap();
+        state.begin_slice();
+
+        // B_L0_16x16, zero MVD, and coded_block_pattern zero.
+        let bits = "010111";
+        let data = bit_string(bits);
+        let mut reader = BitReader::new(&data);
+        let decoded = state
+            .decode_b_macroblock(&mut reader, 0, 0, b_context())
+            .unwrap();
+        let DecodedBSliceMacroblock::Inter { header, residual } = decoded else {
+            panic!("expected B inter macroblock");
+        };
+        assert_eq!(
+            header.coded_block_pattern,
+            CodedBlockPattern { luma: 0, chroma: 0 }
+        );
+        assert!(residual.luma.iter().all(|block| block.total_coeff == 0));
+        assert_eq!(reader.bit_position(), bits.len());
+
+        // B mb_type 23 maps to I_NxN with predicted modes and no residual.
+        let bits = format!("000011000{}100100", "1".repeat(16));
+        let data = bit_string(&bits);
+        let mut reader = BitReader::new(&data);
+        let decoded = state
+            .decode_b_macroblock(&mut reader, 1, 0, b_context())
+            .unwrap();
+        assert!(matches!(
+            decoded,
+            DecodedBSliceMacroblock::Intra(crate::DecodedIntraMacroblock {
+                macroblock: IntraMacroblock::Predicted(IntraMacroblockHeader {
+                    luma_prediction: IntraLumaPrediction::FourByFour(_),
+                    ..
+                }),
+                ..
+            })
+        ));
+        assert_eq!(reader.bit_position(), bits.len());
+    }
+
+    #[test]
+    fn complete_b_macroblock_failure_restores_bits_and_neighbours() {
+        let mut state = CavlcNeighborState::new(1, 1).unwrap();
+        state.begin_slice();
+        state.record_luma(0, 0, 0, 6).unwrap();
+
+        let mut reader = BitReader::new(&[0]);
+        assert!(
+            state
+                .decode_b_macroblock(&mut reader, 0, 0, b_context())
+                .is_err()
+        );
+        assert_eq!(reader.bit_position(), 0);
+        assert_eq!(
+            state.luma_context(0, 0, 1),
+            Ok(CoeffTokenContext::NeighborTotal(6))
+        );
+    }
+
     fn header_4x4(luma: u8, chroma: u8) -> IntraMacroblockHeader {
         IntraMacroblockHeader {
             luma_prediction: IntraLumaPrediction::FourByFour(
@@ -1107,6 +1233,15 @@ mod tests {
             coded_block_pattern: CodedBlockPattern { luma, chroma },
             transform_size_8x8,
             qp_delta: 0,
+        }
+    }
+
+    fn b_context() -> BMacroblockContext {
+        BMacroblockContext {
+            num_ref_idx_l0_active: 1,
+            num_ref_idx_l1_active: 1,
+            transform_8x8_mode_enabled: false,
+            direct_8x8_inference: true,
         }
     }
 

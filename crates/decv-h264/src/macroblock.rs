@@ -300,6 +300,15 @@ pub enum BSliceMacroblock {
     Intra(IntraMacroblock),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecodedBSliceMacroblock {
+    Inter {
+        header: BInterMacroblockHeader,
+        residual: InterResidual,
+    },
+    Intra(DecodedIntraMacroblock),
+}
+
 /// Syntax context needed to decode a frame-coded CAVLC B macroblock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BMacroblockContext {

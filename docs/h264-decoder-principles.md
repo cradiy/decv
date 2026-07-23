@@ -655,6 +655,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - transactional frame-coded CAVLC B macroblock headers covering all 23 inter
   types, all 13 sub-macroblock types, Direct/List0/List1/Bi field-presence
   rules, both reference indices, and both motion-vector-difference lists;
+- a complete transactional CAVLC B-macroblock entry point joining those
+  headers with inter residuals or embedded Intra/I_PCM macroblocks and
+  restoring both reader and neighbour state on failure;
 - slice-aware frame-coded P motion-vector prediction at 4x4 granularity,
   including A/B/C/D lookup, C-to-D fallback, directional 16x8/8x16 rules,
   median prediction, P_Skip inference, and transactional state updates;
