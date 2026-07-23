@@ -110,10 +110,30 @@ pub fn filter_deblock_edge(
         alpha_offset_div2,
         beta_offset_div2,
     )?;
+    Ok(filter_deblock_edge_validated(
+        samples,
+        boundary_strength,
+        qp_p,
+        qp_q,
+        alpha_offset_div2,
+        beta_offset_div2,
+        chroma_style,
+    ))
+}
 
+#[allow(clippy::too_many_arguments)]
+fn filter_deblock_edge_validated(
+    samples: DeblockEdgeSamples,
+    boundary_strength: u8,
+    qp_p: u8,
+    qp_q: u8,
+    alpha_offset_div2: i8,
+    beta_offset_div2: i8,
+    chroma_style: bool,
+) -> FilteredDeblockEdge {
     let unchanged = samples.unchanged();
     if boundary_strength == 0 {
-        return Ok(unchanged);
+        return unchanged;
     }
 
     let qp_average = (i16::from(qp_p) + i16::from(qp_q) + 1) >> 1;
@@ -125,7 +145,7 @@ pub fn filter_deblock_edge(
     let [p0, p1, p2, p3] = samples.p.map(i16::from);
     let [q0, q1, q2, q3] = samples.q.map(i16::from);
     if (p0 - q0).abs() >= alpha || (p1 - p0).abs() >= beta || (q1 - q0).abs() >= beta {
-        return Ok(unchanged);
+        return unchanged;
     }
 
     if boundary_strength < 4 {
@@ -150,7 +170,7 @@ pub fn filter_deblock_edge(
             q1
         };
 
-        return Ok(FilteredDeblockEdge {
+        return FilteredDeblockEdge {
             p: [
                 clip_sample(p0 + delta),
                 clip_sample(filtered_p1),
@@ -161,7 +181,7 @@ pub fn filter_deblock_edge(
                 clip_sample(filtered_q1),
                 samples.q[2],
             ],
-        });
+        };
     }
 
     let ap = (p2 - p0).abs();
@@ -193,7 +213,7 @@ pub fn filter_deblock_edge(
             samples.q[2],
         ]
     };
-    Ok(FilteredDeblockEdge { p, q })
+    FilteredDeblockEdge { p, q }
 }
 
 pub(crate) fn filter_420_picture(
@@ -463,13 +483,17 @@ fn filter_vertical_edge(
     length: usize,
     parameters: EdgeParameters,
 ) -> Result<()> {
+    validate_edge_parameters(parameters)?;
+    if parameters.boundary_strength == 0 {
+        return Ok(());
+    }
     for offset in 0..length {
         let q0 = (y + offset) * stride + x;
         let samples = DeblockEdgeSamples {
             p: std::array::from_fn(|index| plane[q0 - index - 1]),
             q: std::array::from_fn(|index| plane[q0 + index]),
         };
-        let filtered = apply_parameters(samples, parameters)?;
+        let filtered = apply_parameters(samples, parameters);
         for index in 0..3 {
             plane[q0 - index - 1] = filtered.p[index];
             plane[q0 + index] = filtered.q[index];
@@ -486,13 +510,17 @@ fn filter_horizontal_edge(
     length: usize,
     parameters: EdgeParameters,
 ) -> Result<()> {
+    validate_edge_parameters(parameters)?;
+    if parameters.boundary_strength == 0 {
+        return Ok(());
+    }
     for offset in 0..length {
         let q0 = y * stride + x + offset;
         let samples = DeblockEdgeSamples {
             p: std::array::from_fn(|index| plane[q0 - (index + 1) * stride]),
             q: std::array::from_fn(|index| plane[q0 + index * stride]),
         };
-        let filtered = apply_parameters(samples, parameters)?;
+        let filtered = apply_parameters(samples, parameters);
         for index in 0..3 {
             plane[q0 - (index + 1) * stride] = filtered.p[index];
             plane[q0 + index * stride] = filtered.q[index];
@@ -504,8 +532,8 @@ fn filter_horizontal_edge(
 fn apply_parameters(
     samples: DeblockEdgeSamples,
     parameters: EdgeParameters,
-) -> Result<FilteredDeblockEdge> {
-    filter_deblock_edge(
+) -> FilteredDeblockEdge {
+    filter_deblock_edge_validated(
         samples,
         parameters.boundary_strength,
         parameters.qp_p,
@@ -513,6 +541,16 @@ fn apply_parameters(
         parameters.alpha_offset_div2,
         parameters.beta_offset_div2,
         parameters.chroma_style,
+    )
+}
+
+fn validate_edge_parameters(parameters: EdgeParameters) -> Result<()> {
+    validate_inputs(
+        parameters.boundary_strength,
+        parameters.qp_p,
+        parameters.qp_q,
+        parameters.alpha_offset_div2,
+        parameters.beta_offset_div2,
     )
 }
 

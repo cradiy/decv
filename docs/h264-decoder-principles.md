@@ -717,6 +717,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   boundary strength from Intra/Inter mode, luma coefficients, reference-picture
   identity, and motion-vector differences; chroma-to-luma boundary mapping;
   slice-controlled offsets; and cross-slice edge suppression;
+- deblocking fast rejection before pixel loads for zero-strength edges, with
+  derived-parameter validation performed once per edge segment instead of once
+  per filtered sample;
 - bidirectional deblocking motion comparison with List 0/List 1 reference
   identity, motion-vector thresholds, and equivalent swapped-list handling;
 - a bounded POC output-reorder buffer kept separate from the reference DPB,
