@@ -254,6 +254,42 @@ pub struct IntraPictureReconstructor {
     next_slice_id: u32,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ReconstructionWorkspace {
+    b_motion: BMotionState,
+    cabac_residual: CabacResidualState,
+    next_slice_id: u32,
+}
+
+impl ReconstructionWorkspace {
+    fn new(width_in_macroblocks: usize, height_in_macroblocks: usize) -> Result<Self> {
+        Ok(Self {
+            b_motion: BMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
+            cabac_residual: CabacResidualState::new(width_in_macroblocks, height_in_macroblocks)?,
+            next_slice_id: 0,
+        })
+    }
+
+    fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+    ) -> Result<()> {
+        self.b_motion
+            .reset_for_picture(width_in_macroblocks, height_in_macroblocks)?;
+        let generation_exhausted = self.next_slice_id == u32::MAX;
+        self.cabac_residual.reset_for_picture(
+            width_in_macroblocks,
+            height_in_macroblocks,
+            generation_exhausted,
+        )?;
+        if generation_exhausted {
+            self.next_slice_id = 0;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct NonReferencePictureFinalization {
     width_in_macroblocks: usize,
@@ -305,7 +341,7 @@ impl IntraPictureReconstructor {
         scaling_lists_8x8: ResolvedScalingLists8x8,
         constrained_intra_prediction: bool,
         reconstruction_executor: ReconstructionExecutor,
-        reusable_b_motion: Option<BMotionState>,
+        reusable_workspace: Option<ReconstructionWorkspace>,
         retain_reference_motion: bool,
     ) -> Result<Self> {
         let picture = Yuv420Picture::new(coded_size)?;
@@ -316,11 +352,11 @@ impl IntraPictureReconstructor {
         let macroblock_count = width_in_macroblocks
             .checked_mul(height_in_macroblocks)
             .ok_or(H264Error::IntegerOverflow)?;
-        let b_motion = if let Some(mut b_motion) = reusable_b_motion {
-            b_motion.reset_for_picture(width_in_macroblocks, height_in_macroblocks)?;
-            b_motion
+        let workspace = if let Some(mut workspace) = reusable_workspace {
+            workspace.reset_for_picture(width_in_macroblocks, height_in_macroblocks)?;
+            workspace
         } else {
-            BMotionState::new(width_in_macroblocks, height_in_macroblocks)?
+            ReconstructionWorkspace::new(width_in_macroblocks, height_in_macroblocks)?
         };
         let reference_motion = if retain_reference_motion {
             MotionFieldBuilder::new(coded_size)?
@@ -331,10 +367,10 @@ impl IntraPictureReconstructor {
             width_in_macroblocks,
             picture,
             cavlc: CavlcNeighborState::new(coded_size.width / 16, coded_size.height / 16)?,
-            cabac_residual: CabacResidualState::new(width_in_macroblocks, height_in_macroblocks)?,
+            cabac_residual: workspace.cabac_residual,
             modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
             motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
-            b_motion,
+            b_motion: workspace.b_motion,
             reference_motion,
             completed: vec![false; macroblock_count],
             deblock: vec![MacroblockDeblockInfo::default(); macroblock_count],
@@ -345,7 +381,7 @@ impl IntraPictureReconstructor {
             scan_mode: ScanMode::Frame,
             constrained_intra_prediction,
             reconstruction_executor,
-            next_slice_id: 0,
+            next_slice_id: workspace.next_slice_id,
         })
     }
 
@@ -357,7 +393,7 @@ impl IntraPictureReconstructor {
         parameter_sets: &ActiveParameterSets,
         reconstruction_executor: ReconstructionExecutor,
     ) -> Result<Self> {
-        Self::from_parameter_sets_with_executor_and_b_motion(
+        Self::from_parameter_sets_with_executor_and_workspace(
             parameter_sets,
             reconstruction_executor,
             None,
@@ -365,10 +401,10 @@ impl IntraPictureReconstructor {
         )
     }
 
-    pub(crate) fn from_parameter_sets_with_executor_and_b_motion(
+    pub(crate) fn from_parameter_sets_with_executor_and_workspace(
         parameter_sets: &ActiveParameterSets,
         reconstruction_executor: ReconstructionExecutor,
-        reusable_b_motion: Option<BMotionState>,
+        reusable_workspace: Option<ReconstructionWorkspace>,
         retain_reference_motion: bool,
     ) -> Result<Self> {
         let sps = &parameter_sets.sequence;
@@ -387,7 +423,7 @@ impl IntraPictureReconstructor {
             scaling_lists_8x8,
             pps.constrained_intra_prediction,
             reconstruction_executor,
-            reusable_b_motion,
+            reusable_workspace,
             retain_reference_motion,
         )
     }
@@ -2527,34 +2563,45 @@ impl IntraPictureReconstructor {
     pub(crate) fn into_deblocked_reference_picture(
         self,
     ) -> Result<(Yuv420Picture, ReferenceMotionField)> {
-        let (picture, motion, _) =
-            self.into_deblocked_reference_picture_with_reusable_b_motion()?;
+        let (picture, motion, _) = self.into_deblocked_reference_picture_with_workspace()?;
         Ok((picture, motion))
     }
 
-    pub(crate) fn into_deblocked_reference_picture_with_reusable_b_motion(
+    pub(crate) fn into_deblocked_reference_picture_with_workspace(
         self,
-    ) -> Result<(Yuv420Picture, ReferenceMotionField, BMotionState)> {
-        let (picture, motion, b_motion) =
+    ) -> Result<(Yuv420Picture, ReferenceMotionField, ReconstructionWorkspace)> {
+        let (picture, motion, workspace) =
             self.into_deblocked_picture_with_optional_reference_motion()?;
         let motion = motion.ok_or(H264Error::InvalidSyntax(
             "reference motion field was not retained",
         ))?;
-        Ok((picture, motion, b_motion))
+        Ok((picture, motion, workspace))
     }
 
     pub(crate) fn into_deblocked_picture_with_optional_reference_motion(
         mut self,
-    ) -> Result<(Yuv420Picture, Option<ReferenceMotionField>, BMotionState)> {
+    ) -> Result<(
+        Yuv420Picture,
+        Option<ReferenceMotionField>,
+        ReconstructionWorkspace,
+    )> {
         self.validate_picture_complete()?;
         filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
         let motion = self.reference_motion.finish_optional()?;
-        Ok((self.picture, motion, self.b_motion))
+        Ok((
+            self.picture,
+            motion,
+            ReconstructionWorkspace {
+                b_motion: self.b_motion,
+                cabac_residual: self.cabac_residual,
+                next_slice_id: self.next_slice_id,
+            },
+        ))
     }
 
     pub(crate) fn into_non_reference_finalization(
         self,
-    ) -> Result<(NonReferencePictureFinalization, BMotionState)> {
+    ) -> Result<(NonReferencePictureFinalization, ReconstructionWorkspace)> {
         self.validate_picture_complete()?;
         if self.reference_motion.finish_optional()?.is_some() {
             return Err(H264Error::InvalidSyntax(
@@ -2567,7 +2614,11 @@ impl IntraPictureReconstructor {
                 picture: self.picture,
                 deblock: self.deblock,
             },
-            self.b_motion,
+            ReconstructionWorkspace {
+                b_motion: self.b_motion,
+                cabac_residual: self.cabac_residual,
+                next_slice_id: self.next_slice_id,
+            },
         ))
     }
 
@@ -3380,15 +3431,15 @@ mod tests {
     use super::{
         BDirectPrediction, BReconstructionModes, BSlicePredictionWeights, DeblockReferenceList,
         IntraPictureReconstructor, IntraSliceConfig, MacroblockDeblockInfo,
-        ReconstructionReferenceList, b_inter_deblock_info, inter_deblock_info,
-        write_b_inter_deblock_info, write_inter_deblock_info,
+        ReconstructionReferenceList, ReconstructionWorkspace, b_inter_deblock_info,
+        inter_deblock_info, write_b_inter_deblock_info, write_inter_deblock_info,
     };
     use crate::{
-        BMacroblockContext, CodedBlockPattern, DeblockingFilter, DecodedIntraMacroblock, H264Error,
-        IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax,
-        IntraResidual, MacroblockQuantizer, MotionVector, PcmMacroblock, ResidualBlock,
-        ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition, ResolvedPMacroblock,
-        ResolvedPPartition, resolve_scaling_lists_4x4,
+        BMacroblockContext, CabacResidualBlock, CodedBlockPattern, DeblockingFilter,
+        DecodedIntraMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
+        IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer,
+        MotionVector, PcmMacroblock, ResidualBlock, ResolvedBListMotion, ResolvedBMacroblock,
+        ResolvedBPartition, ResolvedPMacroblock, ResolvedPPartition, resolve_scaling_lists_4x4,
     };
 
     const PREDICTED_MODE: IntraPredictionModeSyntax = IntraPredictionModeSyntax {
@@ -3403,6 +3454,34 @@ mod tests {
             chroma_cr: 0,
             transform_bypass: false,
         }
+    }
+
+    #[test]
+    fn workspace_clears_residual_generations_before_slice_id_wraparound() {
+        let mut workspace = ReconstructionWorkspace::new(2, 1).unwrap();
+        workspace
+            .cabac_residual
+            .record_block(0, u32::MAX, CabacResidualBlock::LumaDc, true)
+            .unwrap();
+        assert_eq!(
+            workspace
+                .cabac_residual
+                .coded_block_flag_context_index(1, u32::MAX, false, CabacResidualBlock::LumaDc,)
+                .unwrap(),
+            Some(86)
+        );
+        workspace.next_slice_id = u32::MAX;
+
+        workspace.reset_for_picture(2, 1).unwrap();
+
+        assert_eq!(workspace.next_slice_id, 0);
+        assert_eq!(
+            workspace
+                .cabac_residual
+                .coded_block_flag_context_index(1, u32::MAX, false, CabacResidualBlock::LumaDc,)
+                .unwrap(),
+            Some(85)
+        );
     }
 
     #[test]

@@ -16,16 +16,15 @@ use decv_core::{
 };
 
 use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
-use crate::intra_reconstruction::ReconstructionReferenceList;
+use crate::intra_reconstruction::{ReconstructionReferenceList, ReconstructionWorkspace};
 use crate::parallelism::ReconstructionExecutor;
 use crate::reorder::PictureReorderBuffer;
 use crate::{
-    AnnexBNalUnit, AnnexBReader, BMotionState, DecodedPictureBuffer, DirectReference,
-    EntropyCodingMode, H264Error, H264Parallelism, ImplicitWeightReference,
-    IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType, ParameterSetStore,
-    ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile, ReferenceKind,
-    ReferencePictureMarking, Result, SequenceParameterSet, SliceType, consume_rbsp_trailing_bits,
-    decode_rbsp,
+    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference, EntropyCodingMode,
+    H264Error, H264Parallelism, ImplicitWeightReference, IntraPictureReconstructor, NalHeader,
+    NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader, PictureOrderCount,
+    PictureParameterSet, Profile, ReferenceKind, ReferencePictureMarking, Result,
+    SequenceParameterSet, SliceType, consume_rbsp_trailing_bits, decode_rbsp,
 };
 
 #[cfg(not(test))]
@@ -85,7 +84,7 @@ pub struct H264Decoder {
     parallelism: H264Parallelism,
     reconstruction_executor: Option<ReconstructionExecutor>,
     auto_executor_size: Option<Size>,
-    reusable_b_motion: Option<BMotionState>,
+    reusable_workspace: Option<ReconstructionWorkspace>,
     pending_non_reference_finalizations: VecDeque<PendingNonReferenceFinalization>,
 }
 
@@ -106,7 +105,7 @@ impl Default for H264Decoder {
             parallelism: H264Parallelism::Auto,
             reconstruction_executor: None,
             auto_executor_size: None,
-            reusable_b_motion: None,
+            reusable_workspace: None,
             pending_non_reference_finalizations: VecDeque::new(),
         }
     }
@@ -206,13 +205,13 @@ impl H264Decoder {
                         self.auto_executor_size = Some(coded_size);
                     }
                     let reconstructor =
-                        IntraPictureReconstructor::from_parameter_sets_with_executor_and_b_motion(
+                        IntraPictureReconstructor::from_parameter_sets_with_executor_and_workspace(
                             &parsed.parameter_sets,
                             self.reconstruction_executor
                                 .as_ref()
                                 .expect("configure initializes the reconstruction executor")
                                 .clone(),
-                            self.reusable_b_motion.take(),
+                            self.reusable_workspace.take(),
                             nal_header.nal_ref_idc != 0,
                         )?;
                     self.current_picture = Some(PendingPicture {
@@ -460,10 +459,10 @@ impl H264Decoder {
             return self.dispatch_non_reference_finalization(picture);
         }
         self.finish_pending_non_reference_finalizations(true)?;
-        let (decoded, motion, reusable_b_motion) = picture
+        let (decoded, motion, reusable_workspace) = picture
             .reconstructor
             .into_deblocked_picture_with_optional_reference_motion()?;
-        self.reusable_b_motion = Some(reusable_b_motion);
+        self.reusable_workspace = Some(reusable_workspace);
         let decoded = Arc::new(decoded);
         let frame = decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format)?;
         if picture.nal_header.nal_ref_idc != 0 {
@@ -532,7 +531,7 @@ impl H264Decoder {
             picture_order_count,
             ..
         } = picture;
-        let (finalization, reusable_b_motion) = reconstructor.into_non_reference_finalization()?;
+        let (finalization, reusable_workspace) = reconstructor.into_non_reference_finalization()?;
         let picture_order_count = picture_order_count.stored.picture_order_count();
         let (sender, receiver) = mpsc::sync_channel(1);
         self.reconstruction_executor
@@ -545,7 +544,7 @@ impl H264Decoder {
                 });
                 let _ = sender.send(frame);
             });
-        self.reusable_b_motion = Some(reusable_b_motion);
+        self.reusable_workspace = Some(reusable_workspace);
         self.pending_non_reference_finalizations
             .push_back(PendingNonReferenceFinalization {
                 picture_order_count,

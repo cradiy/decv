@@ -1406,6 +1406,27 @@ intentional overlap and contention, while wall latency still fell about 1.80%.
 The full 378-test workspace suite, strict all-target Clippy, and the
 597,196,800-byte FFmpeg hash passed.
 
+CABAC residual-neighbour grids now retain their allocations across pictures.
+The first reuse attempt cleared every `Option<BlockState>` with `fill(None)`;
+although this removed allocator traffic, it compiled into element-wise stores
+and increased native whole-decoder instructions by about 8.4%, so that version
+was discarded. The retained design carries the reconstructor's monotonically
+increasing slice identifier in an internal reusable workspace. Entries from a
+previous picture already fail the existing same-slice comparison and therefore
+need no clear. A dimension change reallocates the grids, while the practically
+unreachable `u32` identifier exhaustion path clears them before restarting the
+generation.
+
+Nine alternating native 4K four-worker pairs reduced mean wall time about
+1.41%, task-clock about 1.60%, cycles about 1.00%, instructions about 0.36%,
+and sampled cache misses about 0.91%. Five 600-frame 1080p two-worker pairs
+reduced wall time about 1.51% and task-clock about 1.31%. After retraining the
+same mixed CABAC/CAVLC PGO profile, nine 4K pairs reduced mean wall time about
+1.58%, task-clock about 1.72%, cycles about 3.50%, instructions about 1.47%,
+branches about 1.42%, and sampled cache misses about 3.03%. The 597,196,800-byte
+4K output retained its exact SHA-256 hash, and the full 380-test workspace suite
+plus strict all-target Clippy passed.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

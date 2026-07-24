@@ -385,6 +385,10 @@ impl BlockGrid {
         })
     }
 
+    fn clear(&mut self) {
+        self.entries.fill(None);
+    }
+
     fn neighbour_coded(
         &self,
         x: Option<usize>,
@@ -458,6 +462,29 @@ impl CabacResidualState {
             chroma_dc_cb: BlockGrid::new(width_in_macroblocks, height_in_macroblocks)?,
             chroma_dc_cr: BlockGrid::new(width_in_macroblocks, height_in_macroblocks)?,
         })
+    }
+
+    pub(crate) fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+        clear_entries: bool,
+    ) -> Result<()> {
+        if self.width_in_macroblocks != width_in_macroblocks
+            || self.height_in_macroblocks != height_in_macroblocks
+        {
+            *self = Self::new(width_in_macroblocks, height_in_macroblocks)?;
+            return Ok(());
+        }
+        if clear_entries {
+            self.luma.clear();
+            self.chroma_cb.clear();
+            self.chroma_cr.clear();
+            self.luma_dc.clear();
+            self.chroma_dc_cb.clear();
+            self.chroma_dc_cr.clear();
+        }
+        Ok(())
     }
 
     /// Returns the context index for `coded_block_flag`, or `None` when the
@@ -1230,6 +1257,61 @@ mod tests {
                 .unwrap(),
             Some(93)
         );
+    }
+
+    #[test]
+    fn resets_picture_state_without_reallocating_matching_grids() {
+        let mut state = CabacResidualState::new(2, 1).unwrap();
+        state
+            .record_block(0, 3, CabacResidualBlock::Luma4x4(0), true)
+            .unwrap();
+        state
+            .record_block(1, 3, CabacResidualBlock::ChromaDc { plane: 1 }, true)
+            .unwrap();
+        let pointers = [
+            state.luma.entries.as_ptr(),
+            state.chroma_cb.entries.as_ptr(),
+            state.chroma_cr.entries.as_ptr(),
+            state.luma_dc.entries.as_ptr(),
+            state.chroma_dc_cb.entries.as_ptr(),
+            state.chroma_dc_cr.entries.as_ptr(),
+        ];
+
+        state.reset_for_picture(2, 1, true).unwrap();
+
+        assert_eq!(
+            pointers,
+            [
+                state.luma.entries.as_ptr(),
+                state.chroma_cb.entries.as_ptr(),
+                state.chroma_cr.entries.as_ptr(),
+                state.luma_dc.entries.as_ptr(),
+                state.chroma_dc_cb.entries.as_ptr(),
+                state.chroma_dc_cr.entries.as_ptr(),
+            ]
+        );
+        assert!(state.luma.entries.iter().all(Option::is_none));
+        assert!(state.chroma_cb.entries.iter().all(Option::is_none));
+        assert!(state.chroma_cr.entries.iter().all(Option::is_none));
+        assert!(state.luma_dc.entries.iter().all(Option::is_none));
+        assert!(state.chroma_dc_cb.entries.iter().all(Option::is_none));
+        assert!(state.chroma_dc_cr.entries.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn retains_allocations_and_invalidates_entries_with_a_new_slice_id() {
+        let mut state = CabacResidualState::new(1, 1).unwrap();
+        state
+            .record_block(0, 7, CabacResidualBlock::Luma4x4(0), true)
+            .unwrap();
+        let pointer = state.luma.entries.as_ptr();
+
+        state.reset_for_picture(1, 1, false).unwrap();
+
+        assert_eq!(state.luma.entries.as_ptr(), pointer);
+        assert!(state.luma.entries.iter().any(Option::is_some));
+        assert!(state.luma.neighbour_coded(Some(0), Some(0), 7, false));
+        assert!(!state.luma.neighbour_coded(Some(0), Some(0), 8, false));
     }
 
     #[test]
