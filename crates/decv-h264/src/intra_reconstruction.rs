@@ -1167,9 +1167,12 @@ impl IntraPictureReconstructor {
             let reconstruction =
                 quantizers.with_macroblock(qp_delta, |quantizer| match &decoded.macroblock {
                     CabacPMacroblock::Skip => {
-                        let motion = self
-                            .motion
-                            .resolve_skip_macroblock(macroblock_address, slice_id)?;
+                        let motion = self.motion.resolve_skip_macroblock_at(
+                            macroblock_address,
+                            macroblock_x,
+                            macroblock_y,
+                            slice_id,
+                        )?;
                         if let Err(error) = self.reference_motion.record_p(
                             macroblock_address,
                             &motion,
@@ -1349,9 +1352,12 @@ impl IntraPictureReconstructor {
                     u32::try_from(macroblock_x).map_err(|_| H264Error::IntegerOverflow)?,
                     u32::try_from(macroblock_y).map_err(|_| H264Error::IntegerOverflow)?,
                 )?;
-                let motion = self
-                    .motion
-                    .resolve_skip_macroblock(macroblock_address, slice_id)?;
+                let motion = self.motion.resolve_skip_macroblock_at(
+                    macroblock_address,
+                    macroblock_x,
+                    macroblock_y,
+                    slice_id,
+                )?;
                 if let Err(error) =
                     self.reference_motion
                         .record_p(macroblock_address, &motion, reference_ids_l0)

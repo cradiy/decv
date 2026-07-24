@@ -1511,6 +1511,24 @@ retained SHA-256
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
 and both generated verification corpora remained byte-exact.
 
+P-skip motion derivation now reuses the macroblock coordinates that the
+reconstruction loop has already validated. The public address-only
+`PMotionState` entry point remains unchanged, while the decoder's internal
+path passes `(address, x, y)` through neighbour and median-predictor lookup.
+This removes one runtime-width integer division from every skipped P
+macroblock and a second division from the non-zero prediction branch.
+
+The native build reduced instructions and branches by about 0.09% and 0.05%,
+respectively, but its task-clock and reference-cycle measurements were neutral,
+so there is no portable-build throughput claim. With byte-identical 4K CABAC,
+1080p CABAC, and 1080p CAVLC PGO training inputs, ten of fifteen fixed-CPU 4K
+`Auto` wall-time pairs improved. Mean wall time fell about 1.64%, task-clock
+about 1.23%, instructions about 0.09%, branches about 0.07%, and branch misses
+about 0.50%. The PGO resolver body shrank by 86 bytes. The exact
+597,196,800-byte 4K output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+and both generated verification corpora remained byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

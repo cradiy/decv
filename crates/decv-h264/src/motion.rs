@@ -215,7 +215,23 @@ impl PMotionState {
         macroblock_address: usize,
         slice_id: u32,
     ) -> Result<ResolvedPMacroblock> {
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        self.resolve_skip_macroblock_at(macroblock_address, macroblock_x, macroblock_y, slice_id)
+    }
+
+    pub(crate) fn resolve_skip_macroblock_at(
+        &mut self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        slice_id: u32,
+    ) -> Result<ResolvedPMacroblock> {
         self.ensure_macroblock_available_for_write(macroblock_address)?;
+        debug_assert_eq!(
+            macroblock_address,
+            macroblock_y * self.width_in_macroblocks + macroblock_x
+        );
         let local = [None; 16];
         let geometry = PartitionGeometry {
             x: 0,
@@ -224,7 +240,14 @@ impl PMotionState {
             height: 16,
             macroblock_partition_index: 0,
         };
-        let [a, b, _, _] = self.neighbours(macroblock_address, slice_id, &local, geometry);
+        let [a, b, _, _] = self.neighbours_at(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            slice_id,
+            &local,
+            geometry,
+        );
         let zero = MotionVector::default();
         let vector = if !a.available
             || !b.available
@@ -233,8 +256,10 @@ impl PMotionState {
         {
             zero
         } else {
-            self.predict_motion_vector(
+            self.predict_motion_vector_at(
                 macroblock_address,
+                macroblock_x,
+                macroblock_y,
                 slice_id,
                 &local,
                 geometry,
@@ -287,7 +312,40 @@ impl PMotionState {
         reference_index: u8,
         mode: &PPartitionMode,
     ) -> MotionVector {
-        let [a, b, mut c, d] = self.neighbours(macroblock_address, slice_id, local, geometry);
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        self.predict_motion_vector_at(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            slice_id,
+            local,
+            geometry,
+            reference_index,
+            mode,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_motion_vector_at(
+        &self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        slice_id: u32,
+        local: &[Option<MotionCell>; 16],
+        geometry: PartitionGeometry,
+        reference_index: u8,
+        mode: &PPartitionMode,
+    ) -> MotionVector {
+        let [a, b, mut c, d] = self.neighbours_at(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            slice_id,
+            local,
+            geometry,
+        );
         if !c.available {
             c = d;
         }
@@ -321,15 +379,15 @@ impl PMotionState {
         }
     }
 
-    fn neighbours(
+    fn neighbours_at(
         &self,
         macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
         slice_id: u32,
         local: &[Option<MotionCell>; 16],
         geometry: PartitionGeometry,
     ) -> [NeighbourMotion; 4] {
-        let macroblock_x = macroblock_address % self.width_in_macroblocks;
-        let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let x = (macroblock_x * 16 + usize::from(geometry.x)) as isize;
         let y = (macroblock_y * 16 + usize::from(geometry.y)) as isize;
         [
