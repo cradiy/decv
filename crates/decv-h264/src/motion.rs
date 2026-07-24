@@ -75,6 +75,8 @@ struct MotionCell {
     kind: MotionKind,
 }
 
+const EMPTY_MOTION_CELLS: [Option<MotionCell>; 16] = [None; 16];
+
 #[derive(Debug, Clone, Copy)]
 struct NeighbourMotion {
     available: bool,
@@ -232,7 +234,6 @@ impl PMotionState {
             macroblock_address,
             macroblock_y * self.width_in_macroblocks + macroblock_x
         );
-        let local = [None; 16];
         let geometry = PartitionGeometry {
             x: 0,
             y: 0,
@@ -245,7 +246,7 @@ impl PMotionState {
             macroblock_x,
             macroblock_y,
             slice_id,
-            &local,
+            &EMPTY_MOTION_CELLS,
             geometry,
         );
         let zero = MotionVector::default();
@@ -261,7 +262,7 @@ impl PMotionState {
                 macroblock_x,
                 macroblock_y,
                 slice_id,
-                &local,
+                &EMPTY_MOTION_CELLS,
                 geometry,
                 0,
                 &PPartitionMode::L0_16x16,
@@ -275,17 +276,15 @@ impl PMotionState {
             reference_index: 0,
             motion_vector: vector,
         };
-        let mut completed = [None; 16];
-        fill_partition_cells(
-            &mut completed,
+        let cell = MotionCell {
             slice_id,
-            partition,
-            MotionKind::Inter {
+            kind: MotionKind::Inter {
                 reference_index: 0,
                 vector,
             },
-        )?;
-        self.commit_local_cells(macroblock_address, completed);
+        };
+        let start = macroblock_address * 16;
+        self.cells[start..start + 16].fill(Some(cell));
         Ok(ResolvedPMacroblock {
             skipped: true,
             partitions: smallvec::smallvec![partition],

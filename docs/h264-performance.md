@@ -1550,6 +1550,23 @@ shrunk by about 7.0 KiB, with the less common chroma implementation outlined.
 The exact 597,196,800-byte 4K hash and both generated verification corpora
 remained byte-exact.
 
+P-skip state recording now uses one immutable empty neighbour grid and fills
+the validated destination cells directly. The skipped macroblock is uniform
+by definition, so constructing a second 16-cell stack grid, populating it
+through the generic partition validator, and copying it into the picture
+state was redundant. All fallible neighbour and predictor work still
+completes before the destination changes, preserving transactional failures.
+
+The native resolver shrank from 1,312 to 756 bytes. Fifteen native 4K `Auto`
+pairs reduced mean instructions about 0.23%, reference cycles about 0.28%,
+and wall time about 0.52%; all fifteen instruction pairs improved. With
+byte-identical PGO training inputs, eleven of fifteen 4K `Auto` wall-time
+pairs improved. Mean wall time fell about 1.84%, task-clock about 2.06%,
+reference cycles about 1.47%, and instructions about 0.49%. The PGO resolver
+shrunk by 542 bytes. The exact 597,196,800-byte 4K output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+and both generated verification corpora remained byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
