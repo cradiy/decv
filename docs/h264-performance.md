@@ -1184,6 +1184,17 @@ peak RSS by about 1.9 MiB, a measured memory-side tradeoff for the Serial
 throughput gain. The full workspace suite, strict H.264 Clippy, native H.264
 and MP4/seek corpora, and 4K Serial/Auto/FFmpeg outputs remain byte-exact.
 
+Extending that workspace to retain the roughly 5.5 MiB 4K deblocking-metadata
+allocation was tested and rejected. Reusing the allocation still performed
+the required full `MacroblockDeblockInfo::default()` fill and reduced minor
+faults about 13.6%. The first seven pinned 4K Serial pairs were obscured by two
+large baseline frequency outliers. In the following stable seven pairs,
+candidate task-clock increased about 0.12%, reference cycles about 0.98%, CPU
+cycles about 0.46%, and instructions about 0.034%; only two reference-cycle
+pairs improved. The deblock allocation was removed from the reusable workspace.
+Lower page-fault counts do not justify retaining a larger live allocation when
+the required initialization stores make the primary decode workload slower.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
