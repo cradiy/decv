@@ -504,6 +504,13 @@ cycles about 0.9%. CAVLC improved by about 0.77%, 0.29%, and 1.3%,
 respectively. Two-worker `Auto` instructions fell about 0.63%; its reference
 cycles were noise-level but slightly lower.
 
+Preparing filter parameters once when all four edge strengths match was
+rejected. Applying it to both orientations increased instructions about 0.14%
+without improving reference cycles. A vertical-only variant increased
+instructions about 0.18% and median reference cycles about 0.5%. Further
+vertical work must reduce the number of SIMD arithmetic calls, not only share
+their setup.
+
 Skipping the second coverage walk for an already coalesced uniform Direct B
 partition was rejected in two forms. A branch inside the prediction loop
 reduced instructions about 0.06% but made median reference cycles about 1.1%
