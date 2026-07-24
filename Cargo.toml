@@ -7,3 +7,8 @@ members = [
     "crates/decv-h264",
     "crates/decv-mp4",
 ]
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+panic = "abort"
