@@ -501,6 +501,9 @@ let sample_index = cursor.seek_to_keyframe(target)?;
 
 The cursor is repositioned to that sample in decode order.
 
+Tracks retain a presentation-sorted sync-sample index, so both preceding and
+following keyframe lookup are `O(log keyframe_count)` even for long media.
+
 ### Stage 2: decoder preroll
 
 Accurate seeking is completed by:
@@ -519,6 +522,21 @@ That packet may depend on reference pictures that have not been decoded.
 
 The demuxer does not flush the decoder itself. That would couple the container
 crate to a particular codec instance and higher-level state.
+
+### Low-latency preview seek
+
+Interactive scrubbing often values response time over exact frame selection.
+For that case:
+
+```rust
+let sample_index = cursor.seek_to_keyframe_at_or_after(target)?;
+```
+
+This starts at the following sync sample and therefore requires no earlier
+GOP preroll. The first frame may be later than `target`, by up to the encoder's
+keyframe interval. A player can use this mode while the pointer is moving,
+cancel stale requests, and perform the exact preceding-keyframe seek after
+the interaction settles.
 
 ## 12. Error handling and atomicity
 
@@ -575,7 +593,6 @@ This is a good trade for random-access local files:
 
 Potential future optimizations should be measured before implementation:
 
-- cache a binary-searchable presentation index if seek scans become visible;
 - preserve compact timing runs for extremely long tracks;
 - pool packet buffers if allocation profiles show packet allocation as hot;
 - add a range cache above `MediaInput` for network sources;

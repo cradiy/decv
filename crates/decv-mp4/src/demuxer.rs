@@ -130,6 +130,21 @@ where
         Ok(sample_index)
     }
 
+    /// Repositions to the closest sync sample at or after `target`.
+    ///
+    /// Unlike [`Self::seek_to_keyframe`], this is an approximate forward seek:
+    /// it avoids decoder preroll but may start presentation after `target`.
+    pub fn seek_to_keyframe_at_or_after(
+        &mut self,
+        target: MediaTime,
+    ) -> Result<Option<usize>> {
+        let sample_index = self.track().keyframe_at_or_after(target)?;
+        if let Some(sample_index) = sample_index {
+            self.next_sample_index = sample_index;
+        }
+        Ok(sample_index)
+    }
+
     #[inline]
     pub const fn rewind(&mut self) {
         self.next_sample_index = 0;

@@ -100,6 +100,13 @@ seek, reposition the packet cursor to a preceding keyframe, call `flush`, mark
 the first packet as discontinuous, and discard decoded frames whose PTS is
 before the requested target.
 
+For a low-latency scrub preview, callers may instead use
+`seek_to_keyframe_at_or_after`. That path begins at the next independently
+decodable picture and avoids preroll, but the displayed timestamp can be later
+than the requested target. A typical timeline uses this approximate mode
+while the pointer is moving and performs the preceding-keyframe exact seek
+after the interaction settles.
+
 ## Frame Ownership
 
 `DecodedVideoFrame` is immutable and cheaply cloneable. CPU planes carry an

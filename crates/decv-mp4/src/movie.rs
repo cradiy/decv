@@ -106,6 +106,7 @@ pub struct Track {
     sample_descriptions: Vec<SampleDescription>,
     samples: Vec<Sample>,
     sync_sample_indices: Vec<usize>,
+    sync_sample_indices_by_presentation: Vec<usize>,
     edits: Vec<Edit>,
 }
 
@@ -165,7 +166,11 @@ impl Track {
             .iter()
             .enumerate()
             .filter_map(|(index, sample)| sample.is_sync().then_some(index))
-            .collect();
+            .collect::<Vec<_>>();
+        let mut sync_sample_indices_by_presentation = sync_sample_indices.clone();
+        sync_sample_indices_by_presentation.sort_unstable_by_key(|&index| {
+            (samples[index].presentation_time(), index)
+        });
 
         Ok(Self {
             id,
@@ -179,6 +184,7 @@ impl Track {
             sample_descriptions,
             samples,
             sync_sample_indices,
+            sync_sample_indices_by_presentation,
             edits,
         })
     }
@@ -282,20 +288,94 @@ impl Track {
     /// `target`. The returned index is in decode/sample-table order.
     pub fn keyframe_at_or_before(&self, target: MediaTime) -> Result<Option<usize>> {
         let offset = self.presentation_time_offset()?.value;
-        let mut best: Option<(usize, MediaTime)> = None;
-        for &index in &self.sync_sample_indices {
-            let sample = &self.samples[index];
-            let value = sample
-                .presentation_time()
-                .checked_add(offset)
-                .ok_or(Mp4Error::IntegerOverflow)?;
-            let time = MediaTime::new(value, self.media_timescale);
-            if time <= target && best.is_none_or(|(_, best_time)| time > best_time) {
-                best = Some((index, time));
-            }
+        self.validate_sync_presentation_range(offset)?;
+        let position = self
+            .sync_sample_indices_by_presentation
+            .partition_point(|&index| {
+                adjusted_presentation_time_is_not_after(
+                    self.samples[index].presentation_time(),
+                    offset,
+                    self.media_timescale,
+                    target,
+                )
+            });
+        if position == 0 {
+            return Ok(None);
         }
-        Ok(best.map(|(index, _)| index))
+
+        let candidate = self.sync_sample_indices_by_presentation[position - 1];
+        let presentation_time = self.samples[candidate].presentation_time();
+        let first_equal = self.sync_sample_indices_by_presentation[..position]
+            .partition_point(|&index| self.samples[index].presentation_time() < presentation_time);
+        Ok(Some(
+            self.sync_sample_indices_by_presentation[first_equal],
+        ))
     }
+
+    /// Finds the sync sample with the least presentation time not before
+    /// `target`. This is useful for low-latency seek previews that may jump
+    /// forward to the next independently decodable picture.
+    pub fn keyframe_at_or_after(&self, target: MediaTime) -> Result<Option<usize>> {
+        let offset = self.presentation_time_offset()?.value;
+        self.validate_sync_presentation_range(offset)?;
+        let position = self
+            .sync_sample_indices_by_presentation
+            .partition_point(|&index| {
+                adjusted_presentation_time_is_before(
+                    self.samples[index].presentation_time(),
+                    offset,
+                    self.media_timescale,
+                    target,
+                )
+            });
+        Ok(self
+            .sync_sample_indices_by_presentation
+            .get(position)
+            .copied())
+    }
+
+    fn validate_sync_presentation_range(&self, offset: i64) -> Result<()> {
+        let Some((&first, &last)) = self
+            .sync_sample_indices_by_presentation
+            .first()
+            .zip(self.sync_sample_indices_by_presentation.last())
+        else {
+            return Ok(());
+        };
+        self.samples[first]
+            .presentation_time()
+            .checked_add(offset)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        self.samples[last]
+            .presentation_time()
+            .checked_add(offset)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        Ok(())
+    }
+}
+
+#[inline]
+fn adjusted_presentation_time_is_before(
+    presentation_time: i64,
+    offset: i64,
+    timescale: NonZeroU32,
+    target: MediaTime,
+) -> bool {
+    let adjusted = i128::from(presentation_time) + i128::from(offset);
+    adjusted * i128::from(target.timescale.get())
+        < i128::from(target.value) * i128::from(timescale.get())
+}
+
+#[inline]
+fn adjusted_presentation_time_is_not_after(
+    presentation_time: i64,
+    offset: i64,
+    timescale: NonZeroU32,
+    target: MediaTime,
+) -> bool {
+    let adjusted = i128::from(presentation_time) + i128::from(offset);
+    adjusted * i128::from(target.timescale.get())
+        <= i128::from(target.value) * i128::from(timescale.get())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -732,6 +812,30 @@ mod tests {
                 .unwrap(),
             Some(2)
         );
+        assert_eq!(
+            track
+                .keyframe_at_or_after(MediaTime::from_parts(-9_001, 90_000).unwrap())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            track
+                .keyframe_at_or_after(MediaTime::from_parts(-5_000, 90_000).unwrap())
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            track
+                .keyframe_at_or_after(MediaTime::from_parts(-1, 30).unwrap())
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            track
+                .keyframe_at_or_after(MediaTime::from_parts(0, 1).unwrap())
+                .unwrap(),
+            None
+        );
 
         let SampleDescription::Avc(entry) = &track.sample_descriptions()[0] else {
             panic!("expected AVC sample entry");
@@ -830,6 +934,15 @@ mod tests {
         assert_eq!(
             cursor
                 .seek_to_keyframe(MediaTime::from_parts(-3_000, 90_000).unwrap())
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(cursor.next_sample_index(), 2);
+        assert_eq!(
+            cursor
+                .seek_to_keyframe_at_or_after(
+                    MediaTime::from_parts(-8_999, 90_000).unwrap()
+                )
                 .unwrap(),
             Some(2)
         );

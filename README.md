@@ -66,8 +66,9 @@ untrusted input must not panic or silently produce a known-wrong frame.
 
 `decv-mp4` currently handles ordinary non-fragmented MP4 sample tables,
 including track enumeration, AVC sample descriptions, DTS/PTS/duration,
-sync-sample indexes, simple linear edit lists, packet cursors, and seeking to
-the nearest preceding keyframe. Fragmented MP4, audio decoding, and encrypted
+binary-searchable sync-sample indexes, simple linear edit lists, packet
+cursors, exact-seek preroll from a preceding keyframe, and low-latency preview
+seeks to a following keyframe. Fragmented MP4, audio decoding, and encrypted
 media are not yet implemented.
 
 ## Decoder Contract
