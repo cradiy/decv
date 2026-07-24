@@ -858,6 +858,15 @@ about 3.31%, instructions about 2.66%, and branches about 7.13%. An exhaustive
 rectangle oracle covers every supported fixed width and row count at
 unaligned source and destination addresses.
 
+Keeping four independent source and destination pointer induction variables
+across those rectangle-copy iterations was tested as a follow-up. It shrank
+the native `predict_inter_420_into` symbol by 307 bytes and reduced
+whole-decoder instructions about 0.15% and branches about 0.31%. Seven pinned
+CABAC Serial pairs nevertheless increased average reference cycles about
+0.27%, increased branch misses, and improved only three pairs. The extra live
+pointers harmed the surrounding register allocation enough to outweigh the
+smaller loop, so this variant was fully reverted.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
