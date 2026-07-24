@@ -1307,6 +1307,17 @@ about 1.55%. After PGO, the corresponding reductions were about 0.75%, 0.27%,
 0.93%, 1.76%, and 2.04%. The full workspace suite, strict Clippy, and exact
 4K hash passed.
 
+CABAC coefficient decoding previously initialized its fixed 64-coefficient
+array and then cleared it again inside a generic helper. Removing the second
+clear outright made nine native 4K pairs about 3.35% faster, but a retrained
+PGO build was about 0.55% slower because PGO had already eliminated almost all
+of the redundant work and the source change perturbed layout. That version was
+reverted. Keeping the initialization contract and forcing the helper inline
+gave the portable build a smaller 0.43% mean wall-time gain. Nine PGO pairs
+reduced mean wall time about 0.20%, task-clock about 0.39%, reference cycles
+about 0.78%, and sampled cache misses about 0.84%. The one-line inline hint was
+retained; the observable double-clear removal was not.
+
 Large CABAC non-reference pictures now complete through a bounded cross-frame
 pipeline when a reconstruction pool is active. Picture completeness and the
 discarded reference-motion field are validated synchronously. Deblocking and

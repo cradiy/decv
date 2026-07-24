@@ -289,6 +289,7 @@ fn decode_coefficient_levels_with(
     Ok(output)
 }
 
+#[inline(always)]
 fn decode_coefficient_levels_into_with(
     category: CabacResidualCategory,
     significance_map: CabacSignificanceMap,
