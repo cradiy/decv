@@ -194,8 +194,7 @@ impl BMotionState {
             macroblock_partition_index: 0,
         };
         let neighbour_cells = self.full_macroblock_neighbour_cells(macroblock_address, slice_id);
-        let neighbours_l0 = neighbour_motions(neighbour_cells, false);
-        let neighbours_l1 = neighbour_motions(neighbour_cells, true);
+        let (neighbours_l0, neighbours_l1) = neighbour_motion_lists(neighbour_cells);
         let mut reference_l0 = spatial_direct_reference_index_from(neighbours_l0);
         let mut reference_l1 = spatial_direct_reference_index_from(neighbours_l1);
         if reference_l0.is_none() && reference_l1.is_none() {
@@ -802,26 +801,36 @@ impl BMotionState {
     }
 }
 
-fn neighbour_motions(cells: [Option<MotionCell>; 4], list1: bool) -> [NeighbourMotion; 4] {
-    [
-        neighbour_motion(cells[0], list1),
-        neighbour_motion(cells[1], list1),
-        neighbour_motion(cells[2], list1),
-        neighbour_motion(cells[3], list1),
-    ]
+fn neighbour_motion_lists(
+    [a, b, c, d]: [Option<MotionCell>; 4],
+) -> ([NeighbourMotion; 4], [NeighbourMotion; 4]) {
+    let (a0, a1) = neighbour_motion_pair(a);
+    let (b0, b1) = neighbour_motion_pair(b);
+    let (c0, c1) = neighbour_motion_pair(c);
+    let (d0, d1) = neighbour_motion_pair(d);
+    ([a0, b0, c0, d0], [a1, b1, c1, d1])
 }
 
 #[inline(always)]
-fn neighbour_motion(cell: Option<MotionCell>, list1: bool) -> NeighbourMotion {
+fn neighbour_motion_pair(cell: Option<MotionCell>) -> (NeighbourMotion, NeighbourMotion) {
     let Some(cell) = cell else {
-        return NeighbourMotion::UNAVAILABLE;
+        return (NeighbourMotion::UNAVAILABLE, NeighbourMotion::UNAVAILABLE);
     };
-    let motion = if list1 { cell.list1 } else { cell.list0 };
-    NeighbourMotion {
+    let list0 = NeighbourMotion {
         available: true,
-        reference_index: motion.map_or(-1, |motion| motion.reference_index as i8),
-        vector: motion.map_or_else(MotionVector::default, |motion| motion.motion_vector),
-    }
+        reference_index: cell.list0.map_or(-1, |motion| motion.reference_index as i8),
+        vector: cell
+            .list0
+            .map_or_else(MotionVector::default, |motion| motion.motion_vector),
+    };
+    let list1 = NeighbourMotion {
+        available: true,
+        reference_index: cell.list1.map_or(-1, |motion| motion.reference_index as i8),
+        vector: cell
+            .list1
+            .map_or_else(MotionVector::default, |motion| motion.motion_vector),
+    };
+    (list0, list1)
 }
 
 fn spatial_direct_reference_index_from([a, b, mut c, d]: [NeighbourMotion; 4]) -> Option<u8> {

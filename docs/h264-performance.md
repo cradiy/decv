@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.58 s | 1.50 s | 80,324 KiB | 113.9 FPS |
-| decv Auto (2 workers) | NV12 | 1.68 s | 1.77 s | 79,864 KiB | 107.1 FPS |
-| FFmpeg 1 thread | NV12 | 0.61 s | 0.69 s | 152,300 KiB | 295.1 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.42 s | 287,168 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.56 s | 0.55 s | 95,864 KiB | 321.4 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.95 s | 192,212 KiB | 782.6 FPS |
+| decv Serial | NV12 | 1.56 s | 1.48 s | 80,492 KiB | 115.4 FPS |
+| decv Auto (2 workers) | NV12 | 1.73 s | 1.82 s | 79,772 KiB | 104.0 FPS |
+| FFmpeg 1 thread | NV12 | 0.61 s | 0.69 s | 152,128 KiB | 295.1 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 286,788 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,772 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 0.97 s | 192,168 KiB | 782.6 FPS |
 
 On this workload:
 
 - decv Serial takes about **2.6x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **6.2x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **6.7x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **1.25x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.27x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
   **28%** of FFmpeg Auto NV12 peak RSS;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 89.9% throughput headroom over that
-line, and the measured two-worker Auto result has about 78.6%. The ordering
+seconds. The current Serial result has about 92.3% throughput headroom over that
+line, and the measured two-worker Auto result has about 73.4%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -729,6 +729,18 @@ reference cycles about 3.09%, instructions about 4.18%, and branches about
 5.60%, again with all five pairs improving. Edge-focused tests compare the
 newly eligible single-axis fast paths against clipped scalar interpolation,
 and the complete stream corpus remains byte-exact.
+
+Spatial Direct B-motion derivation now normalizes each of the four neighbouring
+motion cells into List0 and List1 forms in one pass. The previous code unpacked
+the same `Option<MotionCell>` array twice, duplicating availability and list
+selection work in an already large routine. The fused implementation reduced
+the native `resolve_spatial_direct_macroblock` symbol from 7,297 to 6,843
+bytes. Seven alternating CABAC Serial runs reduced instructions about 0.17%,
+branches about 0.43%, and median reference cycles about 0.50%, with five of
+seven cycle pairs improving. Five `Auto` runs reduced median reference cycles
+about 0.31%, with three pairs improving. Five CAVLC Serial runs reduced median
+reference cycles about 1.09%, with four pairs improving. The complete real
+stream corpus remains byte-exact.
 
 ## BitReader Checkpoint
 
