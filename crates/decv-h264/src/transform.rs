@@ -521,9 +521,21 @@ impl PreparedInverseScale4x4 {
         scan_mode: ScanMode,
         preserve_dc: bool,
     ) -> Result<Block4x4> {
+        let mut residual = [[0; 4]; 4];
+        self.reconstruct_into(values, scan_mode, preserve_dc, &mut residual)?;
+        Ok(residual)
+    }
+
+    pub(crate) fn reconstruct_into(
+        &self,
+        values: &[i32; 16],
+        scan_mode: ScanMode,
+        preserve_dc: bool,
+        residual: &mut Block4x4,
+    ) -> Result<()> {
         let coefficients = inverse_scan_4x4(values, scan_mode);
         let scaled = self.scale(&coefficients, preserve_dc)?;
-        inverse_transform_4x4(&scaled)
+        inverse_transform_4x4_into(&scaled, residual)
     }
 
     fn scale(&self, coefficients: &Block4x4, preserve_dc: bool) -> Result<Block4x4> {
@@ -614,6 +626,12 @@ fn norm_adjust_8x8_index(row: usize, column: usize) -> usize {
 
 /// Applies the normative separable H.264 4x4 inverse integer transform.
 pub fn inverse_transform_4x4(scaled: &Block4x4) -> Result<Block4x4> {
+    let mut residual = [[0; 4]; 4];
+    inverse_transform_4x4_into(scaled, &mut residual)?;
+    Ok(residual)
+}
+
+fn inverse_transform_4x4_into(scaled: &Block4x4, residual: &mut Block4x4) -> Result<()> {
     let mut horizontal = [[0i64; 4]; 4];
     for row in 0..4 {
         horizontal[row] = inverse_transform_1d([
@@ -624,7 +642,6 @@ pub fn inverse_transform_4x4(scaled: &Block4x4) -> Result<Block4x4> {
         ]);
     }
 
-    let mut residual = [[0; 4]; 4];
     for column in 0..4 {
         let transformed = inverse_transform_1d([
             horizontal[0][column],
@@ -637,7 +654,7 @@ pub fn inverse_transform_4x4(scaled: &Block4x4) -> Result<Block4x4> {
             residual[row][column] = i32::try_from(value).map_err(|_| H264Error::IntegerOverflow)?;
         }
     }
-    Ok(residual)
+    Ok(())
 }
 
 /// Applies the normative separable H.264 8x8 inverse integer transform.

@@ -85,7 +85,12 @@ pub fn reconstruct_intra_residual(
                 let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
                 let coefficients =
                     merge_dc_and_ac(transformed_dc[block_y][block_x], &block.coefficients);
-                luma[index] = prepared_scale.reconstruct(&coefficients, scan_mode, true)?;
+                prepared_scale.reconstruct_into(
+                    &coefficients,
+                    scan_mode,
+                    true,
+                    &mut luma[index],
+                )?;
             }
             ReconstructedLumaResidual::FourByFour(Box::new(luma))
         }
@@ -99,7 +104,7 @@ pub fn reconstruct_intra_residual(
             }
             for (output, block) in luma.iter_mut().zip(&residual.luma) {
                 ensure_block_size(block.max_num_coeff, 16)?;
-                *output = prepared_scale.reconstruct(&block.coefficients, scan_mode, false)?;
+                prepared_scale.reconstruct_into(&block.coefficients, scan_mode, false, output)?;
             }
             ReconstructedLumaResidual::FourByFour(Box::new(luma))
         }
@@ -233,7 +238,7 @@ fn reconstruct_inter_residual_with_transform_size(
         let prepared_scale = PreparedInverseScale4x4::new(quantizer.luma, scaling)?;
         for (output, block) in luma.iter_mut().zip(&residual.luma) {
             ensure_block_size(block.max_num_coeff, 16)?;
-            *output = prepared_scale.reconstruct(&block.coefficients, scan_mode, false)?;
+            prepared_scale.reconstruct_into(&block.coefficients, scan_mode, false, output)?;
         }
         ReconstructedLumaResidual::FourByFour(Box::new(luma))
     };
@@ -276,7 +281,7 @@ fn reconstruct_chroma(
         ensure_block_size(block.max_num_coeff, 15)?;
         let (block_x, block_y) = CHROMA_BLOCK_COORDINATES[index];
         let coefficients = merge_dc_and_ac(transformed_dc[block_y][block_x], &block.coefficients);
-        output[index] = prepared_scale.reconstruct(&coefficients, scan_mode, true)?;
+        prepared_scale.reconstruct_into(&coefficients, scan_mode, true, &mut output[index])?;
     }
     Ok(output)
 }
