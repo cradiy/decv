@@ -253,8 +253,8 @@ fn decode_mp4(
             .decoder_config()?
             .ok_or("seek selected no MP4 decoder configuration")?,
     )?;
-    if seek_target.is_some() {
-        decoder.flush();
+    if let Some(target) = seek_target {
+        decoder.flush_for_seek(target);
     }
 
     let mut first_packet = true;

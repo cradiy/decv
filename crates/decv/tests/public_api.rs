@@ -37,6 +37,7 @@ fn facade_exposes_the_complete_decoder_contract() {
         .set_parallelism(H264Parallelism::Threads(NonZeroUsize::new(1).unwrap()))
         .unwrap();
     accepts_consumer_decoder(&mut decoder);
+    decoder.flush_for_seek(MediaTime::from_parts(0, 1).unwrap());
 }
 
 #[test]

@@ -50,7 +50,7 @@ struct PendingPicture {
 #[derive(Debug)]
 struct PendingNonReferenceFinalization {
     picture_order_count: i32,
-    receiver: Receiver<Result<DecodedVideoFrame>>,
+    receiver: Receiver<Result<Option<DecodedVideoFrame>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,9 +76,10 @@ pub struct H264Decoder {
     current_picture: Option<PendingPicture>,
     dpb: Option<DecodedPictureBuffer>,
     dpb_configuration: Option<DpbConfiguration>,
-    reorder: PictureReorderBuffer<DecodedVideoFrame>,
+    reorder: PictureReorderBuffer<Option<DecodedVideoFrame>>,
     outputs: VecDeque<DecodeOutput>,
     announced_format: Option<VideoFormat>,
+    output_start_time: Option<MediaTime>,
     next_frame_id: u64,
     draining: bool,
     parallelism: H264Parallelism,
@@ -100,6 +101,7 @@ impl Default for H264Decoder {
             reorder: PictureReorderBuffer::new(0),
             outputs: VecDeque::new(),
             announced_format: None,
+            output_start_time: None,
             next_frame_id: 0,
             draining: false,
             parallelism: H264Parallelism::Auto,
@@ -145,6 +147,18 @@ impl H264Decoder {
 
     pub fn parallelism(&self) -> H264Parallelism {
         self.parallelism
+    }
+
+    /// Clears the old decode timeline and suppresses frame materialization
+    /// before `target`.
+    ///
+    /// Reference pictures are still reconstructed normally because later
+    /// pictures can depend on them. Pictures before `target` retain their
+    /// place in output reordering, but do not allocate an NV12 chroma plane or
+    /// produce output events. This is intended for exact MP4 seek preroll.
+    pub fn flush_for_seek(&mut self, target: MediaTime) {
+        self.flush_timeline();
+        self.output_start_time = Some(target);
     }
 
     fn process_packet(&mut self, packet: &EncodedVideoPacket) -> Result<()> {
@@ -464,7 +478,10 @@ impl H264Decoder {
             .into_deblocked_picture_with_optional_reference_motion()?;
         self.reusable_workspace = Some(reusable_workspace);
         let decoded = Arc::new(decoded);
-        let frame = decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format)?;
+        let frame = self
+            .should_materialize_output(picture.pts)
+            .then(|| decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format))
+            .transpose()?;
         if picture.nal_header.nal_ref_idc != 0 {
             let motion = Arc::new(motion.ok_or(H264Error::InvalidSyntax(
                 "reference picture has no retained motion field",
@@ -505,7 +522,7 @@ impl H264Decoder {
             }
         }
         let picture_order_count = picture.picture_order_count.stored.picture_order_count();
-        if let Some(frame) = self.reorder.push(picture_order_count, frame)? {
+        if let Some(frame) = self.reorder.push(picture_order_count, frame)?.flatten() {
             self.queue_output_frame(frame)?;
         }
         Ok(())
@@ -533,6 +550,7 @@ impl H264Decoder {
         } = picture;
         let (finalization, reusable_workspace) = reconstructor.into_non_reference_finalization()?;
         let picture_order_count = picture_order_count.stored.picture_order_count();
+        let materialize_output = self.should_materialize_output(pts);
         let (sender, receiver) = mpsc::sync_channel(1);
         self.reconstruction_executor
             .as_ref()
@@ -540,7 +558,9 @@ impl H264Decoder {
             .expect("the asynchronous path requires a reconstruction pool")
             .spawn(move || {
                 let frame = finalization.finish().and_then(|picture_data| {
-                    picture_data.into_nv12_frame(0, pts, duration, format)
+                    materialize_output
+                        .then(|| picture_data.into_nv12_frame(0, pts, duration, format))
+                        .transpose()
                 });
                 let _ = sender.send(frame);
             });
@@ -583,7 +603,11 @@ impl H264Decoder {
             .pop_front()
             .expect("the pending finalization was inspected above");
         let frame = frame?;
-        if let Some(frame) = self.reorder.push(pending.picture_order_count, frame)? {
+        if let Some(frame) = self
+            .reorder
+            .push(pending.picture_order_count, frame)?
+            .flatten()
+        {
             self.queue_output_frame(frame)?;
         }
         Ok(true)
@@ -635,7 +659,7 @@ impl H264Decoder {
     fn drain_reorder(&mut self) -> Result<()> {
         self.finish_pending_non_reference_finalizations(true)?;
         let frames = self.reorder.drain();
-        for frame in frames {
+        for frame in frames.into_iter().flatten() {
             self.queue_output_frame(frame)?;
         }
         Ok(())
@@ -649,6 +673,7 @@ impl H264Decoder {
         self.outputs.clear();
         self.reorder.clear();
         self.announced_format = None;
+        self.output_start_time = None;
         self.next_frame_id = 0;
         self.draining = false;
     }
@@ -661,6 +686,13 @@ impl H264Decoder {
         self.outputs.clear();
         self.reorder.clear();
         self.draining = false;
+    }
+
+    #[inline]
+    fn should_materialize_output(&self, pts: Option<MediaTime>) -> bool {
+        self.output_start_time
+            .zip(pts)
+            .is_none_or(|(start, pts)| pts >= start)
     }
 
     fn ensure_dpb(&mut self, parsed: &ParsedSliceHeader, nal_header: NalHeader) -> Result<()> {
@@ -781,6 +813,7 @@ impl VideoDecoder for H264Decoder {
 
     fn flush(&mut self) {
         self.flush_timeline();
+        self.output_start_time = None;
     }
 
     fn drain(&mut self) -> Result<()> {
@@ -1601,6 +1634,72 @@ mod tests {
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::EndOfStream
+        ));
+    }
+
+    #[test]
+    fn seek_preroll_preserves_references_without_materializing_early_frames() {
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        let target = MediaTime::from_parts(1, 1).unwrap();
+        decoder.flush_for_seek(target);
+
+        let mut preroll = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        preroll.pts = MediaTime::from_parts(0, 1);
+        preroll.discontinuity = true;
+        assert!(matches!(
+            decoder.send_packet(preroll).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::NeedInput
+        ));
+
+        let mut selected = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x41, single_macroblock_p_skip_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        selected.pts = MediaTime::from_parts(2, 1);
+        assert!(matches!(
+            decoder.send_packet(selected).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame)
+                if frame.id == 1 && frame.pts == MediaTime::from_parts(2, 1)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+
+        decoder.flush();
+        let mut unfiltered = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        unfiltered.pts = MediaTime::from_parts(0, 1);
+        assert!(matches!(
+            decoder.send_packet(unfiltered).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame)
+                if frame.id == 2 && frame.pts == MediaTime::from_parts(0, 1)
         ));
     }
 

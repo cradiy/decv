@@ -509,7 +509,7 @@ following keyframe lookup are `O(log keyframe_count)` even for long media.
 Accurate seeking is completed by:
 
 ```text
-1. flush the decoder;
+1. flush the decoder for the requested output start time;
 2. start feeding packets from the selected sync sample;
 3. decode reference and reordered pictures normally;
 4. discard output frames whose PTS is before the exact target;
@@ -519,6 +519,12 @@ Accurate seeking is completed by:
 
 Starting directly at an arbitrary non-keyframe packet is not accurate seek.
 That packet may depend on reference pictures that have not been decoded.
+
+`H264Decoder::flush_for_seek(target)` implements the first and fourth steps
+inside the decoder. Pre-target pictures still participate in reconstruction,
+the DPB, deblocking, and output reordering, but they are represented by
+lightweight reorder markers instead of materialized NV12 frames. The CLI uses
+this path and retains its PTS filter as a defensive check.
 
 The demuxer does not flush the decoder itself. That would couple the container
 crate to a particular codec instance and higher-level state.

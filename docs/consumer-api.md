@@ -100,6 +100,12 @@ seek, reposition the packet cursor to a preceding keyframe, call `flush`, mark
 the first packet as discontinuous, and discard decoded frames whose PTS is
 before the requested target.
 
+When using `H264Decoder` directly, prefer `flush_for_seek(target)` over plain
+`flush` for exact seek preroll. It still reconstructs reference pictures and
+maintains display reordering, but suppresses pre-target output materialization.
+This avoids allocating and interleaving NV12 output that the caller would
+immediately discard. The ordinary trait-level `flush` clears this filter.
+
 For a low-latency scrub preview, callers may instead use
 `seek_to_keyframe_at_or_after`. That path begins at the next independently
 decodable picture and avoids preroll, but the displayed timestamp can be later

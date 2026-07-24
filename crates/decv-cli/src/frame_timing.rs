@@ -1,7 +1,8 @@
 use std::time::{Duration, Instant};
 
 use decv_core::{
-    DecodeInputStatus, DecodeOutput, EncodedVideoPacket, VideoDecoder, VideoDecoderConfig,
+    DecodeInputStatus, DecodeOutput, EncodedVideoPacket, MediaTime, VideoDecoder,
+    VideoDecoderConfig,
 };
 use decv_h264::{H264Decoder, H264Error, H264Parallelism};
 
@@ -138,11 +139,11 @@ impl CliDecoder {
         Ok(output)
     }
 
-    pub(crate) fn flush(&mut self) {
+    pub(crate) fn flush_for_seek(&mut self, target: MediaTime) {
         if let Some(timing) = self.timing.as_mut() {
-            timing.measure(|| self.decoder.flush());
+            timing.measure(|| self.decoder.flush_for_seek(target));
         } else {
-            self.decoder.flush();
+            self.decoder.flush_for_seek(target);
         }
     }
 

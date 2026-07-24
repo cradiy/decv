@@ -1728,6 +1728,25 @@ Seeking made the fault easier to observe by reconstructing many boundary
 macroblocks quickly, but decoder parallelism and timeline state were not the
 root cause.
 
+## Exact Seek Preroll Output Suppression
+
+An exact seek must reconstruct every dependency from the preceding sync
+sample, but frames before the requested timestamp do not need consumer-facing
+NV12 storage. `H264Decoder::flush_for_seek` retains a lightweight marker for
+each suppressed picture in the presentation reorder buffer. Reference
+pictures still enter the DPB, and non-reference pictures still finish
+deblocking, so the first selected frame remains byte-exact.
+
+On the 30-second 1920x1080, 120 fps test stream, seeking to 29.90 seconds
+requires roughly 228 frames of preroll from the 28-second keyframe. Ten
+alternating native release pairs reduced median end-to-end CLI time from
+1.315 seconds to 1.230 seconds (about 6.5%) and median user CPU time from
+1.510 seconds to 1.445 seconds (about 4.3%). First-frame-only measurements
+were noisier but usually saved 35-50 ms. This does not remove the dominant
+reconstruction cost of a long GOP; approximate following-keyframe preview,
+request cancellation, or a shorter source keyframe interval is still required
+for consistently immediate interactive scrubbing.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
