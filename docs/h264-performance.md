@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.60 s | 1.51 s | 80,320 KiB | 112.5 FPS |
-| decv Auto (2 workers) | NV12 | 1.73 s | 1.83 s | 79,892 KiB | 104.0 FPS |
-| FFmpeg 1 thread | NV12 | 0.61 s | 0.68 s | 152,224 KiB | 295.1 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.40 s | 290,316 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.57 s | 0.56 s | 95,544 KiB | 315.8 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.94 s | 192,172 KiB | 818.2 FPS |
+| decv Serial | NV12 | 1.58 s | 1.50 s | 80,324 KiB | 113.9 FPS |
+| decv Auto (2 workers) | NV12 | 1.68 s | 1.77 s | 79,864 KiB | 107.1 FPS |
+| FFmpeg 1 thread | NV12 | 0.61 s | 0.69 s | 152,300 KiB | 295.1 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.42 s | 287,168 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.56 s | 0.55 s | 95,864 KiB | 321.4 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 0.95 s | 192,212 KiB | 782.6 FPS |
 
 On this workload:
 
 - decv Serial takes about **2.6x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **6.7x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **6.2x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **1.3x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.25x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
   **28%** of FFmpeg Auto NV12 peak RSS;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 87.5% throughput headroom over that
-line, and the measured two-worker Auto result has about 73.3%. The ordering
+seconds. The current Serial result has about 89.9% throughput headroom over that
+line, and the measured two-worker Auto result has about 78.6%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -713,6 +713,22 @@ samples slower, with its median about 0.81% higher. Outlining the complete
 and whole-decoder instructions about 0.37%, but the added block-level call made
 all five Serial samples slower and increased median reference cycles about
 1.4%. Both variants were fully reverted.
+
+Inter-prediction fast-path eligibility now tracks horizontal and vertical
+filter margins independently. Previously, a horizontal-only filter near the
+top or bottom edge unnecessarily selected the clipped scalar path, a
+vertical-only filter did the same near the left or right edge, and integer
+motion required six-tap margins that it never read. Temporary counters on the
+300-frame CABAC stream found 3.77% of luma and 2.14% of chroma predictions
+using the clipped path before this change. Seven alternating native CABAC
+Serial runs reduced median reference cycles about 2.37%, task-clock about
+2.29%, instructions about 3.77%, and branches about 5.20%; all seven paired
+cycle samples improved. Five `Auto` runs reduced median reference cycles about
+3.35%, with all five pairs improving. Five CAVLC Serial runs reduced median
+reference cycles about 3.09%, instructions about 4.18%, and branches about
+5.60%, again with all five pairs improving. Edge-focused tests compare the
+newly eligible single-axis fast paths against clipped scalar interpolation,
+and the complete stream corpus remains byte-exact.
 
 ## BitReader Checkpoint
 

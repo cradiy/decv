@@ -89,8 +89,10 @@ impl Yuv420Picture {
             usize::from(partition.height),
             picture_width,
             picture_height,
-            2,
-            3,
+            if fractional_motion_x == 0 { 0 } else { 2 },
+            if fractional_motion_x == 0 { 0 } else { 3 },
+            if fractional_motion_y == 0 { 0 } else { 2 },
+            if fractional_motion_y == 0 { 0 } else { 3 },
         );
         if luma_is_interior {
             predict_luma::<false>(
@@ -134,7 +136,9 @@ impl Yuv420Picture {
             chroma_width,
             chroma_height,
             0,
-            1,
+            u8::from(fractional_chroma_x != 0),
+            0,
+            u8::from(fractional_chroma_y != 0),
         );
         if chroma_is_interior {
             predict_chroma::<false>(
@@ -203,8 +207,10 @@ fn interpolation_window_is_inside(
     height: usize,
     plane_width: usize,
     plane_height: usize,
-    margin_before: i32,
-    margin_after: i32,
+    margin_left: u8,
+    margin_right: u8,
+    margin_top: u8,
+    margin_bottom: u8,
 ) -> bool {
     let Ok(width) = i32::try_from(width) else {
         return false;
@@ -218,11 +224,15 @@ fn interpolation_window_is_inside(
     let Ok(plane_height) = i32::try_from(plane_height) else {
         return false;
     };
-    x >= margin_before
-        && y >= margin_before
-        && x.checked_add(width - 1 + margin_after)
+    let margin_left = i32::from(margin_left);
+    let margin_right = i32::from(margin_right);
+    let margin_top = i32::from(margin_top);
+    let margin_bottom = i32::from(margin_bottom);
+    x >= margin_left
+        && y >= margin_top
+        && x.checked_add(width - 1 + margin_right)
             .is_some_and(|right| right < plane_width)
-        && y.checked_add(height - 1 + margin_after)
+        && y.checked_add(height - 1 + margin_bottom)
             .is_some_and(|bottom| bottom < plane_height)
 }
 
@@ -1831,6 +1841,115 @@ mod tests {
         assert_eq!(prediction.luma[0][0], 20);
         assert_eq!(prediction.cb[0][0], 10);
         assert_eq!(prediction.cr[0][0], 11);
+    }
+
+    #[test]
+    fn single_axis_filters_remain_fast_at_the_other_picture_edge() {
+        let picture = gradient_picture();
+        let (luma, cb, cr) = picture.planes();
+        for partition in [
+            ResolvedPPartition {
+                x: 4,
+                y: 0,
+                width: 8,
+                height: 4,
+                reference_index: 0,
+                motion_vector: MotionVector { x: 1, y: 0 },
+            },
+            ResolvedPPartition {
+                x: 0,
+                y: 4,
+                width: 8,
+                height: 8,
+                reference_index: 0,
+                motion_vector: MotionVector { x: 0, y: 1 },
+            },
+        ] {
+            let prediction = picture.predict_inter_420(0, 0, partition).unwrap();
+            let current_x = i32::from(partition.x);
+            let current_y = i32::from(partition.y);
+            let reference_luma_x = current_x + i32::from(partition.motion_vector.x).div_euclid(4);
+            let reference_luma_y = current_y + i32::from(partition.motion_vector.y).div_euclid(4);
+            let luma_fraction_x = i32::from(partition.motion_vector.x).rem_euclid(4) as u8;
+            let luma_fraction_y = i32::from(partition.motion_vector.y).rem_euclid(4) as u8;
+            assert!(interpolation_window_is_inside(
+                reference_luma_x,
+                reference_luma_y,
+                usize::from(partition.width),
+                usize::from(partition.height),
+                16,
+                16,
+                if luma_fraction_x == 0 { 0 } else { 2 },
+                if luma_fraction_x == 0 { 0 } else { 3 },
+                if luma_fraction_y == 0 { 0 } else { 2 },
+                if luma_fraction_y == 0 { 0 } else { 3 },
+            ));
+            for y in 0..usize::from(partition.height) {
+                for x in 0..usize::from(partition.width) {
+                    assert_eq!(
+                        prediction.luma[y][x],
+                        interpolate_luma_inner::<true>(
+                            luma,
+                            16,
+                            16,
+                            reference_luma_x + x as i32,
+                            reference_luma_y + y as i32,
+                            luma_fraction_x,
+                            luma_fraction_y,
+                        )
+                    );
+                }
+            }
+
+            let reference_chroma_x =
+                current_x / 2 + i32::from(partition.motion_vector.x).div_euclid(8);
+            let reference_chroma_y =
+                current_y / 2 + i32::from(partition.motion_vector.y).div_euclid(8);
+            let chroma_fraction_x = i32::from(partition.motion_vector.x).rem_euclid(8) as u8;
+            let chroma_fraction_y = i32::from(partition.motion_vector.y).rem_euclid(8) as u8;
+            assert!(interpolation_window_is_inside(
+                reference_chroma_x,
+                reference_chroma_y,
+                usize::from(partition.width / 2),
+                usize::from(partition.height / 2),
+                8,
+                8,
+                0,
+                u8::from(chroma_fraction_x != 0),
+                0,
+                u8::from(chroma_fraction_y != 0),
+            ));
+            for y in 0..usize::from(partition.height / 2) {
+                for x in 0..usize::from(partition.width / 2) {
+                    let sample_x = reference_chroma_x + x as i32;
+                    let sample_y = reference_chroma_y + y as i32;
+                    assert_eq!(
+                        prediction.cb[y][x],
+                        interpolate_chroma_inner::<true>(
+                            cb,
+                            8,
+                            8,
+                            sample_x,
+                            sample_y,
+                            chroma_fraction_x,
+                            chroma_fraction_y,
+                        )
+                    );
+                    assert_eq!(
+                        prediction.cr[y][x],
+                        interpolate_chroma_inner::<true>(
+                            cr,
+                            8,
+                            8,
+                            sample_x,
+                            sample_y,
+                            chroma_fraction_x,
+                            chroma_fraction_y,
+                        )
+                    );
+                }
+            }
+        }
     }
 
     #[test]
