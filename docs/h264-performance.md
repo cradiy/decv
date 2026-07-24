@@ -1318,6 +1318,33 @@ moving from 34.27 to 36.14 FPS. The PGO four-worker output retained the exact
 597,196,800-byte FFmpeg hash. On this CPU the best measured software result is
 therefore approximately 4K40, still roughly three times short of 4K120.
 
+Sampling that PGO four-worker build showed the next scheduling limit clearly:
+the caller accounted for 64.14% of sampled cycles, while the four reconstruction
+workers accounted for 9.71%, 9.59%, 8.79%, and 7.77%. CABAC B-slice syntax and
+residual decoding alone occupied about 23% of the combined sample. Merely adding
+workers cannot consume that serial share.
+
+Large CABAC B pictures now overlap those two phases within a picture. One
+eight-macroblock-row pixel batch may reconstruct on the existing worker pool
+while the caller parses, transforms residuals, and resolves motion for the next
+batch. Only owned motion and residual jobs cross the scope. Completed pixels
+return through a bounded one-batch channel and still commit in macroblock
+address order. An intra macroblock and the end of the slice are strict barriers,
+so prediction availability and error ordering retain the synchronous rules.
+Serial mode and pictures below eight million coded pixels keep the former
+path.
+
+The resolution gate is important. Enabling the overlap on the 1080p two-worker
+stream reduced throughput by about 4.0% because scheduling cost exceeded the
+saved idle time; disabling it below the 4K class removes that regression. After
+retraining PGO, nine alternating pinned 4K four-worker pairs had a median wall
+time improvement of about 1.95%. Mean throughput moved from 39.06 to 39.77 FPS;
+seven of nine pairs improved. Mean task-clock, reference cycles, and
+instructions increased about 2.89%, 1.66%, and 1.85%, respectively, reflecting
+intentional overlap and contention, while wall latency still fell about 1.80%.
+The full 378-test workspace suite, strict all-target Clippy, and the
+597,196,800-byte FFmpeg hash passed.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
@@ -1377,11 +1404,15 @@ The wall-time gap is not explained by thread count alone. Single-threaded
 FFmpeg is already about 2.9x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
 parallelizes owned CABAC P- and B-macroblock pixel reconstruction. CABAC
-parsing, residual reconstruction, output packaging, and deblocking remain
-serial.
+parsing and residual reconstruction remain ordered on the caller. Non-reference
+deblocking and output packaging can overlap a later picture, but reference
+pictures still impose their synchronous completion barrier.
 
 The immediate optimization priority should therefore remain single-thread hot
-loops and broader dependency-aware parallelism, not a larger Rayon pool.
-Deblocking and motion compensation are the most important measured hot regions.
-Any new optimization must keep byte-exact output against FFmpeg and must be
-benchmarked in both `Serial` and `Auto` modes.
+loops and broader dependency-aware parallelism, not a larger Rayon pool. The
+new B-batch overlap consumes part of the caller's former idle boundary, but
+CABAC arithmetic and residual parsing remain a serial dependency chain.
+Motion compensation is the largest combined worker cost, and reference-picture
+deblocking remains a visible barrier. Any new optimization must keep byte-exact
+output against FFmpeg and must be benchmarked in both `Serial` and `Auto`
+modes.
