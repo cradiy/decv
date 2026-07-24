@@ -577,6 +577,20 @@ regressed roughly 1% to 2.6%. The optimized fixed-size copy has a longer
 instruction stream but better throughput than repeated structured stores on
 this CPU.
 
+Address-ordered macroblock commit now validates the complete batch once and
+copies each fixed 16x16 luma and 8x8 chroma block with a private raw-pointer
+row kernel. The prior safe slice loop was fully unrolled by LLVM, including a
+multiply and two bounds checks for every row; the validated kernel advances
+destination pointers by the stride and emits only the fixed-width loads and
+stores. Rollback restoration performs its own one-time macroblock range
+assertion before entering the same unsafe boundary. Five alternating CABAC
+Serial runs reduced instructions about 1.86%, branches about 3.39%, median
+reference cycles about 0.9%, and median wall time about 1.7%. CAVLC improved
+about 1.51%, 2.6%, 1.6%, and 1.5%, respectively. Two-worker `Auto`
+instructions fell about 1.66%, branches about 2.98%, and all five paired cycle
+samples improved, with the median about 1.0% lower; its wall time remained
+within scheduling noise.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
