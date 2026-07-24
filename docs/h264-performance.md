@@ -386,7 +386,10 @@ block transactionally, but the hot macroblock loops no longer materialize a
 `Result<Block4x4>`, inspect its discriminant, and copy the 64-byte success
 payload. Seven alternating pinned runs reduced CABAC reference cycles about
 1.0% and instructions 0.3%; CAVLC reference cycles fell about 0.5% and
-instructions 0.4%.
+instructions 0.4%. After the three 4x4 residual changes, the fixed benchmark
+measures 1.78 seconds in Serial mode and 1.98 seconds in Auto mode. FFmpeg
+takes 0.61 seconds with one thread for the comparable NV12 output, leaving a
+roughly 2.9x single-thread gap.
 
 ## BitReader Checkpoint
 
@@ -436,7 +439,7 @@ with exact A/B decoder binaries and both CABAC and CAVLC inputs.
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
-FFmpeg is already about 3.2x faster in the comparable NV12 case. FFmpeg then
+FFmpeg is already about 2.9x faster in the comparable NV12 case. FFmpeg then
 reduces latency further with mature frame/slice threading, while decv currently
 parallelizes owned CABAC P- and B-macroblock pixel reconstruction. CABAC
 parsing, residual reconstruction, output packaging, and deblocking remain
