@@ -731,6 +731,22 @@ impl CabacResidualState {
         )
     }
 
+    /// Records the inferred all-zero residual state of an inter skip.
+    ///
+    /// A skipped macroblock has no residual syntax to consume. Keeping this
+    /// separate from [`Self::decode_inter_residual_terminal`] avoids building
+    /// an unused `InterResidual` and repeatedly deriving the same block-grid
+    /// coordinates.
+    pub(crate) fn record_zero_inter_macroblock_terminal(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<()> {
+        self.validate_macroblock(macroblock_address)?;
+        self.record_zero_inter_macroblock_known(macroblock_address, slice_id);
+        Ok(())
+    }
+
     fn decode_intra_residual_inner(
         &mut self,
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
@@ -797,6 +813,10 @@ impl CabacResidualState {
         coded_block_pattern: CodedBlockPattern,
         transform_size_8x8: bool,
     ) -> Result<InterResidual> {
+        if !coded_block_pattern.has_residual() {
+            self.record_zero_inter_macroblock_known(macroblock_address, slice_id);
+            return Ok(InterResidual::empty_420());
+        }
         self.record_block_known(
             macroblock_address,
             slice_id,
@@ -824,6 +844,34 @@ impl CabacResidualState {
             &mut residual.chroma_ac,
         )?;
         Ok(residual)
+    }
+
+    fn record_zero_inter_macroblock_known(&mut self, macroblock_address: usize, slice_id: u32) {
+        debug_assert!(self.validate_macroblock(macroblock_address).is_ok());
+        let state = Some(BlockState {
+            slice_id,
+            coded: false,
+        });
+        self.luma_dc.entries[macroblock_address] = state;
+        self.chroma_dc_cb.entries[macroblock_address] = state;
+        self.chroma_dc_cr.entries[macroblock_address] = state;
+
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        let luma_x = macroblock_x * 4;
+        let luma_y = macroblock_y * 4;
+        for y in luma_y..luma_y + 4 {
+            let start = y * self.luma.width + luma_x;
+            self.luma.entries[start..start + 4].fill(state);
+        }
+
+        let chroma_x = macroblock_x * 2;
+        let chroma_y = macroblock_y * 2;
+        for y in chroma_y..chroma_y + 2 {
+            let start = y * self.chroma_cb.width + chroma_x;
+            self.chroma_cb.entries[start..start + 2].fill(state);
+            self.chroma_cr.entries[start..start + 2].fill(state);
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1310,6 +1358,32 @@ mod tests {
         assert!(state.luma_dc.entries.iter().all(Option::is_none));
         assert!(state.chroma_dc_cb.entries.iter().all(Option::is_none));
         assert!(state.chroma_dc_cr.entries.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn records_an_inferred_zero_inter_macroblock_as_one_state_transition() {
+        let mut state = CabacResidualState::new(2, 1).unwrap();
+        state.record_zero_inter_macroblock_terminal(0, 7).unwrap();
+
+        let expected = Some(BlockState {
+            slice_id: 7,
+            coded: false,
+        });
+        let snapshot = state.snapshot_macroblock(0);
+        assert_eq!(snapshot.luma, [expected; 16]);
+        assert_eq!(snapshot.chroma_cb, [expected; 4]);
+        assert_eq!(snapshot.chroma_cr, [expected; 4]);
+        assert_eq!(snapshot.luma_dc, expected);
+        assert_eq!(snapshot.chroma_dc_cb, expected);
+        assert_eq!(snapshot.chroma_dc_cr, expected);
+        assert!(
+            state
+                .snapshot_macroblock(1)
+                .luma
+                .iter()
+                .all(Option::is_none)
+        );
+        assert!(state.record_zero_inter_macroblock_terminal(2, 7).is_err());
     }
 
     #[test]

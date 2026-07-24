@@ -134,16 +134,7 @@ impl CabacBMacroblockState {
             )?
         };
         if skipped {
-            {
-                let mut syntax = cabac.syntax();
-                residuals.decode_inter_residual_terminal(
-                    &mut syntax,
-                    macroblock_address,
-                    slice_id,
-                    CodedBlockPattern { luma: 0, chroma: 0 },
-                    false,
-                )?;
-            }
+            residuals.record_zero_inter_macroblock_terminal(macroblock_address, slice_id)?;
             self.motion_l0
                 .record_direct_macroblock(macroblock_address, slice_id)?;
             self.motion_l1

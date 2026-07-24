@@ -1594,6 +1594,30 @@ SHA-256
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
 and the generated H.264 corpus remained byte-exact.
 
+Zero-residual CABAC inter macroblocks now record their inferred neighbour
+state as one macroblock transition. P- and B-skips avoid creating a CABAC
+syntax facade and an unused `InterResidual`; ordinary inter macroblocks with a
+zero coded-block pattern avoid walking the luma and chroma residual loops.
+The specialized fill derives the macroblock coordinates once and writes the
+three DC states plus the luma, Cb, and Cr grids in contiguous rows. No bitstream
+syntax is skipped because a zero coded-block pattern contains no residual
+bins.
+
+After excluding one scheduler outlier, fourteen alternating native 4K `Auto`
+pairs reduced median wall time about 4.66%, task-clock about 2.97%, reference
+cycles about 3.90%, instructions about 4.64%, and branches about 3.49%. Every
+wall-time, task-clock, instruction, and branch pair improved. With
+byte-identical mixed PGO training manifests, fifteen 4K `Auto` pairs reduced
+median task-clock about 0.68% and reference cycles about 0.79%, while wall time
+was neutral; PGO instructions increased about 0.62% and branches about 1.54%.
+On the 300-frame 1080p stream, seven PGO pairs reduced median wall time about
+1.69%, task-clock about 1.42%, and reference cycles about 1.22%, while
+instructions increased about 0.42% and branches about 1.23%. The native
+critical-path gain is therefore clear, while PGO already optimizes much of the
+old zero-pattern loop and should be judged primarily by elapsed CPU time. The
+streamed 597,196,800-byte 4K output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`.
+
 ## Frame Service Timing
 
 `decv-cli` has an opt-in `frame-timing` feature for measuring decoder
