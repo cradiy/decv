@@ -561,6 +561,14 @@ about 0.09%, but five paired CABAC runs put median reference cycles about
 0.16% and wall time about 0.5% higher. Packing four useful samples into an
 SSE2 vector does not amortize its setup on this workload.
 
+Changing the 16-cell B-motion commit helper from an owned array parameter to
+a borrowed array was rejected after disassembly. LLVM had already lowered the
+owned ABI to a single 320-byte copy into the address-indexed motion state, and
+the borrowed version emitted the same copy. Serial measurements happened to
+improve through code-layout changes, but two-worker `Auto` instructions rose
+about 0.08% and branches about 0.16% without a stable wall-time win. The source
+change therefore did not remove the operation it was intended to optimize.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
