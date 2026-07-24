@@ -906,48 +906,73 @@ unsafe fn filter_vertical_chroma_edge_sse2(
     thresholds: Option<EdgeThresholds>,
 ) {
     use std::arch::x86_64::{
-        __m128i, _mm_cvtsi128_si64, _mm_loadu_si128, _mm_packus_epi16, _mm_setzero_si128,
+        _mm_cvtsi32_si128, _mm_cvtsi128_si64, _mm_packus_epi16, _mm_setzero_si128,
+        _mm_srli_si128, _mm_unpacklo_epi8, _mm_unpacklo_epi16, _mm_unpacklo_epi32,
     };
 
     let Some(thresholds) = thresholds else {
         return;
     };
-    let mut p0 = [0i16; 8];
-    let mut p1 = [0i16; 8];
-    let mut q0 = [0i16; 8];
-    let mut q1 = [0i16; 8];
-    let base = plane.as_mut_ptr().wrapping_add(y * stride + x);
-    for row in 0..8 {
-        let edge = base.wrapping_add(row * stride);
+    let base = plane
+        .as_mut_ptr()
+        .wrapping_add(y * stride + x)
+        .wrapping_sub(2);
+    let mut rows = [0u32; 8];
+    for (row, samples) in rows.iter_mut().enumerate() {
         // SAFETY: Picture traversal proves two samples on each side for all
-        // eight rows.
-        unsafe {
-            p0[row] = i16::from(*edge.wrapping_sub(1));
-            p1[row] = i16::from(*edge.wrapping_sub(2));
-            q0[row] = i16::from(*edge);
-            q1[row] = i16::from(*edge.wrapping_add(1));
-        }
+        // eight rows, so p1 through q1 form one valid unaligned u32.
+        *samples = unsafe {
+            base.wrapping_add(row * stride)
+                .cast::<u32>()
+                .read_unaligned()
+        };
     }
-    // SAFETY: Each local array contains exactly eight i16 lanes.
-    let p0 = unsafe { _mm_loadu_si128(p0.as_ptr().cast::<__m128i>()) };
-    // SAFETY: See above.
-    let p1 = unsafe { _mm_loadu_si128(p1.as_ptr().cast::<__m128i>()) };
-    // SAFETY: See above.
-    let q0 = unsafe { _mm_loadu_si128(q0.as_ptr().cast::<__m128i>()) };
-    // SAFETY: See above.
-    let q1 = unsafe { _mm_loadu_si128(q1.as_ptr().cast::<__m128i>()) };
+    let row0 = _mm_cvtsi32_si128(rows[0] as i32);
+    let row1 = _mm_cvtsi32_si128(rows[1] as i32);
+    let row2 = _mm_cvtsi32_si128(rows[2] as i32);
+    let row3 = _mm_cvtsi32_si128(rows[3] as i32);
+    let row4 = _mm_cvtsi32_si128(rows[4] as i32);
+    let row5 = _mm_cvtsi32_si128(rows[5] as i32);
+    let row6 = _mm_cvtsi32_si128(rows[6] as i32);
+    let row7 = _mm_cvtsi32_si128(rows[7] as i32);
+    let rows01 = _mm_unpacklo_epi8(row0, row1);
+    let rows23 = _mm_unpacklo_epi8(row2, row3);
+    let rows45 = _mm_unpacklo_epi8(row4, row5);
+    let rows67 = _mm_unpacklo_epi8(row6, row7);
+    let lower = _mm_unpacklo_epi16(rows01, rows23);
+    let upper = _mm_unpacklo_epi16(rows45, rows67);
+    // SAFETY: Every vector lane contains one validated chroma sample set.
+    let zero = _mm_setzero_si128();
+    macro_rules! column {
+        ($shift:literal) => {
+            _mm_unpacklo_epi8(
+                _mm_unpacklo_epi32(
+                    _mm_srli_si128::<$shift>(lower),
+                    _mm_srli_si128::<$shift>(upper),
+                ),
+                zero,
+            )
+        };
+    }
+    let p1 = column!(0);
+    let p0 = column!(4);
+    let q0 = column!(8);
+    let q1 = column!(12);
     // SAFETY: Every vector lane contains one validated chroma sample set.
     let (filtered_p0, filtered_q0) =
         unsafe { filter_chroma_lanes_sse2(p0, p1, q0, q1, boundary_strengths, thresholds) };
-    let zero = _mm_setzero_si128();
     let filtered_p0 = (_mm_cvtsi128_si64(_mm_packus_epi16(filtered_p0, zero)) as u64).to_le_bytes();
     let filtered_q0 = (_mm_cvtsi128_si64(_mm_packus_epi16(filtered_q0, zero)) as u64).to_le_bytes();
-    for row in 0..8 {
-        let edge = base.wrapping_add(row * stride);
-        // SAFETY: These are the same validated samples gathered above.
+    const REPLACED_BYTES: u32 = 0x00ff_ff00;
+    for (row, samples) in rows.iter_mut().enumerate() {
+        let replacement =
+            u32::from(filtered_p0[row]) << 8 | u32::from(filtered_q0[row]) << 16;
+        *samples = (*samples & !REPLACED_BYTES) | replacement;
+        // SAFETY: This is the same validated four-byte row loaded above.
         unsafe {
-            *edge.wrapping_sub(1) = filtered_p0[row];
-            *edge = filtered_q0[row];
+            base.wrapping_add(row * stride)
+                .cast::<u32>()
+                .write_unaligned(*samples);
         }
     }
 }

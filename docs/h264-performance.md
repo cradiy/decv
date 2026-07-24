@@ -892,6 +892,20 @@ improved; reference cycles fell about 2.91%, task-clock about 2.58%,
 instructions about 6.36%, and branches about 3.91%. The portable and native
 H.264 and MP4 corpora remain byte-exact.
 
+Vertical chroma deblocking now gathers each eight-row edge with eight
+unaligned 32-bit loads, transposes p1/p0/q0/q1 in SSE2 registers, and writes
+the same eight complete words back after filtering. The previous kernel made
+32 scalar sample loads and 16 scattered byte stores around the SIMD equation.
+The existing randomized scalar oracle covers mixed boundary strengths, and
+the native `.text` shrank by 176 bytes. Fourteen pinned CABAC Serial pairs
+reduced average reference cycles about 1.13% and task-clock about 1.08%, with
+eleven pairs improving. Seven two-worker `Auto` pairs reduced reference cycles
+about 1.51% and task-clock about 1.63%, with six pairs improving. CAVLC is a
+measured tradeoff: fourteen Serial pairs increased reference cycles about
+0.41% and task-clock about 0.37%, despite slightly fewer instructions. The
+complete kernel is retained for the High Profile CABAC and high-frame-rate
+primary target. Portable and native H.264 and MP4 corpora remain byte-exact.
+
 Keeping four independent source and destination pointer induction variables
 across those rectangle-copy iterations was tested as a follow-up. It shrank
 the native `predict_inter_420_into` symbol by 307 bytes and reduced
