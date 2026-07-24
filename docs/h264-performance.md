@@ -466,6 +466,12 @@ returns `Result<Option<CabacCoefficientBlock>>` with an approximately
 pinned runs reduced CABAC instructions about 0.4%, branches about 0.9%, and
 reference cycles about 0.7%. CAVLC instructions were neutral.
 
+The adjacent 65-byte significance-map return was also converted to a
+caller-owned buffer and rejected. It increased CABAC instructions about 0.1%
+and reference cycles about 0.3%, indicating that LLVM already handles this
+smaller return more efficiently than the explicit initialization and mutable
+output path.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
