@@ -638,7 +638,78 @@ Validate every boundary before trusting the stream.
 Measure performance in the real decoding pipeline.
 ```
 
-## 14. Current Implementation Checkpoint
+## 14. DSP Dispatch Is a Kernel Boundary, Not a Framework
+
+A software decoder eventually needs a DSP dispatch layer if it must remain
+portable while using different instruction sets. In this context, DSP does not
+mean a separate hardware digital-signal processor. It means a small,
+immutable set of pixel and transform kernels selected for the current CPU:
+
+```text
+normative H.264 control flow
+    -> validated coarse kernel request
+    -> scalar, SSE2, AVX2, NEON, or another architecture backend
+```
+
+The layer is valuable for three reasons:
+
+1. the parser, DPB, reference-list, and error-handling code must not be copied
+   into every architecture backend;
+2. a portable binary should detect CPU features once instead of querying them
+   in inner sample loops;
+3. every optimized backend needs one scalar oracle and the same exhaustive
+   byte-exact tests.
+
+This does **not** justify a large trait hierarchy or a function pointer for
+every pixel, tap, coefficient, row, or 4x4 block. Dispatch has a real cost:
+indirect calls inhibit inlining, arguments must cross the call boundary, and
+small kernels cannot amortize either cost. Measurements in this decoder found
+that outlining luma and chroma prediction separately made the whole decoder
+about 1.1% slower. A full-YUV wrapper around already inlined weighted
+prediction also failed to produce a stable gain. In contrast, selecting AVX2
+once for an entire NV12 chroma plane improved both CABAC and CAVLC workloads,
+and selecting one fixed-width copy for a complete integer-motion rectangle
+removed repeated row dispatch profitably.
+
+The intended shape is therefore a small value selected when the decoder is
+constructed:
+
+```rust,ignore
+struct H264Dsp {
+    interleave_nv12_chroma: InterleaveNv12ChromaFn,
+    // Add an entry only after a complete coarse kernel and a second useful
+    // backend both exist.
+}
+```
+
+Good future entries operate on enough work to amortize one indirect call:
+
+- a complete output plane;
+- all luma and chroma work for one prediction operation;
+- a complete macroblock reconstruction or transform batch;
+- a complete deblocking edge or macroblock when its parameters are already
+  derived.
+
+Bad entries expose individual samples, six-tap evaluations, rows, 4x4
+transforms, or CABAC bins. Those are implementation details inside a selected
+kernel, where compile-time specialization and inlining remain more valuable
+than runtime polymorphism.
+
+Each entry should be a safe wrapper around any `unsafe` ISA-specific function.
+The wrapper validates lengths, strides, alignment assumptions, picture
+boundaries, and CPU capability once. The kernel may then use raw pointers and
+unchecked accesses only within that proven contract. Architecture modules
+should be separated as `scalar`, `x86`, and `aarch64`, while normative decoder
+state stays architecture-independent. Tests must be able to force every
+available backend and compare its complete output against the scalar oracle.
+
+There is no need to populate the table speculatively. Keep a direct call until
+there are at least two real implementations and profiling shows that the
+boundary is coarse enough. This preserves current inlining while allowing the
+table to grow kernel by kernel instead of becoming an abstraction tax paid by
+the entire decoder.
+
+## 15. Current Implementation Checkpoint
 
 At the checkpoint recorded by this document, the Rust implementation includes:
 
