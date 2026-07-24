@@ -1126,6 +1126,42 @@ slower. All three variants were fully reverted. Future allocation work should
 reuse the large per-picture reconstruction state, rather than reshaping these
 small temporary objects.
 
+Two attempts to avoid clearing `BMotionState` were rejected because they
+weakened its hot neighbour-access layout. A `MaybeUninit<MotionCell>` array
+gated by one completion byte per macroblock reduced 4K page faults about 4.1%,
+but the required cell-to-macroblock division increased instructions about
+1.24% and branches about 0.86%. Splitting slice IDs and both motion lists into
+three arrays avoided that division, but destroyed AoS locality: instructions
+increased about 2.56%, branches about 3.83%, and page faults increased. A final
+AoS variant used one presence byte per cell; it reduced page faults about 10%,
+but still increased instructions about 1.66% and branches about 2.83% without
+a stable cycle gain. The initialized `Option<MotionCell>` representation was
+restored. Its up-front clear is cheaper than adding work to every neighbour
+lookup.
+
+DPB reference identities now use a non-zero 32-bit token instead of an
+ordinary 64-bit integer. Zero remains the `Option` niche, so
+`Option<ReferenceId>` is four bytes, `StoredListMotion` is twelve bytes, and a
+retained 4x4 `MotionFieldCell` shrank from 56 to 36 bytes. On the 3840x2176
+coded 4K stream, one reference motion field consequently fell from about
+27.9 MiB to 17.9 MiB. Tokens wrap while skipping identities still present in
+the at-most-16-picture DPB, preserving indefinite playback without collision;
+IDR and DPB clear still restart allocation at one. Layout and wraparound tests
+lock down both invariants.
+
+The smaller motion field converted directly into whole-decoder gains. Ten
+alternating pinned 4K Serial pairs reduced task-clock about 4.10%, reference
+cycles about 3.36%, instructions about 0.21%, branches about 0.18%, and page
+faults about 11.3%; nine cycle pairs improved. Ten 4K four-worker `Auto` pairs
+reduced task-clock about 4.20% and reference cycles about 3.50%; all ten cycle
+pairs and nine task-clock pairs improved, while page faults fell about 9.2%.
+Seven 1080p CABAC pairs all improved in both modes: Serial task-clock and
+cycles fell about 2.23% and 2.30%, while two-worker `Auto` fell about 3.30%
+and 3.26%. Across ten noisier CAVLC Serial pairs, task-clock fell about 1.77%
+and reference cycles about 2.24%. The full workspace suite, strict H.264
+Clippy, native H.264 corpus, MP4/seek corpus, and 4K Serial/Auto/FFmpeg
+three-way comparison remain byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

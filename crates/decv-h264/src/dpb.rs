@@ -1,6 +1,6 @@
 //! Decoded Picture Buffer and reference-picture management.
 
-use std::sync::Arc;
+use std::{num::NonZeroU32, sync::Arc};
 
 use crate::{
     H264Error, MAX_DPB_FRAMES, MemoryManagementOperation, ReferenceListModification, Result,
@@ -16,12 +16,17 @@ pub type ActiveReferenceInfoList = Vec<Option<ActiveReferenceInfo>>;
 pub type ActiveBReferenceInfoLists = (ActiveReferenceInfoList, ActiveReferenceInfoList);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ReferenceId(pub(crate) u64);
+pub struct ReferenceId(NonZeroU32);
 
 impl ReferenceId {
     #[inline]
+    pub(crate) fn new(value: u32) -> Self {
+        Self(NonZeroU32::new(value).expect("DPB reference IDs are never zero"))
+    }
+
+    #[inline]
     pub const fn get(self) -> u64 {
-        self.0
+        self.0.get() as u64
     }
 }
 
@@ -60,7 +65,7 @@ pub struct DecodedPictureBuffer {
     max_num_ref_frames: usize,
     max_frame_num: u32,
     max_long_term_frame_idx: Option<u32>,
-    next_reference_id: u64,
+    next_reference_id: u32,
     references: Vec<DpbReference>,
 }
 
@@ -523,11 +528,8 @@ impl DecodedPictureBuffer {
                 "adaptive memory control exceeds max_num_ref_frames",
             ));
         }
-        let id = ReferenceId(self.next_reference_id);
-        let next_reference_id = self
-            .next_reference_id
-            .checked_add(1)
-            .ok_or(H264Error::IntegerOverflow)?;
+        let (id, next_reference_id) =
+            Self::next_available_reference_id(&references, self.next_reference_id);
         references.push(DpbReference {
             id,
             frame_num,
@@ -543,12 +545,28 @@ impl DecodedPictureBuffer {
     }
 
     fn allocate_reference_id(&mut self) -> Result<ReferenceId> {
-        let id = ReferenceId(self.next_reference_id);
-        self.next_reference_id = self
-            .next_reference_id
-            .checked_add(1)
-            .ok_or(H264Error::IntegerOverflow)?;
+        let (id, next_reference_id) =
+            Self::next_available_reference_id(&self.references, self.next_reference_id);
+        self.next_reference_id = next_reference_id;
         Ok(id)
+    }
+
+    fn next_available_reference_id(
+        references: &[DpbReference],
+        mut candidate: u32,
+    ) -> (ReferenceId, u32) {
+        debug_assert_ne!(candidate, 0);
+        loop {
+            let id = ReferenceId::new(candidate);
+            candidate = if candidate == u32::MAX {
+                1
+            } else {
+                candidate + 1
+            };
+            if references.iter().all(|reference| reference.id != id) {
+                return (id, candidate);
+            }
+        }
     }
 
     fn ensure_frame_num(&self, frame_num: u32) -> Result<()> {
@@ -732,6 +750,32 @@ mod tests {
 
     fn luma_value(picture: &Yuv420Picture) -> u8 {
         picture.planes().0[0]
+    }
+
+    #[test]
+    fn reference_ids_keep_motion_fields_compact() {
+        assert_eq!(std::mem::size_of::<ReferenceId>(), 4);
+        assert_eq!(
+            std::mem::size_of::<Option<ReferenceId>>(),
+            std::mem::size_of::<ReferenceId>()
+        );
+        assert_eq!(std::mem::size_of::<crate::StoredListMotion>(), 12);
+        assert_eq!(std::mem::size_of::<crate::MotionFieldCell>(), 36);
+    }
+
+    #[test]
+    fn reference_ids_wrap_without_colliding_with_the_active_dpb() {
+        let mut dpb = DecodedPictureBuffer::new(2, 4).unwrap();
+        dpb.store_short_term(0, 0, picture(0)).unwrap();
+        dpb.next_reference_id = u32::MAX;
+        dpb.store_short_term(1, 1, picture(1)).unwrap();
+        assert_eq!(dpb.references[1].id.get(), u64::from(u32::MAX));
+        assert_eq!(dpb.next_reference_id, 1);
+
+        dpb.store_short_term(2, 2, picture(2)).unwrap();
+        assert_eq!(dpb.references.len(), 2);
+        assert_eq!(dpb.references[1].id.get(), 1);
+        assert_ne!(dpb.references[0].id, dpb.references[1].id);
     }
 
     #[test]

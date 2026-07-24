@@ -450,19 +450,19 @@ mod tests {
                     ]
                     .into(),
                 },
-                Some(&[Some(ReferenceId(7))]),
-                Some(&[Some(ReferenceId(8))]),
+                Some(&[Some(ReferenceId::new(7))]),
+                Some(&[Some(ReferenceId::new(8))]),
             )
             .unwrap();
         let field = builder.finish().unwrap();
         assert!(field.cell(0, 0).unwrap().intra);
         assert_eq!(
             field.cell(4, 0).unwrap().list0.unwrap().reference_id,
-            Some(ReferenceId(7))
+            Some(ReferenceId::new(7))
         );
         assert_eq!(
             field.cell(7, 3).unwrap().list1.unwrap().reference_id,
-            Some(ReferenceId(8))
+            Some(ReferenceId::new(8))
         );
     }
 
@@ -516,13 +516,13 @@ mod tests {
                         motion_vector: MotionVector { x: 3, y: -2 },
                     }],
                 },
-                Some(&[Some(ReferenceId(9))]),
+                Some(&[Some(ReferenceId::new(9))]),
             )
             .unwrap();
 
         let cell = builder.finish().unwrap().cell(3, 3).unwrap();
         assert!(!cell.intra);
-        assert_eq!(cell.list0.unwrap().reference_id, Some(ReferenceId(9)));
+        assert_eq!(cell.list0.unwrap().reference_id, Some(ReferenceId::new(9)));
         assert_eq!(cell.list0.unwrap().vector, MotionVector { x: 3, y: -2 });
     }
 

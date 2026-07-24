@@ -1760,7 +1760,7 @@ mod tests {
 
     #[test]
     fn temporal_direct_maps_stable_identity_and_scales_colocated_motion() {
-        let reference_id = crate::ReferenceId(7);
+        let reference_id = crate::ReferenceId::new(7);
         let mut colocated = MotionFieldBuilder::new(Size::new(16, 16)).unwrap();
         colocated
             .record_p(
@@ -1795,7 +1795,7 @@ mod tests {
                 TemporalDirectContext {
                     current_picture_order_count: 2,
                     colocated: DirectReference {
-                        id: crate::ReferenceId(8),
+                        id: crate::ReferenceId::new(8),
                         picture_order_count: 8,
                         long_term: false,
                         motion: &colocated_motion,
@@ -1826,7 +1826,7 @@ mod tests {
         let colocated_motion = ReferenceMotionField::all_intra(Size::new(16, 16)).unwrap();
         let reference_motion = ReferenceMotionField::all_intra(Size::new(16, 16)).unwrap();
         let references_l0 = [Some(DirectReference {
-            id: crate::ReferenceId(7),
+            id: crate::ReferenceId::new(7),
             picture_order_count: 0,
             long_term: false,
             motion: &reference_motion,
@@ -1839,7 +1839,7 @@ mod tests {
                 TemporalDirectContext {
                     current_picture_order_count: 2,
                     colocated: DirectReference {
-                        id: crate::ReferenceId(8),
+                        id: crate::ReferenceId::new(8),
                         picture_order_count: 4,
                         long_term: false,
                         motion: &colocated_motion,
