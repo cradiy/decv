@@ -530,6 +530,20 @@ and reference cycles about 0.3%, indicating that LLVM already handles this
 smaller return more efficiently than the explicit initialization and mutable
 output path.
 
+Parallel P/B reconstruction workers now initialize their address-ordered
+macroblock output slots in place. The slots are allocated as
+`MaybeUninit<StagedMacroblockPixels>` and become initialized on the worker
+that reconstructs them, so the main thread neither receives a roughly
+392-byte owned result nor takes initial ownership of its cache lines by
+zero-filling them. Ordinary indexed Rayon collection runs every job and
+preserves error order before the initialized boxed slice is converted into a
+`Vec`. Five alternating runs pinned to the two `Auto` CPUs reduced
+instructions about 0.9%, branches about 1.3%, median reference cycles about
+1.4%, and median wall time about 0.7%; every paired cycle and wall-time sample
+was faster. A preliminary version that zero-filled the slots on the main
+thread removed the same result copies but made cycles slightly worse,
+confirming that first-touch placement is part of the optimization.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
