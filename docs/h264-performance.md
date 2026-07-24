@@ -40,30 +40,30 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.87 s | 1.77 s | 80,208 KiB | 96.3 FPS |
-| decv Auto (2 workers) | NV12 | 2.09 s | 2.20 s | 79,496 KiB | 86.1 FPS |
-| FFmpeg 1 thread | NV12 | 0.63 s | 0.72 s | 152,452 KiB | 285.7 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.47 s | 299,600 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.59 s | 0.57 s | 95,648 KiB | 305.1 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.99 s | 192,340 KiB | 818.2 FPS |
+| decv Serial | NV12 | 1.76 s | 1.68 s | 80,548 KiB | 102.3 FPS |
+| decv Auto (2 workers) | NV12 | 1.89 s | 2.05 s | 78,680 KiB | 95.2 FPS |
+| FFmpeg 1 thread | NV12 | 0.63 s | 0.72 s | 152,448 KiB | 285.7 FPS |
+| FFmpeg Auto | NV12 | 0.27 s | 1.48 s | 277,944 KiB | 666.7 FPS |
+| FFmpeg 1 thread | decode-only | 0.58 s | 0.56 s | 95,928 KiB | 310.3 FPS |
+| FFmpeg Auto | decode-only | 0.23 s | 0.97 s | 192,364 KiB | 782.6 FPS |
 
 On this workload:
 
-- decv Serial takes about **3.0x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **2.8x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **8.0x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **7.0x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **1.5x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.4x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
-  **27%** of FFmpeg Auto NV12 peak RSS;
+  **28%** of FFmpeg Auto NV12 peak RSS;
 - prior measurements with 16 decv workers were slower than the two-worker
   `Auto` policy and consumed far more CPU, confirming that the current parallel
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 60.4% throughput headroom over that
-line, and the measured two-worker Auto result has about 43.5%. The ordering
+seconds. The current Serial result has about 70.5% throughput headroom over that
+line, and the measured two-worker Auto result has about 58.7%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -479,7 +479,8 @@ macroblock-addressed slot while the completion bit remains unset until the
 pixel batch commits. Five alternating pinned runs improved median reference
 cycles about 1.6% in serial mode and 0.6% with the two-worker `Auto` mode.
 Instructions remained effectively flat, while branches fell about 0.06% in
-serial mode and 0.08% in `Auto`.
+serial mode and 0.08% in `Auto`. The refreshed fixed benchmark now measures
+1.76 seconds in Serial mode and 1.89 seconds in Auto mode.
 
 Hoisting integer-motion row-width dispatch out of the luma and chroma copy
 loops was rejected. Compile-time-width row kernels removed about 1.9% of
