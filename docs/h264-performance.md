@@ -353,6 +353,22 @@ vertical quarter-sample positions. Alternating samples reduced CABAC reference
 cycles about 1.1% and CAVLC about 0.9%. The fixed benchmark now measures 1.87
 seconds in Serial mode and 2.09 seconds in Auto mode.
 
+The 4x4 inverse-quantization path now validates the QP and scaling list,
+inverse-scans the scaling weights, and derives the sixteen position-specific
+level scales once per luma or chroma block group rather than once per block.
+The prepared level scales fit in a compact `u16[4][4]`; checked coefficient
+arithmetic and the public transform API retain their existing overflow
+semantics. Five alternating pinned runs reduced CABAC instructions about 2.2%
+and reference cycles about 0.3%, while CAVLC instructions fell about 2.8% and
+reference cycles about 1.0%.
+
+Two more aggressive layouts were rejected. Storing the prepared scales as
+`i32` or `i64` still removed roughly 2% of instructions, but slightly increased
+CABAC reference cycles because the larger live context outweighed the saved
+work. Fusing inverse scan and scaling into one iterator loop increased
+whole-decoder instructions by about 0.4% and regressed CAVLC reference cycles,
+so the small intermediate coefficient block remains.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
