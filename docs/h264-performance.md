@@ -927,6 +927,19 @@ follow-up made all seven 4K `Auto` cycle pairs slower and increased reference
 cycles about 0.89%, so eight rows remain the measured batching sweet spot.
 Serial/Auto CABAC, CAVLC, and 4K outputs remain byte-exact.
 
+`Auto` reconstruction parallelism now selects its pool after the coded picture
+size is known. Pictures below roughly eight megapixels retain the conservative
+two-worker cap, while 4K-class pictures may use up to four workers. On the
+48-frame 4K stream, seven alternating pinned wall-time pairs moved the median
+from 1.47 to 1.43 seconds, about 2.7% faster, while average user CPU increased
+from 1.52 to 1.63 seconds. The 300-frame 1080p CABAC stream remained exactly
+2.43 seconds in both binaries with unchanged user CPU because it still selects
+two workers. Eight physical workers were rejected: their 4K median was 1.52
+seconds versus 1.44 seconds for four workers, and average user CPU rose from
+1.65 to 1.99 seconds. The pool is created once for the active coded size and is
+reused across pictures; an IDR resolution change rebuilds it only when the
+coded size changes.
+
 Keeping four independent source and destination pointer induction variables
 across those rectangle-copy iterations was tested as a follow-up. It shrank
 the native `predict_inter_420_into` symbol by 307 bytes and reduced

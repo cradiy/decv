@@ -133,15 +133,16 @@ decoder.configure(video_config)?;
 Rules:
 
 - `Serial` is the deterministic fallback and test oracle.
-- `Auto` currently caps the worker count at two instead of consuming every
-  logical CPU in a UI application. Four workers improve the 1080p benchmark
-  when pinned to four performance cores, but unpinned runs still add CPU work
-  without reducing wall time. The cap can be retuned as more stages become
-  parallel.
+- `Auto` caps reconstruction at two workers below roughly eight megapixels and
+  four workers for 4K-class coded pictures. This preserves the interactive
+  1080p policy while using the measured 4K scaling headroom. Eight workers are
+  slower and consume substantially more CPU with the current serial CABAC
+  phase.
 - `set_parallelism` must run before decoding begins. It is separate from the
   codec-independent `VideoDecoderConfig`.
-- a decoder owns a persistent pool; it must not create OS threads
-  per frame;
+- a decoder owns a persistent pool selected after the coded size is known; it
+  must not create OS threads per frame, and rebuilds only when an `Auto` coded
+  size changes;
 - single-job batches stay serial;
 - `flush` waits for or cancels all internal work before clearing the DPB;
 - no task may outlive the decoder or a borrowed reference picture.

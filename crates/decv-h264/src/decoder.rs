@@ -61,6 +61,7 @@ pub struct H264Decoder {
     draining: bool,
     parallelism: H264Parallelism,
     reconstruction_executor: Option<ReconstructionExecutor>,
+    auto_executor_size: Option<Size>,
 }
 
 impl Default for H264Decoder {
@@ -79,6 +80,7 @@ impl Default for H264Decoder {
             draining: false,
             parallelism: H264Parallelism::Auto,
             reconstruction_executor: None,
+            auto_executor_size: None,
         }
     }
 }
@@ -104,9 +106,13 @@ impl H264Decoder {
                 "H.264 parallelism cannot change after decoding begins",
             ));
         }
-        let executor = ReconstructionExecutor::try_new(parallelism)?;
         self.parallelism = parallelism;
-        self.reconstruction_executor = Some(executor);
+        self.auto_executor_size = None;
+        self.reconstruction_executor = if parallelism == H264Parallelism::Auto {
+            None
+        } else {
+            Some(ReconstructionExecutor::try_new(parallelism)?)
+        };
         Ok(())
     }
 
@@ -160,6 +166,17 @@ impl H264Decoder {
                 if self.current_picture.is_none() {
                     self.ensure_dpb(&parsed, nal_header)?;
                     let format = video_format(&parsed)?;
+                    let coded_size = parsed.parameter_sets.sequence.coded_size;
+                    if self.parallelism == H264Parallelism::Auto
+                        && self.auto_executor_size != Some(coded_size)
+                    {
+                        self.reconstruction_executor =
+                            Some(ReconstructionExecutor::try_new_for_coded_size(
+                                self.parallelism,
+                                coded_size,
+                            )?);
+                        self.auto_executor_size = Some(coded_size);
+                    }
                     let reconstructor =
                         IntraPictureReconstructor::from_parameter_sets_with_executor(
                             &parsed.parameter_sets,
@@ -553,7 +570,9 @@ impl VideoDecoder for H264Decoder {
             ));
         }
         self.reset_all_state();
-        if self.reconstruction_executor.is_none() {
+        if self.reconstruction_executor.is_none()
+            && self.parallelism != H264Parallelism::Auto
+        {
             self.reconstruction_executor = Some(ReconstructionExecutor::try_new(self.parallelism)?);
         }
         self.bitstream_format = config.bitstream_format;
