@@ -192,6 +192,17 @@ routing it through owned staging measured slower. `Serial`, conservative
 CABAC P and B fixtures must match byte for byte between serial and two-thread
 decoding.
 
+Large CABAC non-reference pictures also use a bounded frame-finalization
+pipeline. Once their syntax and pixels are complete, validation remains on the
+decoder thread while deblocking and NV12 packaging run on the existing pool.
+They cannot enter the DPB or serve as co-located references, so later picture
+reconstruction does not depend on their finalized pixels. Results are consumed
+strictly in decode order, pending work is bounded to one fewer than the pool's
+worker count, and every reference, drain, flush, IDR, and end-of-sequence
+boundary synchronizes or discards work as required. Reference pictures,
+CAVLC, sub-two-megapixel pictures, and `Serial` retain synchronous
+finalization.
+
 ## Acceptance Checks
 
 Every parallel stage must pass:

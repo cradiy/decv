@@ -1286,6 +1286,27 @@ reference cycles about 4.92%; five CAVLC pairs reduced them about 5.18% and
 reliable benefit. The full H.264 unit suite, strict H.264 Clippy, generated
 byte-exact corpus, and 48-frame 4K FFmpeg hash all passed.
 
+Large CABAC non-reference pictures now complete through a bounded cross-frame
+pipeline when a reconstruction pool is active. Picture completeness and the
+discarded reference-motion field are validated synchronously. Deblocking and
+NV12 packaging then run on the existing pool while the decoder begins the next
+picture. Completed tasks are consumed strictly in decode order; a reference
+picture, drain, ordinary IDR boundary, or end marker waits for prior tasks.
+Flush and `no_output_of_prior_pictures` wait and discard them. The pending
+queue is bounded to one fewer than the pool's worker count, leaving a worker
+available for current-picture reconstruction. Serial mode, CAVLC, and pictures
+below two million coded pixels retain the synchronous path.
+
+Against the preceding native binary, seven alternating pinned 4K four-worker
+pairs all improved. Average wall time for the 48-frame 3840x2160-visible
+stream fell from 1.399 to 1.316 seconds, or from 34.31 to 36.47 FPS:
+wall time fell about 5.90%, task-clock about 1.75%, and reference cycles about
+0.53%. Five 1080p two-worker CABAC pairs reduced wall time about 4.90%, from
+120.16 to 126.35 FPS. The equivalent 4K Serial path was effectively unchanged
+at 34.57 FPS, confirming that the gain comes from the bounded overlap rather
+than less reconstruction work. The generated H.264 corpus and the 48-frame
+4K output remain byte-exact against FFmpeg.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

@@ -243,6 +243,20 @@ pub struct IntraPictureReconstructor {
     next_slice_id: u32,
 }
 
+#[derive(Debug)]
+pub(crate) struct NonReferencePictureFinalization {
+    width_in_macroblocks: usize,
+    picture: Yuv420Picture,
+    deblock: Vec<MacroblockDeblockInfo>,
+}
+
+impl NonReferencePictureFinalization {
+    pub(crate) fn finish(mut self) -> Result<Yuv420Picture> {
+        filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
+        Ok(self.picture)
+    }
+}
+
 impl IntraPictureReconstructor {
     pub fn new(
         coded_size: Size,
@@ -2489,14 +2503,38 @@ impl IntraPictureReconstructor {
     pub(crate) fn into_deblocked_picture_with_optional_reference_motion(
         mut self,
     ) -> Result<(Yuv420Picture, Option<ReferenceMotionField>, BMotionState)> {
+        self.validate_picture_complete()?;
+        filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
+        let motion = self.reference_motion.finish_optional()?;
+        Ok((self.picture, motion, self.b_motion))
+    }
+
+    pub(crate) fn into_non_reference_finalization(
+        self,
+    ) -> Result<(NonReferencePictureFinalization, BMotionState)> {
+        self.validate_picture_complete()?;
+        if self.reference_motion.finish_optional()?.is_some() {
+            return Err(H264Error::InvalidSyntax(
+                "non-reference picture retained a reference motion field",
+            ));
+        }
+        Ok((
+            NonReferencePictureFinalization {
+                width_in_macroblocks: self.width_in_macroblocks,
+                picture: self.picture,
+                deblock: self.deblock,
+            },
+            self.b_motion,
+        ))
+    }
+
+    fn validate_picture_complete(&self) -> Result<()> {
         if self.completed.iter().any(|&completed| !completed) {
             return Err(H264Error::InvalidSyntax(
                 "cannot output an incomplete reconstructed picture",
             ));
         }
-        filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
-        let motion = self.reference_motion.finish_optional()?;
-        Ok((self.picture, motion, self.b_motion))
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
