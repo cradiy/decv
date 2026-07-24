@@ -1286,6 +1286,17 @@ reference cycles about 4.92%; five CAVLC pairs reduced them about 5.18% and
 reliable benefit. The full H.264 unit suite, strict H.264 Clippy, generated
 byte-exact corpus, and 48-frame 4K FFmpeg hash all passed.
 
+Two follow-up attempts to reduce the remaining validation cost were rejected.
+Trusting the already resolved motion state and recording only macroblock
+completion reduced native instructions about 0.99% and branches about 1.37%,
+but was wall-time neutral in Serial and about 1% slower with four workers.
+After retraining PGO it remained about 0.4% slower across nine alternating
+pairs. Replacing the small partition-mask loop with multiplication and dynamic
+shifts reduced instructions about 0.71% and branches about 1.15%, but increased
+reference cycles about 1.46% and wall time about 1.27%. Both implementations
+were fully reverted; fewer retired instructions did not compensate for their
+longer dependency paths and changed layout.
+
 Large CABAC non-reference pictures now complete through a bounded cross-frame
 pipeline when a reconstruction pool is active. Picture completeness and the
 discarded reference-motion field are validated synchronously. Deblocking and
