@@ -670,6 +670,16 @@ cycle sample was slower. The experiment was fully reverted. A future DSP
 dispatch boundary must therefore operate on a coarser unit than one luma or
 chroma partition call.
 
+Processing a sixteen-pixel two-dimensional luma interpolation row with one
+AVX2 kernel instead of two SSE2 chunks was also rejected. The wider six-tap
+path needed extra lane rearrangement and 16-to-32-bit packing for the diagonal
+filter. Although an exhaustive SIMD-versus-scalar test and the complete
+byte-exact stream corpus passed, five alternating native CABAC Serial runs
+increased whole-decoder instructions about 0.84%, branches about 0.60%, and
+median reference cycles about 0.39%. The implementation was fully reverted;
+AVX2 width alone is not sufficient evidence that an H.264 interpolation
+kernel is faster.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
