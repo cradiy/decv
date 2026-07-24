@@ -691,6 +691,15 @@ pressure. Five alternating CABAC Serial runs increased instructions about
 improved. Unlike bypass bins, the probability-modelled MPS/LPS choice is
 biased enough that retaining its branch is cheaper.
 
+Forcing the complete `decode_decision` operation to inline at every optimized
+call site was also rejected. It removed the standalone 381-byte symbol and
+reduced whole-decoder instructions about 0.36% and branches about 0.49%, but
+expanded native `.text` by about 9 KiB. The first seven CABAC Serial pairs
+looked promising; extending the same alternating pinned run to fourteen pairs
+left only seven improvements, increased average reference cycles about 0.19%,
+and increased task-clock about 1.0%. The ordinary `#[inline]` hint was
+restored so LTO can keep this moderately large, error-aware operation outlined.
+
 Processing a sixteen-pixel two-dimensional luma interpolation row with one
 AVX2 kernel instead of two SSE2 chunks was also rejected. The wider six-tap
 path needed extra lane rearrangement and 16-to-32-bit packing for the diagonal
