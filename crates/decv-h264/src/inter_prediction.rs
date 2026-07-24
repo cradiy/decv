@@ -869,6 +869,26 @@ fn predict_chroma<const CLIP: bool>(
     }
 
     #[cfg(target_arch = "x86_64")]
+    if !CLIP && prediction.width == 8 {
+        // SAFETY: SSE2 is part of the x86_64 baseline. The non-clipping path
+        // is selected only after validating four samples plus the right
+        // neighbour from both chroma planes.
+        unsafe {
+            predict_chroma_pair_sse2(
+                prediction,
+                cb,
+                cr,
+                width,
+                reference_x as usize,
+                reference_y as usize,
+                x_fraction,
+                y_fraction,
+            );
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
     if !CLIP && prediction.width == 16 && std::is_x86_feature_detected!("avx2") {
         // SAFETY: Runtime detection proves AVX2 support. The non-clipping
         // path is selected only after validating both chroma source planes.
@@ -915,6 +935,98 @@ fn predict_chroma<const CLIP: bool>(
                 interpolate_chroma_inner::<CLIP>(cb, width, height, x, y, x_fraction, y_fraction);
             prediction.cr[output_y][output_x] =
                 interpolate_chroma_inner::<CLIP>(cr, width, height, x, y, x_fraction, y_fraction);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn predict_chroma_pair_sse2(
+    prediction: &mut InterPrediction420,
+    cb: &[u8],
+    cr: &[u8],
+    stride: usize,
+    reference_x: usize,
+    reference_y: usize,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_add_epi16, _mm_cvtsi32_si128, _mm_cvtsi128_si32, _mm_mullo_epi16,
+        _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_srli_epi16, _mm_srli_si128,
+        _mm_unpacklo_epi8, _mm_unpacklo_epi32,
+    };
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load_pair(cb: *const u8, cr: *const u8) -> __m128i {
+        // SAFETY: The caller validated four samples from each plane. Unaligned
+        // integer loads have no alignment requirement.
+        let cb = unsafe { std::ptr::read_unaligned(cb.cast::<i32>()) };
+        // SAFETY: See above.
+        let cr = unsafe { std::ptr::read_unaligned(cr.cast::<i32>()) };
+        _mm_unpacklo_epi8(
+            _mm_unpacklo_epi32(_mm_cvtsi32_si128(cb), _mm_cvtsi32_si128(cr)),
+            _mm_setzero_si128(),
+        )
+    }
+
+    debug_assert_eq!(prediction.width, 8);
+    let x = i16::from(x_fraction);
+    let y = i16::from(y_fraction);
+    let w00 = _mm_set1_epi16((8 - x) * (8 - y));
+    let w10 = _mm_set1_epi16(x * (8 - y));
+    let w01 = _mm_set1_epi16((8 - x) * y);
+    let w11 = _mm_set1_epi16(x * y);
+    let rounding = _mm_set1_epi16(32);
+    let zero = _mm_setzero_si128();
+    for output_y in 0..usize::from(prediction.height / 2) {
+        let offset = (reference_y + output_y) * stride + reference_x;
+        let cb_base = cb.as_ptr().wrapping_add(offset);
+        let cr_base = cr.as_ptr().wrapping_add(offset);
+        // SAFETY: Interior validation includes the current and next rows plus
+        // one sample to the right in both planes.
+        let a = unsafe { load_pair(cb_base, cr_base) };
+        let weighted = if x_fraction == 0 {
+            // SAFETY: See above.
+            let c =
+                unsafe { load_pair(cb_base.wrapping_add(stride), cr_base.wrapping_add(stride)) };
+            _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(c, w01))
+        } else if y_fraction == 0 {
+            // SAFETY: See above.
+            let b = unsafe { load_pair(cb_base.wrapping_add(1), cr_base.wrapping_add(1)) };
+            _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(b, w10))
+        } else {
+            // SAFETY: See above.
+            let b = unsafe { load_pair(cb_base.wrapping_add(1), cr_base.wrapping_add(1)) };
+            // SAFETY: See above.
+            let c =
+                unsafe { load_pair(cb_base.wrapping_add(stride), cr_base.wrapping_add(stride)) };
+            // SAFETY: See above.
+            let d = unsafe {
+                load_pair(
+                    cb_base.wrapping_add(stride + 1),
+                    cr_base.wrapping_add(stride + 1),
+                )
+            };
+            _mm_add_epi16(
+                _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(b, w10)),
+                _mm_add_epi16(_mm_mullo_epi16(c, w01), _mm_mullo_epi16(d, w11)),
+            )
+        };
+        let packed = _mm_packus_epi16(_mm_srli_epi16::<6>(_mm_add_epi16(weighted, rounding)), zero);
+        // SAFETY: Each destination row contains four writable bytes, and
+        // unaligned integer stores have no alignment requirement.
+        unsafe {
+            std::ptr::write_unaligned(
+                prediction.cb[output_y].as_mut_ptr().cast::<i32>(),
+                _mm_cvtsi128_si32(packed),
+            );
+            std::ptr::write_unaligned(
+                prediction.cr[output_y].as_mut_ptr().cast::<i32>(),
+                _mm_cvtsi128_si32(_mm_srli_si128::<4>(packed)),
+            );
         }
     }
 }
@@ -1586,6 +1698,27 @@ mod tests {
                                 x_fraction,
                                 y_fraction,
                             );
+                        }
+                        if width == 8 {
+                            let mut paired = InterPrediction420::empty();
+                            paired.width = width;
+                            paired.height = height;
+                            // SAFETY: SSE2 is part of the x86_64 baseline,
+                            // and the same interior source rectangle was used
+                            // by the per-plane SSE2 oracle above.
+                            unsafe {
+                                predict_chroma_pair_sse2(
+                                    &mut paired,
+                                    &cb,
+                                    &cr,
+                                    40,
+                                    8,
+                                    8,
+                                    x_fraction,
+                                    y_fraction,
+                                );
+                            }
+                            assert_eq!(paired, prediction);
                         }
                         if width == 16 && std::is_x86_feature_detected!("avx2") {
                             let mut avx2 = InterPrediction420::empty();
