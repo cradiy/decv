@@ -569,6 +569,14 @@ improve through code-layout changes, but two-worker `Auto` instructions rose
 about 0.08% and branches about 0.16% without a stable wall-time win. The source
 change therefore did not remove the operation it was intended to optimize.
 
+Writing a uniform spatial-Direct motion cell into its sixteen final slots with
+slice `fill` was also rejected. It avoided the stack array and reduced
+whole-decoder instructions about 0.25% and branches about 0.14%, but four of
+five CABAC runs used more reference cycles and later paired wall-time samples
+regressed roughly 1% to 2.6%. The optimized fixed-size copy has a longer
+instruction stream but better throughput than repeated structured stores on
+this CPU.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
