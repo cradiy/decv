@@ -473,6 +473,14 @@ runs reduced instructions and branches by about 0.04% to 0.05%; median
 reference cycles improved about 0.7%. The full byte-exact FFmpeg corpus still
 matches.
 
+Pending P/B reconstruction jobs no longer carry a copy of
+`MacroblockDeblockInfo`. The metadata is staged in its final
+macroblock-addressed slot while the completion bit remains unset until the
+pixel batch commits. Five alternating pinned runs improved median reference
+cycles about 1.6% in serial mode and 0.6% with the two-worker `Auto` mode.
+Instructions remained effectively flat, while branches fell about 0.06% in
+serial mode and 0.08% in `Auto`.
+
 The adjacent 65-byte significance-map return was also converted to a
 caller-owned buffer and rejected. It increased CABAC instructions about 0.1%
 and reference cycles about 0.3%, indicating that LLVM already handles this
