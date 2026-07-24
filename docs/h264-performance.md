@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.59 s | 1.51 s | 80,200 KiB | 113.2 FPS |
-| decv Auto (2 workers) | NV12 | 1.76 s | 1.88 s | 79,076 KiB | 102.3 FPS |
-| FFmpeg 1 thread | NV12 | 0.61 s | 0.69 s | 152,080 KiB | 295.1 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 289,816 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.56 s | 0.55 s | 95,564 KiB | 321.4 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.97 s | 192,512 KiB | 818.2 FPS |
+| decv Serial | NV12 | 1.58 s | 1.49 s | 80,428 KiB | 113.9 FPS |
+| decv Auto (2 workers) | NV12 | 1.70 s | 1.78 s | 79,980 KiB | 105.9 FPS |
+| FFmpeg 1 thread | NV12 | 0.62 s | 0.70 s | 152,272 KiB | 290.3 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 281,212 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.56 s | 0.55 s | 95,516 KiB | 321.4 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.94 s | 192,388 KiB | 818.2 FPS |
 
 On this workload:
 
-- decv Serial takes about **2.6x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **2.5x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **6.8x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **6.5x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **1.31x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.24x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
   **28%** of FFmpeg Auto NV12 peak RSS;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 88.7% throughput headroom over that
-line, and the measured two-worker Auto result has about 70.5%. The ordering
+seconds. The current Serial result has about 89.9% throughput headroom over that
+line, and the measured two-worker Auto result has about 76.5%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -806,6 +806,22 @@ showing that the extra allocation costs more than the once-per-frame move.
 The boxed layout was fully reverted. The sampled cost attributed to
 `finish_current_picture` is therefore dominated by inlined deblocking and
 picture finalization, not by its entry move.
+
+NV12 output now selects a 32-sample AVX2 Cb/Cr interleave kernel once per
+picture when the CPU supports it, with the existing SSE2 and scalar paths kept
+as fallbacks. The dispatch is deliberately outlined: allowing LTO to inline
+the AVX2 path into the already large `finish_current_picture` reduced
+instructions but produced inconsistent cycles on CAVLC. Outlining the
+full-plane operation shrank `finish_current_picture` from 22,758 to 22,163
+bytes and made the workloads agree. Five pinned CABAC Serial pairs reduced
+average reference cycles about 0.61%, instructions about 0.33%, and branches
+about 0.42%. Five CAVLC Serial pairs reduced reference cycles about 1.66%,
+instructions about 0.38%, and branches about 0.46%, with four pairs improving.
+The two-worker `Auto` measurement remained scheduling-sensitive: average
+reference cycles fell about 1.34% and its wall-time median moved from 2.60 to
+2.57 seconds, but only two of five pairs improved. The complete H.264 and MP4
+FFmpeg corpora remain byte-exact. The fixed 180-frame benchmark now measures
+1.58 seconds in Serial mode and 1.70 seconds in Auto mode.
 
 ## BitReader Checkpoint
 

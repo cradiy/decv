@@ -729,8 +729,26 @@ fn interleave_chroma(cb: &[u8], cr: &[u8], output_len: usize) -> Vec<u8> {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "sse2")]
+#[inline(never)]
 unsafe fn interleave_chroma_into(cb: *const u8, cr: *const u8, output: *mut u8, len: usize) {
+    if std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: Runtime feature detection proves AVX2 support. The caller
+        // provides equal readable inputs and two output bytes per sample.
+        unsafe {
+            interleave_chroma_avx2(cb, cr, output, len);
+        }
+    } else {
+        // SAFETY: SSE2 is part of the x86_64 architecture baseline and the
+        // caller provides the bounds described above.
+        unsafe {
+            interleave_chroma_sse2(cb, cr, output, len);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn interleave_chroma_sse2(cb: *const u8, cr: *const u8, output: *mut u8, len: usize) {
     use std::arch::x86_64::{
         __m128i, _mm_loadu_si128, _mm_storeu_si128, _mm_unpackhi_epi8, _mm_unpacklo_epi8,
     };
@@ -762,6 +780,47 @@ unsafe fn interleave_chroma_into(cb: *const u8, cr: *const u8, output: *mut u8, 
             output.add(index * 2 + 1).write(*cr.add(index));
         }
         index += 1;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn interleave_chroma_avx2(cb: *const u8, cr: *const u8, output: *mut u8, len: usize) {
+    use std::arch::x86_64::{
+        __m256i, _mm256_loadu_si256, _mm256_permute2x128_si256, _mm256_storeu_si256,
+        _mm256_unpackhi_epi8, _mm256_unpacklo_epi8,
+    };
+
+    let mut index = 0;
+    while index + 32 <= len {
+        // SAFETY: The loop bound leaves 32 readable input bytes and 64
+        // writable output bytes. Unaligned SIMD loads and stores are used.
+        unsafe {
+            let cb_samples = _mm256_loadu_si256(cb.add(index).cast::<__m256i>());
+            let cr_samples = _mm256_loadu_si256(cr.add(index).cast::<__m256i>());
+            let low = _mm256_unpacklo_epi8(cb_samples, cr_samples);
+            let high = _mm256_unpackhi_epi8(cb_samples, cr_samples);
+            _mm256_storeu_si256(
+                output.add(index * 2).cast::<__m256i>(),
+                _mm256_permute2x128_si256::<0x20>(low, high),
+            );
+            _mm256_storeu_si256(
+                output.add(index * 2 + 32).cast::<__m256i>(),
+                _mm256_permute2x128_si256::<0x31>(low, high),
+            );
+        }
+        index += 32;
+    }
+
+    // SAFETY: The completed AVX2 prefix leaves equal readable tails and two
+    // output bytes per remaining sample. SSE2 is guaranteed on x86_64.
+    unsafe {
+        interleave_chroma_sse2(
+            cb.add(index),
+            cr.add(index),
+            output.add(index * 2),
+            len - index,
+        );
     }
 }
 
@@ -865,6 +924,8 @@ mod tests {
         ChromaPlane, IntraReferenceAvailability, MacroblockPixels, StagedMacroblockPixels,
         Yuv420Picture, interleave_chroma,
     };
+    #[cfg(target_arch = "x86_64")]
+    use super::{interleave_chroma_avx2, interleave_chroma_sse2};
     use crate::{H264Error, PcmMacroblock};
 
     const ALL_REFERENCES: IntraReferenceAvailability = IntraReferenceAvailability {
@@ -883,6 +944,36 @@ mod tests {
                 .collect();
             let expected: Vec<_> = cb.iter().zip(&cr).flat_map(|(&cb, &cr)| [cb, cr]).collect();
             assert_eq!(interleave_chroma(&cb, &cr, len * 2), expected);
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn x86_chroma_interleave_backends_match_scalar_for_vector_and_tail_lengths() {
+        for len in 0..=65 {
+            let cb: Vec<_> = (0..len).map(|index| index as u8).collect();
+            let cr: Vec<_> = (0..len)
+                .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
+                .collect();
+            let expected: Vec<_> = cb.iter().zip(&cr).flat_map(|(&cb, &cr)| [cb, cr]).collect();
+
+            let mut sse2 = vec![0; len * 2];
+            // SAFETY: SSE2 is part of the x86_64 baseline and all three
+            // allocations have the exact lengths required by the backend.
+            unsafe {
+                interleave_chroma_sse2(cb.as_ptr(), cr.as_ptr(), sse2.as_mut_ptr(), cb.len());
+            }
+            assert_eq!(sse2, expected);
+
+            if std::arch::is_x86_feature_detected!("avx2") {
+                let mut avx2 = vec![0; len * 2];
+                // SAFETY: Runtime detection proves AVX2 support and the
+                // allocations have the exact lengths required by the backend.
+                unsafe {
+                    interleave_chroma_avx2(cb.as_ptr(), cr.as_ptr(), avx2.as_mut_ptr(), cb.len());
+                }
+                assert_eq!(avx2, expected);
+            }
         }
     }
 

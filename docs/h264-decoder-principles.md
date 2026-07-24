@@ -736,10 +736,11 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - each macroblock derives its 32 luma-grid boundary strengths once and reuses
   them for Y, Cb, and Cr filtering, avoiding repeated reference-identity and
   motion-vector comparisons for the two chroma planes;
-- on x86-64, SSE2 filters four samples of a weak luma edge together; horizontal
-  edges use contiguous four-byte rows, while vertical edges load four 64-bit
-  rows and transpose them in registers before one write per row; strong,
-  chroma, and non-x86-64 filtering retain the scalar path;
+- on x86-64, SSE2 filters four weak or strong luma sample sets together;
+  horizontal edges use contiguous rows, while vertical edges load four 64-bit
+  rows and transpose them in registers before one write per row; paired chroma
+  edges use eight SSE2 lanes, while non-x86-64 filtering retains scalar
+  fallbacks;
 - structure-of-arrays reconstruction bookkeeping keeps completion flags
   separate from deblocking metadata, so picture finalization filters the
   in-place metadata instead of allocating and copying one large record per
@@ -760,6 +761,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
   reference picture, retaining original list indices and mapping entries back
   to stable reference IDs;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
+  x86-64 dispatches the complete chroma plane once to a 32-sample AVX2 kernel
+  when available, otherwise using the SSE2 fallback, keeping feature selection
+  outside the inner sample loop;
 - a CAVLC I-slice driver that joins header position, `nC`, QP, transforms,
   prediction, picture writes, and RBSP trailing-bit validation;
 - a progressive CAVLC B-slice driver for List 0, List 1, bidirectional,
