@@ -1604,8 +1604,10 @@ impl IntraPictureReconstructor {
                                     macroblock_y,
                                     slice_id,
                                 )?;
-                                if let Err(error) = self.reference_motion.record_b(
+                                if let Err(error) = self.reference_motion.record_b_at(
                                     macroblock_address,
+                                    macroblock_x,
+                                    macroblock_y,
                                     &motion,
                                     reference_ids_l0,
                                     reference_ids_l1,
@@ -1669,8 +1671,10 @@ impl IntraPictureReconstructor {
                                             header,
                                         )?
                                     };
-                                    if let Err(error) = self.reference_motion.record_b(
+                                    if let Err(error) = self.reference_motion.record_b_at(
                                         macroblock_address,
+                                        macroblock_x,
+                                        macroblock_y,
                                         &motion,
                                         reference_ids_l0,
                                         reference_ids_l1,
@@ -1862,8 +1866,10 @@ impl IntraPictureReconstructor {
                             return Err(error);
                         }
                     };
-                if let Err(error) = self.reference_motion.record_b(
+                if let Err(error) = self.reference_motion.record_b_at(
                     macroblock_address,
+                    macroblock_x,
+                    macroblock_y,
                     &motion,
                     reference_ids_l0,
                     reference_ids_l1,
@@ -1974,8 +1980,10 @@ impl IntraPictureReconstructor {
                             header,
                         )?
                     };
-                    if let Err(error) = self.reference_motion.record_b(
+                    if let Err(error) = self.reference_motion.record_b_at(
                         macroblock_address,
+                        macroblock_x,
+                        macroblock_y,
                         &motion,
                         reference_ids_l0,
                         reference_ids_l1,

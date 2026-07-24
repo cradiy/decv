@@ -1618,6 +1618,25 @@ old zero-pattern loop and should be judged primarily by elapsed CPU time. The
 streamed 597,196,800-byte 4K output retained SHA-256
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`.
 
+Reference-motion recording for B pictures now preserves the macroblock
+coordinates already validated by the reconstruction loop. The address-only
+test entry point derives the same coordinates, while the decoder's internal
+path passes `(address, x, y)` directly. The fixed-row uniform writer is
+outlined to keep the B recorder compact and removes one runtime-width integer
+division without returning a large helper value. Mixed partitions retain the
+existing complete coverage and overlap validation.
+
+Ten alternating native 4K `Auto` pairs reduced mean wall time about 2.18%,
+task-clock about 1.30%, and reference cycles about 1.41%; instructions and
+branches were effectively neutral. With byte-identical PGO training
+manifests, fifteen 4K `Auto` pairs reduced mean wall time about 0.74%,
+task-clock about 0.56%, reference cycles about 0.78%, instructions about
+0.69%, and branches about 0.23%. All fifteen PGO instruction pairs, fourteen
+branch pairs, and nine wall-time pairs improved. The streamed
+597,196,800-byte 4K output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+and the generated H.264 and MP4/seek corpora remained byte-exact.
+
 ## Frame Service Timing
 
 `decv-cli` has an opt-in `frame-timing` feature for measuring decoder

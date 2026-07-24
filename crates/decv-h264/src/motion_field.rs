@@ -185,9 +185,36 @@ impl MotionFieldBuilder {
         self.record_complete_inter_macroblock(macroblock_address, cells, coverage)
     }
 
+    #[cfg(test)]
     pub(crate) fn record_b(
         &mut self,
         macroblock_address: usize,
+        motion: &ResolvedBMacroblock,
+        reference_ids_l0: Option<&[Option<ReferenceId>]>,
+        reference_ids_l1: Option<&[Option<ReferenceId>]>,
+    ) -> Result<()> {
+        if macroblock_address >= self.completed.len() {
+            return Err(H264Error::InvalidSyntax(
+                "reference motion-field macroblock exceeds the picture",
+            ));
+        }
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        self.record_b_at(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            motion,
+            reference_ids_l0,
+            reference_ids_l1,
+        )
+    }
+
+    pub(crate) fn record_b_at(
+        &mut self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
         motion: &ResolvedBMacroblock,
         reference_ids_l0: Option<&[Option<ReferenceId>]>,
         reference_ids_l1: Option<&[Option<ReferenceId>]>,
@@ -225,8 +252,10 @@ impl MotionFieldBuilder {
                     .flatten(),
                 vector: list.motion_vector,
             });
-            return self.record_uniform_macroblock(
+            return self.record_uniform_macroblock_at(
                 macroblock_address,
+                macroblock_x,
+                macroblock_y,
                 MotionFieldCell {
                     intra: false,
                     list0,
@@ -410,6 +439,42 @@ impl MotionFieldBuilder {
         Ok(())
     }
 
+    #[inline(never)]
+    fn record_uniform_macroblock_at(
+        &mut self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        cell: MotionFieldCell,
+    ) -> Result<()> {
+        let macroblock_count = self.completed.len();
+        if macroblock_address >= macroblock_count {
+            return Err(H264Error::InvalidSyntax(
+                "reference motion-field macroblock exceeds the picture",
+            ));
+        }
+        if self.completed[macroblock_address] != 0 {
+            return Err(H264Error::InvalidSyntax(
+                "reference motion-field macroblock was already recorded",
+            ));
+        }
+        debug_assert!(macroblock_x < self.width_in_macroblocks);
+        debug_assert_eq!(
+            macroblock_address,
+            macroblock_y * self.width_in_macroblocks + macroblock_x
+        );
+        let field_width = self.width_in_macroblocks * 4;
+        let first = macroblock_y * 4 * field_width + macroblock_x * 4;
+        for row in 0..4 {
+            let row_start = first + row * field_width;
+            for destination in &mut self.cells[row_start..row_start + 4] {
+                destination.write(cell);
+            }
+        }
+        self.completed[macroblock_address] = 1;
+        Ok(())
+    }
+
     fn macroblock_indices(&self, macroblock_address: usize) -> Result<[usize; 16]> {
         let macroblock_count = self.completed.len();
         if macroblock_address >= macroblock_count {
@@ -550,6 +615,65 @@ mod tests {
             field.cell(7, 3).unwrap().list1.unwrap().reference_id,
             Some(ReferenceId::new(8))
         );
+    }
+
+    #[test]
+    fn coordinate_preserving_b_record_matches_the_address_entry_point() {
+        let motion = ResolvedBMacroblock {
+            direct: true,
+            partitions: vec![ResolvedBPartition {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                list0: Some(ResolvedBListMotion {
+                    reference_index: 0,
+                    motion_vector: MotionVector { x: 2, y: -1 },
+                }),
+                list1: Some(ResolvedBListMotion {
+                    reference_index: 0,
+                    motion_vector: MotionVector { x: -3, y: 4 },
+                }),
+            }]
+            .into(),
+        };
+        let references_l0 = [Some(ReferenceId::new(7))];
+        let references_l1 = [Some(ReferenceId::new(8))];
+
+        let mut address_only = MotionFieldBuilder::new(Size::new(32, 16)).unwrap();
+        address_only.record_intra(0).unwrap();
+        address_only
+            .record_b(
+                1,
+                &motion,
+                Some(&references_l0),
+                Some(&references_l1),
+            )
+            .unwrap();
+
+        let mut coordinate_preserving = MotionFieldBuilder::new(Size::new(32, 16)).unwrap();
+        coordinate_preserving.record_intra(0).unwrap();
+        coordinate_preserving
+            .record_b_at(
+                1,
+                1,
+                0,
+                &motion,
+                Some(&references_l0),
+                Some(&references_l1),
+            )
+            .unwrap();
+
+        let address_only = address_only.finish().unwrap();
+        let coordinate_preserving = coordinate_preserving.finish().unwrap();
+        for y in 0..4 {
+            for x in 0..8 {
+                assert_eq!(
+                    coordinate_preserving.cell(x, y),
+                    address_only.cell(x, y)
+                );
+            }
+        }
     }
 
     #[test]
