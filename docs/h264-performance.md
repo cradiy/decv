@@ -495,6 +495,15 @@ about 0.2% and median reference cycles about 1.4%. A useful next deblock step
 must batch a complete edge rather than expanding the existing small kernels
 inside picture traversal.
 
+Picture traversal now submits each complete sixteen-sample luma edge to one
+out-of-line batch entry. The x86-64 backend reuses the proven four-lane SSE2
+weak and strong kernels inside that compact entry, while the portable backend
+retains segmented scalar filtering. Five alternating pinned runs reduced
+CABAC instructions about 0.65%, branches about 0.28%, and median reference
+cycles about 0.9%. CAVLC improved by about 0.77%, 0.29%, and 1.3%,
+respectively. Two-worker `Auto` instructions fell about 0.63%; its reference
+cycles were noise-level but slightly lower.
+
 Skipping the second coverage walk for an already coalesced uniform Direct B
 partition was rejected in two forms. A branch inside the prediction loop
 reduced instructions about 0.06% but made median reference cycles about 1.1%
