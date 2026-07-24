@@ -340,63 +340,51 @@ pub(crate) fn filter_420_picture(
         let luma_x = macroblock_x * 16;
         let luma_y = macroblock_y * 16;
         if filter_left && vertical_strengths[0] != [0; 4] {
-            for block_row in 0..4 {
-                filter_vertical_edge(
-                    luma,
-                    width,
-                    luma_x,
-                    luma_y + block_row * 4,
-                    4,
-                    vertical_strengths[0][block_row],
-                    left_thresholds[0],
-                );
-            }
+            filter_vertical_luma_edge(
+                luma,
+                width,
+                luma_x,
+                luma_y,
+                vertical_strengths[0],
+                left_thresholds[0],
+            );
         }
         for block_column in 1..4 {
             if (block_column == 2 || !current.transform_8x8)
                 && vertical_strengths[block_column] != [0; 4]
             {
-                for block_row in 0..4 {
-                    filter_vertical_edge(
-                        luma,
-                        width,
-                        luma_x + block_column * 4,
-                        luma_y + block_row * 4,
-                        4,
-                        vertical_strengths[block_column][block_row],
-                        internal_thresholds[0],
-                    );
-                }
-            }
-        }
-        if filter_top && horizontal_strengths[0] != [0; 4] {
-            for block_column in 0..4 {
-                filter_horizontal_edge(
+                filter_vertical_luma_edge(
                     luma,
                     width,
                     luma_x + block_column * 4,
                     luma_y,
-                    4,
-                    horizontal_strengths[0][block_column],
-                    top_thresholds[0],
+                    vertical_strengths[block_column],
+                    internal_thresholds[0],
                 );
             }
+        }
+        if filter_top && horizontal_strengths[0] != [0; 4] {
+            filter_horizontal_luma_edge(
+                luma,
+                width,
+                luma_x,
+                luma_y,
+                horizontal_strengths[0],
+                top_thresholds[0],
+            );
         }
         for block_row in 1..4 {
             if (block_row == 2 || !current.transform_8x8)
                 && horizontal_strengths[block_row] != [0; 4]
             {
-                for block_column in 0..4 {
-                    filter_horizontal_edge(
-                        luma,
-                        width,
-                        luma_x + block_column * 4,
-                        luma_y + block_row * 4,
-                        4,
-                        horizontal_strengths[block_row][block_column],
-                        internal_thresholds[0],
-                    );
-                }
+                filter_horizontal_luma_edge(
+                    luma,
+                    width,
+                    luma_x,
+                    luma_y + block_row * 4,
+                    horizontal_strengths[block_row],
+                    internal_thresholds[0],
+                );
             }
         }
 
@@ -614,6 +602,7 @@ fn list_motion_differs(previous: DeblockListMotion, current: DeblockListMotion) 
         || (i32::from(previous.vector.y) - i32::from(current.vector.y)).abs() >= 4
 }
 
+#[cfg(any(test, not(target_arch = "x86_64")))]
 fn filter_vertical_edge(
     plane: &mut [u8],
     stride: usize,
@@ -653,6 +642,7 @@ fn filter_vertical_edge(
     }
 }
 
+#[cfg(any(test, not(target_arch = "x86_64")))]
 fn filter_horizontal_edge(
     plane: &mut [u8],
     stride: usize,
@@ -682,6 +672,7 @@ fn filter_horizontal_edge(
     filter_horizontal_edge_scalar(plane, stride, x, y, length, parameters);
 }
 
+#[cfg(any(test, not(target_arch = "x86_64")))]
 fn filter_horizontal_edge_scalar(
     plane: &mut [u8],
     stride: usize,
@@ -701,6 +692,84 @@ fn filter_horizontal_edge_scalar(
             plane[q0 - (index + 1) * stride] = filtered.p[index];
             plane[q0 + index * stride] = filtered.q[index];
         }
+    }
+}
+
+#[inline(never)]
+fn filter_vertical_luma_edge(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    boundary_strengths: [u8; 4],
+    thresholds: Option<EdgeThresholds>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    for (segment, boundary_strength) in boundary_strengths.into_iter().enumerate() {
+        let Some(parameters) = prepare_edge_strength(boundary_strength, thresholds) else {
+            continue;
+        };
+        // SAFETY: Picture traversal guarantees sixteen complete luma rows and
+        // three samples on either side of this edge. Each call consumes one
+        // non-overlapping four-row segment.
+        unsafe {
+            if parameters.boundary_strength < 4 {
+                filter_vertical_weak_luma_sse2(plane, stride, x, y + segment * 4, parameters);
+            } else {
+                filter_vertical_strong_luma_sse2(plane, stride, x, y + segment * 4, parameters);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for (segment, boundary_strength) in boundary_strengths.into_iter().enumerate() {
+        filter_vertical_edge(
+            plane,
+            stride,
+            x,
+            y + segment * 4,
+            4,
+            boundary_strength,
+            thresholds,
+        );
+    }
+}
+
+#[inline(never)]
+fn filter_horizontal_luma_edge(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    boundary_strengths: [u8; 4],
+    thresholds: Option<EdgeThresholds>,
+) {
+    #[cfg(target_arch = "x86_64")]
+    for (segment, boundary_strength) in boundary_strengths.into_iter().enumerate() {
+        let Some(parameters) = prepare_edge_strength(boundary_strength, thresholds) else {
+            continue;
+        };
+        // SAFETY: Picture traversal guarantees sixteen horizontally adjacent
+        // luma samples and three complete rows on either side. Each call
+        // consumes one non-overlapping four-column segment.
+        unsafe {
+            if parameters.boundary_strength < 4 {
+                filter_horizontal_weak_luma_sse2(plane, stride, x + segment * 4, y, parameters);
+            } else {
+                filter_horizontal_strong_luma_sse2(plane, stride, x + segment * 4, y, parameters);
+            }
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    for (segment, boundary_strength) in boundary_strengths.into_iter().enumerate() {
+        filter_horizontal_edge(
+            plane,
+            stride,
+            x + segment * 4,
+            y,
+            4,
+            boundary_strength,
+            thresholds,
+        );
     }
 }
 
@@ -1490,6 +1559,7 @@ unsafe fn filter_vertical_strong_luma_sse2(
     }
 }
 
+#[cfg(any(test, not(target_arch = "x86_64")))]
 fn apply_parameters(
     samples: DeblockEdgeSamples,
     parameters: PreparedEdgeParameters,
@@ -1551,14 +1621,15 @@ mod tests {
     use super::{
         ALPHA, BETA, DeblockEdgeSamples, DeblockListMotion, DeblockMotion, FilteredDeblockEdge,
         MacroblockDeblockInfo, TC0, boundary_strength, filter_420_picture, filter_deblock_edge,
+        filter_horizontal_edge, filter_horizontal_luma_edge, filter_vertical_edge,
+        filter_vertical_luma_edge, prepare_edge_thresholds_unchecked,
     };
     #[cfg(target_arch = "x86_64")]
     use super::{
-        EdgeParameters, filter_horizontal_chroma_edge, filter_horizontal_edge,
-        filter_horizontal_edge_scalar, filter_horizontal_strong_luma_sse2,
-        filter_horizontal_weak_luma_sse2, filter_vertical_chroma_edge, filter_vertical_edge,
-        filter_vertical_strong_luma_sse2, filter_vertical_weak_luma_sse2, prepare_edge_parameters,
-        prepare_edge_thresholds_unchecked,
+        EdgeParameters, filter_horizontal_chroma_edge, filter_horizontal_edge_scalar,
+        filter_horizontal_strong_luma_sse2, filter_horizontal_weak_luma_sse2,
+        filter_vertical_chroma_edge, filter_vertical_strong_luma_sse2,
+        filter_vertical_weak_luma_sse2, prepare_edge_parameters,
     };
     use crate::{DeblockingFilter, H264Error, MotionVector, Yuv420Picture};
 
@@ -1737,6 +1808,75 @@ mod tests {
                     assert_eq!(
                         simd, scalar,
                         "vertical qp={qp} boundary_strength={boundary_strength} seed={seed}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn luma_edge_batches_match_segmented_filtering() {
+        const STRENGTHS: [[u8; 4]; 6] = [
+            [0, 0, 0, 0],
+            [1, 2, 3, 4],
+            [4, 3, 2, 1],
+            [1, 1, 2, 2],
+            [4, 4, 4, 4],
+            [0, 3, 0, 4],
+        ];
+        for qp in [18, 24, 32, 40, 51] {
+            let thresholds =
+                prepare_edge_thresholds_unchecked(qp, qp.saturating_sub(2), 0, 0, false);
+            for strengths in STRENGTHS {
+                for seed in 0..16usize {
+                    let original: Vec<u8> = (0..32 * 32)
+                        .map(|index| {
+                            let x = index % 32;
+                            let y = index / 32;
+                            if seed.is_multiple_of(2) {
+                                96 + ((x * 3 + y * 2 + seed) % 13) as u8
+                            } else {
+                                ((index * 73 + index / 11 * 29 + seed * 41) & 0xff) as u8
+                            }
+                        })
+                        .collect();
+
+                    let mut segmented = original.clone();
+                    for (segment, strength) in strengths.into_iter().enumerate() {
+                        filter_horizontal_edge(
+                            &mut segmented,
+                            32,
+                            8 + segment * 4,
+                            16,
+                            4,
+                            strength,
+                            thresholds,
+                        );
+                    }
+                    let mut batched = original.clone();
+                    filter_horizontal_luma_edge(&mut batched, 32, 8, 16, strengths, thresholds);
+                    assert_eq!(
+                        batched, segmented,
+                        "horizontal qp={qp} strengths={strengths:?} seed={seed}"
+                    );
+
+                    let mut segmented = original.clone();
+                    for (segment, strength) in strengths.into_iter().enumerate() {
+                        filter_vertical_edge(
+                            &mut segmented,
+                            32,
+                            16,
+                            8 + segment * 4,
+                            4,
+                            strength,
+                            thresholds,
+                        );
+                    }
+                    let mut batched = original;
+                    filter_vertical_luma_edge(&mut batched, 32, 16, 8, strengths, thresholds);
+                    assert_eq!(
+                        batched, segmented,
+                        "vertical qp={qp} strengths={strengths:?} seed={seed}"
                     );
                 }
             }
