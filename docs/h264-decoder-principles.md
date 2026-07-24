@@ -670,7 +670,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - block-level interpolation-footprint classification: ordinary interior
   motion compensation uses a bounds-check-free specialization, while the
   clipped edge path preserves normative sample replication; integer interior
-  motion uses row copies instead of entering the per-sample interpolator;
+  motion selects a fixed-width rectangle-copy kernel once, with four-row
+  expansion preserving memory-level parallelism instead of entering either a
+  per-row width dispatcher or the per-sample interpolator;
 - x86-64 SSE2 evaluates horizontal-only and vertical-only luma six-tap
   interpolation eight samples at a time for common 8- and 16-pixel partition
   widths, while diagonal and clipped positions retain the scalar path;

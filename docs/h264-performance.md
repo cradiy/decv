@@ -843,6 +843,21 @@ average reference cycles about 0.52% across eight alternating pinned pairs.
 The unsigned sentinel was fully reverted; fewer instructions alone do not
 justify a worse CABAC dependency schedule.
 
+Interior integer-motion prediction now selects its fixed row width once per
+luma or chroma rectangle and copies four independent rows per iteration.
+Previously every row and both chroma planes re-entered a 2/4/8/16-byte jump
+table. A first const-width loop reduced instructions about 2.9% and branches
+about 7.8% but left CABAC cycles unchanged because its row pointers formed a
+serial dependency chain. Four-row expansion retains the hoisted dispatch while
+restoring memory-level parallelism. Five pinned CABAC Serial pairs all
+improved, reducing reference cycles about 2.95%, instructions about 2.71%, and
+branches about 7.31%. Five CAVLC Serial pairs reduced reference cycles about
+1.72%, instructions about 3.08%, and branches about 8.07%, with four pairs
+improving. All five two-worker `Auto` pairs improved; reference cycles fell
+about 3.31%, instructions about 2.66%, and branches about 7.13%. An exhaustive
+rectangle oracle covers every supported fixed width and row count at
+unaligned source and destination addresses.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

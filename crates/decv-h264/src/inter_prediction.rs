@@ -249,19 +249,34 @@ fn predict_luma<const CLIP: bool>(
 ) {
     if !CLIP && x_fraction == 0 && y_fraction == 0 {
         let output_width = usize::from(prediction.width);
+        let output_height = usize::from(prediction.height);
         let reference_x = reference_x as usize;
         let reference_y = reference_y as usize;
-        for output_y in 0..usize::from(prediction.height) {
-            let start = (reference_y + output_y) * width + reference_x;
-            // SAFETY: the complete source rectangle was validated as
-            // interior, the destination row has 16 bytes, and valid luma
-            // partition widths are exactly 4, 8, or 16 bytes.
-            unsafe {
-                copy_fixed_row(
-                    prediction.luma[output_y].as_mut_ptr(),
+        let start = reference_y * width + reference_x;
+        // SAFETY: The complete source rectangle was validated as interior,
+        // every destination row has sixteen bytes, and the selected constant
+        // width is the validated partition width.
+        unsafe {
+            match output_width {
+                4 => copy_fixed_rows::<4, 16>(
+                    prediction.luma.as_mut_ptr().cast(),
                     plane.as_ptr().add(start),
-                    output_width,
-                );
+                    width,
+                    output_height,
+                ),
+                8 => copy_fixed_rows::<8, 16>(
+                    prediction.luma.as_mut_ptr().cast(),
+                    plane.as_ptr().add(start),
+                    width,
+                    output_height,
+                ),
+                16 => copy_fixed_rows::<16, 16>(
+                    prediction.luma.as_mut_ptr().cast(),
+                    plane.as_ptr().add(start),
+                    width,
+                    output_height,
+                ),
+                _ => unreachable!("validated luma partition widths are 4, 8, or 16"),
             }
         }
         return;
@@ -855,24 +870,58 @@ fn predict_chroma<const CLIP: bool>(
 ) {
     if !CLIP && x_fraction == 0 && y_fraction == 0 {
         let output_width = usize::from(prediction.width / 2);
+        let output_height = usize::from(prediction.height / 2);
         let reference_x = reference_x as usize;
         let reference_y = reference_y as usize;
-        for output_y in 0..usize::from(prediction.height / 2) {
-            let start = (reference_y + output_y) * width + reference_x;
-            // SAFETY: the complete source rectangles were validated as
-            // interior, each destination row has eight bytes, and valid
-            // chroma partition widths are exactly 2, 4, or 8 bytes.
-            unsafe {
-                copy_fixed_row(
-                    prediction.cb[output_y].as_mut_ptr(),
-                    cb.as_ptr().add(start),
-                    output_width,
-                );
-                copy_fixed_row(
-                    prediction.cr[output_y].as_mut_ptr(),
-                    cr.as_ptr().add(start),
-                    output_width,
-                );
+        let start = reference_y * width + reference_x;
+        // SAFETY: Both complete source rectangles were validated as interior,
+        // each destination row has eight bytes, and the selected constant
+        // width is the validated chroma partition width.
+        unsafe {
+            match output_width {
+                2 => {
+                    copy_fixed_rows::<2, 8>(
+                        prediction.cb.as_mut_ptr().cast(),
+                        cb.as_ptr().add(start),
+                        width,
+                        output_height,
+                    );
+                    copy_fixed_rows::<2, 8>(
+                        prediction.cr.as_mut_ptr().cast(),
+                        cr.as_ptr().add(start),
+                        width,
+                        output_height,
+                    );
+                }
+                4 => {
+                    copy_fixed_rows::<4, 8>(
+                        prediction.cb.as_mut_ptr().cast(),
+                        cb.as_ptr().add(start),
+                        width,
+                        output_height,
+                    );
+                    copy_fixed_rows::<4, 8>(
+                        prediction.cr.as_mut_ptr().cast(),
+                        cr.as_ptr().add(start),
+                        width,
+                        output_height,
+                    );
+                }
+                8 => {
+                    copy_fixed_rows::<8, 8>(
+                        prediction.cb.as_mut_ptr().cast(),
+                        cb.as_ptr().add(start),
+                        width,
+                        output_height,
+                    );
+                    copy_fixed_rows::<8, 8>(
+                        prediction.cr.as_mut_ptr().cast(),
+                        cr.as_ptr().add(start),
+                        width,
+                        output_height,
+                    );
+                }
+                _ => unreachable!("validated chroma partition widths are 2, 4, or 8"),
             }
         }
         return;
@@ -1270,6 +1319,55 @@ pub(crate) unsafe fn copy_fixed_row(destination: *mut u8, source: *const u8, wid
     }
 }
 
+#[inline(always)]
+unsafe fn copy_fixed_rows<const ROW_WIDTH: usize, const DESTINATION_STRIDE: usize>(
+    mut destination: *mut u8,
+    mut source: *const u8,
+    source_stride: usize,
+    mut rows: usize,
+) {
+    debug_assert!(matches!(ROW_WIDTH, 2 | 4 | 8 | 16));
+    debug_assert!(ROW_WIDTH <= DESTINATION_STRIDE);
+    debug_assert!(matches!(rows, 2 | 4 | 8 | 16));
+    while rows >= 4 {
+        // SAFETY: The caller validates every source and destination row.
+        // Four independent fixed-size copies expose row-level memory
+        // parallelism without repeating the runtime width dispatch.
+        unsafe {
+            copy_fixed_row(destination, source, ROW_WIDTH);
+            copy_fixed_row(
+                destination.add(DESTINATION_STRIDE),
+                source.add(source_stride),
+                ROW_WIDTH,
+            );
+            copy_fixed_row(
+                destination.add(2 * DESTINATION_STRIDE),
+                source.add(2 * source_stride),
+                ROW_WIDTH,
+            );
+            copy_fixed_row(
+                destination.add(3 * DESTINATION_STRIDE),
+                source.add(3 * source_stride),
+                ROW_WIDTH,
+            );
+            destination = destination.add(4 * DESTINATION_STRIDE);
+            source = source.add(4 * source_stride);
+        }
+        rows -= 4;
+    }
+    if rows == 2 {
+        // SAFETY: Chroma partitions may leave exactly two validated rows.
+        unsafe {
+            copy_fixed_row(destination, source, ROW_WIDTH);
+            copy_fixed_row(
+                destination.add(DESTINATION_STRIDE),
+                source.add(source_stride),
+                ROW_WIDTH,
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 fn interpolate_luma(
     plane: &[u8],
@@ -1523,6 +1621,43 @@ mod tests {
                 copy_fixed_row(actual.as_mut_ptr().add(3), source.as_ptr().add(1), width);
             }
             assert_eq!(actual, expected, "width={width}");
+        }
+    }
+
+    #[test]
+    fn fixed_rectangle_copy_matches_row_slices_for_all_partition_shapes() {
+        fn check<const WIDTH: usize>(rows: usize) {
+            const SOURCE_STRIDE: usize = 23;
+            const DESTINATION_STRIDE: usize = 20;
+            let source: Vec<u8> = (0..1 + 16 * SOURCE_STRIDE)
+                .map(|index| (index * 37 + 11) as u8)
+                .collect();
+            let mut actual = [0xa5; 3 + 16 * DESTINATION_STRIDE];
+            let mut expected = actual;
+            for row in 0..rows {
+                let source_start = 1 + row * SOURCE_STRIDE;
+                let destination_start = 3 + row * DESTINATION_STRIDE;
+                expected[destination_start..destination_start + WIDTH]
+                    .copy_from_slice(&source[source_start..source_start + WIDTH]);
+            }
+            // SAFETY: Every selected source and destination row contains
+            // `WIDTH` bytes. Offsets one and three exercise unaligned access.
+            unsafe {
+                copy_fixed_rows::<WIDTH, DESTINATION_STRIDE>(
+                    actual.as_mut_ptr().add(3),
+                    source.as_ptr().add(1),
+                    SOURCE_STRIDE,
+                    rows,
+                );
+            }
+            assert_eq!(actual, expected, "width={WIDTH} rows={rows}");
+        }
+
+        for rows in [2, 4, 8, 16] {
+            check::<2>(rows);
+            check::<4>(rows);
+            check::<8>(rows);
+            check::<16>(rows);
         }
     }
 
