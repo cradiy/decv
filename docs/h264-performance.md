@@ -554,6 +554,13 @@ capacity remains the better representation; future work on its visible
 `memmove` cost must eliminate moves without introducing per-macroblock
 allocations.
 
+A paired SSE2 kernel for the two Cb and two Cr samples belonging to a 4x4
+luma partition was also rejected. It was byte-exact for all 64 fractional
+positions and reduced whole-decoder instructions about 0.06% and branches
+about 0.09%, but five paired CABAC runs put median reference cycles about
+0.16% and wall time about 0.5% higher. Packing four useful samples into an
+SSE2 vector does not amortize its setup on this workload.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
