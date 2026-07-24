@@ -991,6 +991,17 @@ bytes; seven pinned CABAC Serial pairs increased reference cycles about 0.57%,
 task-clock about 1.05%, and branches about 0.12%, with only two pairs
 improving. The fixed-size clear was restored.
 
+Representing a CABAC significance map as a partially initialized
+`[MaybeUninit<u8>; 64]` was also tested. Significance decoding wrote each
+position before increasing `count`, and the safe accessor exposed only that
+initialized prefix, eliminating the map's 64-byte zero initialization. It
+passed the residual tests and native byte-exact H.264 corpus, reducing
+whole-decoder instructions about 0.16% and branches about 0.09%. Across
+fourteen pinned CABAC Serial pairs, however, exactly seven improved; average
+reference cycles increased about 0.13%, task-clock about 0.33%, and branch
+misses about 0.61%. The initialized array and derived value semantics were
+restored rather than retaining an unsafe invariant for a slower result.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
