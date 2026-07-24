@@ -655,6 +655,12 @@ instructions fell about 8.2%, branches about 4.4%, and cycles about 3.3%.
 All CAVLC and `Auto` cycle samples improved, and the native binary passed the
 complete byte-exact FFmpeg stream corpus via `DECV_VERIFY_BIN`.
 
+The fixed comparison script accepts an already built decoder through
+`DECV_BENCH_BIN`. With the native binary, its three-run medians were 1.55
+seconds (116.1 FPS) for Serial and 1.67 seconds (107.8 FPS) for `Auto`.
+The same run measured FFmpeg NV12 at 0.61 seconds with one thread and 0.26
+seconds in automatic mode, leaving native decv gaps of about 2.5x and 6.4x.
+
 After LTO, `predict_inter_420_into` contains the specialized luma and chroma
 kernels and is roughly 21.3 KiB. Forcing both kernels out of line reduced the
 combined machine code by about 1.6 KiB, but added two calls per predicted
