@@ -275,9 +275,18 @@ impl ReconstructionWorkspace {
         width_in_macroblocks: usize,
         height_in_macroblocks: usize,
     ) -> Result<()> {
-        self.b_motion
-            .reset_for_picture(width_in_macroblocks, height_in_macroblocks)?;
         let generation_exhausted = self.next_slice_id == u32::MAX;
+        let first_slice_id = if generation_exhausted {
+            1
+        } else {
+            self.next_slice_id + 1
+        };
+        self.b_motion.reset_for_picture(
+            width_in_macroblocks,
+            height_in_macroblocks,
+            first_slice_id,
+            generation_exhausted,
+        )?;
         self.cabac_residual.reset_for_picture(
             width_in_macroblocks,
             height_in_macroblocks,
@@ -3463,6 +3472,10 @@ mod tests {
             .cabac_residual
             .record_block(0, u32::MAX, CabacResidualBlock::LumaDc, true)
             .unwrap();
+        workspace
+            .b_motion
+            .record_intra_macroblock(0, u32::MAX)
+            .unwrap();
         assert_eq!(
             workspace
                 .cabac_residual
@@ -3475,6 +3488,7 @@ mod tests {
         workspace.reset_for_picture(2, 1).unwrap();
 
         assert_eq!(workspace.next_slice_id, 0);
+        workspace.b_motion.record_intra_macroblock(0, 1).unwrap();
         assert_eq!(
             workspace
                 .cabac_residual

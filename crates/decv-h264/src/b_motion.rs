@@ -126,6 +126,7 @@ struct PartitionPlan {
 pub struct BMotionState {
     width_in_macroblocks: usize,
     height_in_macroblocks: usize,
+    first_slice_id: u32,
     cells: Vec<Option<MotionCell>>,
 }
 
@@ -147,6 +148,7 @@ impl BMotionState {
         Ok(Self {
             width_in_macroblocks,
             height_in_macroblocks,
+            first_slice_id: 0,
             cells: vec![None; cell_count],
         })
     }
@@ -155,14 +157,17 @@ impl BMotionState {
         &mut self,
         width_in_macroblocks: usize,
         height_in_macroblocks: usize,
+        first_slice_id: u32,
+        clear_entries: bool,
     ) -> Result<()> {
         let cell_count = b_motion_cell_count(width_in_macroblocks, height_in_macroblocks)?;
         self.width_in_macroblocks = width_in_macroblocks;
         self.height_in_macroblocks = height_in_macroblocks;
-        if self.cells.len() == cell_count {
-            self.cells.fill(None);
-        } else {
+        self.first_slice_id = first_slice_id;
+        if self.cells.len() != cell_count {
             self.cells = vec![None; cell_count];
+        } else if clear_entries {
+            self.cells.fill(None);
         }
         Ok(())
     }
@@ -172,7 +177,7 @@ impl BMotionState {
         macroblock_address: usize,
         slice_id: u32,
     ) -> Result<()> {
-        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        self.ensure_macroblock_available_for_write(macroblock_address, slice_id)?;
         self.commit_local_cells(
             macroblock_address,
             [Some(MotionCell {
@@ -191,7 +196,7 @@ impl BMotionState {
         slice_id: u32,
         header: &BInterMacroblockHeader,
     ) -> Result<ResolvedBMacroblock> {
-        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        self.ensure_macroblock_available_for_write(macroblock_address, slice_id)?;
         let plans = partition_plans(header)?;
         let mut local = [None; 16];
         let mut resolved = SmallVec::with_capacity(plans.len());
@@ -230,7 +235,7 @@ impl BMotionState {
         slice_id: u32,
         context: SpatialDirectContext<'_>,
     ) -> Result<ResolvedBMacroblock> {
-        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        self.ensure_macroblock_available_for_write(macroblock_address, slice_id)?;
         let geometry = PartitionGeometry {
             x: 0,
             y: 0,
@@ -376,7 +381,7 @@ impl BMotionState {
         slice_id: u32,
         context: TemporalDirectContext<'_>,
     ) -> Result<ResolvedBMacroblock> {
-        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        self.ensure_macroblock_available_for_write(macroblock_address, slice_id)?;
         if context.num_ref_idx_l1_active == 0 {
             return Err(H264Error::InvalidSyntax(
                 "temporal Direct requires an active List 1 reference",
@@ -426,7 +431,7 @@ impl BMotionState {
         header: &BInterMacroblockHeader,
         direct_context: DirectMotionContext<'_>,
     ) -> Result<ResolvedBMacroblock> {
-        self.ensure_macroblock_available_for_write(macroblock_address)?;
+        self.ensure_macroblock_available_for_write(macroblock_address, slice_id)?;
         let BPartitionMode::EightByEight { sub_macroblocks } = &header.partition_mode else {
             return Err(H264Error::InvalidSyntax(
                 "mixed Direct resolution requires a B_8x8 macroblock",
@@ -829,18 +834,23 @@ impl BMotionState {
         cell.filter(|cell| cell.slice_id == slice_id)
     }
 
-    fn ensure_macroblock_available_for_write(&self, macroblock_address: usize) -> Result<()> {
+    fn ensure_macroblock_available_for_write(
+        &self,
+        macroblock_address: usize,
+        slice_id: u32,
+    ) -> Result<()> {
         if macroblock_address >= self.width_in_macroblocks * self.height_in_macroblocks {
             return Err(H264Error::InvalidSyntax(
                 "B motion-state macroblock address exceeds the picture",
             ));
         }
+        debug_assert!(slice_id >= self.first_slice_id);
         let start = macroblock_address * 16;
-        let recorded = self.cells[start].is_some();
+        let recorded = self.cells[start].is_some_and(|cell| cell.slice_id >= self.first_slice_id);
         debug_assert!(
-            self.cells[start..start + 16]
-                .iter()
-                .all(|cell| cell.is_some() == recorded),
+            self.cells[start..start + 16].iter().all(|cell| cell
+                .is_some_and(|cell| cell.slice_id >= self.first_slice_id)
+                == recorded),
             "B motion-state macroblocks are recorded atomically"
         );
         if recorded {
@@ -1410,19 +1420,21 @@ mod tests {
     }
 
     #[test]
-    fn resetting_for_the_same_picture_reuses_and_clears_the_allocation() {
+    fn resetting_for_a_new_generation_reuses_stale_allocation() {
         let mut state = BMotionState::new(2, 1).unwrap();
         let allocation = state.cells.as_ptr();
         state.record_intra_macroblock(0, 1).unwrap();
         assert!(state.cells.iter().any(Option::is_some));
 
-        state.reset_for_picture(2, 1).unwrap();
+        state.reset_for_picture(2, 1, 2, false).unwrap();
 
         assert_eq!(state.cells.as_ptr(), allocation);
         assert_eq!(state.cells.len(), 32);
-        assert!(state.cells.iter().all(Option::is_none));
+        assert!(state.cells.iter().any(Option::is_some));
         assert_eq!(state.width_in_macroblocks, 2);
         assert_eq!(state.height_in_macroblocks, 1);
+        state.record_intra_macroblock(0, 2).unwrap();
+        assert!(state.record_intra_macroblock(0, 3).is_err());
     }
 
     #[test]

@@ -1427,6 +1427,27 @@ branches about 1.42%, and sampled cache misses about 3.03%. The 597,196,800-byte
 4K output retained its exact SHA-256 hash, and the full 380-test workspace suite
 plus strict all-target Clippy passed.
 
+The same cross-picture generation now invalidates reusable B-motion cells
+without clearing the complete 16-cell-per-macroblock grid. The grid stores the
+first slice identifier belonging to the current picture. Its existing
+same-slice neighbour filtering already ignores older entries, while the
+duplicate-macroblock guard treats every identifier at or above that boundary
+as current-picture state. All sixteen cells are still overwritten atomically.
+Identifier exhaustion clears both reusable grids before restarting, preserving
+correctness across the `u32` wraparound.
+
+The native build measured this as a small throughput tradeoff: eight stable
+fixed-CPU 4K pairs reduced mean wall time about 0.68%, instructions about
+0.26%, and branches about 0.12%, while task-clock was neutral, cycles increased
+about 0.17%, and sampled cache misses increased about 1.28%. A retrained PGO
+build resolved the added generation check more profitably. Nine 4K pairs
+reduced mean wall time about 1.47%, task-clock and cycles about 0.90%,
+instructions about 0.21%, and branches about 0.09%; sampled cache misses rose
+about 0.25%. On the 600-frame 1080p stream, four of five cycle pairs improved
+and the median wall time moved from 3.93 to 3.91 seconds, with one large
+scheduler outlier. A post-change PGO sample reduced the remaining whole-stream
+`memset` share from about 2.38% to 2.03%. The 4K output remains byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
