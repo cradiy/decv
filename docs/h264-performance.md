@@ -1710,6 +1710,24 @@ performance for a better synthetic number. A future padded/trusted H.264 reader
 could remove some atomic end-of-input checks, but it should be attempted only
 with exact A/B decoder binaries and both CABAC and CAVLC inputs.
 
+## SIMD Edge-Read Safety
+
+The x86 chroma bilinear fast paths must not read an interpolation neighbour
+whose coefficient is zero. In particular, a zero horizontal fraction permits
+the source rectangle to touch the right plane edge, and a zero vertical
+fraction permits it to touch the bottom edge. The former AVX2 and SSE2
+implementations loaded the right, bottom, and bottom-right vectors
+unconditionally, then multiplied the unused vectors by zero. That preserved
+pixel values but could read past the backing allocation at the last row.
+
+The optimized paths now select horizontal-only, vertical-only, and
+two-dimensional load sets before touching source memory. An exact-size
+right/bottom-edge regression is also run under AddressSanitizer: it reported
+the old eight-byte heap over-read and passes with the conditional loads.
+Seeking made the fault easier to observe by reconstructing many boundary
+macroblocks quickly, but decoder parallelism and timeline state were not the
+root cause.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

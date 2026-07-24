@@ -1144,23 +1144,38 @@ unsafe fn predict_chroma_bilinear_avx2(
         let cb_base = cb.as_ptr().wrapping_add(offset);
         let cr_base = cr.as_ptr().wrapping_add(offset);
         // SAFETY: Interior validation includes the current and next rows plus
-        // one sample to the right in both planes.
+        // any right/bottom neighbour required by a non-zero fraction.
         let a = unsafe { load_pair(cb_base, cr_base) };
-        // SAFETY: See above.
-        let b = unsafe { load_pair(cb_base.wrapping_add(1), cr_base.wrapping_add(1)) };
-        // SAFETY: See above.
-        let c = unsafe { load_pair(cb_base.wrapping_add(stride), cr_base.wrapping_add(stride)) };
-        // SAFETY: See above.
-        let d = unsafe {
-            load_pair(
-                cb_base.wrapping_add(stride + 1),
-                cr_base.wrapping_add(stride + 1),
+        let weighted = if x_fraction == 0 {
+            // SAFETY: A non-zero vertical fraction makes the next row part of
+            // the validated interpolation window.
+            let c =
+                unsafe { load_pair(cb_base.wrapping_add(stride), cr_base.wrapping_add(stride)) };
+            _mm256_add_epi16(_mm256_mullo_epi16(a, w00), _mm256_mullo_epi16(c, w01))
+        } else if y_fraction == 0 {
+            // SAFETY: A non-zero horizontal fraction makes the right
+            // neighbour part of the validated interpolation window.
+            let b = unsafe { load_pair(cb_base.wrapping_add(1), cr_base.wrapping_add(1)) };
+            _mm256_add_epi16(_mm256_mullo_epi16(a, w00), _mm256_mullo_epi16(b, w10))
+        } else {
+            // SAFETY: Both non-zero fractions make the right, bottom, and
+            // bottom-right neighbours part of the validated window.
+            let b = unsafe { load_pair(cb_base.wrapping_add(1), cr_base.wrapping_add(1)) };
+            // SAFETY: See above.
+            let c =
+                unsafe { load_pair(cb_base.wrapping_add(stride), cr_base.wrapping_add(stride)) };
+            // SAFETY: See above.
+            let d = unsafe {
+                load_pair(
+                    cb_base.wrapping_add(stride + 1),
+                    cr_base.wrapping_add(stride + 1),
+                )
+            };
+            _mm256_add_epi16(
+                _mm256_add_epi16(_mm256_mullo_epi16(a, w00), _mm256_mullo_epi16(b, w10)),
+                _mm256_add_epi16(_mm256_mullo_epi16(c, w01), _mm256_mullo_epi16(d, w11)),
             )
         };
-        let weighted = _mm256_add_epi16(
-            _mm256_add_epi16(_mm256_mullo_epi16(a, w00), _mm256_mullo_epi16(b, w10)),
-            _mm256_add_epi16(_mm256_mullo_epi16(c, w01), _mm256_mullo_epi16(d, w11)),
-        );
         let packed = _mm256_packus_epi16(
             _mm256_srli_epi16::<6>(_mm256_add_epi16(weighted, rounding)),
             zero,
@@ -1236,25 +1251,42 @@ unsafe fn predict_chroma_bilinear_sse2(
             let base = plane
                 .as_ptr()
                 .wrapping_add((reference_y + output_y) * stride + reference_x);
-            // SAFETY: The interior validation includes the current row, the
-            // next row, and one extra sample to the right.
+            // SAFETY: Interior validation always includes the current row.
             let a = _mm_unpacklo_epi8(unsafe { load(base, output_width) }, zero);
-            // SAFETY: See above.
-            let b = _mm_unpacklo_epi8(unsafe { load(base.wrapping_add(1), output_width) }, zero);
-            // SAFETY: See above.
-            let c = _mm_unpacklo_epi8(
-                unsafe { load(base.wrapping_add(stride), output_width) },
-                zero,
-            );
-            // SAFETY: See above.
-            let d = _mm_unpacklo_epi8(
-                unsafe { load(base.wrapping_add(stride + 1), output_width) },
-                zero,
-            );
-            let weighted = _mm_add_epi16(
-                _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(b, w10)),
-                _mm_add_epi16(_mm_mullo_epi16(c, w01), _mm_mullo_epi16(d, w11)),
-            );
+            let weighted = if weights[1] == 0 && weights[3] == 0 {
+                // SAFETY: A non-zero vertical fraction makes the next row
+                // part of the validated interpolation window.
+                let c = _mm_unpacklo_epi8(
+                    unsafe { load(base.wrapping_add(stride), output_width) },
+                    zero,
+                );
+                _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(c, w01))
+            } else if weights[2] == 0 && weights[3] == 0 {
+                // SAFETY: A non-zero horizontal fraction makes the right
+                // neighbour part of the validated interpolation window.
+                let b =
+                    _mm_unpacklo_epi8(unsafe { load(base.wrapping_add(1), output_width) }, zero);
+                _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(b, w10))
+            } else {
+                // SAFETY: Both fractions are non-zero, so the validated
+                // window includes right, bottom, and bottom-right neighbours.
+                let b =
+                    _mm_unpacklo_epi8(unsafe { load(base.wrapping_add(1), output_width) }, zero);
+                // SAFETY: See above.
+                let c = _mm_unpacklo_epi8(
+                    unsafe { load(base.wrapping_add(stride), output_width) },
+                    zero,
+                );
+                // SAFETY: See above.
+                let d = _mm_unpacklo_epi8(
+                    unsafe { load(base.wrapping_add(stride + 1), output_width) },
+                    zero,
+                );
+                _mm_add_epi16(
+                    _mm_add_epi16(_mm_mullo_epi16(a, w00), _mm_mullo_epi16(b, w10)),
+                    _mm_add_epi16(_mm_mullo_epi16(c, w01), _mm_mullo_epi16(d, w11)),
+                )
+            };
             let packed =
                 _mm_packus_epi16(_mm_srli_epi16::<6>(_mm_add_epi16(weighted, rounding)), zero);
             if output_width == 8 {
@@ -1923,6 +1955,60 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn avx2_chroma_does_not_read_unused_neighbours_at_plane_edges() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+
+        // The horizontal-only case ends on the final plane row; the
+        // vertical-only case ends on the final plane column. Reading the
+        // unused next row or right neighbour is outside these exact buffers.
+        for (stride, rows, x_fraction, y_fraction) in [(9, 4, 1, 0), (8, 5, 0, 1)] {
+            let cb = (0..stride * rows)
+                .map(|index| ((index * 37 + 11) & 0xff) as u8)
+                .collect::<Vec<_>>();
+            let cr = (0..stride * rows)
+                .map(|index| ((index * 61 + 23) & 0xff) as u8)
+                .collect::<Vec<_>>();
+            let mut expected = InterPrediction420::empty();
+            expected.width = 16;
+            expected.height = 8;
+            let mut actual = expected.clone();
+
+            // SAFETY: SSE2 is the x86_64 baseline. Each case provides exactly
+            // the source neighbour required by its one non-zero fraction.
+            unsafe {
+                predict_chroma_bilinear_sse2(
+                    &mut expected,
+                    &cb,
+                    &cr,
+                    stride,
+                    0,
+                    0,
+                    x_fraction,
+                    y_fraction,
+                );
+            }
+            // SAFETY: Runtime detection proves AVX2 support, and the same
+            // exact source rectangles validated for the SSE2 oracle apply.
+            unsafe {
+                predict_chroma_bilinear_avx2(
+                    &mut actual,
+                    &cb,
+                    &cr,
+                    stride,
+                    0,
+                    0,
+                    x_fraction,
+                    y_fraction,
+                );
+            }
+            assert_eq!(actual, expected);
         }
     }
 
