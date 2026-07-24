@@ -458,6 +458,14 @@ on the stack; its instructions increased about 0.1% and reference cycles about
 high-frame-rate target, where CABAC is the primary workload, rather than
 adding a second residual representation and reconstruction pipeline.
 
+CABAC coefficient decoding now writes its 64-entry backing array into a
+caller-owned block and returns only whether `coded_block_flag` selected it.
+The public owned APIs are unchanged, but the decoder hot path no longer
+returns `Result<Option<CabacCoefficientBlock>>` with an approximately
+264-byte success payload for every coded transform block. Five alternating
+pinned runs reduced CABAC instructions about 0.4%, branches about 0.9%, and
+reference cycles about 0.7%. CAVLC instructions were neutral.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
