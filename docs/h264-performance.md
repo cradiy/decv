@@ -683,6 +683,13 @@ reference-cycle pairs improving. CAVLC remained instruction- and
 branch-neutral. Packing `codIRange` and `codIOffset` into one `u32` was tested
 separately and rejected because its additional shifts and merges increased
 whole-decoder instructions about 0.80% without improving the isolated result.
+Making the main MPS/LPS decision branchless was also rejected. An explicit
+mask-based implementation reduced branches about 1.49% and branch misses about
+10%, but it had to load both transition tables and increased register
+pressure. Five alternating CABAC Serial runs increased instructions about
+1.73% and median reference cycles about 0.77%; only one of five cycle pairs
+improved. Unlike bypass bins, the probability-modelled MPS/LPS choice is
+biased enough that retaining its branch is cheaper.
 
 Processing a sixteen-pixel two-dimensional luma interpolation row with one
 AVX2 kernel instead of two SSE2 chunks was also rejected. The wider six-tap
