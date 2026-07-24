@@ -53,6 +53,11 @@ struct PendingNonReferenceFinalization {
     receiver: Receiver<Result<Option<DecodedVideoFrame>>>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SkippedNonReferencePicture {
+    picture_order_count: i32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DpbConfiguration {
     max_num_ref_frames: u32,
@@ -74,6 +79,7 @@ pub struct H264Decoder {
     bitstream_format: BitstreamFormat,
     parser: H264StreamParser,
     current_picture: Option<PendingPicture>,
+    current_skipped_picture: Option<SkippedNonReferencePicture>,
     dpb: Option<DecodedPictureBuffer>,
     dpb_configuration: Option<DpbConfiguration>,
     reorder: PictureReorderBuffer<Option<DecodedVideoFrame>>,
@@ -96,6 +102,7 @@ impl Default for H264Decoder {
             bitstream_format: BitstreamFormat::ByteStream,
             parser: H264StreamParser::new(),
             current_picture: None,
+            current_skipped_picture: None,
             dpb: None,
             dpb_configuration: None,
             reorder: PictureReorderBuffer::new(0),
@@ -125,6 +132,7 @@ impl H264Decoder {
     /// stable as other decoder backends are added.
     pub fn set_parallelism(&mut self, parallelism: H264Parallelism) -> Result<()> {
         if self.current_picture.is_some()
+            || self.current_skipped_picture.is_some()
             || self.dpb.is_some()
             || !self.outputs.is_empty()
             || !self.pending_non_reference_finalizations.is_empty()
@@ -153,8 +161,9 @@ impl H264Decoder {
     /// before `target`.
     ///
     /// Reference pictures are still reconstructed normally because later
-    /// pictures can depend on them. Pictures before `target` retain their
-    /// place in output reordering, but do not allocate an NV12 chroma plane or
+    /// pictures can depend on them. Non-reference pictures before `target`
+    /// retain their place in output reordering but skip pixel reconstruction;
+    /// other suppressed pictures do not allocate an NV12 chroma plane or
     /// produce output events. This is intended for exact MP4 seek preroll.
     pub fn flush_for_seek(&mut self, target: MediaTime) {
         self.flush_timeline();
@@ -203,6 +212,19 @@ impl H264Decoder {
                 if starts_new_picture {
                     self.finish_current_picture()?;
                     self.prepare_for_idr(&parsed, nal_header)?;
+                }
+                if self.current_skipped_picture.is_some() {
+                    return Ok(());
+                }
+                if self.current_picture.is_none()
+                    && self.should_skip_non_reference_picture(nal_header, packet.pts)
+                {
+                    self.current_skipped_picture = Some(SkippedNonReferencePicture {
+                        picture_order_count: picture_order_count
+                            .stored
+                            .picture_order_count(),
+                    });
+                    return Ok(());
                 }
                 if self.current_picture.is_none() {
                     self.ensure_dpb(&parsed, nal_header)?;
@@ -456,6 +478,16 @@ impl H264Decoder {
     }
 
     fn finish_current_picture(&mut self) -> Result<()> {
+        if let Some(skipped) = self.current_skipped_picture.take() {
+            if let Some(frame) = self
+                .reorder
+                .push(skipped.picture_order_count, None)?
+                .flatten()
+            {
+                self.queue_output_frame(frame)?;
+            }
+            return Ok(());
+        }
         let Some(picture) = self.current_picture.take() else {
             return Ok(());
         };
@@ -669,6 +701,7 @@ impl H264Decoder {
         self.discard_pending_non_reference_finalizations();
         self.parser.reset();
         self.current_picture = None;
+        self.current_skipped_picture = None;
         self.clear_dpb();
         self.outputs.clear();
         self.reorder.clear();
@@ -682,6 +715,7 @@ impl H264Decoder {
         self.discard_pending_non_reference_finalizations();
         self.parser.reset_picture_history();
         self.current_picture = None;
+        self.current_skipped_picture = None;
         self.clear_dpb();
         self.outputs.clear();
         self.reorder.clear();
@@ -693,6 +727,19 @@ impl H264Decoder {
         self.output_start_time
             .zip(pts)
             .is_none_or(|(start, pts)| pts >= start)
+    }
+
+    #[inline]
+    fn should_skip_non_reference_picture(
+        &self,
+        nal_header: NalHeader,
+        pts: Option<MediaTime>,
+    ) -> bool {
+        nal_header.nal_ref_idc == 0
+            && self
+                .output_start_time
+                .zip(pts)
+                .is_some_and(|(start, pts)| pts < start)
     }
 
     fn ensure_dpb(&mut self, parsed: &ParsedSliceHeader, nal_header: NalHeader) -> Result<()> {
@@ -1638,14 +1685,14 @@ mod tests {
     }
 
     #[test]
-    fn seek_preroll_preserves_references_without_materializing_early_frames() {
+    fn seek_preroll_skips_non_references_and_preserves_required_references() {
         let mut decoder = H264Decoder::new();
         decoder.configure(byte_stream_config()).unwrap();
-        let target = MediaTime::from_parts(1, 1).unwrap();
+        let target = MediaTime::from_parts(3, 1).unwrap();
         decoder.flush_for_seek(target);
 
         let mut preroll = EncodedVideoPacket::new(annex_b_stream(&[
-            (0x67, single_macroblock_sps_rbsp()),
+            (0x67, single_macroblock_main_sps_rbsp()),
             (0x68, single_macroblock_pps_rbsp()),
             (0x65, single_macroblock_idr_rbsp()),
             (0x09, vec![0x10]),
@@ -1662,14 +1709,35 @@ mod tests {
         ));
 
         let mut selected = EncodedVideoPacket::new(annex_b_stream(&[
-            (0x41, single_macroblock_p_skip_rbsp()),
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
             (0x09, vec![0x10]),
         ]));
-        selected.pts = MediaTime::from_parts(2, 1);
+        selected.pts = MediaTime::from_parts(4, 1);
         assert!(matches!(
             decoder.send_packet(selected).unwrap(),
             DecodeInputStatus::Accepted
         ));
+
+        let mut discarded =
+            EncodedVideoPacket::new(annex_b_stream(&[(0x01, single_macroblock_explicit_b_rbsp())]));
+        discarded.pts = MediaTime::from_parts(2, 1);
+        assert!(matches!(
+            decoder.send_packet(discarded).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert!(decoder.current_picture.is_none());
+        assert!(decoder.current_skipped_picture.is_some());
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(annex_b_stream(&[(
+                    0x09,
+                    vec![0x10],
+                )])))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert!(decoder.current_skipped_picture.is_none());
+
         decoder.drain().unwrap();
         assert!(matches!(
             decoder.receive_frame().unwrap(),
@@ -1678,7 +1746,38 @@ mod tests {
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::Frame(frame)
-                if frame.id == 1 && frame.pts == MediaTime::from_parts(2, 1)
+                if frame.id == 1 && frame.pts == MediaTime::from_parts(4, 1)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+
+        decoder.flush_for_seek(MediaTime::from_parts(1, 1).unwrap());
+        let mut repeated_preroll = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        repeated_preroll.pts = MediaTime::from_parts(0, 1);
+        repeated_preroll.discontinuity = true;
+        assert!(matches!(
+            decoder.send_packet(repeated_preroll).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        let mut repeated_selected = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x09, vec![0x10]),
+        ]));
+        repeated_selected.pts = MediaTime::from_parts(2, 1);
+        assert!(matches!(
+            decoder.send_packet(repeated_selected).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame)
+                if frame.id == 2 && frame.pts == MediaTime::from_parts(2, 1)
         ));
         assert!(matches!(
             decoder.receive_frame().unwrap(),
@@ -1699,7 +1798,7 @@ mod tests {
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::Frame(frame)
-                if frame.id == 2 && frame.pts == MediaTime::from_parts(0, 1)
+                if frame.id == 3 && frame.pts == MediaTime::from_parts(0, 1)
         ));
     }
 

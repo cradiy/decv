@@ -102,9 +102,10 @@ before the requested target.
 
 When using `H264Decoder` directly, prefer `flush_for_seek(target)` over plain
 `flush` for exact seek preroll. It still reconstructs reference pictures and
-maintains display reordering, but suppresses pre-target output materialization.
-This avoids allocating and interleaving NV12 output that the caller would
-immediately discard. The ordinary trait-level `flush` clears this filter.
+maintains display reordering, but suppresses pre-target output materialization
+and skips pixel reconstruction for pre-target non-reference pictures. This
+avoids work whose result cannot affect the selected frame. The ordinary
+trait-level `flush` clears this filter.
 
 For a low-latency scrub preview, callers may instead use
 `seek_to_keyframe_at_or_after`. That path begins at the next independently

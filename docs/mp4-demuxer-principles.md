@@ -521,10 +521,11 @@ Starting directly at an arbitrary non-keyframe packet is not accurate seek.
 That packet may depend on reference pictures that have not been decoded.
 
 `H264Decoder::flush_for_seek(target)` implements the first and fourth steps
-inside the decoder. Pre-target pictures still participate in reconstruction,
-the DPB, deblocking, and output reordering, but they are represented by
-lightweight reorder markers instead of materialized NV12 frames. The CLI uses
-this path and retains its PTS filter as a defensive check.
+inside the decoder. Pre-target reference pictures still participate in
+reconstruction, the DPB, and deblocking. Pre-target non-reference pictures
+cannot affect later reconstruction, so only their parsed picture timing and a
+lightweight reorder marker are retained. The CLI uses this path and retains
+its PTS filter as a defensive check.
 
 The demuxer does not flush the decoder itself. That would couple the container
 crate to a particular codec instance and higher-level state.
