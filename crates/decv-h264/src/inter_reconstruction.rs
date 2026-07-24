@@ -744,34 +744,6 @@ fn reconstruct_p_macroblock_from_list_inner(
     Ok(())
 }
 
-/// Reconstructs one resolved P macroblock without mutating decoder-visible
-/// picture state.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn reconstruct_p_macroblock_pixels_from_list_with_scratch(
-    current_size: Size,
-    references_l0: &[Option<&Yuv420Picture>],
-    macroblock_x: usize,
-    macroblock_y: usize,
-    motion: &ResolvedPMacroblock,
-    residual: Option<&ReconstructedInterResidual>,
-    weights: Option<&PredictionWeightTable>,
-    prediction: &mut InterPrediction420,
-) -> Result<MacroblockPixels> {
-    let mut pixels = MacroblockPixels::empty();
-    reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
-        current_size,
-        references_l0,
-        macroblock_x,
-        macroblock_y,
-        motion,
-        residual,
-        weights,
-        prediction,
-        &mut pixels,
-    )?;
-    Ok(pixels)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
     current_size: Size,

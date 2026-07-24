@@ -8,9 +8,7 @@ use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, fi
 use crate::inter_reconstruction::{
     BPredictionWeightMode, ImplicitWeightReference, reconstruct_b_macroblock_from_lists_with_mode,
     reconstruct_b_macroblock_pixels_from_lists_into_with_scratch,
-    reconstruct_b_macroblock_pixels_from_lists_with_scratch,
     reconstruct_p_macroblock_pixels_from_list_into_with_scratch,
-    reconstruct_p_macroblock_pixels_from_list_with_scratch,
     reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_p_macroblock_from_list_420,
     reconstruct_weighted_p_skip_macroblock_from_list_420,
 };
@@ -1954,32 +1952,40 @@ impl IntraPictureReconstructor {
             return Ok(());
         }
         let coded_size = self.picture.coded_size();
-        let reconstruct = |job: &PendingPInterMacroblock, scratch: &mut InterPrediction420| {
-            reconstruct_p_macroblock_pixels_from_list_with_scratch(
-                coded_size,
-                references_l0,
-                job.macroblock_x,
-                job.macroblock_y,
-                &job.motion,
-                job.residual.as_ref(),
-                weights,
-                scratch,
-            )
-            .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
-        };
         let staged = if jobs.len() > 1
             && let Some(pool) = self.reconstruction_executor.pool()
         {
-            let reconstructed: Vec<Result<StagedMacroblockPixels>> = pool.install(|| {
-                jobs.par_iter()
-                    .map_init(InterPrediction420::empty, |scratch, job| {
-                        reconstruct(job, scratch)
+            let mut staged = Box::<[StagedMacroblockPixels]>::new_uninit_slice(jobs.len());
+            let reconstructed: Vec<Result<()>> = pool.install(|| {
+                staged
+                    .par_iter_mut()
+                    .zip(jobs.par_iter())
+                    .map_init(InterPrediction420::empty, |scratch, (output, job)| {
+                        let output = output.write(StagedMacroblockPixels::empty(job.address));
+                        reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
+                            coded_size,
+                            references_l0,
+                            job.macroblock_x,
+                            job.macroblock_y,
+                            &job.motion,
+                            job.residual.as_ref(),
+                            weights,
+                            scratch,
+                            output.pixels_mut(),
+                        )
                     })
                     .collect()
             });
-            reconstructed
-                .into_iter()
-                .collect::<Result<Vec<StagedMacroblockPixels>>>()?
+            // Every indexed `map` item initializes its slot before performing
+            // fallible reconstruction. `collect` does not short-circuit on an
+            // `Err`, so all slots are initialized when `install` returns.
+            let staged = unsafe { staged.assume_init() }.into_vec();
+            // Indexed parallel collection preserves job order, so malformed
+            // streams still report the first error by macroblock address.
+            for result in reconstructed {
+                result?;
+            }
+            staged
         } else {
             let mut scratch = InterPrediction420::empty();
             let mut staged = Vec::with_capacity(jobs.len());
@@ -2049,38 +2055,43 @@ impl IntraPictureReconstructor {
             },
         };
         let coded_size = self.picture.coded_size();
-        let reconstruct =
-            |job: &PendingBInterMacroblock,
-             scratch: &mut (InterPrediction420, InterPrediction420)| {
-                let (prediction_l0, prediction_l1) = scratch;
-                reconstruct_b_macroblock_pixels_from_lists_with_scratch(
-                    coded_size,
-                    references_l0,
-                    references_l1,
-                    job.macroblock_x,
-                    job.macroblock_y,
-                    &job.motion,
-                    job.residual.as_ref(),
-                    weight_mode,
-                    prediction_l0,
-                    prediction_l1,
-                )
-                .map(|pixels| StagedMacroblockPixels::new(job.address, pixels))
-            };
         let staged = if jobs.len() > 1
             && let Some(pool) = self.reconstruction_executor.pool()
         {
-            let reconstructed: Vec<Result<StagedMacroblockPixels>> = pool.install(|| {
-                jobs.par_iter()
+            let mut staged = Box::<[StagedMacroblockPixels]>::new_uninit_slice(jobs.len());
+            let reconstructed: Vec<Result<()>> = pool.install(|| {
+                staged
+                    .par_iter_mut()
+                    .zip(jobs.par_iter())
                     .map_init(
                         || (InterPrediction420::empty(), InterPrediction420::empty()),
-                        |scratch, job| reconstruct(job, scratch),
+                        |scratch, (output, job)| {
+                            let (prediction_l0, prediction_l1) = scratch;
+                            let output = output.write(StagedMacroblockPixels::empty(job.address));
+                            reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
+                                coded_size,
+                                references_l0,
+                                references_l1,
+                                job.macroblock_x,
+                                job.macroblock_y,
+                                &job.motion,
+                                job.residual.as_ref(),
+                                weight_mode,
+                                prediction_l0,
+                                prediction_l1,
+                                output.pixels_mut(),
+                            )
+                        },
                     )
                     .collect()
             });
-            reconstructed
-                .into_iter()
-                .collect::<Result<Vec<StagedMacroblockPixels>>>()?
+            // See the P-slice path above: ordinary parallel collection runs
+            // every indexed job, and each job initializes its slot first.
+            let staged = unsafe { staged.assume_init() }.into_vec();
+            for result in reconstructed {
+                result?;
+            }
+            staged
         } else {
             let mut scratch = (InterPrediction420::empty(), InterPrediction420::empty());
             let mut staged = Vec::with_capacity(jobs.len());
