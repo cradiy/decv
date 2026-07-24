@@ -511,6 +511,13 @@ instructions about 0.18% and median reference cycles about 0.5%. Further
 vertical work must reduce the number of SIMD arithmetic calls, not only share
 their setup.
 
+An eight-row byte transpose then reduced a uniform weak vertical edge from
+four four-lane arithmetic passes to two eight-lane passes. CABAC instructions
+fell about 0.19% and its reference-cycle median improved about 0.6%, but CAVLC
+reference cycles regressed about 1.6%. Restricting the path independently to
+strengths one, two, or three did not remove that tradeoff, so the larger
+transpose kernel was rejected.
+
 Skipping the second coverage walk for an already coalesced uniform Direct B
 partition was rejected in two forms. A branch inside the prediction loop
 reduced instructions about 0.06% but made median reference cycles about 1.1%
