@@ -1318,6 +1318,15 @@ reduced mean wall time about 0.20%, task-clock about 0.39%, reference cycles
 about 0.78%, and sampled cache misses about 0.84%. The one-line inline hint was
 retained; the observable double-clear removal was not.
 
+Full-macroblock spatial and temporal Direct motion now iterate static 8x8 and
+4x4 partition grids. The selected grid carries both luma offsets and colocated
+4x4-cell offsets, replacing two dynamic `step_by` loops plus repeated
+coordinate division. All alignment, bounds, temporal scaling, coalescing, and
+motion-state commits remain unchanged. Nine native 4K four-worker pairs reduced
+mean wall time about 1.31% and task-clock about 0.61%. After PGO, six of nine
+pairs improved; mean wall time fell about 0.76%, task-clock about 0.93%, and
+reference cycles about 1.29%, with sampled cache misses effectively unchanged.
+
 Large CABAC non-reference pictures now complete through a bounded cross-frame
 pipeline when a reconstruction pool is active. Picture completeness and the
 discarded reference-motion field are validated synchronously. Deblocking and

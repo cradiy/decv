@@ -8,6 +8,31 @@ use crate::{
     ResolvedBMacroblock, ResolvedBPartition, Result,
 };
 
+const DIRECT_8X8_GRID: [(u8, u8, usize, usize); 4] = [
+    (0, 0, 0, 0),
+    (8, 0, 2, 0),
+    (0, 8, 0, 2),
+    (8, 8, 2, 2),
+];
+const DIRECT_4X4_GRID: [(u8, u8, usize, usize); 16] = [
+    (0, 0, 0, 0),
+    (4, 0, 1, 0),
+    (8, 0, 2, 0),
+    (12, 0, 3, 0),
+    (0, 4, 0, 1),
+    (4, 4, 1, 1),
+    (8, 4, 2, 1),
+    (12, 4, 3, 1),
+    (0, 8, 0, 2),
+    (4, 8, 1, 2),
+    (8, 8, 2, 2),
+    (12, 8, 3, 2),
+    (0, 12, 0, 3),
+    (4, 12, 1, 3),
+    (8, 12, 2, 3),
+    (12, 12, 3, 3),
+];
+
 #[derive(Debug, Clone, Copy)]
 pub struct DirectReference<'a> {
     pub id: crate::ReferenceId,
@@ -247,7 +272,11 @@ impl BMotionState {
             )
         });
 
-        let partition_size = if context.direct_8x8_inference { 8 } else { 4 };
+        let (partition_size, direct_grid) = if context.direct_8x8_inference {
+            (8, DIRECT_8X8_GRID.as_slice())
+        } else {
+            (4, DIRECT_4X4_GRID.as_slice())
+        };
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let col_zero_can_change = |prediction: Option<(u8, MotionVector)>| {
@@ -297,43 +326,41 @@ impl BMotionState {
             });
         }
         let mut local = [None; 16];
-        let mut partitions = SmallVec::with_capacity((16 / partition_size) * (16 / partition_size));
-        for y in (0..16).step_by(partition_size) {
-            for x in (0..16).step_by(partition_size) {
-                let colocated = context
-                    .colocated_motion
-                    .cell(macroblock_x * 4 + x / 4, macroblock_y * 4 + y / 4)
-                    .ok_or(H264Error::InvalidSyntax(
-                        "spatial Direct co-located block lies outside the reference motion field",
-                    ))?;
-                let col_zero = colocated_zero_flag(colocated, context.colocated_long_term);
-                let list0 = predicted_l0.map(|(reference_index, vector)| ResolvedBListMotion {
-                    reference_index,
-                    motion_vector: if col_zero && reference_index == 0 {
-                        MotionVector::default()
-                    } else {
-                        vector
-                    },
-                });
-                let list1 = predicted_l1.map(|(reference_index, vector)| ResolvedBListMotion {
-                    reference_index,
-                    motion_vector: if col_zero && reference_index == 0 {
-                        MotionVector::default()
-                    } else {
-                        vector
-                    },
-                });
-                let partition = ResolvedBPartition {
-                    x: x as u8,
-                    y: y as u8,
-                    width: partition_size as u8,
-                    height: partition_size as u8,
-                    list0,
-                    list1,
-                };
-                fill_direct_partition_cells(&mut local, slice_id, partition);
-                partitions.push(partition);
-            }
+        let mut partitions = SmallVec::with_capacity(direct_grid.len());
+        for &(x, y, cell_x, cell_y) in direct_grid {
+            let colocated = context
+                .colocated_motion
+                .cell(macroblock_x * 4 + cell_x, macroblock_y * 4 + cell_y)
+                .ok_or(H264Error::InvalidSyntax(
+                    "spatial Direct co-located block lies outside the reference motion field",
+                ))?;
+            let col_zero = colocated_zero_flag(colocated, context.colocated_long_term);
+            let list0 = predicted_l0.map(|(reference_index, vector)| ResolvedBListMotion {
+                reference_index,
+                motion_vector: if col_zero && reference_index == 0 {
+                    MotionVector::default()
+                } else {
+                    vector
+                },
+            });
+            let list1 = predicted_l1.map(|(reference_index, vector)| ResolvedBListMotion {
+                reference_index,
+                motion_vector: if col_zero && reference_index == 0 {
+                    MotionVector::default()
+                } else {
+                    vector
+                },
+            });
+            let partition = ResolvedBPartition {
+                x,
+                y,
+                width: partition_size,
+                height: partition_size,
+                list0,
+                list1,
+            };
+            fill_direct_partition_cells(&mut local, slice_id, partition);
+            partitions.push(partition);
         }
         coalesce_uniform_direct_grid(&mut partitions);
         self.commit_local_cells(macroblock_address, local);
@@ -355,32 +382,34 @@ impl BMotionState {
                 "temporal Direct requires an active List 1 reference",
             ));
         }
-        let partition_size = if context.direct_8x8_inference { 8 } else { 4 };
+        let (partition_size, direct_grid) = if context.direct_8x8_inference {
+            (8, DIRECT_8X8_GRID.as_slice())
+        } else {
+            (4, DIRECT_4X4_GRID.as_slice())
+        };
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let mut local = [None; 16];
-        let mut partitions = SmallVec::with_capacity((16 / partition_size) * (16 / partition_size));
-        for y in (0..16).step_by(partition_size) {
-            for x in (0..16).step_by(partition_size) {
-                let colocated = context
-                    .colocated
-                    .motion
-                    .cell(macroblock_x * 4 + x / 4, macroblock_y * 4 + y / 4)
-                    .ok_or(H264Error::InvalidSyntax(
-                        "temporal Direct co-located block lies outside the reference motion field",
-                    ))?;
-                let (list0, list1) = temporal_direct_motion(colocated, context)?;
-                let partition = ResolvedBPartition {
-                    x: x as u8,
-                    y: y as u8,
-                    width: partition_size as u8,
-                    height: partition_size as u8,
-                    list0: Some(list0),
-                    list1: Some(list1),
-                };
-                fill_partition_cells(&mut local, slice_id, partition)?;
-                partitions.push(partition);
-            }
+        let mut partitions = SmallVec::with_capacity(direct_grid.len());
+        for &(x, y, cell_x, cell_y) in direct_grid {
+            let colocated = context
+                .colocated
+                .motion
+                .cell(macroblock_x * 4 + cell_x, macroblock_y * 4 + cell_y)
+                .ok_or(H264Error::InvalidSyntax(
+                    "temporal Direct co-located block lies outside the reference motion field",
+                ))?;
+            let (list0, list1) = temporal_direct_motion(colocated, context)?;
+            let partition = ResolvedBPartition {
+                x,
+                y,
+                width: partition_size,
+                height: partition_size,
+                list0: Some(list0),
+                list1: Some(list1),
+            };
+            fill_partition_cells(&mut local, slice_id, partition)?;
+            partitions.push(partition);
         }
         coalesce_uniform_direct_grid(&mut partitions);
         self.commit_local_cells(macroblock_address, local);
