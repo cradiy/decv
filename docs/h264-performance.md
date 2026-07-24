@@ -602,6 +602,21 @@ wall time. Two-worker `Auto` reference cycles improved about 1.1%; its roughly
 0.12% higher instruction count and wall time remained scheduling-sensitive.
 The tradeoff is accepted for the current CABAC-first target.
 
+CABAC P/B deblocking metadata is now constructed directly in its final
+picture-owned slot instead of returning a large `MacroblockDeblockInfo` and
+copying it into place. The direct writers rely on the internal motion
+resolvers' full 4x4-grid coverage, guarded by release-free debug assertions and
+an equivalence test against the value-returning builders. The CAVLC builders
+remain separate because routing them through the shared out-parameter path
+measurably increased their instruction count. Five alternating final-binary
+runs reduced CABAC Serial instructions about 0.61%, branches about 1.20%, and
+median reference cycles about 0.76%, with all five cycle samples improving.
+Two-worker `Auto` instructions fell about 0.44%, branches about 0.84%, and
+median reference cycles about 2.1%; four of five cycle samples improved, with
+the wider median reflecting scheduler variance. Five CAVLC runs remained
+neutral: instructions and branches changed by less than 0.01%, while median
+cycles were about 0.2% lower.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
