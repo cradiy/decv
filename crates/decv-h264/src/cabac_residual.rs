@@ -146,6 +146,14 @@ pub struct CabacSignificanceMap {
 
 impl CabacSignificanceMap {
     #[inline]
+    const fn empty() -> Self {
+        Self {
+            indices: [0; 64],
+            count: 0,
+        }
+    }
+
+    #[inline]
     pub const fn count(self) -> u8 {
         self.count
     }
@@ -202,10 +210,20 @@ pub fn decode_cabac_significance_map(
 
 fn decode_significance_map_with(
     category: CabacResidualCategory,
-    mut decision: impl FnMut(usize) -> Result<u8>,
+    decision: impl FnMut(usize) -> Result<u8>,
 ) -> Result<CabacSignificanceMap> {
+    let mut output = CabacSignificanceMap::empty();
+    decode_significance_map_into_with(category, &mut output, decision)?;
+    Ok(output)
+}
+
+#[inline(always)]
+fn decode_significance_map_into_with(
+    category: CabacResidualCategory,
+    output: &mut CabacSignificanceMap,
+    mut decision: impl FnMut(usize) -> Result<u8>,
+) -> Result<()> {
     let maximum = usize::from(category.maximum_coefficients());
-    let mut indices = [0; 64];
     let mut count = 0usize;
     for coefficient_index in 0..maximum - 1 {
         let significant_offset = if category == CabacResidualCategory::Luma8x8 {
@@ -216,7 +234,8 @@ fn decode_significance_map_with(
         if decision(category.significant_coeff_context_base() + significant_offset)? == 0 {
             continue;
         }
-        indices[count] = u8::try_from(coefficient_index).map_err(|_| H264Error::IntegerOverflow)?;
+        output.indices[count] =
+            u8::try_from(coefficient_index).map_err(|_| H264Error::IntegerOverflow)?;
         count += 1;
         let last_offset = if category == CabacResidualCategory::Luma8x8 {
             usize::from(LAST_SIGNIFICANT_COEFF_OFFSETS_8X8[coefficient_index])
@@ -224,19 +243,15 @@ fn decode_significance_map_with(
             coefficient_index
         };
         if decision(category.last_significant_coeff_context_base() + last_offset)? != 0 {
-            return Ok(CabacSignificanceMap {
-                indices,
-                count: u8::try_from(count).map_err(|_| H264Error::IntegerOverflow)?,
-            });
+            output.count = u8::try_from(count).map_err(|_| H264Error::IntegerOverflow)?;
+            return Ok(());
         }
     }
 
-    indices[count] = u8::try_from(maximum - 1).map_err(|_| H264Error::IntegerOverflow)?;
+    output.indices[count] = u8::try_from(maximum - 1).map_err(|_| H264Error::IntegerOverflow)?;
     count += 1;
-    Ok(CabacSignificanceMap {
-        indices,
-        count: u8::try_from(count).map_err(|_| H264Error::IntegerOverflow)?,
-    })
+    output.count = u8::try_from(count).map_err(|_| H264Error::IntegerOverflow)?;
+    Ok(())
 }
 
 /// Decodes coefficient magnitudes and signs for an existing significance map.
@@ -269,8 +284,11 @@ fn decode_cabac_coefficient_block_into(
     category: CabacResidualCategory,
     output: &mut CabacCoefficientBlock,
 ) -> Result<()> {
-    let significance_map = decode_cabac_significance_map(syntax, category)?;
-    decode_coefficient_levels_into_with(category, significance_map, output, |context_index| {
+    let mut significance_map = CabacSignificanceMap::empty();
+    decode_significance_map_into_with(category, &mut significance_map, |context_index| {
+        syntax.decision_known(context_index)
+    })?;
+    decode_coefficient_levels_into_with(category, &significance_map, output, |context_index| {
         if let Some(context_index) = context_index {
             syntax.decision_known(context_index)
         } else {
@@ -285,14 +303,14 @@ fn decode_coefficient_levels_with(
     decode: impl FnMut(Option<usize>) -> Result<u8>,
 ) -> Result<CabacCoefficientBlock> {
     let mut output = CabacCoefficientBlock::empty(category);
-    decode_coefficient_levels_into_with(category, significance_map, &mut output, decode)?;
+    decode_coefficient_levels_into_with(category, &significance_map, &mut output, decode)?;
     Ok(output)
 }
 
 #[inline(always)]
 fn decode_coefficient_levels_into_with(
     category: CabacResidualCategory,
-    significance_map: CabacSignificanceMap,
+    significance_map: &CabacSignificanceMap,
     output: &mut CabacCoefficientBlock,
     mut decode: impl FnMut(Option<usize>) -> Result<u8>,
 ) -> Result<()> {

@@ -1467,6 +1467,19 @@ task-clock about 1.8% and instructions about 1.6%. The exact
 597,196,800-byte 4K hash, the generated H.264 corpus, and the MP4/seek corpus
 remain unchanged.
 
+CABAC significance maps are now constructed directly in their final stack
+slot. The public split significance/level API is unchanged, while the complete
+block decoder avoids returning and then copying the fixed 64-entry map before
+level decoding. This reduced the PGO
+`decode_cabac_coefficient_block_into` body from 4,423 to 4,327 bytes. The
+native build was throughput-neutral, so the optimization does not depend on a
+portable-build claim. After retraining the same mixed CABAC/CAVLC profile,
+eight of nine alternating fixed-CPU 4K `Auto` wall-time pairs improved. Mean
+wall time fell about 2.45%, task-clock about 2.34%, and reference cycles about
+1.70%. The 597,196,800-byte 4K output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`;
+the generated H.264 and MP4/seek corpora remained byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
