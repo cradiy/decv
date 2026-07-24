@@ -869,6 +869,25 @@ fn predict_chroma<const CLIP: bool>(
     }
 
     #[cfg(target_arch = "x86_64")]
+    if !CLIP && prediction.width == 16 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: Runtime detection proves AVX2 support. The non-clipping
+        // path is selected only after validating both chroma source planes.
+        unsafe {
+            predict_chroma_bilinear_avx2(
+                prediction,
+                cb,
+                cr,
+                width,
+                reference_x as usize,
+                reference_y as usize,
+                x_fraction,
+                y_fraction,
+            );
+        }
+        return;
+    }
+
+    #[cfg(target_arch = "x86_64")]
     if !CLIP && matches!(prediction.width, 8 | 16) {
         // SAFETY: SSE2 is part of the x86_64 baseline. The non-clipping path
         // is selected only after validating the current and next chroma rows,
@@ -896,6 +915,84 @@ fn predict_chroma<const CLIP: bool>(
                 interpolate_chroma_inner::<CLIP>(cb, width, height, x, y, x_fraction, y_fraction);
             prediction.cr[output_y][output_x] =
                 interpolate_chroma_inner::<CLIP>(cr, width, height, x, y, x_fraction, y_fraction);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(clippy::too_many_arguments)]
+unsafe fn predict_chroma_bilinear_avx2(
+    prediction: &mut InterPrediction420,
+    cb: &[u8],
+    cr: &[u8],
+    stride: usize,
+    reference_x: usize,
+    reference_y: usize,
+    x_fraction: u8,
+    y_fraction: u8,
+) {
+    use std::arch::x86_64::{
+        __m128i, __m256i, _mm_loadl_epi64, _mm_storel_epi64, _mm_unpacklo_epi64, _mm256_add_epi16,
+        _mm256_castsi256_si128, _mm256_cvtepu8_epi16, _mm256_extracti128_si256, _mm256_mullo_epi16,
+        _mm256_packus_epi16, _mm256_set1_epi16, _mm256_setzero_si256, _mm256_srli_epi16,
+    };
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_pair(cb: *const u8, cr: *const u8) -> __m256i {
+        // SAFETY: The caller validated eight samples from both planes.
+        let cb = unsafe { _mm_loadl_epi64(cb.cast::<__m128i>()) };
+        // SAFETY: See above.
+        let cr = unsafe { _mm_loadl_epi64(cr.cast::<__m128i>()) };
+        _mm256_cvtepu8_epi16(_mm_unpacklo_epi64(cb, cr))
+    }
+
+    debug_assert_eq!(prediction.width, 16);
+    let x = i16::from(x_fraction);
+    let y = i16::from(y_fraction);
+    let w00 = _mm256_set1_epi16((8 - x) * (8 - y));
+    let w10 = _mm256_set1_epi16(x * (8 - y));
+    let w01 = _mm256_set1_epi16((8 - x) * y);
+    let w11 = _mm256_set1_epi16(x * y);
+    let rounding = _mm256_set1_epi16(32);
+    let zero = _mm256_setzero_si256();
+    for output_y in 0..usize::from(prediction.height / 2) {
+        let offset = (reference_y + output_y) * stride + reference_x;
+        let cb_base = cb.as_ptr().wrapping_add(offset);
+        let cr_base = cr.as_ptr().wrapping_add(offset);
+        // SAFETY: Interior validation includes the current and next rows plus
+        // one sample to the right in both planes.
+        let a = unsafe { load_pair(cb_base, cr_base) };
+        // SAFETY: See above.
+        let b = unsafe { load_pair(cb_base.wrapping_add(1), cr_base.wrapping_add(1)) };
+        // SAFETY: See above.
+        let c = unsafe { load_pair(cb_base.wrapping_add(stride), cr_base.wrapping_add(stride)) };
+        // SAFETY: See above.
+        let d = unsafe {
+            load_pair(
+                cb_base.wrapping_add(stride + 1),
+                cr_base.wrapping_add(stride + 1),
+            )
+        };
+        let weighted = _mm256_add_epi16(
+            _mm256_add_epi16(_mm256_mullo_epi16(a, w00), _mm256_mullo_epi16(b, w10)),
+            _mm256_add_epi16(_mm256_mullo_epi16(c, w01), _mm256_mullo_epi16(d, w11)),
+        );
+        let packed = _mm256_packus_epi16(
+            _mm256_srli_epi16::<6>(_mm256_add_epi16(weighted, rounding)),
+            zero,
+        );
+        // SAFETY: Each destination row contains eight writable bytes.
+        unsafe {
+            _mm_storel_epi64(
+                prediction.cb[output_y].as_mut_ptr().cast::<__m128i>(),
+                _mm256_castsi256_si128(packed),
+            );
+            _mm_storel_epi64(
+                prediction.cr[output_y].as_mut_ptr().cast::<__m128i>(),
+                _mm256_extracti128_si256::<1>(packed),
+            );
         }
     }
 }
@@ -1458,7 +1555,7 @@ mod tests {
 
     #[cfg(target_arch = "x86_64")]
     #[test]
-    fn chroma_sse2_matches_per_sample_bilinear_interpolation() {
+    fn chroma_simd_matches_per_sample_bilinear_interpolation() {
         let cb: Vec<u8> = (0..40 * 40)
             .map(|index| ((index * 37 + index / 13 * 19) & 0xff) as u8)
             .collect();
@@ -1489,6 +1586,20 @@ mod tests {
                                 x_fraction,
                                 y_fraction,
                             );
+                        }
+                        if width == 16 && std::is_x86_feature_detected!("avx2") {
+                            let mut avx2 = InterPrediction420::empty();
+                            avx2.width = width;
+                            avx2.height = height;
+                            // SAFETY: Runtime detection proves AVX2 support,
+                            // and the same interior source rectangle was used
+                            // by the SSE2 oracle above.
+                            unsafe {
+                                predict_chroma_bilinear_avx2(
+                                    &mut avx2, &cb, &cr, 40, 8, 8, x_fraction, y_fraction,
+                                );
+                            }
+                            assert_eq!(avx2, prediction);
                         }
                         for y in 0..usize::from(height / 2) {
                             for x in 0..usize::from(width / 2) {
