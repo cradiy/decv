@@ -3876,13 +3876,13 @@ mod tests {
     }
 
     fn format(size: Size) -> VideoFormat {
-        VideoFormat {
-            coded_size: size,
-            visible_rect: Rect::new(0, 0, size.width, size.height),
-            display_size: size,
-            pixel_format: PixelFormat::Nv12,
-            color: ColorInfo::default(),
-        }
+        VideoFormat::new(
+            size,
+            Rect::new(0, 0, size.width, size.height),
+            size,
+            PixelFormat::Nv12,
+            ColorInfo::default(),
+        )
     }
 
     #[test]

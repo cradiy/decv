@@ -596,28 +596,16 @@ impl Yuv420Picture {
             .ok_or(H264Error::IntegerOverflow)?;
         let chroma = interleave_chroma(&self.cb, &self.cr, chroma_len);
         let chroma: Arc<[u8]> = chroma.into();
-        let frame = DecodedVideoFrame {
+        let frame = DecodedVideoFrame::new(
             id,
             pts,
             duration,
             format,
-            storage: FrameStorage::Cpu(CpuFrame {
-                planes: vec![
-                    CpuPlane {
-                        bytes: self.luma.clone(),
-                        offset: 0,
-                        stride: self.width,
-                        rows: self.height,
-                    },
-                    CpuPlane {
-                        bytes: chroma,
-                        offset: 0,
-                        stride: self.width,
-                        rows: self.height / 2,
-                    },
-                ],
-            }),
-        };
+            FrameStorage::Cpu(CpuFrame::new(vec![
+                CpuPlane::new(self.luma.clone(), 0, self.width, self.height),
+                CpuPlane::new(chroma, 0, self.width, self.height / 2),
+            ])),
+        );
         frame.validate()?;
         Ok(frame)
     }
@@ -1177,13 +1165,13 @@ mod tests {
             )),
         };
         picture.write_pcm_macroblock(0, 0, &pcm).unwrap();
-        let format = VideoFormat {
-            coded_size: Size::new(16, 16),
-            visible_rect: Rect::new(0, 0, 16, 16),
-            display_size: Size::new(16, 16),
-            pixel_format: PixelFormat::Nv12,
-            color: ColorInfo::default(),
-        };
+        let format = VideoFormat::new(
+            Size::new(16, 16),
+            Rect::new(0, 0, 16, 16),
+            Size::new(16, 16),
+            PixelFormat::Nv12,
+            ColorInfo::default(),
+        );
         let frame = picture
             .into_nv12_frame(
                 7,

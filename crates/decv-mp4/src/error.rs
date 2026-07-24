@@ -1,6 +1,7 @@
 use std::{fmt, io};
 
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum Mp4Error {
     Io(io::Error),
     InvalidData(&'static str),

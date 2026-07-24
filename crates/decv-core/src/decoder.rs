@@ -20,6 +20,7 @@ pub enum BitstreamFormat {
 
 /// Codec selection, packet framing, and optional out-of-band configuration.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct VideoDecoderConfig {
     pub codec: VideoCodec,
     pub bitstream_format: BitstreamFormat,
@@ -28,6 +29,21 @@ pub struct VideoDecoderConfig {
 }
 
 impl VideoDecoderConfig {
+    #[inline]
+    pub const fn new(codec: VideoCodec, bitstream_format: BitstreamFormat) -> Self {
+        Self {
+            codec,
+            bitstream_format,
+            codec_data: None,
+        }
+    }
+
+    #[inline]
+    pub fn with_codec_data(mut self, codec_data: impl Into<Arc<[u8]>>) -> Self {
+        self.codec_data = Some(codec_data.into());
+        self
+    }
+
     pub fn validate(&self) -> crate::Result<()> {
         if let BitstreamFormat::LengthPrefixed { length_size } = self.bitstream_format
             && !(1..=4).contains(&length_size)
@@ -43,6 +59,7 @@ impl VideoDecoderConfig {
 /// Result of attempting to transfer packet ownership into a decoder.
 #[derive(Debug, Clone)]
 #[must_use]
+#[non_exhaustive]
 pub enum DecodeInputStatus {
     Accepted,
     /// The decoder must be drained before this unconsumed packet is retried.
@@ -52,6 +69,7 @@ pub enum DecodeInputStatus {
 /// One event produced by the decoder's pull side.
 #[derive(Debug, Clone)]
 #[must_use]
+#[non_exhaustive]
 pub enum DecodeOutput {
     Frame(DecodedVideoFrame),
     /// Always emitted before the first frame using this new format.

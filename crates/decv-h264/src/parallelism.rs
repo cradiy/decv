@@ -7,6 +7,7 @@ use crate::{H264Error, Result};
 
 /// CPU parallelism used by the H.264 reconstruction backend.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum H264Parallelism {
     /// Keep all reconstruction work on the caller thread.
     Serial,

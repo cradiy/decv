@@ -360,13 +360,13 @@ impl AvcSampleEntry {
                 "avcC reserved bits do not have their required values",
             ));
         }
-        Ok(VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            bitstream_format: BitstreamFormat::LengthPrefixed {
+        Ok(VideoDecoderConfig::new(
+            VideoCodec::H264,
+            BitstreamFormat::LengthPrefixed {
                 length_size: (data[4] & 3) + 1,
             },
-            codec_data: Some(Arc::clone(&self.codec_configuration)),
-        })
+        )
+        .with_codec_data(Arc::clone(&self.codec_configuration)))
     }
 }
 

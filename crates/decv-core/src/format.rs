@@ -71,6 +71,7 @@ impl PixelFormat {
 
 /// Image layout and presentation metadata shared by a stream and its frames.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct VideoFormat {
     pub coded_size: Size,
     pub visible_rect: Rect,
@@ -80,6 +81,23 @@ pub struct VideoFormat {
 }
 
 impl VideoFormat {
+    #[inline]
+    pub const fn new(
+        coded_size: Size,
+        visible_rect: Rect,
+        display_size: Size,
+        pixel_format: PixelFormat,
+        color: ColorInfo,
+    ) -> Self {
+        Self {
+            coded_size,
+            visible_rect,
+            display_size,
+            pixel_format,
+            color,
+        }
+    }
+
     pub fn validate(self) -> Result<()> {
         if self.coded_size.is_empty() {
             return Err(MediaError::InvalidVideoFormat(

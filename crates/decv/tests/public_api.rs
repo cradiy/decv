@@ -1,9 +1,10 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
 use decv::{
-    BitstreamFormat, DecodeInputStatus, DecodeOutput, EncodedVideoPacket, FrameStorage,
-    H264Decoder, H264Error, H264Parallelism, Mp4Demuxer, VideoCodec, VideoDecoder,
-    VideoDecoderConfig,
+    BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, CpuFrame, CpuPlane,
+    DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket, FrameStorage,
+    H264Decoder, H264Error, H264Parallelism, Mp4Demuxer, PixelFormat, Rect, Size, TransferFunction,
+    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
 
 fn accepts_consumer_decoder<D>(decoder: &mut D)
@@ -11,17 +12,17 @@ where
     D: VideoDecoder<Error = H264Error>,
 {
     decoder
-        .configure(VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            bitstream_format: BitstreamFormat::ByteStream,
-            codec_data: None,
-        })
+        .configure(VideoDecoderConfig::new(
+            VideoCodec::H264,
+            BitstreamFormat::ByteStream,
+        ))
         .unwrap();
 
     let packet = EncodedVideoPacket::new(Arc::<[u8]>::from([]));
     match decoder.send_packet(packet).unwrap() {
         DecodeInputStatus::Accepted => {}
         DecodeInputStatus::NeedOutput(_) => panic!("an empty fresh decoder has no pending output"),
+        _ => panic!("unexpected decoder input status"),
     }
     assert!(matches!(
         decoder.receive_frame().unwrap(),
@@ -53,5 +54,29 @@ fn frame_storage_requires_forward_compatible_matching() {
         }
     }
 
-    let _ = storage_kind;
+    let format = VideoFormat::new(
+        Size::new(2, 2),
+        Rect::new(0, 0, 2, 2),
+        Size::new(2, 2),
+        PixelFormat::Nv12,
+        ColorInfo::new(
+            ColorRange::Limited,
+            ColorMatrix::Bt709,
+            ColorPrimaries::Bt709,
+            TransferFunction::Bt709,
+        ),
+    );
+    let frame = DecodedVideoFrame::new(
+        1,
+        None,
+        None,
+        format,
+        FrameStorage::Cpu(CpuFrame::new(vec![
+            CpuPlane::new(Arc::<[u8]>::from([0; 4]), 0, 2, 2),
+            CpuPlane::new(Arc::<[u8]>::from([128; 2]), 0, 2, 1),
+        ])),
+    );
+
+    assert_eq!(storage_kind(&frame.storage), "cpu");
+    frame.validate().unwrap();
 }

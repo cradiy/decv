@@ -58,9 +58,27 @@ pub enum TransferFunction {
 
 /// Color metadata retained from codec configuration and VUI syntax.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct ColorInfo {
     pub range: ColorRange,
     pub matrix: ColorMatrix,
     pub primaries: ColorPrimaries,
     pub transfer: TransferFunction,
+}
+
+impl ColorInfo {
+    #[inline]
+    pub const fn new(
+        range: ColorRange,
+        matrix: ColorMatrix,
+        primaries: ColorPrimaries,
+        transfer: TransferFunction,
+    ) -> Self {
+        Self {
+            range,
+            matrix,
+            primaries,
+            transfer,
+        }
+    }
 }

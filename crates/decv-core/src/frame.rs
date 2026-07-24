@@ -4,6 +4,7 @@ use crate::{MediaError, MediaTime, PixelFormat, Result, Size, VideoFormat};
 
 /// One immutable CPU-backed image plane.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CpuPlane {
     pub bytes: Arc<[u8]>,
     pub offset: usize,
@@ -11,10 +12,30 @@ pub struct CpuPlane {
     pub rows: usize,
 }
 
+impl CpuPlane {
+    #[inline]
+    pub fn new(bytes: impl Into<Arc<[u8]>>, offset: usize, stride: usize, rows: usize) -> Self {
+        Self {
+            bytes: bytes.into(),
+            offset,
+            stride,
+            rows,
+        }
+    }
+}
+
 /// CPU-backed storage for all planes of one decoded frame.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CpuFrame {
     pub planes: Vec<CpuPlane>,
+}
+
+impl CpuFrame {
+    #[inline]
+    pub fn new(planes: Vec<CpuPlane>) -> Self {
+        Self { planes }
+    }
 }
 
 /// Ownership-preserving storage for a decoded frame.
@@ -30,6 +51,7 @@ pub enum FrameStorage {
 
 /// A decoded frame with presentation metadata and owned immutable storage.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct DecodedVideoFrame {
     pub id: u64,
     pub pts: Option<MediaTime>,
@@ -39,6 +61,23 @@ pub struct DecodedVideoFrame {
 }
 
 impl DecodedVideoFrame {
+    #[inline]
+    pub const fn new(
+        id: u64,
+        pts: Option<MediaTime>,
+        duration: Option<MediaTime>,
+        format: VideoFormat,
+        storage: FrameStorage,
+    ) -> Self {
+        Self {
+            id,
+            pts,
+            duration,
+            format,
+            storage,
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         self.format.validate()?;
         if self.duration.is_some_and(|duration| duration.value < 0) {

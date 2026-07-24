@@ -32,11 +32,10 @@ use decv::{
 
 let mut decoder = H264Decoder::new();
 decoder.set_parallelism(H264Parallelism::Auto)?;
-decoder.configure(VideoDecoderConfig {
-    codec: VideoCodec::H264,
-    bitstream_format: BitstreamFormat::ByteStream,
-    codec_data: None,
-})?;
+decoder.configure(VideoDecoderConfig::new(
+    VideoCodec::H264,
+    BitstreamFormat::ByteStream,
+))?;
 # Ok::<(), decv::H264Error>(())
 ```
 
@@ -74,6 +73,11 @@ fn send_and_drain(
                     }
                 }
             }
+            _ => {
+                return Err(decv::H264Error::UnsupportedFeature(
+                    "unknown decoder input status",
+                ));
+            }
         }
     }
 
@@ -102,9 +106,12 @@ before the requested target.
 independent backing `Arc<[u8]>`, offset, stride, and row count. Consumers must
 not assume that planes are adjacent or tightly packed.
 
-`FrameStorage` and `PixelFormat` are non-exhaustive. Matches must retain a
-fallback arm so that native or device-backed storage can be added without
-changing the frame metadata contract.
+Extensible facade enums, including `DecodeInputStatus`, `DecodeOutput`,
+`FrameStorage`, and `PixelFormat`, are non-exhaustive. Matches must retain a
+fallback arm. Extensible data structures provide constructors; consumers
+should use those constructors instead of struct literals. This lets later
+versions add device storage, packet side data, configuration, and metadata
+without invalidating existing construction sites.
 
 The current H.264 backend produces NV12:
 

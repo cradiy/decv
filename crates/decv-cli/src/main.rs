@@ -162,11 +162,10 @@ fn decode_annex_b(
     frame_count: &mut u64,
 ) -> Result<(), Box<dyn Error>> {
     let data = fs::read(path)?;
-    decoder.configure(VideoDecoderConfig {
-        codec: VideoCodec::H264,
-        bitstream_format: BitstreamFormat::ByteStream,
-        codec_data: None,
-    })?;
+    decoder.configure(VideoDecoderConfig::new(
+        VideoCodec::H264,
+        BitstreamFormat::ByteStream,
+    ))?;
     for unit in AnnexBReader::new(&data) {
         let unit = unit?;
         let mut framed = Vec::with_capacity(4 + unit.bytes().len());
@@ -253,6 +252,7 @@ fn send_packet(
                     return Err("decoder ended before all input was accepted".into());
                 }
             }
+            _ => return Err("decoder returned an unknown input status".into()),
         }
     }
     if receive_available(decoder, raw_output, frame_count, minimum_pts)? == PullState::EndOfStream {
@@ -320,6 +320,7 @@ fn receive_available(
             }
             DecodeOutput::EndOfStream => return Ok(PullState::EndOfStream),
             DecodeOutput::NeedInput => return Ok(PullState::NeedInput),
+            _ => return Err("decoder returned an unknown output event".into()),
         }
     }
 }

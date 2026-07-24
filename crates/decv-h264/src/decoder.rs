@@ -811,13 +811,13 @@ fn inferred_max_num_reorder_frames(sps: &SequenceParameterSet) -> u32 {
 
 fn video_format(parsed: &ParsedSliceHeader) -> Result<VideoFormat> {
     let sps = &parsed.parameter_sets.sequence;
-    let format = VideoFormat {
-        coded_size: sps.coded_size,
-        visible_rect: sps.visible_rect,
-        display_size: sps.display_size,
-        pixel_format: PixelFormat::Nv12,
-        color: sps.vui.as_ref().map(|vui| vui.color).unwrap_or_default(),
-    };
+    let format = VideoFormat::new(
+        sps.coded_size,
+        sps.visible_rect,
+        sps.display_size,
+        PixelFormat::Nv12,
+        sps.vui.as_ref().map(|vui| vui.color).unwrap_or_default(),
+    );
     format.validate()?;
     Ok(format)
 }
@@ -1052,6 +1052,7 @@ mod tests {
             match decoder.receive_frame() {
                 Ok(DecodeOutput::FormatChanged(_) | DecodeOutput::Frame(_)) => {}
                 Ok(DecodeOutput::NeedInput | DecodeOutput::EndOfStream) | Err(_) => break,
+                Ok(_) => break,
             }
         }
     }
@@ -1178,13 +1179,13 @@ mod tests {
                 1,
                 None,
                 None,
-                VideoFormat {
-                    coded_size: size,
-                    visible_rect: Rect::new(0, 0, 16, 16),
-                    display_size: size,
-                    pixel_format: PixelFormat::Nv12,
-                    color: ColorInfo::default(),
-                },
+                VideoFormat::new(
+                    size,
+                    Rect::new(0, 0, 16, 16),
+                    size,
+                    PixelFormat::Nv12,
+                    ColorInfo::default(),
+                ),
             )
             .unwrap();
         let cpu = match frame.storage {
@@ -1446,18 +1447,18 @@ mod tests {
         ));
         decoder.drain().unwrap();
 
-        let geometry = VideoFormat {
-            coded_size: Size::new(16, 16),
-            visible_rect: Rect::new(2, 2, 12, 12),
-            display_size: Size::new(16, 12),
-            pixel_format: PixelFormat::Nv12,
-            color: ColorInfo {
-                range: ColorRange::Limited,
-                matrix: ColorMatrix::Smpte170M,
-                primaries: ColorPrimaries::Bt601_525,
-                transfer: TransferFunction::Smpte170M,
-            },
-        };
+        let geometry = VideoFormat::new(
+            Size::new(16, 16),
+            Rect::new(2, 2, 12, 12),
+            Size::new(16, 12),
+            PixelFormat::Nv12,
+            ColorInfo::new(
+                ColorRange::Limited,
+                ColorMatrix::Smpte170M,
+                ColorPrimaries::Bt601_525,
+                TransferFunction::Smpte170M,
+            ),
+        );
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(format) if format == geometry
@@ -1467,15 +1468,18 @@ mod tests {
             DecodeOutput::Frame(frame) if frame.format == geometry
         ));
 
-        let bt709_full = VideoFormat {
-            color: ColorInfo {
-                range: ColorRange::Full,
-                matrix: ColorMatrix::Bt709,
-                primaries: ColorPrimaries::Bt709,
-                transfer: TransferFunction::Bt709,
-            },
-            ..geometry
-        };
+        let bt709_full = VideoFormat::new(
+            geometry.coded_size,
+            geometry.visible_rect,
+            geometry.display_size,
+            geometry.pixel_format,
+            ColorInfo::new(
+                ColorRange::Full,
+                ColorMatrix::Bt709,
+                ColorPrimaries::Bt709,
+                TransferFunction::Bt709,
+            ),
+        );
         assert!(matches!(
             decoder.receive_frame().unwrap(),
             DecodeOutput::FormatChanged(format) if format == bt709_full
@@ -1531,6 +1535,7 @@ mod tests {
                     }
                     DecodeOutput::NeedInput => break,
                     DecodeOutput::EndOfStream => panic!("decoder ended before drain"),
+                    _ => panic!("unexpected decoder output"),
                 }
             }
             assert!(decoder.outputs.is_empty());
@@ -2025,6 +2030,7 @@ mod tests {
                 assert_eq!(packet.data.as_ref(), &[0, 0, 1, 0x0b]);
             }
             DecodeInputStatus::Accepted => panic!("packet must remain unconsumed"),
+            _ => panic!("unexpected decoder input status"),
         }
 
         decoder.flush();
@@ -2055,11 +2061,13 @@ mod tests {
         let packet = length_prefixed_stream(&[(0x65, single_macroblock_idr_rbsp())], 4);
         let mut decoder = H264Decoder::new();
         decoder
-            .configure(VideoDecoderConfig {
-                codec: VideoCodec::H264,
-                bitstream_format: BitstreamFormat::LengthPrefixed { length_size: 4 },
-                codec_data: Some(codec_data.into()),
-            })
+            .configure(
+                VideoDecoderConfig::new(
+                    VideoCodec::H264,
+                    BitstreamFormat::LengthPrefixed { length_size: 4 },
+                )
+                .with_codec_data(codec_data),
+            )
             .unwrap();
         assert!(matches!(
             decoder
@@ -2079,11 +2087,13 @@ mod tests {
 
         assert!(
             decoder
-                .configure(VideoDecoderConfig {
-                    codec: VideoCodec::H264,
-                    bitstream_format: BitstreamFormat::LengthPrefixed { length_size: 2 },
-                    codec_data: Some(avcc(&sps, &pps, 4).into()),
-                })
+                .configure(
+                    VideoDecoderConfig::new(
+                        VideoCodec::H264,
+                        BitstreamFormat::LengthPrefixed { length_size: 2 },
+                    )
+                    .with_codec_data(avcc(&sps, &pps, 4)),
+                )
                 .is_err()
         );
     }
@@ -2295,11 +2305,7 @@ mod tests {
     }
 
     fn byte_stream_config() -> VideoDecoderConfig {
-        VideoDecoderConfig {
-            codec: VideoCodec::H264,
-            bitstream_format: BitstreamFormat::ByteStream,
-            codec_data: None,
-        }
+        VideoDecoderConfig::new(VideoCodec::H264, BitstreamFormat::ByteStream)
     }
 
     fn configured_parser_with_sps(sps: Vec<u8>) -> H264StreamParser {

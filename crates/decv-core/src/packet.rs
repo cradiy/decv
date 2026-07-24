@@ -4,6 +4,7 @@ use crate::MediaTime;
 
 /// A compressed video packet with complete decode and presentation timing.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct EncodedVideoPacket {
     pub data: Arc<[u8]>,
     pub pts: Option<MediaTime>,

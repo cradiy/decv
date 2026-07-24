@@ -351,13 +351,11 @@ The `avcC` payload is an `AVCDecoderConfigurationRecord`. It provides:
 The decoder configuration derived by `decv-mp4` is:
 
 ```rust
-VideoDecoderConfig {
-    codec: VideoCodec::H264,
-    bitstream_format: BitstreamFormat::LengthPrefixed {
-        length_size,
-    },
-    codec_data: Some(avcc),
-}
+VideoDecoderConfig::new(
+    VideoCodec::H264,
+    BitstreamFormat::LengthPrefixed { length_size },
+)
+.with_codec_data(avcc)
 ```
 
 MP4 AVC samples must not be treated as Annex-B. Their NAL boundaries are
