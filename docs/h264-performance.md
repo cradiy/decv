@@ -1307,6 +1307,17 @@ at 34.57 FPS, confirming that the gain comes from the bounded overlap rather
 than less reconstruction work. The generated H.264 corpus and the 48-frame
 4K output remain byte-exact against FFmpeg.
 
+Retraining PGO after adding the pipeline produced a further whole-program
+gain. The profile used the 4K CABAC, 1080p CABAC, and 1080p CAVLC streams in
+both Serial and Auto modes. Across seven alternating pinned 4K four-worker
+pairs, PGO reduced average wall time about 10.77%, task-clock about 7.90%,
+reference cycles about 8.52%, and instructions about 14.71%. Same-run
+throughput moved from 35.66 to 39.96 FPS. Seven Serial pairs reduced wall time
+about 5.17%, reference cycles about 5.58%, and instructions about 14.85%,
+moving from 34.27 to 36.14 FPS. The PGO four-worker output retained the exact
+597,196,800-byte FFmpeg hash. On this CPU the best measured software result is
+therefore approximately 4K40, still roughly three times short of 4K120.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
