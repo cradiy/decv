@@ -995,7 +995,15 @@ Four plausible reader changes were tested and rejected:
   about 1.4% to 1.7% of whole-decoder instructions. Despite also reducing
   branches and sampled cache misses, six alternating pinned runs were
   consistently about 1% slower because the refill call lengthened the
-  dependency path.
+  dependency path;
+- adding an unchecked 1-to-7-bit `BitReader` operation for CABAC
+  renormalization produced the same 381-byte native `decode_decision` body as
+  the generic runtime-width call. Its only hot machine-code difference was an
+  equivalent x86 shift-count immediate (`7` versus `0x47` after hardware
+  masking). Seven pinned CABAC Serial pairs changed reference cycles by about
+  +0.07% and instructions by about +0.08%. The compiler already proves the
+  narrow width from the CABAC range invariant, so the extra unsafe API was
+  fully reverted.
 
 Two adjacent CABAC-core experiments were also rejected. Returning the internal
 decision result through a compact `Option<u8>` reduced instructions by about
