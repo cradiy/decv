@@ -1,11 +1,12 @@
 //! Conversion from decoded transform coefficients to spatial residual samples.
 
+use crate::transform::PreparedInverseScale4x4;
 use crate::{
     BInterMacroblockHeader, Block4x4, Block8x8, ColorComponent, H264Error, InterResidual,
     IntraLumaPrediction, IntraMacroblockHeader, IntraResidual, MacroblockQuantizer,
     PInterMacroblockHeader, PredictionClass, ResolvedScalingLists4x4, ResolvedScalingLists8x8,
     Result, ScanMode, inverse_transform_chroma_dc_420, inverse_transform_luma_dc_4x4,
-    reconstruct_residual_4x4, reconstruct_residual_8x8,
+    reconstruct_residual_8x8,
 };
 
 const LUMA_BLOCK_COORDINATES: [(usize, usize); 16] = [
@@ -68,6 +69,7 @@ pub fn reconstruct_intra_residual(
     let luma = match header.luma_prediction {
         IntraLumaPrediction::SixteenBySixteen { .. } => {
             let mut luma = [[[0; 4]; 4]; 16];
+            let prepared_scale = PreparedInverseScale4x4::new(quantizer.luma, luma_scaling)?;
             let dc = residual.luma_dc.as_ref().ok_or(H264Error::InvalidSyntax(
                 "Intra16x16 residual is missing its luma DC block",
             ))?;
@@ -83,18 +85,13 @@ pub fn reconstruct_intra_residual(
                 let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
                 let coefficients =
                     merge_dc_and_ac(transformed_dc[block_y][block_x], &block.coefficients);
-                luma[index] = reconstruct_residual_4x4(
-                    &coefficients,
-                    scan_mode,
-                    quantizer.luma,
-                    luma_scaling,
-                    true,
-                )?;
+                luma[index] = prepared_scale.reconstruct(&coefficients, scan_mode, true)?;
             }
             ReconstructedLumaResidual::FourByFour(Box::new(luma))
         }
         IntraLumaPrediction::FourByFour(_) => {
             let mut luma = [[[0; 4]; 4]; 16];
+            let prepared_scale = PreparedInverseScale4x4::new(quantizer.luma, luma_scaling)?;
             if residual.luma_dc.is_some() {
                 return Err(H264Error::InvalidSyntax(
                     "Intra4x4 residual unexpectedly contains luma DC",
@@ -102,13 +99,7 @@ pub fn reconstruct_intra_residual(
             }
             for (output, block) in luma.iter_mut().zip(&residual.luma) {
                 ensure_block_size(block.max_num_coeff, 16)?;
-                *output = reconstruct_residual_4x4(
-                    &block.coefficients,
-                    scan_mode,
-                    quantizer.luma,
-                    luma_scaling,
-                    false,
-                )?;
+                *output = prepared_scale.reconstruct(&block.coefficients, scan_mode, false)?;
             }
             ReconstructedLumaResidual::FourByFour(Box::new(luma))
         }
@@ -239,15 +230,10 @@ fn reconstruct_inter_residual_with_transform_size(
     } else {
         let mut luma = [[[0; 4]; 4]; 16];
         let scaling = scaling_lists.get(PredictionClass::Inter, ColorComponent::Luma);
+        let prepared_scale = PreparedInverseScale4x4::new(quantizer.luma, scaling)?;
         for (output, block) in luma.iter_mut().zip(&residual.luma) {
             ensure_block_size(block.max_num_coeff, 16)?;
-            *output = reconstruct_residual_4x4(
-                &block.coefficients,
-                scan_mode,
-                quantizer.luma,
-                scaling,
-                false,
-            )?;
+            *output = prepared_scale.reconstruct(&block.coefficients, scan_mode, false)?;
         }
         ReconstructedLumaResidual::FourByFour(Box::new(luma))
     };
@@ -284,12 +270,13 @@ fn reconstruct_chroma(
         .try_into()
         .expect("the source slice has a fixed length");
     let transformed_dc = inverse_transform_chroma_dc_420(&dc_values, qp, scaling_list)?;
+    let prepared_scale = PreparedInverseScale4x4::new(qp, scaling_list)?;
     let mut output = [[[0; 4]; 4]; 4];
     for (index, block) in ac.iter().enumerate() {
         ensure_block_size(block.max_num_coeff, 15)?;
         let (block_x, block_y) = CHROMA_BLOCK_COORDINATES[index];
         let coefficients = merge_dc_and_ac(transformed_dc[block_y][block_x], &block.coefficients);
-        output[index] = reconstruct_residual_4x4(&coefficients, scan_mode, qp, scaling_list, true)?;
+        output[index] = prepared_scale.reconstruct(&coefficients, scan_mode, true)?;
     }
     Ok(output)
 }

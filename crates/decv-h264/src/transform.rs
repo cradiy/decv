@@ -463,52 +463,98 @@ pub fn inverse_scale_4x4(
     scaling_list: &[u8; 16],
     preserve_dc: bool,
 ) -> Result<Block4x4> {
-    if qp > 51 {
-        return Err(H264Error::InvalidSyntax("8-bit transform QP exceeds 51"));
-    }
-    if scaling_list.contains(&0) {
-        return Err(H264Error::InvalidSyntax(
-            "4x4 scaling-list entries must be non-zero",
-        ));
-    }
+    PreparedInverseScale4x4::new(qp, scaling_list)?.scale(coefficients, preserve_dc)
+}
 
-    let weights = inverse_scan_scaling_list_4x4(scaling_list);
-    let qp_div_6 = u32::from(qp / 6);
-    let norm_row = NORM_ADJUST_4X4[usize::from(qp % 6)];
-    let mut scaled = [[0; 4]; 4];
-    for row in 0..4 {
-        for column in 0..4 {
-            if preserve_dc && row == 0 && column == 0 {
-                scaled[row][column] = coefficients[row][column];
-                continue;
-            }
+pub(crate) struct PreparedInverseScale4x4 {
+    level_scales: [[u16; 4]; 4],
+    shift: u32,
+    rounding: i64,
+    shift_left: bool,
+}
 
-            let norm = if row % 2 == 0 && column % 2 == 0 {
-                norm_row[0]
-            } else if row % 2 == 1 && column % 2 == 1 {
-                norm_row[1]
-            } else {
-                norm_row[2]
-            };
-            let level_scale = i64::from(weights[row][column]) * i64::from(norm);
-            let coefficient = i64::from(coefficients[row][column]);
-            let value = if qp >= 24 {
-                coefficient
-                    .checked_mul(level_scale)
-                    .and_then(|value| value.checked_shl(qp_div_6 - 4))
-                    .ok_or(H264Error::IntegerOverflow)?
-            } else {
-                let rounding = 1i64 << (3 - qp_div_6);
-                (coefficient
-                    .checked_mul(level_scale)
-                    .and_then(|value| value.checked_add(rounding))
-                    .ok_or(H264Error::IntegerOverflow)?)
-                    >> (4 - qp_div_6)
-            };
-            scaled[row][column] = i32::try_from(value).map_err(|_| H264Error::IntegerOverflow)?;
+impl PreparedInverseScale4x4 {
+    pub(crate) fn new(qp: u8, scaling_list: &[u8; 16]) -> Result<Self> {
+        if qp > 51 {
+            return Err(H264Error::InvalidSyntax("8-bit transform QP exceeds 51"));
         }
+        if scaling_list.contains(&0) {
+            return Err(H264Error::InvalidSyntax(
+                "4x4 scaling-list entries must be non-zero",
+            ));
+        }
+
+        let weights = inverse_scan_scaling_list_4x4(scaling_list);
+        let qp_div_6 = u32::from(qp / 6);
+        let norm_row = NORM_ADJUST_4X4[usize::from(qp % 6)];
+        let level_scales = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                let norm = if row % 2 == 0 && column % 2 == 0 {
+                    norm_row[0]
+                } else if row % 2 == 1 && column % 2 == 1 {
+                    norm_row[1]
+                } else {
+                    norm_row[2]
+                };
+                u16::from(weights[row][column])
+                    * u16::try_from(norm).expect("4x4 norm adjustments fit u16")
+            })
+        });
+        let shift_left = qp >= 24;
+        let shift = if shift_left {
+            qp_div_6 - 4
+        } else {
+            4 - qp_div_6
+        };
+        let rounding = if shift_left { 0 } else { 1i64 << (shift - 1) };
+        Ok(Self {
+            level_scales,
+            shift,
+            rounding,
+            shift_left,
+        })
     }
-    Ok(scaled)
+
+    pub(crate) fn reconstruct(
+        &self,
+        values: &[i32; 16],
+        scan_mode: ScanMode,
+        preserve_dc: bool,
+    ) -> Result<Block4x4> {
+        let coefficients = inverse_scan_4x4(values, scan_mode);
+        let scaled = self.scale(&coefficients, preserve_dc)?;
+        inverse_transform_4x4(&scaled)
+    }
+
+    fn scale(&self, coefficients: &Block4x4, preserve_dc: bool) -> Result<Block4x4> {
+        let mut scaled = [[0; 4]; 4];
+        for row in 0..4 {
+            for column in 0..4 {
+                if preserve_dc && row == 0 && column == 0 {
+                    scaled[row][column] = coefficients[row][column];
+                    continue;
+                }
+
+                let level_scale = i64::from(self.level_scales[row][column]);
+                let coefficient = i64::from(coefficients[row][column]);
+                let value = if self.shift_left {
+                    coefficient
+                        .checked_mul(level_scale)
+                        .and_then(|value| value.checked_shl(self.shift))
+                        .ok_or(H264Error::IntegerOverflow)?
+                } else {
+                    (coefficient
+                        .checked_mul(level_scale)
+                        .and_then(|value| value.checked_add(self.rounding))
+                        .ok_or(H264Error::IntegerOverflow)?)
+                        >> self.shift
+                };
+                scaled[row][column] =
+                    i32::try_from(value).map_err(|_| H264Error::IntegerOverflow)?;
+            }
+        }
+        Ok(scaled)
+    }
 }
 
 /// Applies the normative H.264 8x8 inverse quantization.
@@ -621,9 +667,7 @@ pub fn reconstruct_residual_4x4(
     scaling_list: &[u8; 16],
     preserve_dc: bool,
 ) -> Result<Block4x4> {
-    let coefficients = inverse_scan_4x4(values, scan_mode);
-    let scaled = inverse_scale_4x4(&coefficients, qp, scaling_list, preserve_dc)?;
-    inverse_transform_4x4(&scaled)
+    PreparedInverseScale4x4::new(qp, scaling_list)?.reconstruct(values, scan_mode, preserve_dc)
 }
 
 /// Runs the 8x8 inverse scan, inverse scaling, and inverse integer transform.
