@@ -779,6 +779,20 @@ five pairs. The wrapper around the already inlined plane kernels was fully
 reverted. A future DSP entry must fuse more than shared SIMD constant setup to
 amortize a full-YUV dispatch boundary.
 
+Removing `TryFrom` and `checked_add` operations from inter-prediction window
+classification was tested in two forms and rejected. Computing the bounded
+coordinates directly in `i64` reduced CABAC Serial instructions about 0.95%,
+branches about 0.41%, and median reference cycles about 0.48%, with five of
+seven pairs improving. `Auto` median reference cycles fell about 0.37%, but
+CAVLC increased about 0.99% and all five pairs were slower despite roughly
+1.1% fewer instructions. Direct `i32` arithmetic is also mathematically safe
+under the decoder's 36,864-macroblock picture limit and i16 motion-vector
+range; it shrank the combined prediction symbol by 226 bytes and reduced
+CABAC instructions about 0.73%. Nevertheless, seven CABAC Serial runs
+increased median reference cycles about 0.48%, with only two pairs improving.
+Both dependency-chain variants were fully reverted; the existing checked
+operations schedule better across the supported workloads.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
