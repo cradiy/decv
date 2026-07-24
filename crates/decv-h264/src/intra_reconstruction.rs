@@ -109,15 +109,25 @@ impl<'a> BDirectPrediction<'a> {
         self,
         state: &mut BMotionState,
         macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
         slice_id: u32,
     ) -> Result<ResolvedBMacroblock> {
         match self.context()? {
-            DirectMotionContext::Spatial(context) => {
-                state.resolve_spatial_direct_macroblock(macroblock_address, slice_id, context)
-            }
-            DirectMotionContext::Temporal(context) => {
-                state.resolve_temporal_direct_macroblock(macroblock_address, slice_id, context)
-            }
+            DirectMotionContext::Spatial(context) => state.resolve_spatial_direct_macroblock_at(
+                macroblock_address,
+                macroblock_x,
+                macroblock_y,
+                slice_id,
+                context,
+            ),
+            DirectMotionContext::Temporal(context) => state.resolve_temporal_direct_macroblock_at(
+                macroblock_address,
+                macroblock_x,
+                macroblock_y,
+                slice_id,
+                context,
+            ),
         }
     }
 
@@ -1584,6 +1594,8 @@ impl IntraPictureReconstructor {
                                 let motion = modes.direct.resolve(
                                     &mut self.b_motion,
                                     macroblock_address,
+                                    macroblock_x,
+                                    macroblock_y,
                                     slice_id,
                                 )?;
                                 if let Err(error) = self.reference_motion.record_b(
@@ -1633,6 +1645,8 @@ impl IntraPictureReconstructor {
                                         modes.direct.resolve(
                                             &mut self.b_motion,
                                             macroblock_address,
+                                            macroblock_x,
+                                            macroblock_y,
                                             slice_id,
                                         )?
                                     } else if has_direct_b_sub_macroblock(header) {
@@ -1828,7 +1842,13 @@ impl IntraPictureReconstructor {
                 let motion =
                     match modes
                         .direct
-                        .resolve(&mut self.b_motion, macroblock_address, slice_id)
+                        .resolve(
+                            &mut self.b_motion,
+                            macroblock_address,
+                            macroblock_x,
+                            macroblock_y,
+                            slice_id,
+                        )
                     {
                         Ok(motion) => motion,
                         Err(error) => {
@@ -1927,7 +1947,13 @@ impl IntraPictureReconstructor {
                     let motion = if is_fully_direct_b_macroblock(header) {
                         modes
                             .direct
-                            .resolve(&mut self.b_motion, macroblock_address, slice_id)?
+                            .resolve(
+                                &mut self.b_motion,
+                                macroblock_address,
+                                macroblock_x,
+                                macroblock_y,
+                                slice_id,
+                            )?
                     } else if has_direct_b_sub_macroblock(header) {
                         modes.direct.resolve_mixed(
                             &mut self.b_motion,

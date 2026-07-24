@@ -1448,6 +1448,25 @@ and the median wall time moved from 3.93 to 3.91 seconds, with one large
 scheduler outlier. A post-change PGO sample reduced the remaining whole-stream
 `memset` share from about 2.38% to 2.03%. The 4K output remains byte-exact.
 
+Full-macroblock Direct resolution now reuses the macroblock coordinates that
+the CABAC/CAVLC reconstruction loop has already validated. The low-level
+public motion-state methods retain their address-only entry points, while the
+decoder's internal path passes `(address, x, y)` to avoid reconstructing
+coordinates with another runtime-width integer division for every B_Skip or
+fully Direct macroblock. Both spatial and temporal Direct use the same
+coordinate-preserving path.
+
+The native build reduced the specialized Spatial Direct symbol by about 100
+bytes and removed its hot `div`, but four-worker timing remained too noisy to
+claim a portable throughput gain. After retraining the same 4K CABAC, 1080p
+CABAC, and 1080p CAVLC PGO profile, nine fixed-CPU 4K four-worker pairs reduced
+mean wall time about 4.48%, task-clock about 3.99%, cycles about 2.63%, and
+instructions about 1.58%; eight wall-time pairs improved. Mean throughput moved
+from 42.93 to 44.95 FPS. Five 300-frame 1080p two-worker pairs reduced
+task-clock about 1.8% and instructions about 1.6%. The exact
+597,196,800-byte 4K hash, the generated H.264 corpus, and the MP4/seek corpus
+remain unchanged.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

@@ -235,7 +235,30 @@ impl BMotionState {
         slice_id: u32,
         context: SpatialDirectContext<'_>,
     ) -> Result<ResolvedBMacroblock> {
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        self.resolve_spatial_direct_macroblock_at(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            slice_id,
+            context,
+        )
+    }
+
+    pub(crate) fn resolve_spatial_direct_macroblock_at(
+        &mut self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        slice_id: u32,
+        context: SpatialDirectContext<'_>,
+    ) -> Result<ResolvedBMacroblock> {
         self.ensure_macroblock_available_for_write(macroblock_address, slice_id)?;
+        debug_assert_eq!(
+            macroblock_address,
+            macroblock_y * self.width_in_macroblocks + macroblock_x
+        );
         let geometry = PartitionGeometry {
             x: 0,
             y: 0,
@@ -282,8 +305,6 @@ impl BMotionState {
         } else {
             (4, DIRECT_4X4_GRID.as_slice())
         };
-        let macroblock_x = macroblock_address % self.width_in_macroblocks;
-        let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let col_zero_can_change = |prediction: Option<(u8, MotionVector)>| {
             prediction.is_some_and(|(reference_index, vector)| {
                 reference_index == 0 && vector != MotionVector::default()
@@ -381,7 +402,30 @@ impl BMotionState {
         slice_id: u32,
         context: TemporalDirectContext<'_>,
     ) -> Result<ResolvedBMacroblock> {
+        let macroblock_x = macroblock_address % self.width_in_macroblocks;
+        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        self.resolve_temporal_direct_macroblock_at(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            slice_id,
+            context,
+        )
+    }
+
+    pub(crate) fn resolve_temporal_direct_macroblock_at(
+        &mut self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        slice_id: u32,
+        context: TemporalDirectContext<'_>,
+    ) -> Result<ResolvedBMacroblock> {
         self.ensure_macroblock_available_for_write(macroblock_address, slice_id)?;
+        debug_assert_eq!(
+            macroblock_address,
+            macroblock_y * self.width_in_macroblocks + macroblock_x
+        );
         if context.num_ref_idx_l1_active == 0 {
             return Err(H264Error::InvalidSyntax(
                 "temporal Direct requires an active List 1 reference",
@@ -392,8 +436,6 @@ impl BMotionState {
         } else {
             (4, DIRECT_4X4_GRID.as_slice())
         };
-        let macroblock_x = macroblock_address % self.width_in_macroblocks;
-        let macroblock_y = macroblock_address / self.width_in_macroblocks;
         let mut local = [None; 16];
         let mut partitions = SmallVec::with_capacity(direct_grid.len());
         for &(x, y, cell_x, cell_y) in direct_grid {
