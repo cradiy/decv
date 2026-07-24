@@ -45,9 +45,110 @@ pub struct ReconstructedIntraResidual {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconstructedInterResidual {
-    pub luma: ReconstructedLumaResidual,
-    pub chroma_cb: [Block4x4; 4],
-    pub chroma_cr: [Block4x4; 4],
+    data: Box<ReconstructedInterResidualData>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReconstructedInterResidualData {
+    luma: ReconstructedInterLumaResidual,
+    chroma_cb: [Block4x4; 4],
+    chroma_cr: [Block4x4; 4],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReconstructedInterLumaResidual {
+    FourByFour([Block4x4; 16]),
+    EightByEight([Block8x8; 4]),
+}
+
+pub(crate) enum ReconstructedInterLumaResidualRef<'a> {
+    FourByFour(&'a [Block4x4; 16]),
+    EightByEight(&'a [Block8x8; 4]),
+}
+
+impl ReconstructedInterResidual {
+    pub(crate) fn four_by_four(
+        luma: [Block4x4; 16],
+        chroma_cb: [Block4x4; 4],
+        chroma_cr: [Block4x4; 4],
+    ) -> Self {
+        Self {
+            data: Box::new(ReconstructedInterResidualData {
+                luma: ReconstructedInterLumaResidual::FourByFour(luma),
+                chroma_cb,
+                chroma_cr,
+            }),
+        }
+    }
+
+    pub(crate) fn eight_by_eight(
+        luma: [Block8x8; 4],
+        chroma_cb: [Block4x4; 4],
+        chroma_cr: [Block4x4; 4],
+    ) -> Self {
+        Self {
+            data: Box::new(ReconstructedInterResidualData {
+                luma: ReconstructedInterLumaResidual::EightByEight(luma),
+                chroma_cb,
+                chroma_cr,
+            }),
+        }
+    }
+
+    pub fn luma_4x4(&self) -> Option<&[Block4x4; 16]> {
+        match &self.data.luma {
+            ReconstructedInterLumaResidual::FourByFour(luma) => Some(luma),
+            ReconstructedInterLumaResidual::EightByEight(_) => None,
+        }
+    }
+
+    pub fn luma_8x8(&self) -> Option<&[Block8x8; 4]> {
+        match &self.data.luma {
+            ReconstructedInterLumaResidual::FourByFour(_) => None,
+            ReconstructedInterLumaResidual::EightByEight(luma) => Some(luma),
+        }
+    }
+
+    pub(crate) fn luma(&self) -> ReconstructedInterLumaResidualRef<'_> {
+        match &self.data.luma {
+            ReconstructedInterLumaResidual::FourByFour(luma) => {
+                ReconstructedInterLumaResidualRef::FourByFour(luma)
+            }
+            ReconstructedInterLumaResidual::EightByEight(luma) => {
+                ReconstructedInterLumaResidualRef::EightByEight(luma)
+            }
+        }
+    }
+
+    pub fn chroma_cb(&self) -> &[Block4x4; 4] {
+        &self.data.chroma_cb
+    }
+
+    pub fn chroma_cr(&self) -> &[Block4x4; 4] {
+        &self.data.chroma_cr
+    }
+
+    pub(crate) fn luma_4x4_mut(&mut self) -> Option<&mut [Block4x4; 16]> {
+        match &mut self.data.luma {
+            ReconstructedInterLumaResidual::FourByFour(luma) => Some(luma),
+            ReconstructedInterLumaResidual::EightByEight(_) => None,
+        }
+    }
+
+    pub(crate) fn luma_8x8_mut(&mut self) -> Option<&mut [Block8x8; 4]> {
+        match &mut self.data.luma {
+            ReconstructedInterLumaResidual::FourByFour(_) => None,
+            ReconstructedInterLumaResidual::EightByEight(luma) => Some(luma),
+        }
+    }
+
+    pub(crate) fn chroma_cb_mut(&mut self) -> &mut [Block4x4; 4] {
+        &mut self.data.chroma_cb
+    }
+
+    pub(crate) fn chroma_cr_mut(&mut self) -> &mut [Block4x4; 4] {
+        &mut self.data.chroma_cr
+    }
 }
 
 /// Applies the 8-bit 4x4 or 8x8 inverse transform pipeline for one intra
@@ -213,9 +314,24 @@ fn reconstruct_inter_residual_with_transform_size(
             "transform-bypass macroblock reconstruction",
         ));
     }
-    let luma = if transform_size_8x8 {
-        let mut luma = [[[0; 8]; 8]; 4];
-        for (block_8x8, output) in luma.iter_mut().enumerate() {
+    let mut output = if transform_size_8x8 {
+        ReconstructedInterResidual::eight_by_eight(
+            [[[0; 8]; 8]; 4],
+            [[[0; 4]; 4]; 4],
+            [[[0; 4]; 4]; 4],
+        )
+    } else {
+        ReconstructedInterResidual::four_by_four(
+            [[[0; 4]; 4]; 16],
+            [[[0; 4]; 4]; 4],
+            [[[0; 4]; 4]; 4],
+        )
+    };
+    if transform_size_8x8 {
+        let luma = output
+            .luma_8x8_mut()
+            .expect("the output transform size was selected above");
+        for (block_8x8, block_output) in luma.iter_mut().enumerate() {
             let mut coefficients = [0; 64];
             for block_4x4 in 0..4 {
                 let source = &residual.luma[block_8x8 * 4 + block_4x4];
@@ -224,43 +340,41 @@ fn reconstruct_inter_residual_with_transform_size(
                     coefficients[4 * index + block_4x4] = source.coefficients[index];
                 }
             }
-            *output = reconstruct_residual_8x8(
+            *block_output = reconstruct_residual_8x8(
                 &coefficients,
                 scan_mode,
                 quantizer.luma,
                 scaling_lists_8x8.get(PredictionClass::Inter),
             )?;
         }
-        ReconstructedLumaResidual::EightByEight(Box::new(luma))
     } else {
-        let mut luma = [[[0; 4]; 4]; 16];
+        let luma = output
+            .luma_4x4_mut()
+            .expect("the output transform size was selected above");
         let scaling = scaling_lists.get(PredictionClass::Inter, ColorComponent::Luma);
         let prepared_scale = PreparedInverseScale4x4::new(quantizer.luma, scaling)?;
-        for (output, block) in luma.iter_mut().zip(&residual.luma) {
+        for (block_output, block) in luma.iter_mut().zip(&residual.luma) {
             ensure_block_size(block.max_num_coeff, 16)?;
-            prepared_scale.reconstruct_into(&block.coefficients, scan_mode, false, output)?;
+            prepared_scale.reconstruct_into(&block.coefficients, scan_mode, false, block_output)?;
         }
-        ReconstructedLumaResidual::FourByFour(Box::new(luma))
-    };
-    let chroma_cb = reconstruct_chroma(
+    }
+    reconstruct_chroma_into(
         &residual.chroma_dc[0],
         &residual.chroma_ac[0],
         quantizer.chroma_cb,
         scaling_lists.get(PredictionClass::Inter, ColorComponent::Cb),
         scan_mode,
+        output.chroma_cb_mut(),
     )?;
-    let chroma_cr = reconstruct_chroma(
+    reconstruct_chroma_into(
         &residual.chroma_dc[1],
         &residual.chroma_ac[1],
         quantizer.chroma_cr,
         scaling_lists.get(PredictionClass::Inter, ColorComponent::Cr),
         scan_mode,
+        output.chroma_cr_mut(),
     )?;
-    Ok(ReconstructedInterResidual {
-        luma,
-        chroma_cb,
-        chroma_cr,
-    })
+    Ok(output)
 }
 
 fn reconstruct_chroma(
@@ -270,20 +384,32 @@ fn reconstruct_chroma(
     scaling_list: &[u8; 16],
     scan_mode: ScanMode,
 ) -> Result<[Block4x4; 4]> {
+    let mut output = [[[0; 4]; 4]; 4];
+    reconstruct_chroma_into(dc, ac, qp, scaling_list, scan_mode, &mut output)?;
+    Ok(output)
+}
+
+fn reconstruct_chroma_into(
+    dc: &crate::ResidualBlock,
+    ac: &[crate::ResidualBlock; 4],
+    qp: u8,
+    scaling_list: &[u8; 16],
+    scan_mode: ScanMode,
+    output: &mut [Block4x4; 4],
+) -> Result<()> {
     ensure_block_size(dc.max_num_coeff, 4)?;
     let dc_values: [i32; 4] = dc.coefficients[..4]
         .try_into()
         .expect("the source slice has a fixed length");
     let transformed_dc = inverse_transform_chroma_dc_420(&dc_values, qp, scaling_list)?;
     let prepared_scale = PreparedInverseScale4x4::new(qp, scaling_list)?;
-    let mut output = [[[0; 4]; 4]; 4];
     for (index, block) in ac.iter().enumerate() {
         ensure_block_size(block.max_num_coeff, 15)?;
         let (block_x, block_y) = CHROMA_BLOCK_COORDINATES[index];
         let coefficients = merge_dc_and_ac(transformed_dc[block_y][block_x], &block.coefficients);
         prepared_scale.reconstruct_into(&coefficients, scan_mode, true, &mut output[index])?;
     }
-    Ok(output)
+    Ok(())
 }
 
 fn merge_dc_and_ac(dc: i32, ac: &[i32; 16]) -> [i32; 16] {
@@ -543,6 +669,14 @@ mod tests {
     }
 
     #[test]
+    fn reconstructed_inter_residual_handle_is_pointer_sized() {
+        assert_eq!(
+            std::mem::size_of::<super::ReconstructedInterResidual>(),
+            std::mem::size_of::<Box<()>>()
+        );
+    }
+
+    #[test]
     fn reconstructs_inter_four_and_eight_by_eight_residuals() {
         let scaling = resolve_scaling_lists_4x4(None, None).unwrap();
         let scaling_8x8 = resolve_scaling_lists_8x8(None, None).unwrap();
@@ -562,9 +696,7 @@ mod tests {
             ScanMode::Frame,
         )
         .unwrap();
-        let ReconstructedLumaResidual::FourByFour(four_blocks) = four.luma else {
-            panic!("expected 4x4 residual blocks");
-        };
+        let four_blocks = four.luma_4x4().expect("expected 4x4 residual blocks");
         assert_eq!(four_blocks[0], [[10; 4]; 4]);
 
         let eight = super::reconstruct_inter_residual(
@@ -576,9 +708,7 @@ mod tests {
             ScanMode::Frame,
         )
         .unwrap();
-        let ReconstructedLumaResidual::EightByEight(ref eight_blocks) = eight.luma else {
-            panic!("expected 8x8 residual blocks");
-        };
+        let eight_blocks = eight.luma_8x8().expect("expected 8x8 residual blocks");
         let mut interleaved = [0; 64];
         interleaved[0] = 64;
         assert_eq!(

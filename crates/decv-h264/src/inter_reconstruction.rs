@@ -4,11 +4,11 @@ use decv_core::Size;
 
 use crate::inter_prediction::copy_fixed_row;
 use crate::picture_surface::{MacroblockPixels, StagedMacroblockPixels};
+use crate::reconstruction::ReconstructedInterLumaResidualRef;
 use crate::{
     H264Error, InterPrediction420, PredictionWeight, PredictionWeightTable,
-    ReconstructedInterResidual, ReconstructedLumaResidual, ResolvedBListMotion,
-    ResolvedBMacroblock, ResolvedBPartition, ResolvedPMacroblock, ResolvedPPartition, Result,
-    WeightOffset, Yuv420Picture,
+    ReconstructedInterResidual, ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition,
+    ResolvedPMacroblock, ResolvedPPartition, Result, WeightOffset, Yuv420Picture,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -878,14 +878,14 @@ fn assemble_residual(residual: &ReconstructedInterResidual) -> MacroblockResidua
     let mut residual_luma = [[0i32; 16]; 16];
     let mut residual_cb = [[0i32; 8]; 8];
     let mut residual_cr = [[0i32; 8]; 8];
-    match &residual.luma {
-        ReconstructedLumaResidual::FourByFour(blocks) => {
+    match residual.luma() {
+        ReconstructedInterLumaResidualRef::FourByFour(blocks) => {
             for (index, block) in blocks.iter().enumerate() {
                 let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
                 copy_residual_block(&mut residual_luma, block_x * 4, block_y * 4, block);
             }
         }
-        ReconstructedLumaResidual::EightByEight(blocks) => {
+        ReconstructedInterLumaResidualRef::EightByEight(blocks) => {
             for (index, block) in blocks.iter().enumerate() {
                 copy_residual_block(&mut residual_luma, index % 2 * 8, index / 2 * 8, block);
             }
@@ -896,13 +896,13 @@ fn assemble_residual(residual: &ReconstructedInterResidual) -> MacroblockResidua
             &mut residual_cb,
             index % 2 * 4,
             index / 2 * 4,
-            &residual.chroma_cb[index],
+            &residual.chroma_cb()[index],
         );
         copy_residual_block(
             &mut residual_cr,
             index % 2 * 4,
             index / 2 * 4,
-            &residual.chroma_cr[index],
+            &residual.chroma_cr()[index],
         );
     }
     (residual_luma, residual_cb, residual_cr)
@@ -926,22 +926,32 @@ fn add_inter_residual_to_prediction(
 
     #[cfg(not(target_arch = "x86_64"))]
     {
-        match &residual.luma {
-            ReconstructedLumaResidual::FourByFour(blocks) => {
+        match residual.luma() {
+            ReconstructedInterLumaResidualRef::FourByFour(blocks) => {
                 for (index, block) in blocks.iter().enumerate() {
                     let (block_x, block_y) = LUMA_BLOCK_COORDINATES[index];
                     add_residual_block(luma, block_x * 4, block_y * 4, block);
                 }
             }
-            ReconstructedLumaResidual::EightByEight(blocks) => {
+            ReconstructedInterLumaResidualRef::EightByEight(blocks) => {
                 for (index, block) in blocks.iter().enumerate() {
                     add_residual_block(luma, index % 2 * 8, index / 2 * 8, block);
                 }
             }
         }
         for index in 0..4 {
-            add_residual_block(cb, index % 2 * 4, index / 2 * 4, &residual.chroma_cb[index]);
-            add_residual_block(cr, index % 2 * 4, index / 2 * 4, &residual.chroma_cr[index]);
+            add_residual_block(
+                cb,
+                index % 2 * 4,
+                index / 2 * 4,
+                &residual.chroma_cb()[index],
+            );
+            add_residual_block(
+                cr,
+                index % 2 * 4,
+                index / 2 * 4,
+                &residual.chroma_cr()[index],
+            );
         }
     }
 }
@@ -980,8 +990,8 @@ unsafe fn add_inter_residual_to_prediction_sse2(
         [[0, 1, 4, 5], [2, 3, 6, 7], [8, 9, 12, 13], [10, 11, 14, 15]];
 
     let zero = _mm_setzero_si128();
-    match &residual.luma {
-        ReconstructedLumaResidual::FourByFour(blocks) => {
+    match residual.luma() {
+        ReconstructedInterLumaResidualRef::FourByFour(blocks) => {
             for (y, prediction_row) in luma.iter_mut().enumerate() {
                 let block_row = BLOCKS_4X4_BY_ROW[y / 4];
                 let row = y % 4;
@@ -1006,7 +1016,7 @@ unsafe fn add_inter_residual_to_prediction_sse2(
                 }
             }
         }
-        ReconstructedLumaResidual::EightByEight(blocks) => {
+        ReconstructedInterLumaResidualRef::EightByEight(blocks) => {
             for (y, prediction_row) in luma.iter_mut().enumerate() {
                 let first = (y / 8) * 2;
                 let row = y % 8;
@@ -1033,7 +1043,7 @@ unsafe fn add_inter_residual_to_prediction_sse2(
         }
     }
 
-    for (prediction, blocks) in [(cb, &residual.chroma_cb), (cr, &residual.chroma_cr)] {
+    for (prediction, blocks) in [(cb, residual.chroma_cb()), (cr, residual.chroma_cr())] {
         for (y, prediction_row) in prediction.iter_mut().enumerate() {
             let first = (y / 4) * 2;
             let row = y % 4;
@@ -1745,11 +1755,11 @@ mod tests {
     }
 
     fn zero_residual() -> ReconstructedInterResidual {
-        ReconstructedInterResidual {
-            luma: ReconstructedLumaResidual::FourByFour(Box::new([[[0; 4]; 4]; 16])),
-            chroma_cb: [[[0; 4]; 4]; 4],
-            chroma_cr: [[[0; 4]; 4]; 4],
-        }
+        ReconstructedInterResidual::four_by_four(
+            [[[0; 4]; 4]; 16],
+            [[[0; 4]; 4]; 4],
+            [[[0; 4]; 4]; 4],
+        )
     }
 
     #[test]
@@ -1778,32 +1788,28 @@ mod tests {
             })
         };
         let residuals = [
-            ReconstructedInterResidual {
-                luma: ReconstructedLumaResidual::FourByFour(Box::new(std::array::from_fn(
-                    |block| {
-                        std::array::from_fn(|row| {
-                            std::array::from_fn(|column| {
-                                VALUES[(block * 5 + row * 3 + column) % VALUES.len()]
-                            })
+            ReconstructedInterResidual::four_by_four(
+                std::array::from_fn(|block| {
+                    std::array::from_fn(|row| {
+                        std::array::from_fn(|column| {
+                            VALUES[(block * 5 + row * 3 + column) % VALUES.len()]
                         })
-                    },
-                ))),
-                chroma_cb: chroma(1),
-                chroma_cr: chroma(5),
-            },
-            ReconstructedInterResidual {
-                luma: ReconstructedLumaResidual::EightByEight(Box::new(std::array::from_fn(
-                    |block| {
-                        std::array::from_fn(|row| {
-                            std::array::from_fn(|column| {
-                                VALUES[(block * 11 + row * 5 + column) % VALUES.len()]
-                            })
+                    })
+                }),
+                chroma(1),
+                chroma(5),
+            ),
+            ReconstructedInterResidual::eight_by_eight(
+                std::array::from_fn(|block| {
+                    std::array::from_fn(|row| {
+                        std::array::from_fn(|column| {
+                            VALUES[(block * 11 + row * 5 + column) % VALUES.len()]
                         })
-                    },
-                ))),
-                chroma_cb: chroma(2),
-                chroma_cr: chroma(7),
-            },
+                    })
+                }),
+                chroma(2),
+                chroma(7),
+            ),
         ];
 
         for residual in &residuals {
@@ -1957,12 +1963,10 @@ mod tests {
         let reference = picture(40);
         let mut current = picture(0);
         let mut residual = zero_residual();
-        let ReconstructedLumaResidual::FourByFour(blocks) = &mut residual.luma else {
-            unreachable!()
-        };
+        let blocks = residual.luma_4x4_mut().expect("the helper uses 4x4 luma");
         blocks[0] = [[10; 4]; 4];
         blocks[1] = [[-50; 4]; 4];
-        residual.chroma_cb[0] = [[220; 4]; 4];
+        residual.chroma_cb_mut()[0] = [[220; 4]; 4];
         reconstruct_p_macroblock_420(
             &mut current,
             &[&reference],
@@ -2412,9 +2416,7 @@ mod tests {
         let second = picture(80);
         let mut current = picture(0);
         let mut residual = zero_residual();
-        let ReconstructedLumaResidual::FourByFour(blocks) = &mut residual.luma else {
-            unreachable!()
-        };
+        let blocks = residual.luma_4x4_mut().expect("the helper uses 4x4 luma");
         blocks[0] = [[10; 4]; 4];
         reconstruct_b_macroblock_from_lists_420(
             &mut current,
