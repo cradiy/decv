@@ -407,6 +407,18 @@ reduced CABAC reference cycles about 1.3%, instructions 0.3%, and branches
 0.4%; CAVLC reference cycles fell about 1.8% with a similar instruction
 reduction.
 
+A diagnostic run over the 300-frame CABAC stream counted 1,135,509 Spatial
+Direct macroblocks on the existing zero-change fast path, 353,134 grids that
+were constructed and then coalesced to one uniform partition, and only 1,777
+genuinely non-uniform grids. An attempted uniform-zero-flag shortcut therefore
+removed about 0.6% of whole-decoder instructions and 0.9% of branches, and
+made CAVLC faster. It was still rejected: inlining the shortcut grew the
+already-large function from about 8 KiB to 10 KiB and regressed CABAC
+reference cycles about 0.5%; outlining the rare grid builder shrank the main
+body below 8 KiB but regressed CABAC about 0.9%. This path is sensitive to
+front-end layout and branch prediction, so fewer derived partitions alone are
+not sufficient evidence of a win.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
