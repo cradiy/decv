@@ -1224,6 +1224,35 @@ surrounding per-partition control overhead; the existing two-dimensional SSE2
 kernel remains appropriate until a materially different workload proves
 otherwise.
 
+LLVM profile-guided optimization is now available as a separate native build:
+
+```text
+rustup component add llvm-tools-preview
+./scripts/build_pgo_release.sh representative-4k.h264 representative.mp4
+```
+
+The script builds an instrumented decoder, decodes every supplied input once
+in `Serial` and once in `Auto`, merges the raw profiles with the
+toolchain-matched `llvm-profdata`, and writes the optimized binary to
+`target/pgo/release/decv-cli`. Training inputs are intentionally supplied by
+the caller: PGO specializes branch probabilities, layout, and inlining for the
+workload it observes. Use representative profiles, entropy modes, resolutions,
+and GOP structures rather than a single tiny conformance stream.
+
+A mixed 4K High CABAC, 1080p High CABAC, 1080p Main CAVLC, and byte-exact
+regression-corpus profile produced a large native win. Seven pinned 4K Serial
+pairs reduced average task-clock about 7.0%, reference cycles about 6.7%, and
+instructions about 14.4%; every pair improved. Seven pinned 4K four-worker
+pairs reduced task-clock about 5.0%, reference cycles about 6.1%, and
+instructions about 14.4%. Five pinned 1080p CABAC Serial pairs reduced
+task-clock about 6.0%, reference cycles about 6.3%, and instructions about
+14.5%, again with every pair improving. Five 1080p CAVLC Serial pairs reduced
+average task-clock about 1.0%, reference cycles about 0.9%, and instructions
+about 8.7%, though three individual timing pairs were slightly slower and the
+profile grew native `.text` about 11.4%. PGO is therefore an effective
+throughput build mode, not a replacement for portable release binaries or
+representative cross-workload validation.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
