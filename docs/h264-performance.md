@@ -1051,6 +1051,23 @@ better than writing the weighted result directly across destination strides;
 removing instructions is not sufficient when it lengthens the pixel-data
 dependency chain.
 
+Reusing horizontal six-tap rows across adjacent two-dimensional luma outputs
+was evaluated in three forms. A rolling six-row SSE2 window reduces a 16-row,
+eight-sample chunk from roughly 96 to 112 horizontal filter evaluations to 21.
+The fully inlined form passed the SIMD oracle and all native byte-exact stream
+checks; fourteen pinned 4K Serial pairs reduced reference cycles and task-clock
+about 1.0%, with ten pairs improving. The same binary made all seven 1080p
+CABAC pairs slower, however, increasing reference cycles about 1.47%.
+Outlining the rolling kernel removed its 4K benefit (about +0.04% reference
+cycles, four of seven pairs improving) and still made all 1080p pairs about
+1.15% slower. Finally, enabling the inlined kernel only for strides of at least
+3840 pixels left the original algorithm active at 1080p, but LTO layout changes
+alone made all seven 1080p pairs slower by about 1.68%. All three forms were
+reverted. Horizontal-row reuse is algorithmically sound, but adding this large
+specialization to the current monolithic prediction unit costs more front-end
+performance than it saves; it should be reconsidered only with a backend
+layout that isolates inactive code without adding a per-partition call.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
