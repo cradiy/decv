@@ -494,6 +494,12 @@ about 0.2% and median reference cycles about 1.4%. A useful next deblock step
 must batch a complete edge rather than expanding the existing small kernels
 inside picture traversal.
 
+Skipping the second coverage walk for an already coalesced uniform Direct B
+partition was rejected in two forms. A branch inside the prediction loop
+reduced instructions about 0.06% but made median reference cycles about 1.1%
+worse. Outlining all non-uniform coverage validation reduced instructions only
+slightly, increased branches about 0.2%, and was slower in every paired run.
+
 The adjacent 65-byte significance-map return was also converted to a
 caller-owned buffer and rejected. It increased CABAC instructions about 0.1%
 and reference cycles about 0.3%, indicating that LLVM already handles this
