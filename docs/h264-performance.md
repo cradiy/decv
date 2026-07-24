@@ -1009,6 +1009,20 @@ reference cycles increased about 0.13%, task-clock about 0.33%, and branch
 misses about 0.61%. The initialized array and derived value semantics were
 restored rather than retaining an unsafe invariant for a slower result.
 
+Splitting inter prediction into checked and prevalidated entries was tested on
+the 48-frame 4K120 High Profile CABAC stream. Macroblock reconstruction
+validated each partition once and passed an already checked absolute luma
+origin to the prediction kernel, avoiding repeated geometry, overflow, and
+current-picture boundary checks for the two reference lists of bidirectional
+partitions. All H.264 unit tests and native byte-exact CABAC, CAVLC, and 4K
+outputs passed. The split nevertheless grew native `.text` by about 3.2 KiB.
+Across fourteen alternating pinned 4K Serial pairs, instructions fell about
+0.18% and branches about 1.17%, but reference cycles increased about 0.22%;
+exactly seven pairs improved. The checked entry and its original code layout
+were restored. Validation is not a meaningful part of the 4K motion-
+compensation cost, and duplicating a large prediction entry is worse than its
+few well-predicted guards.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
