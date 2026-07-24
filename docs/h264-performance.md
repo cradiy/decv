@@ -915,6 +915,18 @@ faults were unchanged, and instructions increased slightly. The platform
 allocator/compiler already handles the roughly 1.4 MiB zero fill effectively,
 so the manual allocator code was fully reverted.
 
+Moving the prediction-to-macroblock copy dispatch from every row to one
+rectangle-level helper was tested as a possible coarser DSP boundary. The
+helper selected the fixed 4/8/16-byte luma and 2/4/8-byte chroma widths once,
+then copied every row with specialized const-generic kernels. It passed the
+reconstruction tests, strict Clippy, and the native byte-exact H.264 corpus.
+Whole-decoder instructions fell about 1.88% and branches about 6.20%, but
+native `.text` grew by about 11 KiB; seven pinned CABAC Serial pairs increased
+average reference cycles about 0.85% and CPU cycles about 1.12%. The wider
+inlining boundary traded predictable dispatch for front-end pressure and was
+fully reverted. Coarse DSP dispatch should select substantial kernels, not
+outline small rectangular copies from already hot reconstruction functions.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
