@@ -40,18 +40,18 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.76 s | 1.68 s | 80,548 KiB | 102.3 FPS |
-| decv Auto (2 workers) | NV12 | 1.89 s | 2.05 s | 78,680 KiB | 95.2 FPS |
-| FFmpeg 1 thread | NV12 | 0.63 s | 0.72 s | 152,448 KiB | 285.7 FPS |
-| FFmpeg Auto | NV12 | 0.27 s | 1.48 s | 277,944 KiB | 666.7 FPS |
-| FFmpeg 1 thread | decode-only | 0.58 s | 0.56 s | 95,928 KiB | 310.3 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.97 s | 192,364 KiB | 782.6 FPS |
+| decv Serial | NV12 | 1.71 s | 1.60 s | 80,628 KiB | 105.3 FPS |
+| decv Auto (2 workers) | NV12 | 1.87 s | 2.00 s | 80,080 KiB | 96.3 FPS |
+| FFmpeg 1 thread | NV12 | 0.60 s | 0.69 s | 151,944 KiB | 300.0 FPS |
+| FFmpeg Auto | NV12 | 0.25 s | 1.45 s | 287,152 KiB | 720.0 FPS |
+| FFmpeg 1 thread | decode-only | 0.56 s | 0.54 s | 95,588 KiB | 321.4 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.96 s | 192,168 KiB | 818.2 FPS |
 
 On this workload:
 
-- decv Serial takes about **2.8x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **2.9x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **7.0x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **7.5x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.4x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 70.5% throughput headroom over that
-line, and the measured two-worker Auto result has about 58.7%. The ordering
+seconds. The current Serial result has about 75.4% throughput headroom over that
+line, and the measured two-worker Auto result has about 60.4%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
