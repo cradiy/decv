@@ -513,9 +513,14 @@ impl Yuv420Picture {
 
         let luma = Arc::make_mut(&mut self.luma);
         let chroma_stride = self.width / 2;
+        let mut expected_address = staged[0].address;
+        let mut macroblock_x = expected_address % width_in_macroblocks;
+        let mut macroblock_y = expected_address / width_in_macroblocks;
         for entry in staged {
-            let macroblock_x = entry.address % width_in_macroblocks;
-            let macroblock_y = entry.address / width_in_macroblocks;
+            if entry.address != expected_address {
+                macroblock_x = entry.address % width_in_macroblocks;
+                macroblock_y = entry.address / width_in_macroblocks;
+            }
             // SAFETY: The address pass above proves every staged macroblock is
             // inside the macroblock-aligned picture, so all three rectangles
             // fit their destination planes.
@@ -541,6 +546,12 @@ impl Yuv420Picture {
                     macroblock_y * 8,
                     &entry.pixels.cr,
                 );
+            }
+            expected_address = entry.address + 1;
+            macroblock_x += 1;
+            if macroblock_x == width_in_macroblocks {
+                macroblock_x = 0;
+                macroblock_y += 1;
             }
         }
         Ok(())
@@ -1041,6 +1052,26 @@ mod tests {
             .unwrap();
         assert_eq!(&picture.luma[..16], &[70; 16]);
         assert_eq!(&before.luma[..16], &[10; 16]);
+    }
+
+    #[test]
+    fn commits_contiguous_rows_and_recomputes_after_address_gaps() {
+        let pixels = |value| MacroblockPixels::new([[value; 16]; 16], [[0; 8]; 8], [[0; 8]; 8]);
+        let mut picture = Yuv420Picture::new(Size::new(48, 32)).unwrap();
+        picture
+            .commit_macroblock_batch(&[
+                StagedMacroblockPixels::new(1, pixels(10)),
+                StagedMacroblockPixels::new(2, pixels(20)),
+                StagedMacroblockPixels::new(3, pixels(30)),
+                StagedMacroblockPixels::new(5, pixels(50)),
+            ])
+            .unwrap();
+
+        assert_eq!(picture.luma[16], 10);
+        assert_eq!(picture.luma[32], 20);
+        assert_eq!(picture.luma[16 * 48], 30);
+        assert_eq!(picture.luma[16 * 48 + 16], 0);
+        assert_eq!(picture.luma[16 * 48 + 32], 50);
     }
 
     #[test]
