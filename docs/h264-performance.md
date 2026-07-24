@@ -442,6 +442,22 @@ rejected. LLVM expanded the helper from about 405 bytes to 2.3 KiB, while
 CABAC did not show a stable cycle improvement. The compact four-source AVX2
 kernel remains preferable to trading instruction count for front-end pressure.
 
+Reconstructed inter luma and both chroma planes now live in one allocation,
+and the owned residual handle is one machine word instead of roughly 520
+bytes. Reconstruction initializes the luma and chroma blocks directly inside
+that allocation, so CABAC pending P/B jobs move only a pointer while retaining
+the previous one-allocation-per-coded-macroblock behavior. A layout regression
+test fixes the pointer-sized handle invariant. Five alternating pinned runs
+reduced CABAC instructions about 0.3%, branches about 0.2%, and reference
+cycles about 3.4%; every paired run was faster by roughly 3.0% to 4.7%.
+
+This layout deliberately favors the batched CABAC path. CAVLC consumes each
+residual immediately and previously benefited from keeping the chroma arrays
+on the stack; its instructions increased about 0.1% and reference cycles about
+0.5%. That measured tradeoff is accepted for the current high-profile,
+high-frame-rate target, where CABAC is the primary workload, rather than
+adding a second residual representation and reconstruction pipeline.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
