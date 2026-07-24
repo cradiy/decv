@@ -20,6 +20,7 @@ the `0.1.0` crates as a complete H.264 conformance implementation.
 
 | Crate | Responsibility |
 | --- | --- |
+| `decv` | Narrow consumer facade for decoding, immutable frames, H.264 configuration, and MP4 packet access |
 | `decv-core` | Codec-independent time, packet, frame, color, input, and synchronous decoder contracts |
 | `decv-h264` | Pure-Rust H.264 parsing, reconstruction, deblocking, DPB management, and NV12 output |
 | `decv-mp4` | Synchronous random-access MP4 parsing, track/sample indexing, packet timestamps, and keyframe seek |
@@ -27,6 +28,11 @@ the `0.1.0` crates as a complete H.264 conformance implementation.
 | `decv-cli` | Annex-B/MP4 decoding, seek, verification, and benchmark command |
 
 The library crates and command-line tool are independently buildable.
+
+Ordinary consumers should prefer the `decv` facade. The codec implementation
+crates also expose lower-level parsing and reconstruction types for decoder
+development; those internals are not part of the stable-candidate consumer
+boundary.
 
 ## Current Video Support
 
@@ -91,6 +97,9 @@ Decoded frames own or share immutable storage. A `CpuPlane` carries its real
 backing allocation, offset, stride, and row count; consumers must not assume
 that planes are adjacent or tightly packed.
 
+See [Consumer API boundary](docs/consumer-api.md) for the supported facade,
+packet backpressure loop, seek lifecycle, and frame ownership rules.
+
 ## Basic Use
 
 Build the portable workspace:
@@ -150,6 +159,7 @@ independent native binaries are measured on the same inputs.
 ## Design Notes
 
 - [H.264 decoder principles](docs/h264-decoder-principles.md)
+- [Consumer API boundary](docs/consumer-api.md)
 - [H.264 performance record](docs/h264-performance.md)
 - [H.264 reconstruction parallelism](docs/h264-parallel-decoding-plan.md)
 - [MP4 demuxer principles](docs/mp4-demuxer-principles.md)

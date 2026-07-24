@@ -192,6 +192,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "decv"
+version = "0.1.0"
+dependencies = [
+ "decv-core",
+ "decv-h264",
+ "decv-mp4",
+]
+
+[[package]]
 name = "decv-cli"
 version = "0.1.0"
 dependencies = [
