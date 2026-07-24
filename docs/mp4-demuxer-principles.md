@@ -536,14 +536,21 @@ Interactive scrubbing often values response time over exact frame selection.
 For that case:
 
 ```rust
-let sample_index = cursor.seek_to_keyframe_at_or_after(target)?;
+let sample_index = cursor.seek_to_nearest_keyframe(target)?;
 ```
 
-This starts at the following sync sample and therefore requires no earlier
-GOP preroll. The first frame may be later than `target`, by up to the encoder's
-keyframe interval. A player can use this mode while the pointer is moving,
-cancel stale requests, and perform the exact preceding-keyframe seek after
-the interaction settles.
+This starts at the presentation-nearest sync sample and therefore requires no
+earlier GOP preroll. It uses the same presentation-sorted index and remains
+`O(log keyframe_count)`. The first frame may precede or follow `target`; a tie
+selects the earlier keyframe. Choosing the nearest of the adjacent sync
+samples limits ordinary preview timestamp error to half of that keyframe
+interval.
+
+`seek_to_keyframe_at_or_after` remains useful when a preview must never move
+backward, at the cost of potentially jumping by the complete keyframe
+interval. A player can use either approximate mode while the pointer is
+moving, cancel stale requests, and perform the exact preceding-keyframe seek
+after the interaction settles.
 
 ## 12. Error handling and atomicity
 

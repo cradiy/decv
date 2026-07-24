@@ -138,6 +138,13 @@ fn facade_demuxes_and_decodes_a_real_mp4_in_presentation_order() {
         .unwrap();
     let mut cursor = demuxer.packet_cursor(track_index).unwrap();
     assert_eq!(cursor.track().samples().len(), 3);
+    assert_eq!(
+        cursor
+            .seek_to_nearest_keyframe(MediaTime::from_parts(512, 15_360).unwrap())
+            .unwrap(),
+        Some(0)
+    );
+    cursor.rewind();
 
     let config = cursor.decoder_config().unwrap().unwrap();
     assert_eq!(

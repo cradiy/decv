@@ -168,9 +168,8 @@ impl Track {
             .filter_map(|(index, sample)| sample.is_sync().then_some(index))
             .collect::<Vec<_>>();
         let mut sync_sample_indices_by_presentation = sync_sample_indices.clone();
-        sync_sample_indices_by_presentation.sort_unstable_by_key(|&index| {
-            (samples[index].presentation_time(), index)
-        });
+        sync_sample_indices_by_presentation
+            .sort_unstable_by_key(|&index| (samples[index].presentation_time(), index));
 
         Ok(Self {
             id,
@@ -307,9 +306,7 @@ impl Track {
         let presentation_time = self.samples[candidate].presentation_time();
         let first_equal = self.sync_sample_indices_by_presentation[..position]
             .partition_point(|&index| self.samples[index].presentation_time() < presentation_time);
-        Ok(Some(
-            self.sync_sample_indices_by_presentation[first_equal],
-        ))
+        Ok(Some(self.sync_sample_indices_by_presentation[first_equal]))
     }
 
     /// Finds the sync sample with the least presentation time not before
@@ -332,6 +329,60 @@ impl Track {
             .sync_sample_indices_by_presentation
             .get(position)
             .copied())
+    }
+
+    /// Finds the sync sample with presentation time nearest to `target`.
+    ///
+    /// This is intended for low-latency interactive previews. The result may
+    /// precede or follow the requested time and therefore must not be used as
+    /// a substitute for [`Self::keyframe_at_or_before`] when exact seek
+    /// preroll is required. Equidistant keyframes prefer the earlier one.
+    pub fn keyframe_nearest(&self, target: MediaTime) -> Result<Option<usize>> {
+        let offset = self.presentation_time_offset()?.value;
+        self.validate_sync_presentation_range(offset)?;
+        let position = self
+            .sync_sample_indices_by_presentation
+            .partition_point(|&index| {
+                adjusted_presentation_time_is_before(
+                    self.samples[index].presentation_time(),
+                    offset,
+                    self.media_timescale,
+                    target,
+                )
+            });
+        let after = self
+            .sync_sample_indices_by_presentation
+            .get(position)
+            .copied();
+        let Some(previous_position) = position.checked_sub(1) else {
+            return Ok(after);
+        };
+        let previous = self.sync_sample_indices_by_presentation[previous_position];
+        let previous_time = self.samples[previous].presentation_time();
+        let first_equal = self.sync_sample_indices_by_presentation[..position]
+            .partition_point(|&index| self.samples[index].presentation_time() < previous_time);
+        let before = self.sync_sample_indices_by_presentation[first_equal];
+        let Some(after) = after else {
+            return Ok(Some(before));
+        };
+
+        let before_distance = adjusted_presentation_distance(
+            self.samples[before].presentation_time(),
+            offset,
+            self.media_timescale,
+            target,
+        );
+        let after_distance = adjusted_presentation_distance(
+            self.samples[after].presentation_time(),
+            offset,
+            self.media_timescale,
+            target,
+        );
+        Ok(Some(if before_distance <= after_distance {
+            before
+        } else {
+            after
+        }))
     }
 
     fn validate_sync_presentation_range(&self, offset: i64) -> Result<()> {
@@ -376,6 +427,19 @@ fn adjusted_presentation_time_is_not_after(
     let adjusted = i128::from(presentation_time) + i128::from(offset);
     adjusted * i128::from(target.timescale.get())
         <= i128::from(target.value) * i128::from(timescale.get())
+}
+
+#[inline]
+fn adjusted_presentation_distance(
+    presentation_time: i64,
+    offset: i64,
+    timescale: NonZeroU32,
+    target: MediaTime,
+) -> i128 {
+    let adjusted = i128::from(presentation_time) + i128::from(offset);
+    let sample = adjusted * i128::from(target.timescale.get());
+    let target = i128::from(target.value) * i128::from(timescale.get());
+    (sample - target).abs()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -836,6 +900,37 @@ mod tests {
                 .unwrap(),
             None
         );
+        assert_eq!(
+            track
+                .keyframe_nearest(MediaTime::from_parts(-9_001, 90_000).unwrap())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            track
+                .keyframe_nearest(MediaTime::from_parts(-7_000, 90_000).unwrap())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            track
+                .keyframe_nearest(MediaTime::from_parts(-1, 15).unwrap())
+                .unwrap(),
+            Some(0),
+            "an equidistant target prefers the earlier keyframe"
+        );
+        assert_eq!(
+            track
+                .keyframe_nearest(MediaTime::from_parts(-5_000, 90_000).unwrap())
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(
+            track
+                .keyframe_nearest(MediaTime::from_parts(0, 1).unwrap())
+                .unwrap(),
+            Some(2)
+        );
 
         let SampleDescription::Avc(entry) = &track.sample_descriptions()[0] else {
             panic!("expected AVC sample entry");
@@ -940,9 +1035,21 @@ mod tests {
         assert_eq!(cursor.next_sample_index(), 2);
         assert_eq!(
             cursor
-                .seek_to_keyframe_at_or_after(
-                    MediaTime::from_parts(-8_999, 90_000).unwrap()
-                )
+                .seek_to_keyframe_at_or_after(MediaTime::from_parts(-8_999, 90_000).unwrap())
+                .unwrap(),
+            Some(2)
+        );
+        assert_eq!(cursor.next_sample_index(), 2);
+        assert_eq!(
+            cursor
+                .seek_to_nearest_keyframe(MediaTime::from_parts(-7_000, 90_000).unwrap())
+                .unwrap(),
+            Some(0)
+        );
+        assert_eq!(cursor.next_sample_index(), 0);
+        assert_eq!(
+            cursor
+                .seek_to_nearest_keyframe(MediaTime::from_parts(-5_000, 90_000).unwrap())
                 .unwrap(),
             Some(2)
         );

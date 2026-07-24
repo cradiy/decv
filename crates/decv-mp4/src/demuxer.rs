@@ -134,11 +134,21 @@ where
     ///
     /// Unlike [`Self::seek_to_keyframe`], this is an approximate forward seek:
     /// it avoids decoder preroll but may start presentation after `target`.
-    pub fn seek_to_keyframe_at_or_after(
-        &mut self,
-        target: MediaTime,
-    ) -> Result<Option<usize>> {
+    pub fn seek_to_keyframe_at_or_after(&mut self, target: MediaTime) -> Result<Option<usize>> {
         let sample_index = self.track().keyframe_at_or_after(target)?;
+        if let Some(sample_index) = sample_index {
+            self.next_sample_index = sample_index;
+        }
+        Ok(sample_index)
+    }
+
+    /// Repositions to the sync sample nearest to `target`.
+    ///
+    /// This is an approximate preview seek: the selected picture may be
+    /// earlier or later than `target`, but decoding can begin without preroll.
+    /// Use [`Self::seek_to_keyframe`] for an exact seek.
+    pub fn seek_to_nearest_keyframe(&mut self, target: MediaTime) -> Result<Option<usize>> {
+        let sample_index = self.track().keyframe_nearest(target)?;
         if let Some(sample_index) = sample_index {
             self.next_sample_index = sample_index;
         }

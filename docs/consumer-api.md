@@ -108,11 +108,13 @@ avoids work whose result cannot affect the selected frame. The ordinary
 trait-level `flush` clears this filter.
 
 For a low-latency scrub preview, callers may instead use
-`seek_to_keyframe_at_or_after`. That path begins at the next independently
-decodable picture and avoids preroll, but the displayed timestamp can be later
-than the requested target. A typical timeline uses this approximate mode
-while the pointer is moving and performs the preceding-keyframe exact seek
-after the interaction settles.
+`seek_to_nearest_keyframe`. That path begins at the independently decodable
+picture closest to the requested presentation time and avoids preroll. It may
+display an earlier or later timestamp, with equidistant keyframes preferring
+the earlier one. `seek_to_keyframe_at_or_after` remains available when a
+preview must never move backward. A typical timeline uses an approximate mode
+while the pointer is moving, cancels stale requests, and performs the
+preceding-keyframe exact seek after the interaction settles.
 
 ## Frame Ownership
 

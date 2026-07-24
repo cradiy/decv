@@ -1792,6 +1792,10 @@ deblocking. Further acceleration of normal decode helps this path, but an
 interactive sub-100 ms response across a 4.167-second GOP requires a
 presentation strategy as well: following-keyframe preview, cached decoder
 checkpoints/reference pictures, request cancellation, or shorter source GOPs.
+`PacketCursor::seek_to_nearest_keyframe` provides the generic preview lookup:
+it chooses the closer adjacent sync sample in logarithmic time, avoids preroll,
+and limits the usual preview timestamp error to half of the surrounding
+keyframe interval. Exact output still uses the preceding-keyframe path above.
 
 ## Integer Bidirectional Prediction Fusion
 
