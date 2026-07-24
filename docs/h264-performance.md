@@ -877,6 +877,21 @@ about 3.31%, instructions about 2.66%, and branches about 7.13%. An exhaustive
 rectangle oracle covers every supported fixed width and row count at
 unaligned source and destination addresses.
 
+Inter residual reconstruction now uses the decoded block's `total_coeff`
+metadata to skip inverse scan, inverse quantization, and inverse transform for
+known-zero blocks. The 8x8 path skips only when all four interleaved source
+blocks are empty; chroma skips only when both its transformed DC value and AC
+block are zero. Block-size syntax validation still runs before every shortcut,
+and output storage is zero-initialized. The native binary's `.text` shrank by
+about 1.2 KiB. Seven pinned CABAC Serial pairs all improved, reducing average
+reference cycles about 3.75%, task-clock about 3.69%, instructions about
+6.42%, and branches about 3.98%. Seven CAVLC Serial pairs all improved,
+reducing reference cycles about 4.98%, task-clock about 4.81%, instructions
+about 6.90%, and branches about 3.91%. All seven two-worker `Auto` pairs also
+improved; reference cycles fell about 2.91%, task-clock about 2.58%,
+instructions about 6.36%, and branches about 3.91%. The portable and native
+H.264 and MP4 corpora remain byte-exact.
+
 Keeping four independent source and destination pointer induction variables
 across those rectangle-copy iterations was tested as a follow-up. It shrank
 the native `predict_inter_420_into` symbol by 307 bytes and reduced

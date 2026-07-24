@@ -332,10 +332,16 @@ fn reconstruct_inter_residual_with_transform_size(
             .luma_8x8_mut()
             .expect("the output transform size was selected above");
         for (block_8x8, block_output) in luma.iter_mut().enumerate() {
+            let source_blocks = &residual.luma[block_8x8 * 4..block_8x8 * 4 + 4];
+            for source in source_blocks {
+                ensure_block_size(source.max_num_coeff, 16)?;
+            }
+            if source_blocks.iter().all(|block| block.total_coeff == 0) {
+                continue;
+            }
             let mut coefficients = [0; 64];
             for block_4x4 in 0..4 {
-                let source = &residual.luma[block_8x8 * 4 + block_4x4];
-                ensure_block_size(source.max_num_coeff, 16)?;
+                let source = &source_blocks[block_4x4];
                 for index in 0..16 {
                     coefficients[4 * index + block_4x4] = source.coefficients[index];
                 }
@@ -355,6 +361,9 @@ fn reconstruct_inter_residual_with_transform_size(
         let prepared_scale = PreparedInverseScale4x4::new(quantizer.luma, scaling)?;
         for (block_output, block) in luma.iter_mut().zip(&residual.luma) {
             ensure_block_size(block.max_num_coeff, 16)?;
+            if block.total_coeff == 0 {
+                continue;
+            }
             prepared_scale.reconstruct_into(&block.coefficients, scan_mode, false, block_output)?;
         }
     }
@@ -406,7 +415,11 @@ fn reconstruct_chroma_into(
     for (index, block) in ac.iter().enumerate() {
         ensure_block_size(block.max_num_coeff, 15)?;
         let (block_x, block_y) = CHROMA_BLOCK_COORDINATES[index];
-        let coefficients = merge_dc_and_ac(transformed_dc[block_y][block_x], &block.coefficients);
+        let dc = transformed_dc[block_y][block_x];
+        if dc == 0 && block.total_coeff == 0 {
+            continue;
+        }
+        let coefficients = merge_dc_and_ac(dc, &block.coefficients);
         prepared_scale.reconstruct_into(&coefficients, scan_mode, true, &mut output[index])?;
     }
     Ok(())
@@ -686,6 +699,7 @@ mod tests {
             chroma_ac: [[ResidualBlock::empty(15); 4]; 2],
         };
         residual.luma[0].coefficients[0] = 64;
+        residual.luma[0].total_coeff = 1;
 
         let four = super::reconstruct_inter_residual(
             &inter_header(false),
