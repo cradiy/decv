@@ -193,8 +193,7 @@ impl BMotionState {
             height: 16,
             macroblock_partition_index: 0,
         };
-        let empty = [None; 16];
-        let neighbour_cells = self.neighbour_cells(macroblock_address, slice_id, &empty, geometry);
+        let neighbour_cells = self.full_macroblock_neighbour_cells(macroblock_address, slice_id);
         let neighbours_l0 = neighbour_motions(neighbour_cells, false);
         let neighbours_l1 = neighbour_motions(neighbour_cells, true);
         let mut reference_l0 = spatial_direct_reference_index_from(neighbours_l0);
@@ -705,28 +704,31 @@ impl BMotionState {
         ]
     }
 
-    fn neighbour_cells(
+    fn full_macroblock_neighbour_cells(
         &self,
         macroblock_address: usize,
         slice_id: u32,
-        local: &[Option<MotionCell>; 16],
-        geometry: PartitionGeometry,
     ) -> [Option<MotionCell>; 4] {
         let macroblock_x = macroblock_address % self.width_in_macroblocks;
         let macroblock_y = macroblock_address / self.width_in_macroblocks;
-        let x = (macroblock_x * 16 + usize::from(geometry.x)) as isize;
-        let y = (macroblock_y * 16 + usize::from(geometry.y)) as isize;
+        let same_slice = |cell: Option<MotionCell>| cell.filter(|cell| cell.slice_id == slice_id);
+        let left = (macroblock_x > 0)
+            .then(|| self.cells[(macroblock_address - 1) * 16 + 3])
+            .flatten();
+        let top = (macroblock_y > 0)
+            .then(|| self.cells[(macroblock_address - self.width_in_macroblocks) * 16 + 12])
+            .flatten();
+        let top_right = (macroblock_y > 0 && macroblock_x + 1 < self.width_in_macroblocks)
+            .then(|| self.cells[(macroblock_address - self.width_in_macroblocks + 1) * 16 + 12])
+            .flatten();
+        let top_left = (macroblock_y > 0 && macroblock_x > 0)
+            .then(|| self.cells[(macroblock_address - self.width_in_macroblocks - 1) * 16 + 15])
+            .flatten();
         [
-            self.neighbour_cell_at(x - 1, y, macroblock_address, slice_id, local),
-            self.neighbour_cell_at(x, y - 1, macroblock_address, slice_id, local),
-            self.neighbour_cell_at(
-                x + isize::from(geometry.width),
-                y - 1,
-                macroblock_address,
-                slice_id,
-                local,
-            ),
-            self.neighbour_cell_at(x - 1, y - 1, macroblock_address, slice_id, local),
+            same_slice(left),
+            same_slice(top),
+            same_slice(top_right),
+            same_slice(top_left),
         ]
     }
 
