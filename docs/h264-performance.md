@@ -1342,6 +1342,16 @@ task-clock by -0.04%; 4K measurements did not retain that direction. That
 negligible result does not justify changing the public motion-header field
 types, so all three versions were reverted.
 
+Outlining the co-located-grid half of spatial Direct derivation was also
+rejected. It reduced the hot entry point from 6,627 to 4,421 machine-code bytes
+and moved another 2,336 bytes behind a non-inlined call. Native measurements
+were nearly neutral. After representative PGO retraining, instructions fell
+about 0.65%, branches about 1.06%, and sampled cache misses about 0.71%, but
+seven of nine alternating 4K pairs became slower: mean wall time increased
+about 1.90%, task-clock about 1.38%, and reference cycles about 1.80%. The
+Direct result remains on the caller's dependency chain, so saving instruction
+cache did not repay the call boundary. The outline was fully reverted.
+
 Large CABAC non-reference pictures now complete through a bounded cross-frame
 pipeline when a reconstruction pool is active. Picture completeness and the
 discarded reference-motion field are validated synchronously. Deblocking and
