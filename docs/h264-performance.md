@@ -723,6 +723,16 @@ and whole-decoder instructions about 0.37%, but the added block-level call made
 all five Serial samples slower and increased median reference cycles about
 1.4%. Both variants were fully reverted.
 
+Fusing 4x4 inverse scan and inverse scaling into one coordinate-driven pass
+was also rejected. It removed the intermediate coefficient matrix, shrank
+`PreparedInverseScale4x4::reconstruct_into` from 2,642 to 1,611 native bytes,
+and reduced total `.text` by 672 bytes. However, the irregular scatter loop
+prevented the profitable straight-line/vectorized lowering of the two-pass
+form. Seven pinned CABAC Serial pairs increased whole-decoder instructions
+about 1.76%, branches about 7.50%, and reference cycles about 2.36%, with only
+one pair improving. The separate inverse-scan and row-major scale passes were
+fully restored.
+
 Inter-prediction fast-path eligibility now tracks horizontal and vertical
 filter margins independently. Previously, a horizontal-only filter near the
 top or bottom edge unnecessarily selected the clipped scalar path, a
