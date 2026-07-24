@@ -621,7 +621,7 @@ pub fn inverse_transform_4x4(scaled: &Block4x4) -> Result<Block4x4> {
             i64::from(scaled[row][1]),
             i64::from(scaled[row][2]),
             i64::from(scaled[row][3]),
-        ])?;
+        ]);
     }
 
     let mut residual = [[0; 4]; 4];
@@ -631,7 +631,7 @@ pub fn inverse_transform_4x4(scaled: &Block4x4) -> Result<Block4x4> {
             horizontal[1][column],
             horizontal[2][column],
             horizontal[3][column],
-        ])?;
+        ]);
         for row in 0..4 {
             let value = (transformed[row] + 32) >> 6;
             residual[row][column] = i32::try_from(value).map_err(|_| H264Error::IntegerOverflow)?;
@@ -781,25 +781,15 @@ pub fn inverse_transform_chroma_dc_420(
     Ok(dc)
 }
 
-fn inverse_transform_1d(values: [i64; 4]) -> Result<[i64; 4]> {
-    let e0 = values[0]
-        .checked_add(values[2])
-        .ok_or(H264Error::IntegerOverflow)?;
-    let e1 = values[0]
-        .checked_sub(values[2])
-        .ok_or(H264Error::IntegerOverflow)?;
-    let e2 = (values[1] >> 1)
-        .checked_sub(values[3])
-        .ok_or(H264Error::IntegerOverflow)?;
-    let e3 = values[1]
-        .checked_add(values[3] >> 1)
-        .ok_or(H264Error::IntegerOverflow)?;
-    Ok([
-        e0.checked_add(e3).ok_or(H264Error::IntegerOverflow)?,
-        e1.checked_add(e2).ok_or(H264Error::IntegerOverflow)?,
-        e1.checked_sub(e2).ok_or(H264Error::IntegerOverflow)?,
-        e0.checked_sub(e3).ok_or(H264Error::IntegerOverflow)?,
-    ])
+// One pass grows the absolute input bound by less than 3.5x. The first pass
+// starts from i32 coefficients and the second from its output, so every
+// intermediate remains below 2^36 and cannot overflow i64.
+fn inverse_transform_1d(values: [i64; 4]) -> [i64; 4] {
+    let e0 = values[0] + values[2];
+    let e1 = values[0] - values[2];
+    let e2 = (values[1] >> 1) - values[3];
+    let e3 = values[1] + (values[3] >> 1);
+    [e0 + e3, e1 + e2, e1 - e2, e0 - e3]
 }
 
 fn inverse_transform_8x8_1d(values: [i64; 8]) -> [i64; 8] {
@@ -1008,6 +998,46 @@ mod tests {
         let mut ac = [[0; 4]; 4];
         ac[0][1] = 64;
         assert_eq!(inverse_transform_4x4(&ac), Ok([[1, 1, 0, -1]; 4]));
+    }
+
+    #[test]
+    fn inverse_transform_4x4_extremes_match_a_wide_oracle() {
+        fn pass(values: [i128; 4]) -> [i128; 4] {
+            let e0 = values[0] + values[2];
+            let e1 = values[0] - values[2];
+            let e2 = (values[1] >> 1) - values[3];
+            let e3 = values[1] + (values[3] >> 1);
+            [e0 + e3, e1 + e2, e1 - e2, e0 - e3]
+        }
+
+        fn oracle(input: &[[i32; 4]; 4]) -> [[i32; 4]; 4] {
+            let horizontal: [[i128; 4]; 4] = std::array::from_fn(|row| input[row].map(i128::from));
+            let horizontal = horizontal.map(pass);
+            std::array::from_fn(|row| {
+                std::array::from_fn(|column| {
+                    let transformed = pass(std::array::from_fn(|index| horizontal[index][column]));
+                    i32::try_from((transformed[row] + 32) >> 6).unwrap()
+                })
+            })
+        }
+
+        let checkerboard = std::array::from_fn(|row| {
+            std::array::from_fn(|column| {
+                if (row + column) % 2 == 0 {
+                    i32::MAX
+                } else {
+                    i32::MIN
+                }
+            })
+        });
+        for input in [[[i32::MAX; 4]; 4], [[i32::MIN; 4]; 4], checkerboard] {
+            assert_eq!(inverse_transform_4x4(&input), Ok(oracle(&input)));
+        }
+        for index in 0..16 {
+            let mut input = [[0; 4]; 4];
+            input[index / 4][index % 4] = if index % 2 == 0 { i32::MAX } else { i32::MIN };
+            assert_eq!(inverse_transform_4x4(&input), Ok(oracle(&input)));
+        }
     }
 
     #[test]
