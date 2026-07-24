@@ -742,6 +742,14 @@ about 0.31%, with three pairs improving. Five CAVLC Serial runs reduced median
 reference cycles about 1.09%, with four pairs improving. The complete real
 stream corpus remains byte-exact.
 
+Replacing the known single-element Spatial Direct `SmallVec::push` with manual
+unchecked inline-buffer initialization was tested and rejected. It removed the
+generic capacity branch and reduced whole-decoder instructions about 0.09% and
+branches about 0.12%, but expanded `resolve_spatial_direct_macroblock` by 88
+bytes. Seven alternating CABAC Serial runs increased median branch misses about
+0.45% and median reference cycles about 0.11%; only two of seven cycle pairs
+improved. The unsafe initialization was fully reverted.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
