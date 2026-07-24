@@ -643,6 +643,15 @@ cycles about 0.50%; CAVLC median cycles likewise fell about 0.51%. `Auto`
 instructions fell about 0.17% and branches about 0.34%, while its 0.06% higher
 median cycles remained within thread-scheduling noise.
 
+After LTO, `predict_inter_420_into` contains the specialized luma and chroma
+kernels and is roughly 21.3 KiB. Forcing both kernels out of line reduced the
+combined machine code by about 1.6 KiB, but added two calls per predicted
+partition. Five alternating CABAC Serial runs increased instructions about
+0.78%, branches about 1.69%, and median reference cycles about 1.1%; every
+cycle sample was slower. The experiment was fully reverted. A future DSP
+dispatch boundary must therefore operate on a coarser unit than one luma or
+chroma partition call.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
