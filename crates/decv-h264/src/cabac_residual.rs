@@ -170,6 +170,15 @@ pub struct CabacCoefficientBlock {
 
 impl CabacCoefficientBlock {
     #[inline]
+    const fn empty(category: CabacResidualCategory) -> Self {
+        Self {
+            coefficients: [0; 64],
+            coefficient_count: 0,
+            maximum_coefficients: category.maximum_coefficients(),
+        }
+    }
+
+    #[inline]
     pub const fn coefficient_count(self) -> u8 {
         self.coefficient_count
     }
@@ -250,17 +259,44 @@ pub fn decode_cabac_coefficient_block(
     syntax: &mut CabacSyntaxDecoder<'_, '_>,
     category: CabacResidualCategory,
 ) -> Result<CabacCoefficientBlock> {
+    let mut output = CabacCoefficientBlock::empty(category);
+    decode_cabac_coefficient_block_into(syntax, category, &mut output)?;
+    Ok(output)
+}
+
+fn decode_cabac_coefficient_block_into(
+    syntax: &mut CabacSyntaxDecoder<'_, '_>,
+    category: CabacResidualCategory,
+    output: &mut CabacCoefficientBlock,
+) -> Result<()> {
     let significance_map = decode_cabac_significance_map(syntax, category)?;
-    decode_cabac_coefficient_levels(syntax, category, significance_map)
+    decode_coefficient_levels_into_with(category, significance_map, output, |context_index| {
+        if let Some(context_index) = context_index {
+            syntax.decision_known(context_index)
+        } else {
+            syntax.bypass()
+        }
+    })
 }
 
 fn decode_coefficient_levels_with(
     category: CabacResidualCategory,
     significance_map: CabacSignificanceMap,
-    mut decode: impl FnMut(Option<usize>) -> Result<u8>,
+    decode: impl FnMut(Option<usize>) -> Result<u8>,
 ) -> Result<CabacCoefficientBlock> {
+    let mut output = CabacCoefficientBlock::empty(category);
+    decode_coefficient_levels_into_with(category, significance_map, &mut output, decode)?;
+    Ok(output)
+}
+
+fn decode_coefficient_levels_into_with(
+    category: CabacResidualCategory,
+    significance_map: CabacSignificanceMap,
+    output: &mut CabacCoefficientBlock,
+    mut decode: impl FnMut(Option<usize>) -> Result<u8>,
+) -> Result<()> {
     let context_base = category.coefficient_level_context_base();
-    let mut coefficients = [0; 64];
+    output.coefficients.fill(0);
     let mut node_context = 0usize;
 
     for &coefficient_index in significance_map.indices().iter().rev() {
@@ -305,14 +341,12 @@ fn decode_coefficient_levels_with(
         } else {
             -magnitude
         };
-        coefficients[usize::from(coefficient_index)] = coefficient;
+        output.coefficients[usize::from(coefficient_index)] = coefficient;
     }
 
-    Ok(CabacCoefficientBlock {
-        coefficients,
-        coefficient_count: significance_map.count,
-        maximum_coefficients: category.maximum_coefficients(),
-    })
+    output.coefficient_count = significance_map.count;
+    output.maximum_coefficients = category.maximum_coefficients();
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -769,16 +803,17 @@ impl CabacResidualState {
                     self.record_block_known(macroblock_address, slice_id, block, false);
                     continue;
                 }
-                let coefficients = self
-                    .decode_coded_coefficient_block(
-                        syntax,
-                        macroblock_address,
-                        slice_id,
-                        current_is_intra,
-                        block,
-                    )?
-                    .expect("4:2:0 luma 8x8 blocks have no coded_block_flag");
-                let split = split_luma_8x8(coefficients)?;
+                let mut coefficients = CabacCoefficientBlock::empty(block.category());
+                let coded = self.decode_coded_coefficient_block_into(
+                    syntax,
+                    macroblock_address,
+                    slice_id,
+                    current_is_intra,
+                    block,
+                    &mut coefficients,
+                )?;
+                debug_assert!(coded, "4:2:0 luma 8x8 blocks have no coded_block_flag");
+                let split = split_luma_8x8(&coefficients)?;
                 luma[usize::from(region) * 4..usize::from(region + 1) * 4].copy_from_slice(&split);
             }
             return Ok(());
@@ -876,27 +911,30 @@ impl CabacResidualState {
         block: CabacResidualBlock,
     ) -> Result<ResidualBlock> {
         let maximum_coefficients = block.category().maximum_coefficients();
-        let coefficients = self.decode_coded_coefficient_block(
+        let mut coefficients = CabacCoefficientBlock::empty(block.category());
+        if self.decode_coded_coefficient_block_into(
             syntax,
             macroblock_address,
             slice_id,
             current_is_intra,
             block,
-        )?;
-        coefficients.map_or_else(
-            || Ok(ResidualBlock::empty(maximum_coefficients)),
-            coefficient_block_to_residual,
-        )
+            &mut coefficients,
+        )? {
+            coefficient_block_to_residual(&coefficients)
+        } else {
+            Ok(ResidualBlock::empty(maximum_coefficients))
+        }
     }
 
-    fn decode_coded_coefficient_block(
+    fn decode_coded_coefficient_block_into(
         &mut self,
         syntax: &mut CabacSyntaxDecoder<'_, '_>,
         macroblock_address: usize,
         slice_id: u32,
         current_is_intra: bool,
         block: CabacResidualBlock,
-    ) -> Result<Option<CabacCoefficientBlock>> {
+        output: &mut CabacCoefficientBlock,
+    ) -> Result<bool> {
         let coded = match self.coded_block_flag_context_index(
             macroblock_address,
             slice_id,
@@ -908,12 +946,12 @@ impl CabacResidualState {
         };
         if !coded {
             self.record_block_known(macroblock_address, slice_id, block, false);
-            return Ok(None);
+            return Ok(false);
         }
 
-        let coefficients = decode_cabac_coefficient_block(syntax, block.category())?;
+        decode_cabac_coefficient_block_into(syntax, block.category(), output)?;
         self.record_block_known(macroblock_address, slice_id, block, true);
-        Ok(Some(coefficients))
+        Ok(true)
     }
 
     pub(crate) fn snapshot_macroblock(
@@ -1090,7 +1128,7 @@ fn validate_coded_block_pattern(coded_block_pattern: CodedBlockPattern) -> Resul
     Ok(())
 }
 
-fn coefficient_block_to_residual(block: CabacCoefficientBlock) -> Result<ResidualBlock> {
+fn coefficient_block_to_residual(block: &CabacCoefficientBlock) -> Result<ResidualBlock> {
     if block.maximum_coefficients > 16 {
         return Err(H264Error::InvalidSyntax(
             "CABAC coefficient block does not fit a 4x4 residual",
@@ -1105,7 +1143,7 @@ fn coefficient_block_to_residual(block: CabacCoefficientBlock) -> Result<Residua
     })
 }
 
-fn split_luma_8x8(block: CabacCoefficientBlock) -> Result<[ResidualBlock; 4]> {
+fn split_luma_8x8(block: &CabacCoefficientBlock) -> Result<[ResidualBlock; 4]> {
     if block.maximum_coefficients != 64 {
         return Err(H264Error::InvalidSyntax(
             "CABAC luma 8x8 split requires 64 coefficients",
@@ -1384,7 +1422,7 @@ mod tests {
             maximum_coefficients: 15,
         };
         assert_eq!(
-            coefficient_block_to_residual(small).unwrap(),
+            coefficient_block_to_residual(&small).unwrap(),
             ResidualBlock {
                 coefficients: {
                     let mut coefficients = [0; 16];
@@ -1402,7 +1440,7 @@ mod tests {
             coefficient_count: 64,
             maximum_coefficients: 64,
         };
-        let split = split_luma_8x8(block_8x8).unwrap();
+        let split = split_luma_8x8(&block_8x8).unwrap();
         for (block_index, block) in split.iter().enumerate() {
             assert_eq!(block.total_coeff, 16);
             assert_eq!(block.max_num_coeff, 16);
