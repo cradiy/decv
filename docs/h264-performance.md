@@ -834,6 +834,15 @@ CAVLC Serial pairs reduced reference cycles about 0.36%, instructions about
 same direction: reference cycles fell about 0.38% and branches about 0.81%.
 A regression test covers duplicate rejection, clear, and re-recording.
 
+Representing an absent B-motion neighbour reference with `u8::MAX` instead of
+signed `-1` was tested and rejected. It removed sign checks and conversions,
+shrinking `resolve_spatial_direct_macroblock` by 732 bytes and reducing
+whole-decoder instructions about 0.60% on CABAC and 0.68% on CAVLC. CAVLC
+reference cycles improved about 0.99%, but the primary CABAC workload increased
+average reference cycles about 0.52% across eight alternating pinned pairs.
+The unsigned sentinel was fully reverted; fewer instructions alone do not
+justify a worse CABAC dependency schedule.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
