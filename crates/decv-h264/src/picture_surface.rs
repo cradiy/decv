@@ -452,28 +452,36 @@ impl Yuv420Picture {
         macroblock_y: usize,
         snapshot: &MacroblockPixels,
     ) {
-        write_block(
-            Arc::make_mut(&mut self.luma),
-            self.width,
-            macroblock_x * 16,
-            macroblock_y * 16,
-            &snapshot.luma,
+        assert!(
+            macroblock_x < self.width / 16 && macroblock_y < self.height / 16,
+            "restored macroblock must lie inside the picture"
         );
         let chroma_stride = self.width / 2;
-        write_block(
-            &mut self.cb,
-            chroma_stride,
-            macroblock_x * 8,
-            macroblock_y * 8,
-            &snapshot.cb,
-        );
-        write_block(
-            &mut self.cr,
-            chroma_stride,
-            macroblock_x * 8,
-            macroblock_y * 8,
-            &snapshot.cr,
-        );
+        // SAFETY: The assertion above and macroblock-aligned picture
+        // dimensions prove that all three rectangles fit their planes.
+        unsafe {
+            write_block(
+                Arc::make_mut(&mut self.luma),
+                self.width,
+                macroblock_x * 16,
+                macroblock_y * 16,
+                &snapshot.luma,
+            );
+            write_block(
+                &mut self.cb,
+                chroma_stride,
+                macroblock_x * 8,
+                macroblock_y * 8,
+                &snapshot.cb,
+            );
+            write_block(
+                &mut self.cr,
+                chroma_stride,
+                macroblock_x * 8,
+                macroblock_y * 8,
+                &snapshot.cr,
+            );
+        }
     }
 
     pub(crate) fn commit_macroblock_batch(
@@ -508,27 +516,32 @@ impl Yuv420Picture {
         for entry in staged {
             let macroblock_x = entry.address % width_in_macroblocks;
             let macroblock_y = entry.address / width_in_macroblocks;
-            write_block(
-                luma,
-                self.width,
-                macroblock_x * 16,
-                macroblock_y * 16,
-                &entry.pixels.luma,
-            );
-            write_block(
-                &mut self.cb,
-                chroma_stride,
-                macroblock_x * 8,
-                macroblock_y * 8,
-                &entry.pixels.cb,
-            );
-            write_block(
-                &mut self.cr,
-                chroma_stride,
-                macroblock_x * 8,
-                macroblock_y * 8,
-                &entry.pixels.cr,
-            );
+            // SAFETY: The address pass above proves every staged macroblock is
+            // inside the macroblock-aligned picture, so all three rectangles
+            // fit their destination planes.
+            unsafe {
+                write_block(
+                    luma,
+                    self.width,
+                    macroblock_x * 16,
+                    macroblock_y * 16,
+                    &entry.pixels.luma,
+                );
+                write_block(
+                    &mut self.cb,
+                    chroma_stride,
+                    macroblock_x * 8,
+                    macroblock_y * 8,
+                    &entry.pixels.cb,
+                );
+                write_block(
+                    &mut self.cr,
+                    chroma_stride,
+                    macroblock_x * 8,
+                    macroblock_y * 8,
+                    &entry.pixels.cr,
+                );
+            }
         }
         Ok(())
     }
@@ -808,16 +821,26 @@ fn read_block<const SIZE: usize>(
     })
 }
 
-fn write_block<const SIZE: usize>(
+unsafe fn write_block<const SIZE: usize>(
     plane: &mut [u8],
     stride: usize,
     x: usize,
     y: usize,
     block: &[[u8; SIZE]; SIZE],
 ) {
-    for (row, samples) in block.iter().enumerate() {
-        let start = (y + row) * stride + x;
-        plane[start..start + SIZE].copy_from_slice(samples);
+    // SAFETY: The caller guarantees that the first destination row begins
+    // within `plane`.
+    let mut destination = unsafe { plane.as_mut_ptr().add(y * stride + x) };
+    let mut source = block.as_ptr().cast::<u8>();
+    for _ in 0..SIZE {
+        // SAFETY: The caller guarantees that every SIZE-byte destination row
+        // is in `plane`. Exclusive `plane` and shared `block` references prove
+        // that source and destination do not overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(source, destination, SIZE);
+            source = source.add(SIZE);
+            destination = destination.add(stride);
+        }
     }
 }
 
