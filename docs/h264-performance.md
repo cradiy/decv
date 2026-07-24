@@ -419,6 +419,16 @@ body below 8 KiB but regressed CABAC about 0.9%. This path is sensitive to
 front-end layout and branch prediction, so fewer derived partitions alone are
 not sufficient evidence of a win.
 
+On AVX2-capable x86-64 CPUs, the common sixteen-luma-pixel chroma partition now
+interpolates its eight Cb and eight Cr samples together as sixteen `u16` lanes.
+This shares the four bilinear weights, rounding, and packing work across both
+planes; runtime feature detection retains the SSE2 path for other x86-64 CPUs
+and for narrower partitions. The SIMD oracle covers every one of the 64
+fractional positions and compares AVX2, SSE2, and per-sample scalar results.
+Seven alternating pinned runs reduced CABAC reference cycles about 1.4% and
+CAVLC about 0.5%. Whole-decoder instructions were effectively neutral, while
+branches fell about 0.3%.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
