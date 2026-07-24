@@ -813,8 +813,10 @@ impl CabacResidualState {
                     &mut coefficients,
                 )?;
                 debug_assert!(coded, "4:2:0 luma 8x8 blocks have no coded_block_flag");
-                let split = split_luma_8x8(&coefficients)?;
-                luma[usize::from(region) * 4..usize::from(region + 1) * 4].copy_from_slice(&split);
+                split_luma_8x8_into(
+                    &coefficients,
+                    &mut luma[usize::from(region) * 4..usize::from(region + 1) * 4],
+                )?;
             }
             return Ok(());
         }
@@ -1143,19 +1145,19 @@ fn coefficient_block_to_residual(block: &CabacCoefficientBlock) -> Result<Residu
     })
 }
 
-fn split_luma_8x8(block: &CabacCoefficientBlock) -> Result<[ResidualBlock; 4]> {
-    if block.maximum_coefficients != 64 {
+fn split_luma_8x8_into(block: &CabacCoefficientBlock, output: &mut [ResidualBlock]) -> Result<()> {
+    if block.maximum_coefficients != 64 || output.len() != 4 {
         return Err(H264Error::InvalidSyntax(
             "CABAC luma 8x8 split requires 64 coefficients",
         ));
     }
-    let mut output = [ResidualBlock::empty(16); 4];
+    output.fill(ResidualBlock::empty(16));
     for (coefficient_index, &coefficient) in block.coefficients().iter().enumerate() {
         let output_block = coefficient_index % 4;
         output[output_block].coefficients[coefficient_index / 4] = coefficient;
         output[output_block].total_coeff += u8::from(coefficient != 0);
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1440,7 +1442,8 @@ mod tests {
             coefficient_count: 64,
             maximum_coefficients: 64,
         };
-        let split = split_luma_8x8(&block_8x8).unwrap();
+        let mut split = [ResidualBlock::empty(16); 4];
+        split_luma_8x8_into(&block_8x8, &mut split).unwrap();
         for (block_index, block) in split.iter().enumerate() {
             assert_eq!(block.total_coeff, 16);
             assert_eq!(block.max_num_coeff, 16);
