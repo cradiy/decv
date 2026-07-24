@@ -905,6 +905,16 @@ about 0.29%, task-clock about 1.39%, and branch misses about 0.48%; removing
 roughly 0.15% of instructions and branches did not help. The well-predicted
 release checks were restored.
 
+Allocating the per-picture deblocking grid with the global allocator's
+zero-filled entry point was tested against `vec![Default::default(); count]`.
+The explicit implementation kept every Rust value initialized, passed an
+all-zero-versus-default layout test, shrank the picture-constructor symbol by
+774 bytes, and passed the byte-exact corpus. Across fourteen pinned CABAC
+Serial pairs, reference cycles and task-clock were both within 0.01%, page
+faults were unchanged, and instructions increased slightly. The platform
+allocator/compiler already handles the roughly 1.4 MiB zero fill effectively,
+so the manual allocator code was fully reverted.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
