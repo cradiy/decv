@@ -803,11 +803,7 @@ impl CabacResidualState {
             CabacResidualBlock::LumaDc,
             false,
         );
-        let mut residual = InterResidual {
-            luma: [ResidualBlock::empty(16); 16],
-            chroma_dc: [ResidualBlock::empty(4); 2],
-            chroma_ac: [[ResidualBlock::empty(15); 4]; 2],
-        };
+        let mut residual = InterResidual::empty_420();
         self.decode_luma_residual_into(
             syntax,
             macroblock_address,

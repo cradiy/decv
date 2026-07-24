@@ -90,6 +90,29 @@ pub struct InterResidual {
     pub chroma_ac: [[ResidualBlock; 4]; 2],
 }
 
+impl InterResidual {
+    #[inline(always)]
+    pub(crate) fn empty_420() -> Self {
+        // SAFETY: Keep this constructor next to the type definition so field
+        // changes must preserve the invariant. InterResidual currently
+        // contains only i32 and u8 fields, for which all-zero is valid. The
+        // non-zero per-category maxima are restored before the value escapes.
+        let mut residual = unsafe { std::mem::zeroed::<Self>() };
+        for block in &mut residual.luma {
+            block.max_num_coeff = 16;
+        }
+        for block in &mut residual.chroma_dc {
+            block.max_num_coeff = 4;
+        }
+        for plane in &mut residual.chroma_ac {
+            for block in plane {
+                block.max_num_coeff = 15;
+            }
+        }
+        residual
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedIntraMacroblock {
     pub macroblock: IntraMacroblock,

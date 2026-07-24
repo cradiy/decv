@@ -1480,6 +1480,21 @@ wall time fell about 2.45%, task-clock about 2.34%, and reference cycles about
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`;
 the generated H.264 and MP4/seek corpora remained byte-exact.
 
+CABAC inter residuals now initialize their integer-only backing storage once
+and then write the per-category coefficient maxima in place. This replaces
+array-repeat construction of 26 zero `ResidualBlock` values, which previously
+made LLVM materialize and copy several large stack regions. The all-zero bit
+pattern is valid for every `i32` and `u8` field, and all non-zero maxima are
+restored before the value becomes observable.
+
+In the native build, the `decode_inter_residual_inner` stack frame fell from
+3,032 to 1,800 bytes and the symbol from 1,692 to 1,124 bytes. Nine alternating
+4K `Auto` pairs reduced mean wall time about 1.37% and task-clock about 1.33%;
+six wall-time pairs and seven reference-cycle pairs improved. After retraining
+PGO, seven of nine wall-time pairs improved. Mean wall time fell about 1.85%,
+task-clock about 1.10%, and reference cycles about 1.05%. The exact 4K hash and
+both generated verification corpora remained unchanged.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
