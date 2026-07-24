@@ -1110,7 +1110,12 @@ main resolver shrank from about 6.7 KiB to 4.4 KiB, with a separate 2.5 KiB
 grid helper. The candidate passed its focused motion tests, but the grid path
 was not cold enough: ten pinned native 4K Serial pairs increased instructions
 about 0.48% and average reference cycles about 1.34%, with nine cycle pairs
-slower. The existing single function was restored.
+slower. A later four-worker retest was nearly neutral in a native build, but
+representative PGO retraining confirmed the dependency cost: instructions
+fell about 0.65%, branches about 1.06%, and sampled cache misses about 0.71%,
+while seven of nine alternating 4K pairs became slower. Mean wall time
+increased about 1.90%, task-clock about 1.38%, and reference cycles about
+1.80%. The existing single function was restored.
 
 Three allocation-oriented follow-ups did not justify retention. Constructing
 the luma `Arc<[u8]>` directly through a fully initialized
@@ -1341,16 +1346,6 @@ sampled cache misses about 1.14%, but changed wall time by only -0.07% and
 task-clock by -0.04%; 4K measurements did not retain that direction. That
 negligible result does not justify changing the public motion-header field
 types, so all three versions were reverted.
-
-Outlining the co-located-grid half of spatial Direct derivation was also
-rejected. It reduced the hot entry point from 6,627 to 4,421 machine-code bytes
-and moved another 2,336 bytes behind a non-inlined call. Native measurements
-were nearly neutral. After representative PGO retraining, instructions fell
-about 0.65%, branches about 1.06%, and sampled cache misses about 0.71%, but
-seven of nine alternating 4K pairs became slower: mean wall time increased
-about 1.90%, task-clock about 1.38%, and reference cycles about 1.80%. The
-Direct result remains on the caller's dependency chain, so saving instruction
-cache did not repay the call boundary. The outline was fully reverted.
 
 Large CABAC non-reference pictures now complete through a bounded cross-frame
 pipeline when a reconstruction pool is active. Picture completeness and the
