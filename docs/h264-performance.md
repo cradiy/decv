@@ -793,6 +793,20 @@ increased median reference cycles about 0.48%, with only two pairs improving.
 Both dependency-chain variants were fully reverted; the existing checked
 operations schedule better across the supported workloads.
 
+Heap-owning the 1,208-byte `IntraPictureReconstructor` and consuming it through
+a `Box<Self>` frame-finalization entry was tested and rejected. It removed the
+1,208-byte `memcpy` from `finish_current_picture`, reduced that function's
+native stack frame from 1,960 to 872 bytes, and shrank its inlined machine code
+from 22,758 to 18,508 bytes. Four pinned CABAC Serial `perf stat` pairs,
+however, left reference cycles and instructions effectively unchanged at
+about +0.06% and +0.05%; clean alternating wall-time medians were identical.
+Five two-worker `Auto` runs were also median-neutral. Five CAVLC Serial runs
+made every candidate pair slower and increased median wall time about 1.3%,
+showing that the extra allocation costs more than the once-per-frame move.
+The boxed layout was fully reverted. The sampled cost attributed to
+`finish_current_picture` is therefore dominated by inlined deblocking and
+picture finalization, not by its entry move.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
