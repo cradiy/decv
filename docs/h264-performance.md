@@ -617,6 +617,14 @@ the wider median reflecting scheduler variance. Five CAVLC runs remained
 neutral: instructions and branches changed by less than 0.01%, while median
 cycles were about 0.2% lower.
 
+Moving spatial-Direct B neighbour preparation into one non-inlined helper was
+rejected. It reduced `resolve_spatial_direct_macroblock` from roughly 8.1 KiB
+to 6.9 KiB, but introduced a roughly 1.9 KiB helper and an out-of-line
+64-byte neighbour-pair return. Five alternating CABAC Serial runs increased
+instructions about 0.44% and median reference cycles about 0.39%; the code was
+fully reverted. Reducing one symbol's size is not useful when the split adds
+more aggregate code and return-value traffic.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
