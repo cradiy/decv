@@ -391,6 +391,12 @@ measures 1.78 seconds in Serial mode and 1.98 seconds in Auto mode. FFmpeg
 takes 0.61 seconds with one thread for the comparable NV12 output, leaving a
 roughly 2.9x single-thread gap.
 
+The same internal output pattern now applies between inverse scaling and the
+integer transform, removing the remaining `Result<Block4x4>` temporary inside
+the prepared reconstruction path. CABAC reference cycles were neutral while
+instructions fell 0.6%; CAVLC instructions fell 0.8% and reference cycles
+about 3.5%.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
