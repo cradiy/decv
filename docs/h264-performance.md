@@ -380,6 +380,14 @@ about 1.2%, despite reducing whole-decoder instructions by only 0.1% to 0.2%.
 The gain comes mainly from shortening the dependency chain through each
 butterfly.
 
+Decoder-internal 4x4 reconstruction now writes into its final luma or chroma
+block slot and returns `Result<()>`. The public API still returns an owned
+block transactionally, but the hot macroblock loops no longer materialize a
+`Result<Block4x4>`, inspect its discriminant, and copy the 64-byte success
+payload. Seven alternating pinned runs reduced CABAC reference cycles about
+1.0% and instructions 0.3%; CAVLC reference cycles fell about 0.5% and
+instructions 0.4%.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
