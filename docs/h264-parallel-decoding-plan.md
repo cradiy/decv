@@ -201,7 +201,7 @@ Every parallel stage must pass:
 - deterministic malformed-input errors with no panic;
 - ThreadSanitizer or Miri coverage for newly introduced unsafe boundaries when
   practical;
-- bounded memory during long playback;
+- bounded memory during long-running decoding;
 - benchmarks with 1, 2, 4, and auto worker counts;
 - proof that `Serial` remains available on all supported architectures.
 

@@ -954,7 +954,7 @@ The next dependency chain is:
 ```text
 broader conformance and fuzz corpus
     -> 1080p60 profiling and bounded-memory soak testing
-    -> MP4 demuxing and GPUI playback integration
+    -> broader container and timestamp integration
     -> fields, transform bypass, and hardware backends as needed
 ```
 

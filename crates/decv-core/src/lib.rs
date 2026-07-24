@@ -1,8 +1,7 @@
 //! Codec-independent media types and synchronous decoder contracts.
 //!
-//! This crate deliberately has no dependency on GPUI or an asynchronous
-//! runtime. A decoder can run on any caller-owned worker thread, while the
-//! application remains responsible for scheduling, playback clocks, and UI.
+//! This crate deliberately has no asynchronous-runtime dependency. A decoder
+//! remains synchronous and can run on any caller-owned worker thread.
 
 mod color;
 mod decoder;

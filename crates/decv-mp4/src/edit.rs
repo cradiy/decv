@@ -31,13 +31,13 @@ impl Edit {
         self.media_time
     }
 
-    /// Integer half of the signed 16.16 playback rate.
+    /// Integer half of the signed 16.16 media rate.
     #[inline]
     pub const fn media_rate_integer(self) -> i16 {
         self.media_rate_integer
     }
 
-    /// Fractional half of the signed 16.16 playback rate.
+    /// Fractional half of the signed 16.16 media rate.
     #[inline]
     pub const fn media_rate_fraction(self) -> i16 {
         self.media_rate_fraction

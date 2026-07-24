@@ -28,7 +28,7 @@ pub enum FrameStorage {
     Cpu(CpuFrame),
 }
 
-/// A decoded frame ready to be consumed by a renderer or playback backend.
+/// A decoded frame with presentation metadata and owned immutable storage.
 #[derive(Debug, Clone)]
 pub struct DecodedVideoFrame {
     pub id: u64,

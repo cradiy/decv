@@ -15,9 +15,9 @@ The main rule is:
 > An MP4 demuxer does not decode video. It converts container metadata plus
 > random-access bytes into correctly framed, timed compressed packets.
 
-## 1. Container, codec, and player are separate layers
+## 1. Input, container, and codec are separate layers
 
-For the current local MP4 playback path, the data moves through three layers:
+The current MP4 path moves data through three layers:
 
 ```text
 MediaInput
@@ -30,9 +30,6 @@ decv-mp4
 decv-h264
     |  DecodedVideoFrame
     |  NV12 + geometry + color + presentation time
-    v
-player / gpui_video
-       clock + scheduling + frame dropping + rendering
 ```
 
 Each layer answers a different question:
@@ -40,10 +37,9 @@ Each layer answers a different question:
 - `MediaInput`: where are the bytes?
 - `decv-mp4`: which bytes form the next compressed sample, and when is it used?
 - `decv-h264`: how do those compressed bytes reconstruct pictures?
-- the player: when should each decoded picture be shown?
 
-Keeping these boundaries strict prevents network policy, UI state, and playback
-clocks from leaking into the parser or decoder.
+Keeping these boundaries strict prevents storage policy and codec
+reconstruction from leaking into the demuxer.
 
 ## 2. MP4 is a tree of bounded boxes
 
@@ -133,7 +129,7 @@ The consequences are useful:
 - memory inputs need no cursor;
 - HTTP or WebDAV implementations can use range requests;
 - multiple packet cursors can read one immutable input independently;
-- thumbnail extraction does not disturb the main playback cursor.
+- one extraction cursor does not disturb another cursor.
 
 `read_at` is allowed to return a short read. All exact-field and exact-sample
 paths therefore loop until the requested range is complete or a zero-byte read
@@ -422,8 +418,8 @@ The current mapping accepts:
 It explicitly rejects:
 
 - repeated media segments;
-- an empty edit after media playback has begun;
-- non-unit playback rates;
+- an empty edit after a media segment has begun;
+- non-unit media rates;
 - an empty duration that cannot be represented exactly in the media scale.
 
 Those are valid container features, but silently flattening them into one
@@ -477,8 +473,8 @@ track index
 next sample index
 ```
 
-This makes cursors cheap and independent. The main playback path and thumbnail
-extraction can create separate cursors over the same random-access source.
+This makes cursors cheap and independent. Multiple extraction operations can
+create separate cursors over the same random-access source.
 
 Sequential reading still follows sample-table/decode order:
 
@@ -509,22 +505,22 @@ The cursor is repositioned to that sample in decode order.
 
 ### Stage 2: decoder preroll
 
-The playback layer must then:
+Accurate seeking is completed by:
 
 ```text
 1. flush the decoder;
 2. start feeding packets from the selected sync sample;
 3. decode reference and reordered pictures normally;
 4. discard output frames whose PTS is before the exact target;
-5. present the first frame at or after the target;
-6. establish a new playback-clock origin.
+5. retain the first output frame at or after the target;
+6. establish the new presentation-timeline origin.
 ```
 
 Starting directly at an arbitrary non-keyframe packet is not accurate seek.
 That packet may depend on reference pictures that have not been decoded.
 
 The demuxer does not flush the decoder itself. That would couple the container
-crate to a particular codec instance and playback policy.
+crate to a particular codec instance and higher-level state.
 
 ## 12. Error handling and atomicity
 
@@ -571,7 +567,7 @@ read a known sample        -> O(sample_size)
 sequential packet access   -> O(1) index step + I/O
 ```
 
-This is a good trade for local playback:
+This is a good trade for random-access local files:
 
 - timing runs are not expanded repeatedly;
 - chunk lookup is not repeated for every seek;
@@ -610,7 +606,7 @@ Not implemented yet:
 
 - fragmented MP4 (`moof`, `traf`, `trun`, and fragment defaults);
 - encrypted/protected sample entries and CENC metadata;
-- audio tracks and interleaved A/V playback;
+- audio sample descriptions and interleaved A/V demuxing;
 - complex/repeated/variable-rate edit lists;
 - mid-stream sample-description switching in the CLI;
 - subtitle and metadata packet APIs;

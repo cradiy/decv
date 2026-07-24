@@ -1145,7 +1145,7 @@ ordinary 64-bit integer. Zero remains the `Option` niche, so
 retained 4x4 `MotionFieldCell` shrank from 56 to 36 bytes. On the 3840x2176
 coded 4K stream, one reference motion field consequently fell from about
 27.9 MiB to 17.9 MiB. Tokens wrap while skipping identities still present in
-the at-most-16-picture DPB, preserving indefinite playback without collision;
+the at-most-16-picture DPB, preserving indefinite decoding without collision;
 IDR and DPB clear still restart allocation at one. Layout and wraparound tests
 lock down both invariants.
 

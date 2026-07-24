@@ -1357,7 +1357,7 @@ mod tests {
     }
 
     #[test]
-    fn long_playback_keeps_decoder_state_bounded() {
+    fn long_decode_keeps_decoder_state_bounded() {
         const FRAME_COUNT: u64 = 2_048;
 
         let mut decoder = H264Decoder::new();
