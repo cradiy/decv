@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.56 s | 1.48 s | 80,492 KiB | 115.4 FPS |
-| decv Auto (2 workers) | NV12 | 1.73 s | 1.82 s | 79,772 KiB | 104.0 FPS |
-| FFmpeg 1 thread | NV12 | 0.61 s | 0.69 s | 152,128 KiB | 295.1 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 286,788 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,772 KiB | 315.8 FPS |
-| FFmpeg Auto | decode-only | 0.23 s | 0.97 s | 192,168 KiB | 782.6 FPS |
+| decv Serial | NV12 | 1.59 s | 1.51 s | 80,200 KiB | 113.2 FPS |
+| decv Auto (2 workers) | NV12 | 1.76 s | 1.88 s | 79,076 KiB | 102.3 FPS |
+| FFmpeg 1 thread | NV12 | 0.61 s | 0.69 s | 152,080 KiB | 295.1 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 289,816 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.56 s | 0.55 s | 95,564 KiB | 321.4 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.97 s | 192,512 KiB | 818.2 FPS |
 
 On this workload:
 
 - decv Serial takes about **2.6x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **6.7x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **6.8x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **1.27x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.31x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
   **28%** of FFmpeg Auto NV12 peak RSS;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 92.3% throughput headroom over that
-line, and the measured two-worker Auto result has about 73.4%. The ordering
+seconds. The current Serial result has about 88.7% throughput headroom over that
+line, and the measured two-worker Auto result has about 70.5%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -749,6 +749,25 @@ branches about 0.12%, but expanded `resolve_spatial_direct_macroblock` by 88
 bytes. Seven alternating CABAC Serial runs increased median branch misses about
 0.45% and median reference cycles about 0.11%; only two of seven cycle pairs
 improved. The unsafe initialization was fully reverted.
+
+Explicit single-list prediction weighting now initializes its SSE2 weight,
+rounding, shift, and offset vectors once per luma or chroma plane instead of
+once per row. The same kernel retains scalar tails for arbitrary row widths,
+and an exhaustive oracle covers multi-row luma/chroma strides, all normative
+partition widths, guarded SIMD parameter extremes, and scalar fallbacks. The
+native `apply_prediction_weights_for_list` symbol shrank from about 15.4 KiB
+to 10.0 KiB. Seven alternating CABAC Serial runs reduced instructions about
+0.67%, branches about 1.38%, task-clock about 0.82%, and median reference
+cycles about 0.80%, with five of seven cycle pairs improving. Five `Auto` runs
+reduced instructions about 0.67%, branches about 1.35%, and median reference
+cycles about 0.61%, with three pairs improving. CAVLC instructions and branches
+fell about 0.76% and 1.50%; its median reference cycles increased about 0.13%
+despite three of five pairs improving, a noise-level tradeoff accepted for the
+primary High Profile CABAC target. The complete stream corpus remains
+byte-exact. A follow-up guard that skipped the SSE2 helper for widths below
+eight shaved roughly another 0.02% of instructions, but added branches through
+the surrounding dispatch and weakened five-run CABAC median reference-cycle
+improvement to about 0.07%. That extra width branch was not retained.
 
 ## BitReader Checkpoint
 

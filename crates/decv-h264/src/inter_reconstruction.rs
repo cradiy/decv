@@ -1059,13 +1059,13 @@ fn apply_prediction_weights_for_list(
         offset: 0,
     });
     let luma_width = usize::from(prediction.width);
-    for row in prediction
-        .luma
-        .iter_mut()
-        .take(usize::from(prediction.height))
-    {
-        weighted_row(&mut row[..luma_width], luma, table.luma_log2_weight_denom);
-    }
+    weighted_plane(
+        &mut prediction.luma,
+        luma_width,
+        usize::from(prediction.height),
+        luma,
+        table.luma_log2_weight_denom,
+    );
 
     let chroma_default = 1i32 << table.chroma_log2_weight_denom;
     let chroma = weights.chroma.unwrap_or([
@@ -1080,23 +1080,65 @@ fn apply_prediction_weights_for_list(
     ]);
     let chroma_height = usize::from(prediction.height / 2);
     let chroma_width = usize::from(prediction.width / 2);
-    for row in prediction.cb.iter_mut().take(chroma_height) {
-        weighted_row(
-            &mut row[..chroma_width],
-            chroma[0],
-            table.chroma_log2_weight_denom,
-        );
-    }
-    for row in prediction.cr.iter_mut().take(chroma_height) {
-        weighted_row(
-            &mut row[..chroma_width],
-            chroma[1],
-            table.chroma_log2_weight_denom,
-        );
-    }
+    weighted_plane(
+        &mut prediction.cb,
+        chroma_width,
+        chroma_height,
+        chroma[0],
+        table.chroma_log2_weight_denom,
+    );
+    weighted_plane(
+        &mut prediction.cr,
+        chroma_width,
+        chroma_height,
+        chroma[1],
+        table.chroma_log2_weight_denom,
+    );
     Ok(())
 }
 
+fn weighted_plane<const STRIDE: usize, const ROWS: usize>(
+    samples: &mut [[u8; STRIDE]; ROWS],
+    width: usize,
+    height: usize,
+    weight: WeightOffset,
+    denominator: u8,
+) {
+    assert!(width <= STRIDE && height <= ROWS);
+
+    #[cfg(target_arch = "x86_64")]
+    let vectorized_width = if (-128..=128).contains(&weight.weight)
+        && (-128..=127).contains(&weight.offset)
+        && denominator <= 7
+    {
+        // SAFETY: The fixed plane layout and checked dimensions prove
+        // every row range. The guarded H.264 parameters keep the intermediate
+        // weighted values within i16.
+        unsafe {
+            weighted_plane_sse2(
+                samples.as_mut_ptr().cast::<u8>(),
+                STRIDE,
+                width,
+                height,
+                weight.weight,
+                weight.offset,
+                u32::from(denominator),
+            )
+        }
+    } else {
+        0
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let vectorized_width = 0;
+
+    for row in samples.iter_mut().take(height) {
+        for sample in &mut row[vectorized_width..width] {
+            *sample = weighted_sample(*sample, weight, denominator);
+        }
+    }
+}
+
+#[cfg(test)]
 #[inline]
 fn weighted_row(samples: &mut [u8], weight: WeightOffset, denominator: u8) {
     #[cfg(target_arch = "x86_64")]
@@ -1108,8 +1150,11 @@ fn weighted_row(samples: &mut [u8], weight: WeightOffset, denominator: u8) {
         // weight, offset, and denominator ranges keep every intermediate in
         // i16, and the helper only loads and stores complete chunks.
         unsafe {
-            weighted_row_sse2(
-                samples,
+            weighted_plane_sse2(
+                samples.as_mut_ptr(),
+                samples.len(),
+                samples.len(),
+                1,
                 weight.weight,
                 weight.offset,
                 u32::from(denominator),
@@ -1127,8 +1172,12 @@ fn weighted_row(samples: &mut [u8], weight: WeightOffset, denominator: u8) {
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
-unsafe fn weighted_row_sse2(
-    samples: &mut [u8],
+#[allow(clippy::too_many_arguments)]
+unsafe fn weighted_plane_sse2(
+    samples: *mut u8,
+    stride: usize,
+    width: usize,
+    height: usize,
     weight: i32,
     value_offset: i32,
     denominator: u32,
@@ -1161,62 +1210,65 @@ unsafe fn weighted_row_sse2(
     });
     let shift = _mm_cvtsi32_si128(denominator as i32);
     let value_offset = _mm_set1_epi16(value_offset as i16);
-    let mut offset = 0;
-    while samples.len() - offset >= 16 {
-        // SAFETY: The loop condition proves the 16-byte range is in-bounds.
-        let packed = unsafe { _mm_loadu_si128(samples.as_ptr().add(offset).cast::<__m128i>()) };
-        // SAFETY: This function and the helper are compiled with SSE2 enabled.
-        let low = unsafe {
-            apply(
-                _mm_unpacklo_epi8(packed, zero),
-                weight,
-                rounding,
-                shift,
-                value_offset,
-            )
-        };
-        // SAFETY: This function and the helper are compiled with SSE2 enabled.
-        let high = unsafe {
-            apply(
-                _mm_unpackhi_epi8(packed, zero),
-                weight,
-                rounding,
-                shift,
-                value_offset,
-            )
-        };
-        // SAFETY: The loop condition proves the destination is in-bounds.
-        unsafe {
-            _mm_storeu_si128(
-                samples.as_mut_ptr().add(offset).cast::<__m128i>(),
-                _mm_packus_epi16(low, high),
-            );
+    let vectorized_width = width / 16 * 16 + usize::from(width % 16 >= 8) * 8;
+    for row in 0..height {
+        let row = unsafe { samples.add(row * stride) };
+        let mut offset = 0;
+        while vectorized_width - offset >= 16 {
+            // SAFETY: vectorized_width never exceeds the validated row width.
+            let packed = unsafe { _mm_loadu_si128(row.add(offset).cast::<__m128i>()) };
+            // SAFETY: This function and the helper are compiled with SSE2 enabled.
+            let low = unsafe {
+                apply(
+                    _mm_unpacklo_epi8(packed, zero),
+                    weight,
+                    rounding,
+                    shift,
+                    value_offset,
+                )
+            };
+            // SAFETY: This function and the helper are compiled with SSE2 enabled.
+            let high = unsafe {
+                apply(
+                    _mm_unpackhi_epi8(packed, zero),
+                    weight,
+                    rounding,
+                    shift,
+                    value_offset,
+                )
+            };
+            // SAFETY: The destination covers the same validated row bytes.
+            unsafe {
+                _mm_storeu_si128(
+                    row.add(offset).cast::<__m128i>(),
+                    _mm_packus_epi16(low, high),
+                );
+            }
+            offset += 16;
         }
-        offset += 16;
-    }
-    if samples.len() - offset >= 8 {
-        // SAFETY: The branch proves the eight-byte range is in-bounds.
-        let packed = unsafe { _mm_loadl_epi64(samples.as_ptr().add(offset).cast::<__m128i>()) };
-        // SAFETY: This function and the helper are compiled with SSE2 enabled.
-        let low = unsafe {
-            apply(
-                _mm_unpacklo_epi8(packed, zero),
-                weight,
-                rounding,
-                shift,
-                value_offset,
-            )
-        };
-        // SAFETY: The branch proves the destination is in-bounds.
-        unsafe {
-            _mm_storel_epi64(
-                samples.as_mut_ptr().add(offset).cast::<__m128i>(),
-                _mm_packus_epi16(low, zero),
-            );
+        if vectorized_width - offset >= 8 {
+            // SAFETY: The remaining vectorized row range contains eight bytes.
+            let packed = unsafe { _mm_loadl_epi64(row.add(offset).cast::<__m128i>()) };
+            // SAFETY: This function and the helper are compiled with SSE2 enabled.
+            let low = unsafe {
+                apply(
+                    _mm_unpacklo_epi8(packed, zero),
+                    weight,
+                    rounding,
+                    shift,
+                    value_offset,
+                )
+            };
+            // SAFETY: The destination covers the same validated eight bytes.
+            unsafe {
+                _mm_storel_epi64(
+                    row.add(offset).cast::<__m128i>(),
+                    _mm_packus_epi16(low, zero),
+                );
+            }
         }
-        offset += 8;
     }
-    offset
+    vectorized_width
 }
 
 fn apply_explicit_bipred_weights(
@@ -2259,6 +2311,38 @@ mod tests {
                 );
             }
         }
+
+        fn check_plane<const STRIDE: usize, const ROWS: usize>(
+            cases: &[(WeightOffset, u8)],
+            widths: &[usize],
+        ) {
+            let source: [[u8; STRIDE]; ROWS] = std::array::from_fn(|y| {
+                std::array::from_fn(|x| (x * 73 + y * 41 + STRIDE * 19) as u8)
+            });
+            for &width in widths {
+                for height in [1, ROWS / 2, ROWS] {
+                    for &(weight, denominator) in cases {
+                        let mut actual = source;
+                        let mut expected = source;
+                        for row in expected.iter_mut().take(height) {
+                            for sample in &mut row[..width] {
+                                *sample = weighted_sample(*sample, weight, denominator);
+                            }
+                        }
+
+                        weighted_plane(&mut actual, width, height, weight, denominator);
+                        assert_eq!(
+                            actual, expected,
+                            "stride={STRIDE} width={width} height={height} \
+                             weight={weight:?} denominator={denominator}"
+                        );
+                    }
+                }
+            }
+        }
+
+        check_plane::<16, 16>(&cases, &[2, 4, 8, 16]);
+        check_plane::<8, 8>(&cases, &[2, 4, 8]);
     }
 
     #[test]
