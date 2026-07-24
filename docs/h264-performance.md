@@ -369,6 +369,17 @@ work. Fusing inverse scan and scaling into one iterator loop increased
 whole-decoder instructions by about 0.4% and regressed CAVLC reference cycles,
 so the small intermediate coefficient block remains.
 
+The separable 4x4 inverse transform no longer performs checked `i64`
+addition and subtraction at every butterfly. Starting from `i32`
+coefficients, one pass grows the absolute bound by less than 3.5x and the
+second pass therefore remains below `2^36`; the final checked conversion is
+unchanged. An `i128` oracle covers uniform extrema, a maximum/minimum
+checkerboard, and an extreme impulse at every coefficient position. Seven
+alternating pinned runs reduced CABAC reference cycles about 1.4% and CAVLC
+about 1.2%, despite reducing whole-decoder instructions by only 0.1% to 0.2%.
+The gain comes mainly from shortening the dependency chain through each
+butterfly.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
