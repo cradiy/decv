@@ -6,6 +6,7 @@ frame_count="${1:-60}"
 run_count="${2:-5}"
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
+decv="${DECV_BENCH_BIN:-}"
 
 if ! [[ "$frame_count" =~ ^[1-9][0-9]*$ && "$run_count" =~ ^[1-9][0-9]*$ ]]; then
     echo "usage: $0 [positive-frame-count] [positive-run-count]" >&2
@@ -32,8 +33,16 @@ ffmpeg -hide_banner -loglevel error \
     "cabac=1:bframes=3:ref=3:weightp=2:weightb=1:8x8dct=1:direct=auto:keyint=60:min-keyint=60:scenecut=0" \
     -f h264 -y "$work_dir/input.h264"
 
-cargo build --quiet --manifest-path "$repo_dir/Cargo.toml" \
-    -p decv-cli --release
+if [[ -n "$decv" ]]; then
+    if [[ ! -x "$decv" ]]; then
+        echo "DECV_BENCH_BIN must name an executable decoder binary" >&2
+        exit 2
+    fi
+else
+    cargo build --quiet --manifest-path "$repo_dir/Cargo.toml" \
+        -p decv-cli --release
+    decv="$repo_dir/target/release/decv-cli"
+fi
 
 median() {
     sort -n "$1" | awk '
@@ -78,7 +87,6 @@ benchmark() {
 }
 
 input="$work_dir/input.h264"
-decv="$repo_dir/target/release/decv-cli"
 
 echo "1920x1080 60fps High Profile CABAC software decode"
 echo "frames=$frame_count runs=$run_count input_bytes=$(wc -c <"$input")"
