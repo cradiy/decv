@@ -104,22 +104,42 @@ pub struct BMotionState {
     cells: Vec<Option<MotionCell>>,
 }
 
+fn b_motion_cell_count(width_in_macroblocks: usize, height_in_macroblocks: usize) -> Result<usize> {
+    if width_in_macroblocks == 0 || height_in_macroblocks == 0 {
+        return Err(H264Error::InvalidSyntax(
+            "B motion-state picture dimensions must be non-zero",
+        ));
+    }
+    width_in_macroblocks
+        .checked_mul(height_in_macroblocks)
+        .and_then(|value| value.checked_mul(16))
+        .ok_or(H264Error::IntegerOverflow)
+}
+
 impl BMotionState {
     pub fn new(width_in_macroblocks: usize, height_in_macroblocks: usize) -> Result<Self> {
-        if width_in_macroblocks == 0 || height_in_macroblocks == 0 {
-            return Err(H264Error::InvalidSyntax(
-                "B motion-state picture dimensions must be non-zero",
-            ));
-        }
-        let cell_count = width_in_macroblocks
-            .checked_mul(height_in_macroblocks)
-            .and_then(|value| value.checked_mul(16))
-            .ok_or(H264Error::IntegerOverflow)?;
+        let cell_count = b_motion_cell_count(width_in_macroblocks, height_in_macroblocks)?;
         Ok(Self {
             width_in_macroblocks,
             height_in_macroblocks,
             cells: vec![None; cell_count],
         })
+    }
+
+    pub(crate) fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+    ) -> Result<()> {
+        let cell_count = b_motion_cell_count(width_in_macroblocks, height_in_macroblocks)?;
+        self.width_in_macroblocks = width_in_macroblocks;
+        self.height_in_macroblocks = height_in_macroblocks;
+        if self.cells.len() == cell_count {
+            self.cells.fill(None);
+        } else {
+            self.cells = vec![None; cell_count];
+        }
+        Ok(())
     }
 
     pub fn record_intra_macroblock(
@@ -1358,6 +1378,22 @@ mod tests {
             num_ref_idx_l0_active: 2,
             num_ref_idx_l1_active: 2,
         }
+    }
+
+    #[test]
+    fn resetting_for_the_same_picture_reuses_and_clears_the_allocation() {
+        let mut state = BMotionState::new(2, 1).unwrap();
+        let allocation = state.cells.as_ptr();
+        state.record_intra_macroblock(0, 1).unwrap();
+        assert!(state.cells.iter().any(Option::is_some));
+
+        state.reset_for_picture(2, 1).unwrap();
+
+        assert_eq!(state.cells.as_ptr(), allocation);
+        assert_eq!(state.cells.len(), 32);
+        assert!(state.cells.iter().all(Option::is_none));
+        assert_eq!(state.width_in_macroblocks, 2);
+        assert_eq!(state.height_in_macroblocks, 1);
     }
 
     #[test]

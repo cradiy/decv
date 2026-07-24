@@ -1162,6 +1162,28 @@ and reference cycles about 2.24%. The full workspace suite, strict H.264
 Clippy, native H.264 corpus, MP4/seek corpus, and 4K Serial/Auto/FFmpeg
 three-way comparison remain byte-exact.
 
+The per-picture B-motion workspace now retains its allocation across pictures
+of the same decoder. A 4K frame uses 522,240 addressable 4x4 motion cells.
+Previously, finishing every picture dropped that large `Vec<Option<MotionCell>>`
+and the following picture allocated it again. The retained workspace still
+fills every cell with `None` before reuse, so no motion or slice state crosses
+the picture boundary; a coded-size change either resizes or replaces the
+allocation through the same validated cell-count calculation. A focused test
+locks down same-size allocation reuse and the complete clear.
+
+Seven alternating pinned 4K Serial pairs all improved: average task-clock fell
+about 2.54% and reference cycles about 2.63%, while instructions were within
+0.03%. Four-worker `Auto` was a smaller, scheduling-sensitive gain:
+task-clock fell about 0.40% and reference cycles about 0.81%, while ordinary
+CPU cycles increased about 0.24%. At 1080p, six of seven Serial pairs improved;
+average task-clock fell about 1.69%, reference cycles about 0.76%, and minor
+faults about 29.9%. Two-worker `Auto` was effectively neutral at about -0.03%
+task-clock and -0.15% reference cycles. Minor faults increased in both 4K
+modes and 1080p `Auto`, and one 4K Serial `/usr/bin/time` sample increased
+peak RSS by about 1.9 MiB, a measured memory-side tradeoff for the Serial
+throughput gain. The full workspace suite, strict H.264 Clippy, native H.264
+and MP4/seek corpora, and 4K Serial/Auto/FFmpeg outputs remain byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

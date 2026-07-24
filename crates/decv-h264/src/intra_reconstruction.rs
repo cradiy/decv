@@ -269,6 +269,7 @@ impl IntraPictureReconstructor {
             scaling_lists_8x8,
             constrained_intra_prediction,
             ReconstructionExecutor::serial(),
+            None,
         )
     }
 
@@ -278,6 +279,7 @@ impl IntraPictureReconstructor {
         scaling_lists_8x8: ResolvedScalingLists8x8,
         constrained_intra_prediction: bool,
         reconstruction_executor: ReconstructionExecutor,
+        reusable_b_motion: Option<BMotionState>,
     ) -> Result<Self> {
         let picture = Yuv420Picture::new(coded_size)?;
         let width_in_macroblocks =
@@ -287,6 +289,12 @@ impl IntraPictureReconstructor {
         let macroblock_count = width_in_macroblocks
             .checked_mul(height_in_macroblocks)
             .ok_or(H264Error::IntegerOverflow)?;
+        let b_motion = if let Some(mut b_motion) = reusable_b_motion {
+            b_motion.reset_for_picture(width_in_macroblocks, height_in_macroblocks)?;
+            b_motion
+        } else {
+            BMotionState::new(width_in_macroblocks, height_in_macroblocks)?
+        };
         Ok(Self {
             width_in_macroblocks,
             picture,
@@ -294,7 +302,7 @@ impl IntraPictureReconstructor {
             cabac_residual: CabacResidualState::new(width_in_macroblocks, height_in_macroblocks)?,
             modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
             motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
-            b_motion: BMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
+            b_motion,
             reference_motion: MotionFieldBuilder::new(coded_size)?,
             completed: vec![false; macroblock_count],
             deblock: vec![MacroblockDeblockInfo::default(); macroblock_count],
@@ -317,6 +325,18 @@ impl IntraPictureReconstructor {
         parameter_sets: &ActiveParameterSets,
         reconstruction_executor: ReconstructionExecutor,
     ) -> Result<Self> {
+        Self::from_parameter_sets_with_executor_and_b_motion(
+            parameter_sets,
+            reconstruction_executor,
+            None,
+        )
+    }
+
+    pub(crate) fn from_parameter_sets_with_executor_and_b_motion(
+        parameter_sets: &ActiveParameterSets,
+        reconstruction_executor: ReconstructionExecutor,
+        reusable_b_motion: Option<BMotionState>,
+    ) -> Result<Self> {
         let sps = &parameter_sets.sequence;
         let pps = &parameter_sets.picture;
         let scaling_lists = resolve_scaling_lists_4x4(
@@ -333,6 +353,7 @@ impl IntraPictureReconstructor {
             scaling_lists_8x8,
             pps.constrained_intra_prediction,
             reconstruction_executor,
+            reusable_b_motion,
         )
     }
 
@@ -2437,8 +2458,16 @@ impl IntraPictureReconstructor {
     }
 
     pub(crate) fn into_deblocked_reference_picture(
-        mut self,
+        self,
     ) -> Result<(Yuv420Picture, ReferenceMotionField)> {
+        let (picture, motion, _) =
+            self.into_deblocked_reference_picture_with_reusable_b_motion()?;
+        Ok((picture, motion))
+    }
+
+    pub(crate) fn into_deblocked_reference_picture_with_reusable_b_motion(
+        mut self,
+    ) -> Result<(Yuv420Picture, ReferenceMotionField, BMotionState)> {
         if self.completed.iter().any(|&completed| !completed) {
             return Err(H264Error::InvalidSyntax(
                 "cannot output an incomplete reconstructed picture",
@@ -2446,7 +2475,7 @@ impl IntraPictureReconstructor {
         }
         filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
         let motion = self.reference_motion.finish()?;
-        Ok((self.picture, motion))
+        Ok((self.picture, motion, self.b_motion))
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -13,11 +13,12 @@ use crate::intra_reconstruction::ReconstructionReferenceList;
 use crate::parallelism::ReconstructionExecutor;
 use crate::reorder::PictureReorderBuffer;
 use crate::{
-    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference, EntropyCodingMode,
-    H264Error, H264Parallelism, ImplicitWeightReference, IntraPictureReconstructor, NalHeader,
-    NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader, PictureOrderCount,
-    PictureParameterSet, Profile, ReferenceKind, ReferencePictureMarking, Result,
-    SequenceParameterSet, SliceType, consume_rbsp_trailing_bits, decode_rbsp,
+    AnnexBNalUnit, AnnexBReader, BMotionState, DecodedPictureBuffer, DirectReference,
+    EntropyCodingMode, H264Error, H264Parallelism, ImplicitWeightReference,
+    IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType, ParameterSetStore,
+    ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile, ReferenceKind,
+    ReferencePictureMarking, Result, SequenceParameterSet, SliceType, consume_rbsp_trailing_bits,
+    decode_rbsp,
 };
 
 #[derive(Debug)]
@@ -62,6 +63,7 @@ pub struct H264Decoder {
     parallelism: H264Parallelism,
     reconstruction_executor: Option<ReconstructionExecutor>,
     auto_executor_size: Option<Size>,
+    reusable_b_motion: Option<BMotionState>,
 }
 
 impl Default for H264Decoder {
@@ -81,6 +83,7 @@ impl Default for H264Decoder {
             parallelism: H264Parallelism::Auto,
             reconstruction_executor: None,
             auto_executor_size: None,
+            reusable_b_motion: None,
         }
     }
 }
@@ -178,12 +181,13 @@ impl H264Decoder {
                         self.auto_executor_size = Some(coded_size);
                     }
                     let reconstructor =
-                        IntraPictureReconstructor::from_parameter_sets_with_executor(
+                        IntraPictureReconstructor::from_parameter_sets_with_executor_and_b_motion(
                             &parsed.parameter_sets,
                             self.reconstruction_executor
                                 .as_ref()
                                 .expect("configure initializes the reconstruction executor")
                                 .clone(),
+                            self.reusable_b_motion.take(),
                         )?;
                     self.current_picture = Some(PendingPicture {
                         reconstructor,
@@ -415,7 +419,10 @@ impl H264Decoder {
         let Some(picture) = self.current_picture.take() else {
             return Ok(());
         };
-        let (decoded, motion) = picture.reconstructor.into_deblocked_reference_picture()?;
+        let (decoded, motion, reusable_b_motion) = picture
+            .reconstructor
+            .into_deblocked_reference_picture_with_reusable_b_motion()?;
+        self.reusable_b_motion = Some(reusable_b_motion);
         let decoded = Arc::new(decoded);
         let motion = Arc::new(motion);
         let frame = decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format)?;
