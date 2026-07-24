@@ -5,6 +5,7 @@ edition = "2024"
 
 [features]
 internal-profiling = ["decv-h264/internal-profiling"]
+frame-timing = []
 
 [dependencies]
 decv-core = { path = "../decv-core" }

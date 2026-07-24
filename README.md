@@ -119,6 +119,21 @@ cargo run --release -p decv-cli -- --seek 12.5 input.mp4 output.nv12
 Select reconstruction parallelism with `--parallelism serial`, `auto`, or a
 positive worker count.
 
+For opt-in frame-service latency statistics, build the CLI with its dedicated
+feature:
+
+```bash
+cargo run --release -p decv-cli --features frame-timing -- \
+    --frame-timing --parallelism auto input.h264
+```
+
+The summary reports mean, p50, p95, p99, and maximum wall time accumulated
+inside decoder API calls between output-frame events. It excludes input file
+reads, raw-frame writes, and per-frame logging. The first sample includes
+decoder startup and any presentation-reordering pre-roll, so use a sufficiently
+long stream when evaluating steady-state tail latency. The feature is absent
+from ordinary release and PGO builds unless explicitly enabled.
+
 ## Portable and Tuned Builds
 
 The normal Cargo build remains the portable library baseline. CPU-specific

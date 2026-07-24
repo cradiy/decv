@@ -1567,6 +1567,26 @@ shrunk by 542 bytes. The exact 597,196,800-byte 4K output retained SHA-256
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
 and both generated verification corpora remained byte-exact.
 
+## Frame Service Timing
+
+`decv-cli` has an opt-in `frame-timing` feature for measuring decoder
+tail latency without changing the library API or ordinary release binaries.
+With `--frame-timing`, it accumulates wall time spent in `send_packet`,
+`receive_frame`, `flush`, and `drain` between output-frame events, then reports
+mean, p50, p95, p99, and maximum service time. File reads, visible-frame
+writes, and CLI logging are outside the measured interval. The first sample
+includes decoder initialization and presentation-reordering pre-roll; long
+streams are required for representative steady-state percentiles.
+
+On the native development build, the current 48-frame 4K sample reported a
+25.019 ms mean and 22.337 ms p50. Two runs of the 300-frame 1080p CABAC sample
+reported 7.515-8.223 ms means, 7.078-7.921 ms p50s, 11.555-12.210 ms p95s,
+21.979-25.608 ms p99s, and 46.628-50.576 ms maxima. The run-to-run spread is
+itself a reminder that host scheduling affects wall-time tails. These are
+diagnostic service intervals rather than a playback scheduler result. They
+expose long decoder stalls that a whole-stream FPS average hides and provide a
+second acceptance signal for future optimizations.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

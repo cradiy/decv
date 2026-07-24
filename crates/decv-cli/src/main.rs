@@ -7,16 +7,31 @@ use std::{
     path::Path,
 };
 
+#[cfg(not(feature = "frame-timing"))]
+use decv_core::VideoDecoder;
 use decv_core::{
     BitstreamFormat, DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket,
-    FrameStorage, MediaTime, PixelFormat, Rect, VideoCodec, VideoDecoder, VideoDecoderConfig,
+    FrameStorage, MediaTime, PixelFormat, Rect, VideoCodec, VideoDecoderConfig,
 };
-use decv_h264::{AnnexBReader, H264Decoder, H264Parallelism};
+#[cfg(not(feature = "frame-timing"))]
+use decv_h264::H264Decoder;
+use decv_h264::{AnnexBReader, H264Parallelism};
 use decv_mp4::{FourCc, Mp4Demuxer};
 
+#[cfg(feature = "frame-timing")]
+mod frame_timing;
+#[cfg(feature = "frame-timing")]
+use frame_timing::CliDecoder;
+#[cfg(not(feature = "frame-timing"))]
+type CliDecoder = H264Decoder;
+
 const VIDE: FourCc = FourCc::new(*b"vide");
+#[cfg(not(feature = "frame-timing"))]
 const USAGE: &str = "usage: decv-cli [--seek <seconds>] [--parallelism <serial|auto|threads>] \
                      <input.h264|input.mp4> [output.nv12]";
+#[cfg(feature = "frame-timing")]
+const USAGE: &str = "usage: decv-cli [--seek <seconds>] [--parallelism <serial|auto|threads>] \
+                     [--frame-timing] <input.h264|input.mp4> [output.nv12]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullState {
@@ -30,6 +45,8 @@ struct CliOptions {
     output_path: Option<String>,
     seek_target: Option<MediaTime>,
     parallelism: H264Parallelism,
+    #[cfg(feature = "frame-timing")]
+    frame_timing: bool,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -41,9 +58,14 @@ fn main() -> Result<(), Box<dyn Error>> {
         output_path,
         seek_target,
         parallelism,
+        #[cfg(feature = "frame-timing")]
+        frame_timing,
     } = parse_arguments(env::args().skip(1))?;
+    #[cfg(feature = "frame-timing")]
+    let mut decoder = CliDecoder::new(frame_timing);
+    #[cfg(not(feature = "frame-timing"))]
+    let mut decoder = CliDecoder::new();
     let mut raw_output = output_path.as_deref().map(File::create).transpose()?;
-    let mut decoder = H264Decoder::new();
     decoder.set_parallelism(parallelism)?;
     let mut frame_count = 0u64;
     if is_mp4(Path::new(&path))? {
@@ -71,6 +93,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("wrote raw visible NV12 frames to {output_path}");
     }
     println!("decoded {frame_count} frame(s) from {path}");
+    #[cfg(feature = "frame-timing")]
+    if let Some(summary) = decoder.frame_timing_summary() {
+        eprintln!("{summary}");
+    }
     #[cfg(feature = "internal-profiling")]
     eprintln!("{}", decv_h264::inter_prediction_profile());
     Ok(())
@@ -83,7 +109,17 @@ fn parse_arguments(
     let mut seek_target = None;
     let mut parallelism = H264Parallelism::Auto;
     let mut parallelism_specified = false;
+    #[cfg(feature = "frame-timing")]
+    let mut frame_timing = false;
     while let Some(argument) = arguments.next() {
+        #[cfg(feature = "frame-timing")]
+        if argument == "--frame-timing" {
+            if frame_timing {
+                return Err("--frame-timing may only be specified once".into());
+            }
+            frame_timing = true;
+            continue;
+        }
         if argument == "--seek" {
             if seek_target.is_some() {
                 return Err("--seek may only be specified once".into());
@@ -110,6 +146,8 @@ fn parse_arguments(
         output_path: output,
         seek_target,
         parallelism,
+        #[cfg(feature = "frame-timing")]
+        frame_timing,
     })
 }
 
@@ -157,7 +195,7 @@ fn parse_seconds(seconds: &str) -> Result<MediaTime, Box<dyn Error>> {
 
 fn decode_annex_b(
     path: &str,
-    decoder: &mut H264Decoder,
+    decoder: &mut CliDecoder,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
 ) -> Result<(), Box<dyn Error>> {
@@ -184,7 +222,7 @@ fn decode_annex_b(
 
 fn decode_mp4(
     path: &str,
-    decoder: &mut H264Decoder,
+    decoder: &mut CliDecoder,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
     seek_target: Option<MediaTime>,
@@ -235,7 +273,7 @@ fn decode_mp4(
 }
 
 fn send_packet(
-    decoder: &mut H264Decoder,
+    decoder: &mut CliDecoder,
     mut packet: EncodedVideoPacket,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
@@ -290,7 +328,7 @@ fn is_mp4_box_header(header: [u8; 8]) -> bool {
 }
 
 fn receive_available(
-    decoder: &mut H264Decoder,
+    decoder: &mut CliDecoder,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
     minimum_pts: Option<MediaTime>,
@@ -473,11 +511,33 @@ mod tests {
             options.parallelism,
             H264Parallelism::Threads(threads) if threads.get() == 2
         ));
+        #[cfg(feature = "frame-timing")]
+        assert!(!options.frame_timing);
         assert_eq!(
             parse_parallelism("serial").unwrap(),
             H264Parallelism::Serial
         );
         assert_eq!(parse_parallelism("auto").unwrap(), H264Parallelism::Auto);
         assert!(parse_parallelism("0").is_err());
+    }
+
+    #[cfg(feature = "frame-timing")]
+    #[test]
+    fn parses_frame_timing_option_once() {
+        let options = parse_arguments(
+            ["--frame-timing", "input.h264"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap();
+        assert!(options.frame_timing);
+        assert!(
+            parse_arguments(
+                ["--frame-timing", "--frame-timing", "input.h264"]
+                    .map(String::from)
+                    .into_iter(),
+            )
+            .is_err()
+        );
     }
 }
