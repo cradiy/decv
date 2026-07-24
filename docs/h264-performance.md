@@ -591,6 +591,17 @@ instructions fell about 1.66%, branches about 2.98%, and all five paired cycle
 samples improved, with the median about 1.0% lower; its wall time remained
 within scheduling noise.
 
+Consecutive staged macroblocks now derive division-based picture coordinates
+only for the first entry and after a real address gap. The common CABAC batch
+advances x/y counters across rows, while a regression test covers both a row
+transition and a non-consecutive address. Five alternating Serial runs reduced
+CABAC instructions about 0.06%, branches about 0.24%, median reference cycles
+about 1.3%, and median wall time about 1.6%. CAVLC's mostly single-entry commit
+path gained about 0.09% instructions but kept slightly lower median cycles and
+wall time. Two-worker `Auto` reference cycles improved about 1.1%; its roughly
+0.12% higher instruction count and wall time remained scheduling-sensitive.
+The tradeoff is accepted for the current CABAC-first target.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
