@@ -823,6 +823,17 @@ reference cycles fell about 1.34% and its wall-time median moved from 2.60 to
 FFmpeg corpora remain byte-exact. The fixed 180-frame benchmark now measures
 1.58 seconds in Serial mode and 1.70 seconds in Auto mode.
 
+B-picture motion state now uses its atomic macroblock lifecycle when rejecting
+duplicate writes. Every successful commit fills all sixteen 4x4 cells and
+every rollback clears all sixteen, so release builds inspect the first cell
+instead of scanning the complete macroblock; debug builds assert the all-full
+or all-empty invariant. Five pinned CABAC Serial pairs reduced reference
+cycles about 0.57%, instructions about 0.22%, and branches about 0.82%. Five
+CAVLC Serial pairs reduced reference cycles about 0.36%, instructions about
+0.25%, and branches about 0.90%. The two-worker `Auto` averages moved in the
+same direction: reference cycles fell about 0.38% and branches about 0.81%.
+A regression test covers duplicate rejection, clear, and re-recording.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

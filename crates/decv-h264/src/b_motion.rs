@@ -787,7 +787,14 @@ impl BMotionState {
             ));
         }
         let start = macroblock_address * 16;
-        if self.cells[start..start + 16].iter().any(Option::is_some) {
+        let recorded = self.cells[start].is_some();
+        debug_assert!(
+            self.cells[start..start + 16]
+                .iter()
+                .all(|cell| cell.is_some() == recorded),
+            "B motion-state macroblocks are recorded atomically"
+        );
+        if recorded {
             return Err(H264Error::InvalidSyntax(
                 "B motion-state macroblock was already recorded",
             ));
@@ -796,6 +803,10 @@ impl BMotionState {
     }
 
     fn commit_local_cells(&mut self, macroblock_address: usize, local: [Option<MotionCell>; 16]) {
+        debug_assert!(
+            local.iter().all(Option::is_some),
+            "completed B macroblocks contain all sixteen motion cells"
+        );
         let start = macroblock_address * 16;
         self.cells[start..start + 16].copy_from_slice(&local);
     }
@@ -1381,6 +1392,27 @@ mod tests {
                 reference_index: 1,
                 motion_vector: MotionVector { x: -1, y: 4 },
             })
+        );
+    }
+
+    #[test]
+    fn completed_macroblock_guard_allows_clear_and_rerecord() {
+        let mut state = BMotionState::new(1, 1).unwrap();
+        state.record_intra_macroblock(0, 1).unwrap();
+        assert_eq!(
+            state.record_intra_macroblock(0, 2),
+            Err(H264Error::InvalidSyntax(
+                "B motion-state macroblock was already recorded"
+            ))
+        );
+
+        state.clear_macroblock(0).unwrap();
+        state.record_intra_macroblock(0, 2).unwrap();
+        assert_eq!(
+            state.clear_macroblock(1),
+            Err(H264Error::InvalidSyntax(
+                "B motion-state macroblock address exceeds the picture"
+            ))
         );
     }
 

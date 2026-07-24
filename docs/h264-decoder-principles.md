@@ -760,6 +760,9 @@ At the checkpoint recorded by this document, the Rust implementation includes:
 - immutable per-4x4 Intra/List-0/List-1 motion fields retained beside each DPB
   reference picture, retaining original list indices and mapping entries back
   to stable reference IDs;
+- B-motion macroblocks commit or clear all sixteen 4x4 cells atomically;
+  duplicate-write checks inspect the first cell in release builds while debug
+  builds assert the complete all-full or all-empty invariant;
 - one-time I420-to-NV12 interleaving into shared immutable CPU plane storage;
   x86-64 dispatches the complete chroma plane once to a 32-sample AVX2 kernel
   when available, otherwise using the SSE2 fallback, keeping feature selection
