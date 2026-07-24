@@ -1023,6 +1023,19 @@ were restored. Validation is not a meaningful part of the 4K motion-
 compensation cost, and duplicating a large prediction entry is worse than its
 few well-predicted guards.
 
+Outlining only the clipped luma and chroma interpolation paths with
+`#[cold]` was tested separately. The normal interior SIMD paths remained
+inlined, while the infrequent scalar edge paths moved out of
+`predict_inter_420_into`; this reduced that hot symbol from about 23.4 KiB to
+18.3 KiB with essentially no total `.text` change. Unit tests and native
+byte-exact CABAC, CAVLC, and 4K outputs passed. Fourteen alternating pinned 4K
+Serial pairs nevertheless increased average reference cycles about 0.71%,
+with only three pairs improving. Instructions fell about 0.30% and sampled
+cache misses about 0.65%, but branches increased about 0.24%. The cold wrappers
+were removed. Without profile-guided layout, shrinking one symbol does not
+justify adding calls and changing branch placement even for a roughly 2% to 4%
+edge case.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
