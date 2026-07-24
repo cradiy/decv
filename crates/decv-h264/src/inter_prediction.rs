@@ -140,6 +140,17 @@ impl Yuv420Picture {
             0,
             u8::from(fractional_chroma_y != 0),
         );
+        #[cfg(feature = "internal-profiling")]
+        crate::profiling::record_inter_prediction(
+            partition.width,
+            partition.height,
+            fractional_motion_x,
+            fractional_motion_y,
+            !luma_is_interior,
+            fractional_chroma_x,
+            fractional_chroma_y,
+            !chroma_is_interior,
+        );
         if chroma_is_interior {
             predict_chroma::<false>(
                 prediction,

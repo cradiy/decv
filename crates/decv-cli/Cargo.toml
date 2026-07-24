@@ -3,6 +3,9 @@ name = "decv-cli"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+internal-profiling = ["decv-h264/internal-profiling"]
+
 [dependencies]
 decv-core = { path = "../decv-core" }
 decv-h264 = { path = "../decv-h264" }

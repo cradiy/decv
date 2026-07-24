@@ -1,0 +1,195 @@
+//! Opt-in counters for selecting whole-decoder optimization targets.
+
+use std::{
+    fmt,
+    sync::atomic::{AtomicU64, Ordering},
+};
+
+const CALLS: usize = 0;
+const LUMA_PIXELS: usize = 1;
+const CHROMA_PIXELS: usize = 2;
+const WIDTH_4: usize = 3;
+const WIDTH_8: usize = 4;
+const WIDTH_16: usize = 5;
+const LUMA_INTEGER_CALLS: usize = 6;
+const LUMA_HORIZONTAL_CALLS: usize = 7;
+const LUMA_VERTICAL_CALLS: usize = 8;
+const LUMA_TWO_DIMENSIONAL_CALLS: usize = 9;
+const LUMA_CLIPPED_CALLS: usize = 10;
+const LUMA_INTEGER_PIXELS: usize = 11;
+const LUMA_HORIZONTAL_PIXELS: usize = 12;
+const LUMA_VERTICAL_PIXELS: usize = 13;
+const LUMA_TWO_DIMENSIONAL_PIXELS: usize = 14;
+const LUMA_CLIPPED_PIXELS: usize = 15;
+const CHROMA_INTEGER_CALLS: usize = 16;
+const CHROMA_BILINEAR_CALLS: usize = 17;
+const CHROMA_CLIPPED_CALLS: usize = 18;
+const CHROMA_INTEGER_PIXELS: usize = 19;
+const CHROMA_BILINEAR_PIXELS: usize = 20;
+const CHROMA_CLIPPED_PIXELS: usize = 21;
+const COUNTER_COUNT: usize = 22;
+
+static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[doc(hidden)]
+pub struct InterPredictionProfile {
+    counters: [u64; COUNTER_COUNT],
+}
+
+impl InterPredictionProfile {
+    fn counter(self, index: usize) -> u64 {
+        self.counters[index]
+    }
+}
+
+impl fmt::Display for InterPredictionProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let calls = self.counter(CALLS);
+        let luma_pixels = self.counter(LUMA_PIXELS);
+        let chroma_pixels = self.counter(CHROMA_PIXELS);
+        writeln!(
+            formatter,
+            "inter prediction: {calls} calls, {luma_pixels} luma pixels, \
+             {chroma_pixels} chroma pixels"
+        )?;
+        writeln!(
+            formatter,
+            "  widths: 4={} 8={} 16={}",
+            self.counter(WIDTH_4),
+            self.counter(WIDTH_8),
+            self.counter(WIDTH_16)
+        )?;
+        writeln!(
+            formatter,
+            "  luma calls: integer={} horizontal={} vertical={} 2d={} clipped={}",
+            self.counter(LUMA_INTEGER_CALLS),
+            self.counter(LUMA_HORIZONTAL_CALLS),
+            self.counter(LUMA_VERTICAL_CALLS),
+            self.counter(LUMA_TWO_DIMENSIONAL_CALLS),
+            self.counter(LUMA_CLIPPED_CALLS)
+        )?;
+        writeln!(
+            formatter,
+            "  luma pixels: integer={} ({:.1}%) horizontal={} ({:.1}%) \
+             vertical={} ({:.1}%) 2d={} ({:.1}%) clipped={} ({:.1}%)",
+            self.counter(LUMA_INTEGER_PIXELS),
+            percent(self.counter(LUMA_INTEGER_PIXELS), luma_pixels),
+            self.counter(LUMA_HORIZONTAL_PIXELS),
+            percent(self.counter(LUMA_HORIZONTAL_PIXELS), luma_pixels),
+            self.counter(LUMA_VERTICAL_PIXELS),
+            percent(self.counter(LUMA_VERTICAL_PIXELS), luma_pixels),
+            self.counter(LUMA_TWO_DIMENSIONAL_PIXELS),
+            percent(self.counter(LUMA_TWO_DIMENSIONAL_PIXELS), luma_pixels),
+            self.counter(LUMA_CLIPPED_PIXELS),
+            percent(self.counter(LUMA_CLIPPED_PIXELS), luma_pixels)
+        )?;
+        writeln!(
+            formatter,
+            "  chroma calls: integer={} bilinear={} clipped={}",
+            self.counter(CHROMA_INTEGER_CALLS),
+            self.counter(CHROMA_BILINEAR_CALLS),
+            self.counter(CHROMA_CLIPPED_CALLS)
+        )?;
+        write!(
+            formatter,
+            "  chroma pixels: integer={} ({:.1}%) bilinear={} ({:.1}%) \
+             clipped={} ({:.1}%)",
+            self.counter(CHROMA_INTEGER_PIXELS),
+            percent(self.counter(CHROMA_INTEGER_PIXELS), chroma_pixels),
+            self.counter(CHROMA_BILINEAR_PIXELS),
+            percent(self.counter(CHROMA_BILINEAR_PIXELS), chroma_pixels),
+            self.counter(CHROMA_CLIPPED_PIXELS),
+            percent(self.counter(CHROMA_CLIPPED_PIXELS), chroma_pixels)
+        )
+    }
+}
+
+fn percent(value: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        value as f64 * 100.0 / total as f64
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_inter_prediction(
+    width: u8,
+    height: u8,
+    luma_fraction_x: u8,
+    luma_fraction_y: u8,
+    luma_clipped: bool,
+    chroma_fraction_x: u8,
+    chroma_fraction_y: u8,
+    chroma_clipped: bool,
+) {
+    let luma_pixels = u64::from(width) * u64::from(height);
+    let chroma_pixels = luma_pixels / 2;
+    increment(CALLS, 1);
+    increment(LUMA_PIXELS, luma_pixels);
+    increment(CHROMA_PIXELS, chroma_pixels);
+    if let Some(width_counter) = match width {
+        4 => Some(WIDTH_4),
+        8 => Some(WIDTH_8),
+        16 => Some(WIDTH_16),
+        _ => None,
+    } {
+        increment(width_counter, 1);
+    }
+
+    let (luma_calls, luma_work) = match (luma_fraction_x, luma_fraction_y) {
+        (0, 0) => (LUMA_INTEGER_CALLS, LUMA_INTEGER_PIXELS),
+        (_, 0) => (LUMA_HORIZONTAL_CALLS, LUMA_HORIZONTAL_PIXELS),
+        (0, _) => (LUMA_VERTICAL_CALLS, LUMA_VERTICAL_PIXELS),
+        (_, _) => (LUMA_TWO_DIMENSIONAL_CALLS, LUMA_TWO_DIMENSIONAL_PIXELS),
+    };
+    increment(luma_calls, 1);
+    increment(luma_work, luma_pixels);
+    if luma_clipped {
+        increment(LUMA_CLIPPED_CALLS, 1);
+        increment(LUMA_CLIPPED_PIXELS, luma_pixels);
+    }
+
+    let (chroma_calls, chroma_work) = if chroma_fraction_x == 0 && chroma_fraction_y == 0 {
+        (CHROMA_INTEGER_CALLS, CHROMA_INTEGER_PIXELS)
+    } else {
+        (CHROMA_BILINEAR_CALLS, CHROMA_BILINEAR_PIXELS)
+    };
+    increment(chroma_calls, 1);
+    increment(chroma_work, chroma_pixels);
+    if chroma_clipped {
+        increment(CHROMA_CLIPPED_CALLS, 1);
+        increment(CHROMA_CLIPPED_PIXELS, chroma_pixels);
+    }
+}
+
+fn increment(index: usize, value: u64) {
+    COUNTERS[index].fetch_add(value, Ordering::Relaxed);
+}
+
+#[doc(hidden)]
+pub fn reset_inter_prediction_profile() {
+    for counter in &COUNTERS {
+        counter.store(0, Ordering::Relaxed);
+    }
+}
+
+#[doc(hidden)]
+pub fn inter_prediction_profile() -> InterPredictionProfile {
+    InterPredictionProfile {
+        counters: std::array::from_fn(|index| COUNTERS[index].load(Ordering::Relaxed)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_profile_formats_without_dividing_by_zero() {
+        let formatted = InterPredictionProfile::default().to_string();
+        assert!(formatted.contains("0 calls"));
+        assert!(formatted.contains("(0.0%)"));
+    }
+}

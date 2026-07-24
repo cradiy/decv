@@ -1195,6 +1195,35 @@ pairs improved. The deblock allocation was removed from the reusable workspace.
 Lower page-fault counts do not justify retaining a larger live allocation when
 the required initialization stores make the primary decode workload slower.
 
+An opt-in `internal-profiling` feature now counts inter-prediction kernel
+shapes and represented pixel work across all reconstruction workers. Build it
+with:
+
+```text
+DECV_NATIVE_TARGET_DIR=/tmp/decv-profile \
+    ./scripts/build_native_release.sh -p decv-cli --features internal-profiling
+```
+
+The feature deliberately uses relaxed atomic counters and prints one summary
+when `decv-cli` exits. It is for path selection, not timing; ordinary builds do
+not compile the counters or their hot-path call. The current native 48-frame
+4K stream produced 2,647,731 prediction calls. Width 16 accounted for
+2,486,419 calls, width 8 for 161,312, and width 4 for none. By represented
+luma pixels, integer motion accounted for 90.4%, horizontal-only fractional
+motion 3.3%, vertical-only 3.5%, two-dimensional fractional motion 2.8%, and
+clipped edge access only 0.4%. Chroma was 82.9% integer and 17.1% bilinear,
+with 0.4% clipped.
+
+The 300-frame 1080p CABAC and CAVLC streams agreed on the priority: integer
+luma motion represented 94.5% and 94.1% of pixels, two-dimensional motion only
+1.9% and 2.0%, and clipping 0.4% in both. Their chroma work was about 93%
+integer and 7% bilinear. These counts reject generic edge padding or another
+two-dimensional AVX2 attempt as the immediate target for this corpus. The
+dominant opportunity is the complete width-16 integer YUV path and its
+surrounding per-partition control overhead; the existing two-dimensional SSE2
+kernel remains appropriate until a materially different workload proves
+otherwise.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

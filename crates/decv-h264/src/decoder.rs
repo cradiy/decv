@@ -44,9 +44,10 @@ struct DpbConfiguration {
 /// Synchronous pure-Rust H.264 decoder implementing the codec-independent
 /// push/pull contract.
 ///
-/// The current reconstruction backend accepts progressive CAVLC I, P, and
-/// explicit non-Direct B pictures. Unsupported H.264 coding tools return
-/// explicit [`H264Error::UnsupportedFeature`] errors.
+/// The current reconstruction backend accepts progressive frame-coded 8-bit
+/// 4:2:0 I, P, and B pictures using CAVLC or CABAC, including spatial and
+/// temporal Direct B modes. Unsupported H.264 coding tools return explicit
+/// [`H264Error::UnsupportedFeature`] errors.
 #[derive(Debug)]
 pub struct H264Decoder {
     configured: bool,

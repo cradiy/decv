@@ -34,6 +34,8 @@ mod picture;
 mod picture_surface;
 mod pps;
 mod prediction;
+#[cfg(feature = "internal-profiling")]
+mod profiling;
 mod quantization;
 mod rbsp;
 mod reconstruction;
@@ -119,6 +121,11 @@ pub use prediction::{
     Intra4x4References, Intra8x8References, Intra16x16References, IntraChroma420References,
     Prediction4x4, Prediction8x8, Prediction16x16, filter_intra_8x8_references, predict_intra_4x4,
     predict_intra_8x8, predict_intra_16x16, predict_intra_chroma_420,
+};
+#[cfg(feature = "internal-profiling")]
+#[doc(hidden)]
+pub use profiling::{
+    InterPredictionProfile, inter_prediction_profile, reset_inter_prediction_profile,
 };
 pub use quantization::{MacroblockQuantizer, MacroblockQuantizerState, derive_chroma_qp};
 pub use rbsp::{consume_rbsp_trailing_bits, decode_rbsp};

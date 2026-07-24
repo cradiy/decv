@@ -33,6 +33,9 @@ struct CliOptions {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    #[cfg(feature = "internal-profiling")]
+    decv_h264::reset_inter_prediction_profile();
+
     let CliOptions {
         input_path: path,
         output_path,
@@ -68,6 +71,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("wrote raw visible NV12 frames to {output_path}");
     }
     println!("decoded {frame_count} frame(s) from {path}");
+    #[cfg(feature = "internal-profiling")]
+    eprintln!("{}", decv_h264::inter_prediction_profile());
     Ok(())
 }
 
