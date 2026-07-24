@@ -1035,7 +1035,7 @@ impl IntraPictureReconstructor {
         let mut previous_qp_delta_nonzero = false;
         let inter_batch_limit = self
             .width_in_macroblocks
-            .checked_mul(4)
+            .checked_mul(8)
             .ok_or(H264Error::IntegerOverflow)?;
         let mut pending_inter = Vec::with_capacity(inter_batch_limit);
 
@@ -1457,7 +1457,7 @@ impl IntraPictureReconstructor {
         let mut decoded_count = 0usize;
         let inter_batch_limit = self
             .width_in_macroblocks
-            .checked_mul(4)
+            .checked_mul(8)
             .ok_or(H264Error::IntegerOverflow)?;
         let mut pending_inter = Vec::with_capacity(inter_batch_limit);
 

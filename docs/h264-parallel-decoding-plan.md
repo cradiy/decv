@@ -181,7 +181,7 @@ does not justify a thread-pool dependency.
 
 Current status: stages 1 through 5 are implemented for CABAC B and P inter
 macroblocks. Syntax, QP, residual transform, Direct motion, and metadata
-derivation remain serial. Four macroblock rows of owned jobs are reconstructed
+derivation remain serial. Eight macroblock rows of owned jobs are reconstructed
 on a decoder-owned persistent pool, results are collected in address order,
 and batch commit validates all addresses before touching the picture.
 Intra/PCM macroblocks flush the pending batch before using current-picture

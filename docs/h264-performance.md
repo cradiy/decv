@@ -913,6 +913,20 @@ measured tradeoff: fourteen Serial pairs increased reference cycles about
 complete kernel is retained for the High Profile CABAC and high-frame-rate
 primary target. Portable and native H.264 and MP4 corpora remain byte-exact.
 
+CABAC P/B reconstruction batches now accumulate up to eight macroblock rows
+instead of four before entering the worker pool and committing staged pixels.
+At 4K this halves the ordinary pool-entry, staging-allocation, and batch
+commit frequency while keeping the serial CABAC state and all intra barriers
+unchanged. Across fourteen pinned two-worker 4K `Auto` pairs, task-clock fell
+about 1.99%, reference cycles about 0.52%, instructions about 0.22%, branches
+about 0.48%, and sampled cache misses about 8.31%; ten pairs improved. Seven
+4K Serial pairs reduced task-clock about 0.89% and reference cycles about
+0.34%, although only three cycle pairs improved. The 1080p CABAC modes were
+cycle-neutral: about -0.01% in Serial and +0.06% in `Auto`. A sixteen-row
+follow-up made all seven 4K `Auto` cycle pairs slower and increased reference
+cycles about 0.89%, so eight rows remain the measured batching sweet spot.
+Serial/Auto CABAC, CAVLC, and 4K outputs remain byte-exact.
+
 Keeping four independent source and destination pointer induction variables
 across those rectangle-copy iterations was tested as a follow-up. It shrank
 the native `predict_inter_420_into` symbol by 307 bytes and reduced
