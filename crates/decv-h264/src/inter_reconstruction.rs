@@ -1054,46 +1054,43 @@ fn apply_prediction_weights_for_list(
 ) -> Result<()> {
     let weights = prediction_weight(table, list1, reference_index)?;
     let luma_default = 1i32 << table.luma_log2_weight_denom;
-    let luma = weights.luma.unwrap_or(WeightOffset {
-        weight: luma_default,
-        offset: 0,
-    });
-    let luma_width = usize::from(prediction.width);
-    weighted_plane(
-        &mut prediction.luma,
-        luma_width,
-        usize::from(prediction.height),
-        luma,
-        table.luma_log2_weight_denom,
-    );
+    if let Some(luma) = weights
+        .luma
+        .filter(|weight| weight.weight != luma_default || weight.offset != 0)
+    {
+        let luma_width = usize::from(prediction.width);
+        weighted_plane(
+            &mut prediction.luma,
+            luma_width,
+            usize::from(prediction.height),
+            luma,
+            table.luma_log2_weight_denom,
+        );
+    }
 
     let chroma_default = 1i32 << table.chroma_log2_weight_denom;
-    let chroma = weights.chroma.unwrap_or([
-        WeightOffset {
-            weight: chroma_default,
-            offset: 0,
-        },
-        WeightOffset {
-            weight: chroma_default,
-            offset: 0,
-        },
-    ]);
-    let chroma_height = usize::from(prediction.height / 2);
-    let chroma_width = usize::from(prediction.width / 2);
-    weighted_plane(
-        &mut prediction.cb,
-        chroma_width,
-        chroma_height,
-        chroma[0],
-        table.chroma_log2_weight_denom,
-    );
-    weighted_plane(
-        &mut prediction.cr,
-        chroma_width,
-        chroma_height,
-        chroma[1],
-        table.chroma_log2_weight_denom,
-    );
+    if let Some(chroma) = weights.chroma {
+        let chroma_height = usize::from(prediction.height / 2);
+        let chroma_width = usize::from(prediction.width / 2);
+        if chroma[0].weight != chroma_default || chroma[0].offset != 0 {
+            weighted_plane(
+                &mut prediction.cb,
+                chroma_width,
+                chroma_height,
+                chroma[0],
+                table.chroma_log2_weight_denom,
+            );
+        }
+        if chroma[1].weight != chroma_default || chroma[1].offset != 0 {
+            weighted_plane(
+                &mut prediction.cr,
+                chroma_width,
+                chroma_height,
+                chroma[1],
+                table.chroma_log2_weight_denom,
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2092,6 +2089,43 @@ mod tests {
         )
         .unwrap();
         assert_eq!(defaulted, reference);
+
+        let mut partially_identity = picture(0);
+        reconstruct_weighted_p_macroblock_from_list_420(
+            &mut partially_identity,
+            &[Some(&reference)],
+            0,
+            0,
+            &ResolvedPMacroblock {
+                skipped: false,
+                partitions: vec![partition(0, 0, 16, 16, 0)].into(),
+            },
+            &zero_residual(),
+            &PredictionWeightTable {
+                luma_log2_weight_denom: 1,
+                chroma_log2_weight_denom: 1,
+                list0: vec![crate::PredictionWeight {
+                    luma: Some(WeightOffset {
+                        weight: 2,
+                        offset: 0,
+                    }),
+                    chroma: Some([
+                        WeightOffset {
+                            weight: 2,
+                            offset: 0,
+                        },
+                        WeightOffset {
+                            weight: 1,
+                            offset: 0,
+                        },
+                    ]),
+                }],
+                list1: Vec::new(),
+            },
+        )
+        .unwrap();
+        let (luma, cb, cr) = partially_identity.planes();
+        assert_eq!((luma[0], cb[0], cr[0]), (40, 41, 21));
     }
 
     #[test]

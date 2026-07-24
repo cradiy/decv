@@ -1529,6 +1529,27 @@ about 0.50%. The PGO resolver body shrank by 86 bytes. The exact
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
 and both generated verification corpora remained byte-exact.
 
+Single-list weighted prediction now skips planes whose decoded operation is
+the identity. An omitted weight and an explicit `(1 << denominator, 0)`
+weight both reproduce every input sample exactly, so luma, Cb, and Cr can be
+checked independently before entering the SIMD loop. The per-component check
+also preserves a non-identity chroma operation when only its sibling uses the
+default weight.
+
+Fifteen native 4K `Auto` pairs reduced mean instructions about 1.73%,
+reference cycles about 1.51%, task-clock about 1.30%, and wall time about
+0.98%; all fifteen instruction and branch pairs improved. After retraining
+the byte-identical mixed PGO profile, thirty 4K `Auto` pairs reduced
+instructions about 2.49%, branches about 3.12%, task-clock about 0.20%, and
+reference cycles about 0.21%, while wall time remained neutral. The optimized
+work is on the serial critical path: twelve PGO 4K `Serial` pairs reduced mean
+wall time about 2.35%, task-clock about 2.80%, reference cycles about 1.99%,
+instructions about 2.46%, and branches about 3.27%. Eleven of twelve
+reference-cycle pairs improved. The main PGO weighting entry point also
+shrunk by about 7.0 KiB, with the less common chroma implementation outlined.
+The exact 597,196,800-byte 4K hash and both generated verification corpora
+remained byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
