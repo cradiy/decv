@@ -136,9 +136,13 @@ rustup component add llvm-tools-preview
 ```
 
 The PGO script builds and trains `decv-cli`, optimizing its complete linked
-dependency graph. PGO and `target-cpu=native` are not API requirements and
-should not be used for a binary intended for unrelated CPUs or unrepresented
-workloads.
+dependency graph. It records the toolchain, flags, parallelism modes, canonical
+input paths, byte lengths, and SHA-256 hashes in
+`target/pgo-data/training-manifest.tsv`. Compare the `input` rows before
+attributing an A/B result to a source change: changing the relative number or
+kind of training frames can change code layout independently. PGO and
+`target-cpu=native` are not API requirements and should not be used for a
+binary intended for unrelated CPUs or unrepresented workloads.
 
 ## Verification
 
