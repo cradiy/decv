@@ -701,6 +701,19 @@ median reference cycles about 0.39%. The implementation was fully reverted;
 AVX2 width alone is not sufficient evidence that an H.264 interpolation
 kernel is faster.
 
+Removing redundant checked `i64` arithmetic from prepared 4x4 inverse scaling
+was tested but not retained. The mathematical bound is valid: an `i32`
+coefficient multiplied by a `u16` level scale and shifted left by at most four
+cannot overflow `i64`, and the final `i32` conversion still catches invalid
+output. The inlined version reduced CABAC Serial median reference cycles about
+0.44% in five runs, but expanded the combined reconstruction symbol from about
+2.6 KiB to 3.0 KiB and made four of five two-worker `Auto` reference-cycle
+samples slower, with its median about 0.81% higher. Outlining the complete
+16-coefficient scaling pass reduced aggregate machine code to about 2.1 KiB
+and whole-decoder instructions about 0.37%, but the added block-level call made
+all five Serial samples slower and increased median reference cycles about
+1.4%. Both variants were fully reverted.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
