@@ -31,7 +31,7 @@ Snapshot environment:
 
 - CPU: AMD Ryzen AI 7 H 350, 8 cores / 16 logical CPUs;
 - FFmpeg 8.1.2;
-- release-mode `decv-cli`;
+- native release-mode `decv-cli` (`-C target-cpu=native`);
 - date: 2026-07-24.
 
 ## Current Results
@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.58 s | 1.49 s | 80,428 KiB | 113.9 FPS |
-| decv Auto (2 workers) | NV12 | 1.70 s | 1.78 s | 79,980 KiB | 105.9 FPS |
-| FFmpeg 1 thread | NV12 | 0.62 s | 0.70 s | 152,272 KiB | 290.3 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.43 s | 281,212 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.56 s | 0.55 s | 95,516 KiB | 321.4 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.94 s | 192,388 KiB | 818.2 FPS |
+| decv Serial | NV12 | 1.41 s | 1.33 s | 80,332 KiB | 127.7 FPS |
+| decv Auto (2 workers) | NV12 | 1.57 s | 1.59 s | 79,996 KiB | 114.6 FPS |
+| FFmpeg 1 thread | NV12 | 0.61 s | 0.68 s | 152,172 KiB | 295.1 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.44 s | 290,248 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,844 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.95 s | 192,328 KiB | 818.2 FPS |
 
 On this workload:
 
-- decv Serial takes about **2.5x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **2.3x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **6.5x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **6.0x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **1.24x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.10x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
   **28%** of FFmpeg Auto NV12 peak RSS;
@@ -62,10 +62,17 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 89.9% throughput headroom over that
-line, and the measured two-worker Auto result has about 76.5%. The ordering
+seconds. The current Serial result has about 112.8% throughput headroom over
+that line, and the measured two-worker Auto result has about 91.1%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
+
+The Serial result represents about 264.7 million luma pixels per second. A
+3840x2160 120 FPS stream represents about 995.3 million luma pixels per
+second, so the current measured pixel throughput is still roughly 3.76x short
+of the 4K120 target. Resolution scaling is not perfectly linear, but this is a
+useful lower-bound checkpoint: 1080p120 is now demonstrated, while 4K120 still
+requires materially faster kernels and broader frame/slice parallelism.
 
 This snapshot includes the removal of repeated by-value copies of the
 544-byte `MacroblockDeblockInfo` value from the deblocking traversal. Passing
@@ -839,8 +846,8 @@ instructions about 0.38%, and branches about 0.46%, with four pairs improving.
 The two-worker `Auto` measurement remained scheduling-sensitive: average
 reference cycles fell about 1.34% and its wall-time median moved from 2.60 to
 2.57 seconds, but only two of five pairs improved. The complete H.264 and MP4
-FFmpeg corpora remain byte-exact. The fixed 180-frame benchmark now measures
-1.58 seconds in Serial mode and 1.70 seconds in Auto mode.
+FFmpeg corpora remain byte-exact. At that checkpoint, the fixed 180-frame
+benchmark measured 1.58 seconds in Serial mode and 1.70 seconds in Auto mode.
 
 B-picture motion state now uses its atomic macroblock lifecycle when rejecting
 duplicate writes. Every successful commit fills all sixteen 4x4 cells and
