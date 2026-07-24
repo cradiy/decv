@@ -942,6 +942,19 @@ inlining boundary traded predictable dispatch for front-end pressure and was
 fully reverted. Coarse DSP dispatch should select substantial kernels, not
 outline small rectangular copies from already hot reconstruction functions.
 
+A 16-lane AVX2 implementation of two-dimensional fractional luma prediction
+was tested against the existing two-chunk SSE2 kernel. It processed a complete
+16-sample row at once, including the 32-bit diagonal-filter intermediate, and
+matched the scalar oracle for all nine two-axis fractional positions and every
+supported partition height. It also passed the native byte-exact H.264 corpus.
+The extra lane packing and 32-bit result reordering grew native `.text` by
+about 8 KiB; seven pinned CABAC Serial pairs increased instructions about
+0.36%, branches about 0.55%, and average reference cycles about 0.54%, with
+only two pairs improving. The AVX2 path was fully reverted. Wider SIMD is only
+useful when its lane layout matches the codec operation without expensive
+cross-lane packing; a DSP backend must keep the narrower SSE2 kernel when that
+is faster.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
