@@ -139,6 +139,9 @@ struct BReconstructionModes<'a> {
     direct: BDirectPrediction<'a>,
 }
 
+// Pending jobs deliberately omit deblocking metadata. It is staged directly
+// in the address-indexed picture storage and becomes observable only when
+// `completed[address]` is set after the pixel batch commits.
 #[derive(Debug)]
 struct PendingBInterMacroblock {
     address: usize,
@@ -146,7 +149,6 @@ struct PendingBInterMacroblock {
     macroblock_y: usize,
     motion: ResolvedBMacroblock,
     residual: Option<ReconstructedInterResidual>,
-    deblock: MacroblockDeblockInfo,
 }
 
 #[derive(Debug)]
@@ -156,7 +158,6 @@ struct PendingPInterMacroblock {
     macroblock_y: usize,
     motion: ResolvedPMacroblock,
     residual: Option<ReconstructedInterResidual>,
-    deblock: MacroblockDeblockInfo,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1084,13 +1085,13 @@ impl IntraPictureReconstructor {
                                 return Err(error);
                             }
                         };
+                        self.deblock[macroblock_address] = deblock;
                         pending_inter.push(PendingPInterMacroblock {
                             address: macroblock_address,
                             macroblock_x,
                             macroblock_y,
                             motion,
                             residual: None,
-                            deblock,
                         });
                         Ok(())
                     }
@@ -1133,13 +1134,13 @@ impl IntraPictureReconstructor {
                                     return Err(error);
                                 }
                             };
+                            self.deblock[macroblock_address] = deblock;
                             pending_inter.push(PendingPInterMacroblock {
                                 address: macroblock_address,
                                 macroblock_x,
                                 macroblock_y,
                                 motion,
                                 residual: Some(reconstructed),
-                                deblock,
                             });
                             Ok(())
                         }
@@ -1512,13 +1513,13 @@ impl IntraPictureReconstructor {
                                 return Err(error);
                             }
                         };
+                        self.deblock[macroblock_address] = deblock;
                         pending_inter.push(PendingBInterMacroblock {
                             address: macroblock_address,
                             macroblock_x,
                             macroblock_y,
                             motion,
                             residual: None,
-                            deblock,
                         });
                         Ok(())
                     }
@@ -1578,13 +1579,13 @@ impl IntraPictureReconstructor {
                                     return Err(error);
                                 }
                             };
+                            self.deblock[macroblock_address] = deblock;
                             pending_inter.push(PendingBInterMacroblock {
                                 address: macroblock_address,
                                 macroblock_x,
                                 macroblock_y,
                                 motion,
                                 residual: Some(reconstructed),
-                                deblock,
                             });
                             Ok(())
                         }
@@ -2017,7 +2018,7 @@ impl IntraPictureReconstructor {
             return Err(error);
         }
         for job in jobs.iter() {
-            self.complete_inter_macroblock(job.address, job.deblock);
+            self.completed[job.address] = true;
         }
         jobs.clear();
         Ok(())
@@ -2121,7 +2122,7 @@ impl IntraPictureReconstructor {
             return Err(error);
         }
         for job in jobs.iter() {
-            self.complete_inter_macroblock(job.address, job.deblock);
+            self.completed[job.address] = true;
         }
         jobs.clear();
         Ok(())
