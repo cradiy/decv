@@ -643,6 +643,18 @@ cycles about 0.50%; CAVLC median cycles likewise fell about 0.51%. `Auto`
 instructions fell about 0.17% and branches about 0.34%, while its 0.06% higher
 median cycles remained within thread-scheduling noise.
 
+For machine-local deployments, `./scripts/build_native_release.sh` produces an
+opt-in `target/native/release/decv-cli` using `-C target-cpu=native`. The normal
+release build remains portable; the native binary must not be copied to CPUs
+that lack the build machine's instruction-set features. On the Ryzen AI 7 H
+350, five alternating native-versus-portable CABAC Serial runs reduced
+instructions about 8.5%, branches about 4.8%, and median reference cycles about
+4.5%, with every native cycle sample faster. CAVLC instructions fell about
+9.0%, branches about 7.7%, and cycles about 1.5%. Two-worker `Auto`
+instructions fell about 8.2%, branches about 4.4%, and cycles about 3.3%.
+All CAVLC and `Auto` cycle samples improved, and the native binary passed the
+complete byte-exact FFmpeg stream corpus via `DECV_VERIFY_BIN`.
+
 After LTO, `predict_inter_420_into` contains the specialized luma and chroma
 kernels and is roughly 21.3 KiB. Forcing both kernels out of line reduced the
 combined machine code by about 1.6 KiB, but added two calls per predicted
