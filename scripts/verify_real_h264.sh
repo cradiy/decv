@@ -4,6 +4,12 @@ set -euo pipefail
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
+decoder_bin="${DECV_VERIFY_BIN:-}"
+
+if [[ -n "$decoder_bin" && ! -x "$decoder_bin" ]]; then
+    echo "DECV_VERIFY_BIN must name an executable decoder binary" >&2
+    exit 2
+fi
 
 command -v ffmpeg >/dev/null || {
     echo "ffmpeg is required" >&2
@@ -14,6 +20,14 @@ ffmpeg -hide_banner -encoders 2>/dev/null | grep -q 'libx264' || {
     exit 1
 }
 
+run_decoder() {
+    if [[ -n "$decoder_bin" ]]; then
+        "$decoder_bin" "$@"
+    else
+        cargo run --quiet --manifest-path "$repo_dir/Cargo.toml" -p decv-cli -- "$@"
+    fi
+}
+
 verify_stream() {
     local name="$1"
     local input="$work_dir/$name.h264"
@@ -22,8 +36,7 @@ verify_stream() {
 
     ffmpeg -hide_banner -loglevel error \
         -i "$input" -pix_fmt nv12 -f rawvideo -y "$reference"
-    cargo run --quiet --manifest-path "$repo_dir/Cargo.toml" -p decv-cli -- \
-        "$input" "$actual" >/dev/null
+    run_decoder "$input" "$actual" >/dev/null
     cmp "$reference" "$actual"
     echo "$name: byte-exact NV12 match"
 }
@@ -117,7 +130,7 @@ ffmpeg -hide_banner -loglevel error \
 ffmpeg -hide_banner -loglevel error \
     -i "$work_dir/size-b.h264" -pix_fmt nv12 -f rawvideo \
     -y "$work_dir/size-b.ffmpeg.nv12"
-cargo run --quiet --manifest-path "$repo_dir/Cargo.toml" -p decv-cli -- \
+run_decoder \
     "$work_dir/size-change.h264" "$work_dir/size-change.decv.nv12" \
     >"$work_dir/size-change.log"
 
