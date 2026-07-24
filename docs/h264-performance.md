@@ -896,6 +896,15 @@ reference cycles increased about 0.24% and branch misses increased. The
 checked lookup was restored because removing this validation changed layout
 without shortening the arithmetic dependency path.
 
+Replacing release-mode B-partition geometry checks with debug assertions in
+both deblocking-metadata builders was also rejected. The partitions are
+already produced by validated motion-state code, and the change shrank each
+builder by about 0.5 KiB and total native `.text` by about 1 KiB. Fourteen
+pinned CABAC Serial pairs nevertheless increased average reference cycles
+about 0.29%, task-clock about 1.39%, and branch misses about 0.48%; removing
+roughly 0.15% of instructions and branches did not help. The well-predicted
+release checks were restored.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
