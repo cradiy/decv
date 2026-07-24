@@ -534,16 +534,27 @@ impl PreparedInverseScale4x4 {
         residual: &mut Block4x4,
     ) -> Result<()> {
         let coefficients = inverse_scan_4x4(values, scan_mode);
-        let scaled = self.scale(&coefficients, preserve_dc)?;
+        let mut scaled = [[0; 4]; 4];
+        self.scale_into(&coefficients, preserve_dc, &mut scaled)?;
         inverse_transform_4x4_into(&scaled, residual)
     }
 
     fn scale(&self, coefficients: &Block4x4, preserve_dc: bool) -> Result<Block4x4> {
-        let mut scaled = [[0; 4]; 4];
+        let mut output = [[0; 4]; 4];
+        self.scale_into(coefficients, preserve_dc, &mut output)?;
+        Ok(output)
+    }
+
+    fn scale_into(
+        &self,
+        coefficients: &Block4x4,
+        preserve_dc: bool,
+        output: &mut Block4x4,
+    ) -> Result<()> {
         for row in 0..4 {
             for column in 0..4 {
                 if preserve_dc && row == 0 && column == 0 {
-                    scaled[row][column] = coefficients[row][column];
+                    output[row][column] = coefficients[row][column];
                     continue;
                 }
 
@@ -561,11 +572,11 @@ impl PreparedInverseScale4x4 {
                         .ok_or(H264Error::IntegerOverflow)?)
                         >> self.shift
                 };
-                scaled[row][column] =
+                output[row][column] =
                     i32::try_from(value).map_err(|_| H264Error::IntegerOverflow)?;
             }
         }
-        Ok(scaled)
+        Ok(())
     }
 }
 
