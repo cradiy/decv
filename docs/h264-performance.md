@@ -1327,6 +1327,21 @@ mean wall time about 1.31% and task-clock about 0.61%. After PGO, six of nine
 pairs improved; mean wall time fell about 0.76%, task-clock about 0.93%, and
 reference cycles about 1.29%, with sampled cache misses effectively unchanged.
 
+Three scopes of CABAC partition-allocation removal were tested and rejected.
+Inlining the private P/B partition plans and their sub-partition lists with
+four-entry `SmallVec`s made nine native 4K four-worker pairs about 0.93% slower
+in wall time and 0.41% higher in task-clock, despite reducing reference cycles
+about 0.40%. Extending inline storage to the decoded motion headers, first at
+the four-entry maximum and then at one- or two-entry common capacities, did not
+produce a repeatable 4K gain because the larger values changed stack, boxed
+macroblock, and cache behavior. The narrowest version only inlined the
+usually-single motion-vector-difference lists. On a stable 600-frame 1080p
+CABAC run it reduced instructions about 0.19%, branches about 0.30%, and
+sampled cache misses about 1.14%, but changed wall time by only -0.07% and
+task-clock by -0.04%; 4K measurements did not retain that direction. That
+negligible result does not justify changing the public motion-header field
+types, so all three versions were reverted.
+
 Large CABAC non-reference pictures now complete through a bounded cross-frame
 pipeline when a reconstruction pool is active. Picture completeness and the
 discarded reference-motion field are validated synchronously. Deblocking and
