@@ -1036,6 +1036,21 @@ were removed. Without profile-guided layout, shrinking one symbol does not
 justify adding calls and changing branch placement even for a roughly 2% to 4%
 edge case.
 
+Implicit B prediction was also tested with its existing SSE2 weighting kernel
+writing directly into the destination macroblock instead of updating the
+List-0 scratch plane and then copying the finished partition. The 4K workload
+uses `weighted_bipred_idc=2`, so this removes an intermediate write and the
+following luma/chroma row copies from a common path. Offset-destination SIMD
+tests and native Serial/Auto CABAC, CAVLC, and 4K output comparisons were
+byte-exact. Fourteen pinned 4K Serial pairs reduced instructions about 2.26%
+and branches about 5.76%; the B reconstruction symbol also shrank by about 396
+bytes. Reference cycles and task-clock nevertheless increased about 1.1%,
+with only six pairs improving. The original contiguous scratch write followed
+by fixed-width copies was restored. On this CPU, that store pattern schedules
+better than writing the weighted result directly across destination strides;
+removing instructions is not sufficient when it lengthens the pixel-data
+dependency chain.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
