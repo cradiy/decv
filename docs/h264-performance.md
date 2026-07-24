@@ -886,6 +886,16 @@ CABAC Serial pairs nevertheless increased average reference cycles about
 pointers harmed the surrounding register allocation enough to outweigh the
 smaller loop, so this variant was fully reverted.
 
+Extending the CABAC residual checked/internal split from state recording to
+`coded_block_flag` context lookup was tested and rejected. The internal path
+could rely on the already validated macroblock and normative block identifier,
+shrinking its coefficient-block symbol by 129 bytes and reducing
+whole-decoder instructions about 0.12% and branches about 0.36%. Across
+fourteen pinned CABAC Serial pairs, however, exactly seven improved; average
+reference cycles increased about 0.24% and branch misses increased. The
+checked lookup was restored because removing this validation changed layout
+without shortening the arithmetic dependency path.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
