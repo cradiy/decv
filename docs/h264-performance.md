@@ -1495,6 +1495,22 @@ PGO, seven of nine wall-time pairs improved. Mean wall time fell about 1.85%,
 task-clock about 1.10%, and reference cycles about 1.05%. The exact 4K hash and
 both generated verification corpora remained unchanged.
 
+Spatial Direct neighbour lookup now consumes the macroblock coordinates that
+the caller already validated instead of deriving them from the address a
+second time. This removes the remaining hot integer division from full
+macroblock Spatial Direct resolution. The native resolver shrank by 40 bytes,
+although eleven native 4K `Auto` pairs were timing-neutral and do not support
+a portable-build throughput claim.
+
+With the mixed PGO training counts held byte-for-byte equal to the preceding
+baseline, ten of fifteen fixed-CPU 4K `Auto` wall-time pairs improved. Mean
+wall time fell about 0.95%, task-clock about 0.92%, reference cycles about
+0.35%, instructions about 0.12%, and branches about 0.16%. The inlined PGO
+Direct resolver shrank by 45 bytes. The exact 597,196,800-byte 4K output
+retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+and both generated verification corpora remained byte-exact.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

@@ -266,7 +266,12 @@ impl BMotionState {
             height: 16,
             macroblock_partition_index: 0,
         };
-        let neighbour_cells = self.full_macroblock_neighbour_cells(macroblock_address, slice_id);
+        let neighbour_cells = self.full_macroblock_neighbour_cells_at(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            slice_id,
+        );
         let (neighbours_l0, neighbours_l1) = neighbour_motion_lists(neighbour_cells);
         let mut reference_l0 = spatial_direct_reference_index_from(neighbours_l0);
         let mut reference_l1 = spatial_direct_reference_index_from(neighbours_l1);
@@ -799,13 +804,17 @@ impl BMotionState {
         ]
     }
 
-    fn full_macroblock_neighbour_cells(
+    fn full_macroblock_neighbour_cells_at(
         &self,
         macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
         slice_id: u32,
     ) -> [Option<MotionCell>; 4] {
-        let macroblock_x = macroblock_address % self.width_in_macroblocks;
-        let macroblock_y = macroblock_address / self.width_in_macroblocks;
+        debug_assert_eq!(
+            macroblock_address,
+            macroblock_y * self.width_in_macroblocks + macroblock_x
+        );
         let same_slice = |cell: Option<MotionCell>| cell.filter(|cell| cell.slice_id == slice_id);
         let left = (macroblock_x > 0)
             .then(|| self.cells[(macroblock_address - 1) * 16 + 3])
