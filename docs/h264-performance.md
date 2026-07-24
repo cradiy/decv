@@ -769,6 +769,16 @@ eight shaved roughly another 0.02% of instructions, but added branches through
 the surrounding dispatch and weakened five-run CABAC median reference-cycle
 improvement to about 0.07%. That extra width branch was not retained.
 
+A complete YUV420 implicit-biprediction SSE2 entry that shared weight-vector
+setup across luma, Cb, and Cr was tested and rejected. It reduced
+whole-decoder instructions about 0.10% and branches about 0.19%. Seven CABAC
+Serial runs put median reference cycles about 0.10% lower, with four pairs
+improving, but five `Auto` runs increased the median about 0.53% and five CAVLC
+runs increased it about 0.57%; each of those workloads improved only one of
+five pairs. The wrapper around the already inlined plane kernels was fully
+reverted. A future DSP entry must fuse more than shared SIMD constant setup to
+amortize a full-YUV dispatch boundary.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
