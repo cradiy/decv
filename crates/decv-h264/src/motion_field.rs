@@ -79,16 +79,31 @@ pub(crate) struct MotionFieldBuilder {
 
 impl MotionFieldBuilder {
     pub(crate) fn new(coded_size: Size) -> Result<Self> {
+        Self::new_with_retention(coded_size, true)
+    }
+
+    pub(crate) fn new_discarding(coded_size: Size) -> Result<Self> {
+        Self::new_with_retention(coded_size, false)
+    }
+
+    fn new_with_retention(coded_size: Size, retain_cells: bool) -> Result<Self> {
         let (width, height) = field_dimensions(coded_size)?;
         let count = width
             .checked_mul(height)
             .ok_or(H264Error::IntegerOverflow)?;
-        let mut cells = Vec::with_capacity(count);
-        // SAFETY: `MaybeUninit<MotionFieldCell>` may hold uninitialized bytes.
-        // No cell is read before its macroblock is recorded, and `finish`
-        // proves every macroblock complete before converting the allocation.
-        unsafe {
-            cells.set_len(count);
+        let mut cells = if retain_cells {
+            Vec::with_capacity(count)
+        } else {
+            Vec::new()
+        };
+        if retain_cells {
+            // SAFETY: `MaybeUninit<MotionFieldCell>` may hold uninitialized
+            // bytes. No cell is read before its macroblock is recorded, and
+            // `finish` proves every macroblock complete before converting the
+            // allocation.
+            unsafe {
+                cells.set_len(count);
+            }
         }
         Ok(Self {
             width_in_macroblocks: width / 4,
@@ -107,6 +122,15 @@ impl MotionFieldBuilder {
         motion: &ResolvedPMacroblock,
         reference_ids_l0: Option<&[Option<ReferenceId>]>,
     ) -> Result<()> {
+        if self.cells.is_empty() {
+            return self.record_discarded_inter_macroblock(
+                macroblock_address,
+                motion
+                    .partitions
+                    .iter()
+                    .map(|partition| (partition.x, partition.y, partition.width, partition.height)),
+            );
+        }
         if let [partition] = motion.partitions.as_slice()
             && is_full_macroblock_partition(
                 partition.x,
@@ -168,6 +192,15 @@ impl MotionFieldBuilder {
         reference_ids_l0: Option<&[Option<ReferenceId>]>,
         reference_ids_l1: Option<&[Option<ReferenceId>]>,
     ) -> Result<()> {
+        if self.cells.is_empty() {
+            return self.record_discarded_inter_macroblock(
+                macroblock_address,
+                motion
+                    .partitions
+                    .iter()
+                    .map(|partition| (partition.x, partition.y, partition.width, partition.height)),
+            );
+        }
         if let [partition] = motion.partitions.as_slice()
             && is_full_macroblock_partition(
                 partition.x,
@@ -246,11 +279,21 @@ impl MotionFieldBuilder {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn finish(self) -> Result<ReferenceMotionField> {
+        self.finish_optional()?.ok_or(H264Error::InvalidSyntax(
+            "reference motion field was not retained",
+        ))
+    }
+
+    pub(crate) fn finish_optional(self) -> Result<Option<ReferenceMotionField>> {
         if self.completed.contains(&0) {
             return Err(H264Error::InvalidSyntax(
                 "reference motion field is incomplete",
             ));
+        }
+        if self.cells.is_empty() {
+            return Ok(None);
         }
         let mut cells = ManuallyDrop::new(self.cells);
         let cell_len = cells.len();
@@ -266,11 +309,11 @@ impl MotionFieldBuilder {
                 cell_capacity,
             )
         };
-        Ok(ReferenceMotionField {
+        Ok(Some(ReferenceMotionField {
             width_in_4x4_blocks: self.width_in_macroblocks * 4,
             height_in_4x4_blocks: cells.len() / (self.width_in_macroblocks * 4),
             cells,
-        })
+        }))
     }
 
     fn record_complete_inter_macroblock(
@@ -287,19 +330,49 @@ impl MotionFieldBuilder {
         self.record_macroblock(macroblock_address, cells)
     }
 
+    fn record_discarded_inter_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        partitions: impl Iterator<Item = (u8, u8, u8, u8)>,
+    ) -> Result<()> {
+        let mut coverage = 0u16;
+        for (x, y, width, height) in partitions {
+            let partition = partition_mask(x, y, width, height)?;
+            if coverage & partition != 0 {
+                return Err(H264Error::InvalidSyntax(
+                    "motion partitions overlap in the 4x4 field",
+                ));
+            }
+            coverage |= partition;
+        }
+        if coverage != u16::MAX {
+            return Err(H264Error::InvalidSyntax(
+                "motion partitions do not cover the macroblock",
+            ));
+        }
+        self.record_uniform_macroblock(macroblock_address, MotionFieldCell::INTRA)
+    }
+
     fn record_macroblock(
         &mut self,
         macroblock_address: usize,
         local: [MotionFieldCell; 16],
     ) -> Result<()> {
-        let indices = self.macroblock_indices(macroblock_address)?;
+        if macroblock_address >= self.completed.len() {
+            return Err(H264Error::InvalidSyntax(
+                "reference motion-field macroblock exceeds the picture",
+            ));
+        }
         if self.completed[macroblock_address] != 0 {
             return Err(H264Error::InvalidSyntax(
                 "reference motion-field macroblock was already recorded",
             ));
         }
-        for (index, cell) in indices.into_iter().zip(local) {
-            self.cells[index].write(cell);
+        if !self.cells.is_empty() {
+            let indices = self.macroblock_indices(macroblock_address)?;
+            for (index, cell) in indices.into_iter().zip(local) {
+                self.cells[index].write(cell);
+            }
         }
         self.completed[macroblock_address] = 1;
         Ok(())
@@ -310,7 +383,7 @@ impl MotionFieldBuilder {
         macroblock_address: usize,
         cell: MotionFieldCell,
     ) -> Result<()> {
-        let macroblock_count = self.cells.len() / 16;
+        let macroblock_count = self.completed.len();
         if macroblock_address >= macroblock_count {
             return Err(H264Error::InvalidSyntax(
                 "reference motion-field macroblock exceeds the picture",
@@ -321,14 +394,16 @@ impl MotionFieldBuilder {
                 "reference motion-field macroblock was already recorded",
             ));
         }
-        let macroblock_x = macroblock_address % self.width_in_macroblocks;
-        let macroblock_y = macroblock_address / self.width_in_macroblocks;
-        let field_width = self.width_in_macroblocks * 4;
-        let first = macroblock_y * 4 * field_width + macroblock_x * 4;
-        for row in 0..4 {
-            let row_start = first + row * field_width;
-            for destination in &mut self.cells[row_start..row_start + 4] {
-                destination.write(cell);
+        if !self.cells.is_empty() {
+            let macroblock_x = macroblock_address % self.width_in_macroblocks;
+            let macroblock_y = macroblock_address / self.width_in_macroblocks;
+            let field_width = self.width_in_macroblocks * 4;
+            let first = macroblock_y * 4 * field_width + macroblock_x * 4;
+            for row in 0..4 {
+                let row_start = first + row * field_width;
+                for destination in &mut self.cells[row_start..row_start + 4] {
+                    destination.write(cell);
+                }
             }
         }
         self.completed[macroblock_address] = 1;
@@ -336,7 +411,7 @@ impl MotionFieldBuilder {
     }
 
     fn macroblock_indices(&self, macroblock_address: usize) -> Result<[usize; 16]> {
-        let macroblock_count = self.cells.len() / 16;
+        let macroblock_count = self.completed.len();
         if macroblock_address >= macroblock_count {
             return Err(H264Error::InvalidSyntax(
                 "reference motion-field macroblock exceeds the picture",
@@ -378,6 +453,23 @@ fn fill_partition(
     height: u8,
     value: MotionFieldCell,
 ) -> Result<()> {
+    let partition = partition_mask(x, y, width, height)?;
+    if *coverage & partition != 0 {
+        return Err(H264Error::InvalidSyntax(
+            "motion partitions overlap in the 4x4 field",
+        ));
+    }
+    *coverage |= partition;
+    for cell_y in y / 4..(y + height) / 4 {
+        for cell_x in x / 4..(x + width) / 4 {
+            let index = usize::from(cell_y * 4 + cell_x);
+            cells[index] = value;
+        }
+    }
+    Ok(())
+}
+
+fn partition_mask(x: u8, y: u8, width: u8, height: u8) -> Result<u16> {
     if !x.is_multiple_of(4)
         || !y.is_multiple_of(4)
         || !width.is_multiple_of(4)
@@ -389,20 +481,14 @@ fn fill_partition(
             "motion partition is not aligned to the 4x4 field",
         ));
     }
+    let mut mask = 0u16;
     for cell_y in y / 4..(y + height) / 4 {
         for cell_x in x / 4..(x + width) / 4 {
             let index = usize::from(cell_y * 4 + cell_x);
-            let bit = 1u16 << index;
-            if *coverage & bit != 0 {
-                return Err(H264Error::InvalidSyntax(
-                    "motion partitions overlap in the 4x4 field",
-                ));
-            }
-            cells[index] = value;
-            *coverage |= bit;
+            mask |= 1u16 << index;
         }
     }
-    Ok(())
+    Ok(mask)
 }
 
 #[cfg(test)]
@@ -524,6 +610,56 @@ mod tests {
         assert!(!cell.intra);
         assert_eq!(cell.list0.unwrap().reference_id, Some(ReferenceId::new(9)));
         assert_eq!(cell.list0.unwrap().vector, MotionVector { x: 3, y: -2 });
+    }
+
+    #[test]
+    fn discarding_builder_preserves_validation_without_retaining_cells() {
+        let mut builder = MotionFieldBuilder::new_discarding(Size::new(32, 16)).unwrap();
+        builder.record_intra(0).unwrap();
+        builder
+            .record_p(
+                1,
+                &ResolvedPMacroblock {
+                    skipped: false,
+                    partitions: vec![ResolvedPPartition {
+                        x: 0,
+                        y: 0,
+                        width: 16,
+                        height: 16,
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: 3, y: -2 },
+                    }],
+                },
+                Some(&[Some(ReferenceId::new(9))]),
+            )
+            .unwrap();
+        assert!(builder.finish_optional().unwrap().is_none());
+
+        let mut duplicate = MotionFieldBuilder::new_discarding(Size::new(16, 16)).unwrap();
+        duplicate.record_intra(0).unwrap();
+        assert!(duplicate.record_intra(0).is_err());
+
+        let mut incomplete = MotionFieldBuilder::new_discarding(Size::new(16, 16)).unwrap();
+        assert!(
+            incomplete
+                .record_p(
+                    0,
+                    &ResolvedPMacroblock {
+                        skipped: false,
+                        partitions: vec![ResolvedPPartition {
+                            x: 0,
+                            y: 0,
+                            width: 8,
+                            height: 16,
+                            reference_index: 0,
+                            motion_vector: MotionVector::default(),
+                        }],
+                    },
+                    None,
+                )
+                .is_err()
+        );
+        assert!(incomplete.finish_optional().is_err());
     }
 
     #[test]

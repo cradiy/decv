@@ -270,6 +270,7 @@ impl IntraPictureReconstructor {
             constrained_intra_prediction,
             ReconstructionExecutor::serial(),
             None,
+            true,
         )
     }
 
@@ -280,6 +281,7 @@ impl IntraPictureReconstructor {
         constrained_intra_prediction: bool,
         reconstruction_executor: ReconstructionExecutor,
         reusable_b_motion: Option<BMotionState>,
+        retain_reference_motion: bool,
     ) -> Result<Self> {
         let picture = Yuv420Picture::new(coded_size)?;
         let width_in_macroblocks =
@@ -295,6 +297,11 @@ impl IntraPictureReconstructor {
         } else {
             BMotionState::new(width_in_macroblocks, height_in_macroblocks)?
         };
+        let reference_motion = if retain_reference_motion {
+            MotionFieldBuilder::new(coded_size)?
+        } else {
+            MotionFieldBuilder::new_discarding(coded_size)?
+        };
         Ok(Self {
             width_in_macroblocks,
             picture,
@@ -303,7 +310,7 @@ impl IntraPictureReconstructor {
             modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
             motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
             b_motion,
-            reference_motion: MotionFieldBuilder::new(coded_size)?,
+            reference_motion,
             completed: vec![false; macroblock_count],
             deblock: vec![MacroblockDeblockInfo::default(); macroblock_count],
             deblock_reference_addresses: [0; 32],
@@ -329,6 +336,7 @@ impl IntraPictureReconstructor {
             parameter_sets,
             reconstruction_executor,
             None,
+            true,
         )
     }
 
@@ -336,6 +344,7 @@ impl IntraPictureReconstructor {
         parameter_sets: &ActiveParameterSets,
         reconstruction_executor: ReconstructionExecutor,
         reusable_b_motion: Option<BMotionState>,
+        retain_reference_motion: bool,
     ) -> Result<Self> {
         let sps = &parameter_sets.sequence;
         let pps = &parameter_sets.picture;
@@ -354,6 +363,7 @@ impl IntraPictureReconstructor {
             pps.constrained_intra_prediction,
             reconstruction_executor,
             reusable_b_motion,
+            retain_reference_motion,
         )
     }
 
@@ -2466,15 +2476,26 @@ impl IntraPictureReconstructor {
     }
 
     pub(crate) fn into_deblocked_reference_picture_with_reusable_b_motion(
-        mut self,
+        self,
     ) -> Result<(Yuv420Picture, ReferenceMotionField, BMotionState)> {
+        let (picture, motion, b_motion) =
+            self.into_deblocked_picture_with_optional_reference_motion()?;
+        let motion = motion.ok_or(H264Error::InvalidSyntax(
+            "reference motion field was not retained",
+        ))?;
+        Ok((picture, motion, b_motion))
+    }
+
+    pub(crate) fn into_deblocked_picture_with_optional_reference_motion(
+        mut self,
+    ) -> Result<(Yuv420Picture, Option<ReferenceMotionField>, BMotionState)> {
         if self.completed.iter().any(|&completed| !completed) {
             return Err(H264Error::InvalidSyntax(
                 "cannot output an incomplete reconstructed picture",
             ));
         }
         filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
-        let motion = self.reference_motion.finish()?;
+        let motion = self.reference_motion.finish_optional()?;
         Ok((self.picture, motion, self.b_motion))
     }
 

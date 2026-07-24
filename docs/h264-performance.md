@@ -1264,6 +1264,28 @@ profile grew native `.text` about 11.4%. PGO is therefore an effective
 throughput build mode, not a replacement for portable release binaries or
 representative cross-workload validation.
 
+Non-reference pictures now use a validation-only reference-motion builder.
+Motion state is still needed while reconstructing the current picture, but its
+finalized reference-motion field is never stored in the decoded picture buffer
+and cannot be used as colocated motion by a later picture. The builder retains
+macroblock-completion, duplicate-write, partition-alignment, overlap, and
+coverage checks while omitting the final 4x4-cell allocation and writes.
+Reference pictures retain the original field unchanged. At the 3840x2176
+coded size, this removes a roughly 17.9 MiB picture-local allocation from each
+non-reference picture.
+
+Seven alternating pinned 4K Serial pairs all improved: average task-clock fell
+about 2.56%, reference cycles about 4.36%, and sampled cache misses about
+7.93%. Instructions increased about 0.21% and branches about 0.76% because the
+discarding path still validates partition coverage; avoiding the memory
+traffic was nevertheless a stable net win. Five 4K four-worker pairs reduced
+task-clock about 1.87%, reference cycles about 3.14%, and sampled cache misses
+about 5.91%. Five 1080p CABAC Serial pairs reduced task-clock about 3.47% and
+reference cycles about 4.92%; five CAVLC pairs reduced them about 5.18% and
+4.47%. Minor-fault direction varied by workload, so it is not treated as a
+reliable benefit. The full H.264 unit suite, strict H.264 Clippy, generated
+byte-exact corpus, and 48-frame 4K FFmpeg hash all passed.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.

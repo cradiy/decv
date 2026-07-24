@@ -189,6 +189,7 @@ impl H264Decoder {
                                 .expect("configure initializes the reconstruction executor")
                                 .clone(),
                             self.reusable_b_motion.take(),
+                            nal_header.nal_ref_idc != 0,
                         )?;
                     self.current_picture = Some(PendingPicture {
                         reconstructor,
@@ -422,12 +423,14 @@ impl H264Decoder {
         };
         let (decoded, motion, reusable_b_motion) = picture
             .reconstructor
-            .into_deblocked_reference_picture_with_reusable_b_motion()?;
+            .into_deblocked_picture_with_optional_reference_motion()?;
         self.reusable_b_motion = Some(reusable_b_motion);
         let decoded = Arc::new(decoded);
-        let motion = Arc::new(motion);
         let frame = decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format)?;
         if picture.nal_header.nal_ref_idc != 0 {
+            let motion = Arc::new(motion.ok_or(H264Error::InvalidSyntax(
+                "reference picture has no retained motion field",
+            ))?);
             let picture_order_count = picture.picture_order_count.stored.picture_order_count();
             let dpb = self
                 .dpb
