@@ -370,13 +370,19 @@ impl<'data> CabacDecoder<'data> {
     #[inline]
     pub fn decode_bypass(&mut self) -> Result<u8> {
         let bit = self.reader.read_bit().ok_or(H264Error::UnexpectedEof)?;
-        self.offset = (self.offset << 1) | u16::from(bit);
-        if self.offset < self.range {
-            Ok(0)
+        // Keep the arithmetic state local until the bin is known. Besides
+        // preserving the EOF-before-commit rule, this lets optimized builds
+        // lower the unpredictable comparison to a conditional selection.
+        let range = self.range;
+        let mut offset = (self.offset << 1) | u16::from(bit);
+        let bin = if offset < range {
+            0
         } else {
-            self.offset -= self.range;
-            Ok(1)
-        }
+            offset -= range;
+            1
+        };
+        self.offset = offset;
+        Ok(bin)
     }
 
     /// Decodes `end_of_slice_flag` using the fixed termination probability.

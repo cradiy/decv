@@ -40,18 +40,18 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.63 s | 1.55 s | 80,288 KiB | 110.4 FPS |
-| decv Auto (2 workers) | NV12 | 1.79 s | 1.87 s | 79,832 KiB | 100.6 FPS |
-| FFmpeg 1 thread | NV12 | 0.62 s | 0.71 s | 152,312 KiB | 290.3 FPS |
-| FFmpeg Auto | NV12 | 0.26 s | 1.40 s | 287,260 KiB | 692.3 FPS |
-| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,440 KiB | 315.8 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.96 s | 189,308 KiB | 818.2 FPS |
+| decv Serial | NV12 | 1.60 s | 1.51 s | 80,320 KiB | 112.5 FPS |
+| decv Auto (2 workers) | NV12 | 1.73 s | 1.83 s | 79,892 KiB | 104.0 FPS |
+| FFmpeg 1 thread | NV12 | 0.61 s | 0.68 s | 152,224 KiB | 295.1 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.40 s | 290,316 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.56 s | 95,544 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.94 s | 192,172 KiB | 818.2 FPS |
 
 On this workload:
 
 - decv Serial takes about **2.6x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **6.9x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **6.7x** as much wall time as FFmpeg Auto when both
   produce NV12;
 - decv Auto does about **1.3x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 84.0% throughput headroom over that
-line, and the measured two-worker Auto result has about 67.6%. The ordering
+seconds. The current Serial result has about 87.5% throughput headroom over that
+line, and the measured two-worker Auto result has about 73.3%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -656,8 +656,8 @@ All CAVLC and `Auto` cycle samples improved, and the native binary passed the
 complete byte-exact FFmpeg stream corpus via `DECV_VERIFY_BIN`.
 
 The fixed comparison script accepts an already built decoder through
-`DECV_BENCH_BIN`. With the native binary, its three-run medians were 1.55
-seconds (116.1 FPS) for Serial and 1.67 seconds (107.8 FPS) for `Auto`.
+`DECV_BENCH_BIN`. With the native binary, its three-run medians were 1.53
+seconds (117.6 FPS) for Serial and 1.67 seconds (107.8 FPS) for `Auto`.
 The same run measured FFmpeg NV12 at 0.61 seconds with one thread and 0.26
 seconds in automatic mode, leaving native decv gaps of about 2.5x and 6.4x.
 
@@ -669,6 +669,20 @@ partition. Five alternating CABAC Serial runs increased instructions about
 cycle sample was slower. The experiment was fully reverted. A future DSP
 dispatch boundary must therefore operate on a coarser unit than one luma or
 chroma partition call.
+
+CABAC bypass decoding now computes the shifted offset and selected bin in
+locals, then commits the offset once. This lets the optimized x86-64 build
+lower the data-dependent bin selection without an unpredictable branch while
+retaining failure-atomic end-of-input handling. Seven alternating native
+CABAC Serial runs reduced median reference cycles about 2.28%, task-clock
+about 2.19%, and branch misses about 9.5%; all seven paired reference-cycle
+samples improved. Instructions increased about 0.25%, but branches fell about
+0.33%. Five two-worker `Auto` runs reduced median reference cycles about 0.60%,
+task-clock about 0.82%, and branch misses about 8.8%, with four of five
+reference-cycle pairs improving. CAVLC remained instruction- and
+branch-neutral. Packing `codIRange` and `codIOffset` into one `u32` was tested
+separately and rejected because its additional shifts and merges increased
+whole-decoder instructions about 0.80% without improving the isolated result.
 
 Processing a sixteen-pixel two-dimensional luma interpolation row with one
 AVX2 kernel instead of two SSE2 chunks was also rejected. The wider six-tap
