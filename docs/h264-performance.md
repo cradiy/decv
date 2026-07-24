@@ -1844,6 +1844,36 @@ first-frame benchmark, where ten PGO pairs changed the median from 751.3 to
 748.0 ms. That path remains dominated by required reference-picture
 reconstruction rather than threshold preparation.
 
+## Generation-Reused P-Motion and Intra-Mode Grids
+
+The reusable reconstruction workspace now retains the P-slice motion grid and
+the intra-prediction mode grid in addition to the existing B-motion and CABAC
+residual state. A new picture assigns a monotonically increasing first-slice
+generation. Cells from an older generation are treated as empty without
+clearing or reallocating the complete grids; an actual fill is required only
+when the generation counter wraps or coded dimensions change. Rollback still
+clears the affected macroblock immediately, and focused tests cover allocation
+retention, stale-cell invalidation, duplicate-write rejection, and the
+generation-exhaustion clear.
+
+This is especially valuable during exact seek, where several seconds of
+reference pictures may be reconstructed without materializing their output.
+On the 1440x2560 long-GOP seek source, fourteen alternating PGO pairs reduced
+median end-to-end time from about 0.76 to 0.705 seconds, roughly 7.2%. Eleven
+PGO `perf stat` runs reduced mean task-clock from 1.098 to 0.985 seconds
+(10.3%) and minor faults from 129,625 to 86,040 (33.6%). The complete six-frame
+post-seek NV12 suffix retained SHA-256
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`.
+
+The change also improves ordinary 4K decoding. Fourteen alternating PGO pairs
+reduced the 48-frame median from about 0.995 to 0.950 seconds, increasing
+throughput from about 48.2 to 50.5 fps. Eleven PGO counter runs reduced
+task-clock by 1.4%, cycles by 0.7%, wall time by 2.2%, and minor faults by
+17.5%. Instructions were effectively neutral and branches increased about
+1.0%, a measured control-flow cost outweighed by lower allocation and
+page-fault overhead. The full 570 MiB NV12 output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

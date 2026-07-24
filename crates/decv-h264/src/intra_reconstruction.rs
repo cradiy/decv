@@ -268,6 +268,8 @@ pub struct IntraPictureReconstructor {
 pub(crate) struct ReconstructionWorkspace {
     b_motion: BMotionState,
     cabac_residual: CabacResidualState,
+    modes: IntraModeState,
+    motion: PMotionState,
     next_slice_id: u32,
 }
 
@@ -276,6 +278,8 @@ impl ReconstructionWorkspace {
         Ok(Self {
             b_motion: BMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
             cabac_residual: CabacResidualState::new(width_in_macroblocks, height_in_macroblocks)?,
+            modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
+            motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
             next_slice_id: 0,
         })
     }
@@ -300,6 +304,18 @@ impl ReconstructionWorkspace {
         self.cabac_residual.reset_for_picture(
             width_in_macroblocks,
             height_in_macroblocks,
+            generation_exhausted,
+        )?;
+        self.modes.reset_for_picture(
+            width_in_macroblocks,
+            height_in_macroblocks,
+            first_slice_id,
+            generation_exhausted,
+        )?;
+        self.motion.reset_for_picture(
+            width_in_macroblocks,
+            height_in_macroblocks,
+            first_slice_id,
             generation_exhausted,
         )?;
         if generation_exhausted {
@@ -387,8 +403,8 @@ impl IntraPictureReconstructor {
             picture,
             cavlc: CavlcNeighborState::new(coded_size.width / 16, coded_size.height / 16)?,
             cabac_residual: workspace.cabac_residual,
-            modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
-            motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
+            modes: workspace.modes,
+            motion: workspace.motion,
             b_motion: workspace.b_motion,
             reference_motion,
             completed: vec![false; macroblock_count],
@@ -2643,6 +2659,8 @@ impl IntraPictureReconstructor {
             ReconstructionWorkspace {
                 b_motion: self.b_motion,
                 cabac_residual: self.cabac_residual,
+                modes: self.modes,
+                motion: self.motion,
                 next_slice_id: self.next_slice_id,
             },
         ))
@@ -2666,6 +2684,8 @@ impl IntraPictureReconstructor {
             ReconstructionWorkspace {
                 b_motion: self.b_motion,
                 cabac_residual: self.cabac_residual,
+                modes: self.modes,
+                motion: self.motion,
                 next_slice_id: self.next_slice_id,
             },
         ))
@@ -3516,6 +3536,11 @@ mod tests {
             .b_motion
             .record_intra_macroblock(0, u32::MAX)
             .unwrap();
+        workspace
+            .motion
+            .record_intra_macroblock(0, u32::MAX)
+            .unwrap();
+        workspace.modes.record_inter(0, u32::MAX).unwrap();
         assert_eq!(
             workspace
                 .cabac_residual
@@ -3529,6 +3554,8 @@ mod tests {
 
         assert_eq!(workspace.next_slice_id, 0);
         workspace.b_motion.record_intra_macroblock(0, 1).unwrap();
+        workspace.motion.record_intra_macroblock(0, 1).unwrap();
+        workspace.modes.record_inter(0, 1).unwrap();
         assert_eq!(
             workspace
                 .cabac_residual

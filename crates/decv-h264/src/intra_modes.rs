@@ -39,6 +39,18 @@ enum ModeCell {
     },
 }
 
+impl ModeCell {
+    #[inline]
+    const fn slice_id(self) -> Option<u32> {
+        match self {
+            Self::Unavailable => None,
+            Self::IntraNxn { slice_id, .. }
+            | Self::OtherIntra { slice_id }
+            | Self::Inter { slice_id } => Some(slice_id),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct NeighborMode {
     available: bool,
@@ -54,6 +66,7 @@ struct NeighborMode {
 pub struct IntraModeState {
     width_in_macroblocks: usize,
     height_in_macroblocks: usize,
+    first_slice_id: u32,
     cells: Vec<ModeCell>,
 }
 
@@ -71,8 +84,36 @@ impl IntraModeState {
         Ok(Self {
             width_in_macroblocks,
             height_in_macroblocks,
+            first_slice_id: 0,
             cells: vec![ModeCell::Unavailable; cell_count],
         })
+    }
+
+    pub(crate) fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+        first_slice_id: u32,
+        clear_entries: bool,
+    ) -> Result<()> {
+        if width_in_macroblocks == 0 || height_in_macroblocks == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "intra mode grid dimensions must be non-zero",
+            ));
+        }
+        let cell_count = width_in_macroblocks
+            .checked_mul(height_in_macroblocks)
+            .and_then(|count| count.checked_mul(16))
+            .ok_or(H264Error::IntegerOverflow)?;
+        self.width_in_macroblocks = width_in_macroblocks;
+        self.height_in_macroblocks = height_in_macroblocks;
+        self.first_slice_id = first_slice_id;
+        if self.cells.len() != cell_count {
+            self.cells = vec![ModeCell::Unavailable; cell_count];
+        } else if clear_entries {
+            self.cells.fill(ModeCell::Unavailable);
+        }
+        Ok(())
     }
 
     /// Derives and records all sixteen Intra4x4 modes as one transaction.
@@ -291,10 +332,10 @@ impl IntraModeState {
         let stride = self.width_in_macroblocks * 4;
         for local_y in 0..4 {
             let start = (macroblock_y * 4 + local_y) * stride + macroblock_x * 4;
-            if self.cells[start..start + 4]
-                .iter()
-                .any(|cell| *cell != ModeCell::Unavailable)
-            {
+            if self.cells[start..start + 4].iter().any(|cell| {
+                cell.slice_id()
+                    .is_some_and(|slice_id| slice_id >= self.first_slice_id)
+            }) {
                 return Err(H264Error::InvalidSyntax(
                     "macroblock prediction modes were already recorded",
                 ));
@@ -369,6 +410,26 @@ mod tests {
                 true,
             )
             .unwrap();
+    }
+
+    #[test]
+    fn reset_reuses_storage_and_ignores_stale_picture_cells() {
+        let mut state = IntraModeState::new(2, 1).unwrap();
+        state.record_inter(0, 10).unwrap();
+        let allocation = state.cells.as_ptr();
+
+        state.reset_for_picture(2, 1, 11, false).unwrap();
+        assert_eq!(state.cells.as_ptr(), allocation);
+        state.record_inter(0, 11).unwrap();
+        assert!(state.record_inter(0, 11).is_err());
+
+        state.reset_for_picture(2, 1, 12, true).unwrap();
+        assert!(
+            state
+                .cells
+                .iter()
+                .all(|cell| *cell == ModeCell::Unavailable)
+        );
     }
 
     #[test]

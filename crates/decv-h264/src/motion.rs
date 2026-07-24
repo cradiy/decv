@@ -110,6 +110,7 @@ struct PartitionGeometry {
 pub struct PMotionState {
     width_in_macroblocks: usize,
     height_in_macroblocks: usize,
+    first_slice_id: u32,
     cells: Vec<Option<MotionCell>>,
 }
 
@@ -127,8 +128,36 @@ impl PMotionState {
         Ok(Self {
             width_in_macroblocks,
             height_in_macroblocks,
+            first_slice_id: 0,
             cells: vec![None; cell_count],
         })
+    }
+
+    pub(crate) fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+        first_slice_id: u32,
+        clear_entries: bool,
+    ) -> Result<()> {
+        if width_in_macroblocks == 0 || height_in_macroblocks == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "motion-state picture dimensions must be non-zero",
+            ));
+        }
+        let cell_count = width_in_macroblocks
+            .checked_mul(height_in_macroblocks)
+            .and_then(|value| value.checked_mul(16))
+            .ok_or(H264Error::IntegerOverflow)?;
+        self.width_in_macroblocks = width_in_macroblocks;
+        self.height_in_macroblocks = height_in_macroblocks;
+        self.first_slice_id = first_slice_id;
+        if self.cells.len() != cell_count {
+            self.cells = vec![None; cell_count];
+        } else if clear_entries {
+            self.cells.fill(None);
+        }
+        Ok(())
     }
 
     #[inline]
@@ -458,7 +487,14 @@ impl PMotionState {
             ));
         }
         let start = macroblock_address * 16;
-        if self.cells[start..start + 16].iter().any(Option::is_some) {
+        let recorded = self.cells[start].is_some_and(|cell| cell.slice_id >= self.first_slice_id);
+        debug_assert!(
+            self.cells[start..start + 16].iter().all(|cell| cell
+                .is_some_and(|cell| cell.slice_id >= self.first_slice_id)
+                == recorded),
+            "P motion-state macroblocks are recorded atomically"
+        );
+        if recorded {
             return Err(H264Error::InvalidSyntax(
                 "motion-state macroblock was already recorded",
             ));
@@ -714,6 +750,21 @@ mod tests {
             reference_index,
             vector: MotionVector { x, y },
         }
+    }
+
+    #[test]
+    fn reset_reuses_storage_and_ignores_stale_picture_cells() {
+        let mut state = PMotionState::new(2, 1).unwrap();
+        state.record_intra_macroblock(0, 10).unwrap();
+        let allocation = state.cells.as_ptr();
+
+        state.reset_for_picture(2, 1, 11, false).unwrap();
+        assert_eq!(state.cells.as_ptr(), allocation);
+        state.record_intra_macroblock(0, 11).unwrap();
+        assert!(state.record_intra_macroblock(0, 11).is_err());
+
+        state.reset_for_picture(2, 1, 12, true).unwrap();
+        assert!(state.cells.iter().all(Option::is_none));
     }
 
     #[test]
