@@ -1067,7 +1067,8 @@ impl IntraPictureReconstructor {
                             self.motion.clear_macroblock(macroblock_address)?;
                             return Err(error);
                         }
-                        let deblock = match inter_deblock_info(
+                        if let Err(error) = write_inter_deblock_info(
+                            &mut self.deblock[macroblock_address],
                             slice_id,
                             quantizer,
                             false,
@@ -1076,14 +1077,10 @@ impl IntraPictureReconstructor {
                             None,
                             &deblock_references_l0,
                         ) {
-                            Ok(deblock) => deblock,
-                            Err(error) => {
-                                self.motion.clear_macroblock(macroblock_address)?;
-                                self.reference_motion.clear_macroblock(macroblock_address)?;
-                                return Err(error);
-                            }
-                        };
-                        self.deblock[macroblock_address] = deblock;
+                            self.motion.clear_macroblock(macroblock_address)?;
+                            self.reference_motion.clear_macroblock(macroblock_address)?;
+                            return Err(error);
+                        }
                         pending_inter.push(PendingPInterMacroblock {
                             address: macroblock_address,
                             macroblock_x,
@@ -1116,7 +1113,8 @@ impl IntraPictureReconstructor {
                                 self.motion.clear_macroblock(macroblock_address)?;
                                 return Err(error);
                             }
-                            let deblock = match inter_deblock_info(
+                            if let Err(error) = write_inter_deblock_info(
+                                &mut self.deblock[macroblock_address],
                                 slice_id,
                                 quantizer,
                                 header.transform_size_8x8,
@@ -1125,14 +1123,10 @@ impl IntraPictureReconstructor {
                                 Some(residual),
                                 &deblock_references_l0,
                             ) {
-                                Ok(deblock) => deblock,
-                                Err(error) => {
-                                    self.motion.clear_macroblock(macroblock_address)?;
-                                    self.reference_motion.clear_macroblock(macroblock_address)?;
-                                    return Err(error);
-                                }
-                            };
-                            self.deblock[macroblock_address] = deblock;
+                                self.motion.clear_macroblock(macroblock_address)?;
+                                self.reference_motion.clear_macroblock(macroblock_address)?;
+                                return Err(error);
+                            }
                             pending_inter.push(PendingPInterMacroblock {
                                 address: macroblock_address,
                                 macroblock_x,
@@ -1494,7 +1488,8 @@ impl IntraPictureReconstructor {
                             self.b_motion.clear_macroblock(macroblock_address)?;
                             return Err(error);
                         }
-                        let deblock = match b_inter_deblock_info(
+                        if let Err(error) = write_b_inter_deblock_info(
+                            &mut self.deblock[macroblock_address],
                             slice_id,
                             quantizer,
                             false,
@@ -1504,14 +1499,10 @@ impl IntraPictureReconstructor {
                             &deblock_references_l0,
                             &deblock_references_l1,
                         ) {
-                            Ok(deblock) => deblock,
-                            Err(error) => {
-                                self.b_motion.clear_macroblock(macroblock_address)?;
-                                self.reference_motion.clear_macroblock(macroblock_address)?;
-                                return Err(error);
-                            }
-                        };
-                        self.deblock[macroblock_address] = deblock;
+                            self.b_motion.clear_macroblock(macroblock_address)?;
+                            self.reference_motion.clear_macroblock(macroblock_address)?;
+                            return Err(error);
+                        }
                         pending_inter.push(PendingBInterMacroblock {
                             address: macroblock_address,
                             macroblock_x,
@@ -1560,7 +1551,8 @@ impl IntraPictureReconstructor {
                                 self.b_motion.clear_macroblock(macroblock_address)?;
                                 return Err(error);
                             }
-                            let deblock = match b_inter_deblock_info(
+                            if let Err(error) = write_b_inter_deblock_info(
+                                &mut self.deblock[macroblock_address],
                                 slice_id,
                                 quantizer,
                                 header.transform_size_8x8,
@@ -1570,14 +1562,10 @@ impl IntraPictureReconstructor {
                                 &deblock_references_l0,
                                 &deblock_references_l1,
                             ) {
-                                Ok(deblock) => deblock,
-                                Err(error) => {
-                                    self.b_motion.clear_macroblock(macroblock_address)?;
-                                    self.reference_motion.clear_macroblock(macroblock_address)?;
-                                    return Err(error);
-                                }
-                            };
-                            self.deblock[macroblock_address] = deblock;
+                                self.b_motion.clear_macroblock(macroblock_address)?;
+                                self.reference_motion.clear_macroblock(macroblock_address)?;
+                                return Err(error);
+                            }
                             pending_inter.push(PendingBInterMacroblock {
                                 address: macroblock_address,
                                 macroblock_x,
@@ -2861,6 +2849,97 @@ fn inter_deblock_info(
     })
 }
 
+// CABAC writes directly into the picture's final deblock slot. Keep this
+// separate from the value-returning CAVLC builder: routing both paths through
+// one out-parameter helper measurably regressed the CAVLC instruction count.
+#[allow(clippy::too_many_arguments)]
+fn write_inter_deblock_info(
+    output: &mut MacroblockDeblockInfo,
+    slice_id: u32,
+    quantizer: MacroblockQuantizer,
+    transform_8x8: bool,
+    filter: DeblockingFilter,
+    resolved: &ResolvedPMacroblock,
+    residual: Option<&InterResidual>,
+    references_l0: &DeblockReferenceList,
+) -> Result<()> {
+    #[cfg(debug_assertions)]
+    let mut covered = 0u16;
+    let mut first_motion = None;
+    let mut uniform_motion = true;
+    for partition in &resolved.partitions {
+        let reference_id =
+            references_l0
+                .get(partition.reference_index)
+                .ok_or(H264Error::InvalidSyntax(
+                    "P macroblock selects a missing List-0 reference picture",
+                ))?;
+        let start_x = usize::from(partition.x) / 4;
+        let start_y = usize::from(partition.y) / 4;
+        let end_x = usize::from(partition.x + partition.width) / 4;
+        let end_y = usize::from(partition.y + partition.height) / 4;
+        if !partition.x.is_multiple_of(4)
+            || !partition.y.is_multiple_of(4)
+            || !partition.width.is_multiple_of(4)
+            || !partition.height.is_multiple_of(4)
+            || end_x > 4
+            || end_y > 4
+        {
+            return Err(H264Error::InvalidSyntax(
+                "P partition is not aligned to the deblocking grid",
+            ));
+        }
+        #[cfg(debug_assertions)]
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let bit = 1 << (y * 4 + x);
+                debug_assert_eq!(covered & bit, 0);
+                covered |= bit;
+            }
+        }
+        let partition_motion = DeblockMotion::new(
+            DeblockListMotion {
+                reference_id,
+                vector: partition.motion_vector,
+            },
+            DeblockListMotion::default(),
+        );
+        if let Some(first_motion) = first_motion {
+            uniform_motion &= partition_motion == first_motion;
+        } else {
+            first_motion = Some(partition_motion);
+        }
+        if resolved.partitions.len() == 1
+            && start_x == 0
+            && start_y == 0
+            && end_x == 4
+            && end_y == 4
+        {
+            output.motion.fill(partition_motion);
+        } else {
+            for y in start_y..end_y {
+                for x in start_x..end_x {
+                    output.motion[y * 4 + x] = partition_motion;
+                }
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(covered, u16::MAX);
+
+    let luma_nonzero = inter_luma_nonzero(transform_8x8, residual);
+    output.slice_id = slice_id;
+    output.is_intra = false;
+    output.luma_qp = quantizer.luma;
+    output.cb_qp = quantizer.chroma_cb;
+    output.cr_qp = quantizer.chroma_cr;
+    output.transform_8x8 = transform_8x8;
+    output.internal_edges_zero = luma_nonzero == 0 && first_motion.is_some() && uniform_motion;
+    output.luma_nonzero = luma_nonzero;
+    output.filter = filter;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn b_inter_deblock_info(
     slice_id: u32,
@@ -2927,6 +3006,86 @@ fn b_inter_deblock_info(
         motion,
         filter,
     })
+}
+
+// B-slice counterpart of `write_inter_deblock_info`; the resolved CABAC
+// partitions cover the complete 4x4 grid, checked without release-mode cost.
+#[allow(clippy::too_many_arguments)]
+fn write_b_inter_deblock_info(
+    output: &mut MacroblockDeblockInfo,
+    slice_id: u32,
+    quantizer: MacroblockQuantizer,
+    transform_8x8: bool,
+    filter: DeblockingFilter,
+    resolved: &ResolvedBMacroblock,
+    residual: Option<&InterResidual>,
+    references_l0: &DeblockReferenceList,
+    references_l1: &DeblockReferenceList,
+) -> Result<()> {
+    #[cfg(debug_assertions)]
+    let mut covered = 0u16;
+    let mut first_motion = None;
+    let mut uniform_motion = true;
+    for partition in &resolved.partitions {
+        let start_x = usize::from(partition.x) / 4;
+        let start_y = usize::from(partition.y) / 4;
+        let end_x = usize::from(partition.x + partition.width) / 4;
+        let end_y = usize::from(partition.y + partition.height) / 4;
+        if !partition.x.is_multiple_of(4)
+            || !partition.y.is_multiple_of(4)
+            || !partition.width.is_multiple_of(4)
+            || !partition.height.is_multiple_of(4)
+            || end_x > 4
+            || end_y > 4
+        {
+            return Err(H264Error::InvalidSyntax(
+                "B partition is not aligned to the deblocking grid",
+            ));
+        }
+        #[cfg(debug_assertions)]
+        for y in start_y..end_y {
+            for x in start_x..end_x {
+                let bit = 1 << (y * 4 + x);
+                debug_assert_eq!(covered & bit, 0);
+                covered |= bit;
+            }
+        }
+        let list0 = b_deblock_list_motion(partition.list0, references_l0, "List 0")?;
+        let list1 = b_deblock_list_motion(partition.list1, references_l1, "List 1")?;
+        let partition_motion = DeblockMotion::new(list0, list1);
+        if let Some(first_motion) = first_motion {
+            uniform_motion &= partition_motion == first_motion;
+        } else {
+            first_motion = Some(partition_motion);
+        }
+        if resolved.partitions.len() == 1
+            && start_x == 0
+            && start_y == 0
+            && end_x == 4
+            && end_y == 4
+        {
+            output.motion.fill(partition_motion);
+        } else {
+            for y in start_y..end_y {
+                for x in start_x..end_x {
+                    output.motion[y * 4 + x] = partition_motion;
+                }
+            }
+        }
+    }
+    #[cfg(debug_assertions)]
+    debug_assert_eq!(covered, u16::MAX);
+    let luma_nonzero = inter_luma_nonzero(transform_8x8, residual);
+    output.slice_id = slice_id;
+    output.is_intra = false;
+    output.luma_qp = quantizer.luma;
+    output.cb_qp = quantizer.chroma_cb;
+    output.cr_qp = quantizer.chroma_cr;
+    output.transform_8x8 = transform_8x8;
+    output.internal_edges_zero = luma_nonzero == 0 && first_motion.is_some() && uniform_motion;
+    output.luma_nonzero = luma_nonzero;
+    output.filter = filter;
+    Ok(())
 }
 
 fn b_deblock_list_motion(
@@ -3031,14 +3190,17 @@ mod tests {
     use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
 
     use super::{
-        BDirectPrediction, BReconstructionModes, BSlicePredictionWeights,
-        IntraPictureReconstructor, IntraSliceConfig, ReconstructionReferenceList,
+        BDirectPrediction, BReconstructionModes, BSlicePredictionWeights, DeblockReferenceList,
+        IntraPictureReconstructor, IntraSliceConfig, MacroblockDeblockInfo,
+        ReconstructionReferenceList, b_inter_deblock_info, inter_deblock_info,
+        write_b_inter_deblock_info, write_inter_deblock_info,
     };
     use crate::{
         BMacroblockContext, CodedBlockPattern, DeblockingFilter, DecodedIntraMacroblock, H264Error,
         IntraLumaPrediction, IntraMacroblock, IntraMacroblockHeader, IntraPredictionModeSyntax,
-        IntraResidual, MacroblockQuantizer, PcmMacroblock, ResidualBlock,
-        resolve_scaling_lists_4x4,
+        IntraResidual, MacroblockQuantizer, MotionVector, PcmMacroblock, ResidualBlock,
+        ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition, ResolvedPMacroblock,
+        ResolvedPPartition, resolve_scaling_lists_4x4,
     };
 
     const PREDICTED_MODE: IntraPredictionModeSyntax = IntraPredictionModeSyntax {
@@ -3053,6 +3215,125 @@ mod tests {
             chroma_cr: 0,
             transform_bypass: false,
         }
+    }
+
+    #[test]
+    fn direct_deblock_writers_match_value_builders() {
+        let mut references = DeblockReferenceList {
+            ids: [0; 32],
+            len: 2,
+        };
+        references.ids[..2].copy_from_slice(&[7, 9]);
+        let p_motion = ResolvedPMacroblock {
+            skipped: false,
+            partitions: vec![
+                ResolvedPPartition {
+                    x: 0,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                    reference_index: 0,
+                    motion_vector: MotionVector { x: 1, y: 2 },
+                },
+                ResolvedPPartition {
+                    x: 8,
+                    y: 0,
+                    width: 8,
+                    height: 8,
+                    reference_index: 1,
+                    motion_vector: MotionVector { x: 3, y: 4 },
+                },
+                ResolvedPPartition {
+                    x: 0,
+                    y: 8,
+                    width: 8,
+                    height: 8,
+                    reference_index: 1,
+                    motion_vector: MotionVector { x: 5, y: 6 },
+                },
+                ResolvedPPartition {
+                    x: 8,
+                    y: 8,
+                    width: 8,
+                    height: 8,
+                    reference_index: 0,
+                    motion_vector: MotionVector { x: 7, y: 8 },
+                },
+            ],
+        };
+        let quantizer = MacroblockQuantizer {
+            luma: 31,
+            chroma_cb: 29,
+            chroma_cr: 30,
+            transform_bypass: false,
+        };
+        let filter = DeblockingFilter::default();
+        let expected =
+            inter_deblock_info(3, quantizer, true, filter, &p_motion, None, &references).unwrap();
+        let mut written = MacroblockDeblockInfo::default();
+        write_inter_deblock_info(
+            &mut written,
+            3,
+            quantizer,
+            true,
+            filter,
+            &p_motion,
+            None,
+            &references,
+        )
+        .unwrap();
+        assert_eq!(written, expected);
+
+        let b_motion = ResolvedBMacroblock {
+            direct: false,
+            partitions: p_motion
+                .partitions
+                .iter()
+                .enumerate()
+                .map(|(index, partition)| ResolvedBPartition {
+                    x: partition.x,
+                    y: partition.y,
+                    width: partition.width,
+                    height: partition.height,
+                    list0: Some(ResolvedBListMotion {
+                        reference_index: partition.reference_index,
+                        motion_vector: partition.motion_vector,
+                    }),
+                    list1: (index % 2 == 0).then_some(ResolvedBListMotion {
+                        reference_index: 1,
+                        motion_vector: MotionVector {
+                            x: -partition.motion_vector.x,
+                            y: -partition.motion_vector.y,
+                        },
+                    }),
+                })
+                .collect(),
+        };
+        let expected = b_inter_deblock_info(
+            4,
+            quantizer,
+            false,
+            filter,
+            &b_motion,
+            None,
+            &references,
+            &references,
+        )
+        .unwrap();
+        let mut written = MacroblockDeblockInfo::default();
+        write_b_inter_deblock_info(
+            &mut written,
+            4,
+            quantizer,
+            false,
+            filter,
+            &b_motion,
+            None,
+            &references,
+            &references,
+        )
+        .unwrap();
+        assert_eq!(written, expected);
     }
 
     fn predicted(luma_mode: u8, chroma_mode: u8) -> DecodedIntraMacroblock {
