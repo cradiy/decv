@@ -1095,6 +1095,37 @@ specialization to the current monolithic prediction unit costs more front-end
 performance than it saves; it should be reconsidered only with a backend
 layout that isolates inactive code without adding a per-partition call.
 
+Outlining the complete CABAC renormalization path was tested after profiling
+showed that the inlined BitReader refill made `decode_decision` save and
+restore six callee-saved registers. The split reduced the native decision
+symbol from about 381 to 236 bytes. It also reduced whole-decoder instructions
+about 0.12%, but renormalization is too frequent to be a cold call: branches
+increased about 0.76%, and nine of ten pinned 4K Serial reference-cycle pairs
+were slower. This differs from the earlier refill-only split but reaches the
+same conclusion: CABAC arithmetic and its common renormalization dependency
+chain must remain contiguous.
+
+Outlining Spatial Direct's co-located-grid expansion was also rejected. The
+main resolver shrank from about 6.7 KiB to 4.4 KiB, with a separate 2.5 KiB
+grid helper. The candidate passed its focused motion tests, but the grid path
+was not cold enough: ten pinned native 4K Serial pairs increased instructions
+about 0.48% and average reference cycles about 1.34%, with nine cycle pairs
+slower. The existing single function was restored.
+
+Three allocation-oriented follow-ups did not justify retention. Constructing
+the luma `Arc<[u8]>` directly through a fully initialized
+`Arc<[MaybeUninit<u8>]>` was instruction-neutral, showing that the existing
+zeroed `Vec` conversion is already effective on this toolchain. Replacing ten
+per-slice derived reference vectors with inline-capacity-four `SmallVec`s
+reduced instructions about 0.24%, but only one of ten 4K reference-cycle pairs
+improved because the eight simultaneous B-list buffers increased stack and
+register pressure. Finally, building active DPB metadata directly from
+borrowed DPB entries removed intermediate `Arc` clones and pointer searches,
+but increased instructions about 0.16% and made most wall-time pairs slightly
+slower. All three variants were fully reverted. Future allocation work should
+reuse the large per-picture reconstruction state, rather than reshaping these
+small temporary objects.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
