@@ -40,20 +40,20 @@ Median of three runs:
 
 | Decoder mode | Output | Wall time | User CPU | Peak RSS | Throughput |
 | --- | --- | ---: | ---: | ---: | ---: |
-| decv Serial | NV12 | 1.71 s | 1.60 s | 80,628 KiB | 105.3 FPS |
-| decv Auto (2 workers) | NV12 | 1.87 s | 2.00 s | 80,080 KiB | 96.3 FPS |
-| FFmpeg 1 thread | NV12 | 0.60 s | 0.69 s | 151,944 KiB | 300.0 FPS |
-| FFmpeg Auto | NV12 | 0.25 s | 1.45 s | 287,152 KiB | 720.0 FPS |
-| FFmpeg 1 thread | decode-only | 0.56 s | 0.54 s | 95,588 KiB | 321.4 FPS |
-| FFmpeg Auto | decode-only | 0.22 s | 0.96 s | 192,168 KiB | 818.2 FPS |
+| decv Serial | NV12 | 1.63 s | 1.55 s | 80,288 KiB | 110.4 FPS |
+| decv Auto (2 workers) | NV12 | 1.79 s | 1.87 s | 79,832 KiB | 100.6 FPS |
+| FFmpeg 1 thread | NV12 | 0.62 s | 0.71 s | 152,312 KiB | 290.3 FPS |
+| FFmpeg Auto | NV12 | 0.26 s | 1.40 s | 287,260 KiB | 692.3 FPS |
+| FFmpeg 1 thread | decode-only | 0.57 s | 0.55 s | 95,440 KiB | 315.8 FPS |
+| FFmpeg Auto | decode-only | 0.22 s | 0.96 s | 189,308 KiB | 818.2 FPS |
 
 On this workload:
 
-- decv Serial takes about **2.9x** as much wall time as single-threaded FFmpeg
+- decv Serial takes about **2.6x** as much wall time as single-threaded FFmpeg
   when both produce NV12;
-- decv Auto takes about **7.5x** as much wall time as FFmpeg Auto when both
+- decv Auto takes about **6.9x** as much wall time as FFmpeg Auto when both
   produce NV12;
-- decv Auto does about **1.4x** as much total user-CPU work as FFmpeg Auto's
+- decv Auto does about **1.3x** as much total user-CPU work as FFmpeg Auto's
   NV12 path;
 - decv uses about **53%** of FFmpeg single-threaded NV12 peak RSS and about
   **28%** of FFmpeg Auto NV12 peak RSS;
@@ -62,8 +62,8 @@ On this workload:
   region is too narrow to scale.
 
 The 60 FPS real-time target requires decoding 180 frames in at most 3.00
-seconds. The current Serial result has about 75.4% throughput headroom over that
-line, and the measured two-worker Auto result has about 60.4%. The ordering
+seconds. The current Serial result has about 84.0% throughput headroom over that
+line, and the measured two-worker Auto result has about 67.6%. The ordering
 between Serial and Auto remains sensitive to scheduling and thermal state
 because the current parallel region is narrow.
 
@@ -624,6 +624,24 @@ to 6.9 KiB, but introduced a roughly 1.9 KiB helper and an out-of-line
 instructions about 0.44% and median reference cycles about 0.39%; the code was
 fully reverted. Reducing one symbol's size is not useful when the split adds
 more aggregate code and return-value traffic.
+
+The workspace release profile now uses fat LTO and one code-generation unit.
+This gives LLVM visibility across crate boundaries and favors runtime
+throughput over build speed. The release CLI shrank from about 1.5 MiB to
+1.3 MiB. Five alternating CABAC Serial runs reduced instructions about 7.0%,
+branches about 11.7%, and median reference cycles about 2.1%, with all five
+cycle samples improving. CAVLC instructions fell about 7.7%, branches about
+12.5%, and median cycles about 1.6%, also with five of five improvements.
+Two-worker `Auto` instructions fell about 7.7%, branches about 12.2%, and
+median cycles about 3.7%, again improving every paired cycle sample.
+
+Release builds also use aborting panics. Normal malformed-stream and decoder
+failures continue to use `Result`; only an internal panic no longer unwinds.
+On top of fat LTO this reduced the release CLI to about 1.2 MiB. Five CABAC
+Serial runs reduced instructions about 0.24%, branches about 0.61%, and median
+cycles about 0.50%; CAVLC median cycles likewise fell about 0.51%. `Auto`
+instructions fell about 0.17% and branches about 0.34%, while its 0.06% higher
+median cycles remained within thread-scheduling noise.
 
 ## BitReader Checkpoint
 
