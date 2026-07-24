@@ -488,6 +488,12 @@ runs showed reference cycles about 0.8% worse in the reversed-order set. The
 existing repeated branches are highly predictable; the shorter loop appears
 to lengthen the row-to-row dependency path.
 
+Forcing the four-sample vertical and horizontal luma deblock dispatchers
+inline was also rejected. Five alternating pinned runs increased instructions
+about 0.2% and median reference cycles about 1.4%. A useful next deblock step
+must batch a complete edge rather than expanding the existing small kernels
+inside picture traversal.
+
 The adjacent 65-byte significance-map return was also converted to a
 caller-owned buffer and rejected. It increased CABAC instructions about 0.1%
 and reference cycles about 0.3%, indicating that LLVM already handles this
