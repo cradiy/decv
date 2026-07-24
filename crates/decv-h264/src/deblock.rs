@@ -307,15 +307,31 @@ pub(crate) fn filter_420_picture(
             }
         }
 
-        let internal_thresholds = if internal_edges_zero {
-            [None; 3]
-        } else {
-            [
-                edge_thresholds(current, current, 0)?,
-                edge_thresholds(current, current, 1)?,
-                edge_thresholds(current, current, 2)?,
-            ]
-        };
+        let filter_internal_luma = vertical_strengths[1..]
+            .iter()
+            .chain(&horizontal_strengths[1..])
+            .any(|strengths| *strengths != [0; 4]);
+        let filter_internal_chroma =
+            vertical_strengths[2] != [0; 4] || horizontal_strengths[2] != [0; 4];
+        let filter_left = filter_left && vertical_strengths[0] != [0; 4];
+        let filter_top = filter_top && horizontal_strengths[0] != [0; 4];
+        let internal_thresholds = [
+            if filter_internal_luma {
+                edge_thresholds(current, current, 0)?
+            } else {
+                None
+            },
+            if filter_internal_chroma {
+                edge_thresholds(current, current, 1)?
+            } else {
+                None
+            },
+            if filter_internal_chroma {
+                edge_thresholds(current, current, 2)?
+            } else {
+                None
+            },
+        ];
         let left_thresholds = if filter_left {
             let previous = left.expect("filter_left requires a neighbor");
             [
@@ -339,7 +355,7 @@ pub(crate) fn filter_420_picture(
 
         let luma_x = macroblock_x * 16;
         let luma_y = macroblock_y * 16;
-        if filter_left && vertical_strengths[0] != [0; 4] {
+        if filter_left {
             filter_vertical_luma_edge(
                 luma,
                 width,
@@ -363,7 +379,7 @@ pub(crate) fn filter_420_picture(
                 );
             }
         }
-        if filter_top && horizontal_strengths[0] != [0; 4] {
+        if filter_top {
             filter_horizontal_luma_edge(
                 luma,
                 width,
@@ -391,7 +407,7 @@ pub(crate) fn filter_420_picture(
         let chroma_x = macroblock_x * 8;
         let chroma_y = macroblock_y * 8;
         for (plane, component) in [(&mut *cb, 1usize), (&mut *cr, 2usize)] {
-            if filter_left && vertical_strengths[0] != [0; 4] {
+            if filter_left {
                 filter_vertical_chroma_edge(
                     plane,
                     chroma_stride,
@@ -411,7 +427,7 @@ pub(crate) fn filter_420_picture(
                     internal_thresholds[component],
                 );
             }
-            if filter_top && horizontal_strengths[0] != [0; 4] {
+            if filter_top {
                 filter_horizontal_chroma_edge(
                     plane,
                     chroma_stride,
@@ -906,8 +922,8 @@ unsafe fn filter_vertical_chroma_edge_sse2(
     thresholds: Option<EdgeThresholds>,
 ) {
     use std::arch::x86_64::{
-        _mm_cvtsi32_si128, _mm_cvtsi128_si64, _mm_packus_epi16, _mm_setzero_si128,
-        _mm_srli_si128, _mm_unpacklo_epi8, _mm_unpacklo_epi16, _mm_unpacklo_epi32,
+        _mm_cvtsi32_si128, _mm_cvtsi128_si64, _mm_packus_epi16, _mm_setzero_si128, _mm_srli_si128,
+        _mm_unpacklo_epi8, _mm_unpacklo_epi16, _mm_unpacklo_epi32,
     };
 
     let Some(thresholds) = thresholds else {
@@ -965,8 +981,7 @@ unsafe fn filter_vertical_chroma_edge_sse2(
     let filtered_q0 = (_mm_cvtsi128_si64(_mm_packus_epi16(filtered_q0, zero)) as u64).to_le_bytes();
     const REPLACED_BYTES: u32 = 0x00ff_ff00;
     for (row, samples) in rows.iter_mut().enumerate() {
-        let replacement =
-            u32::from(filtered_p0[row]) << 8 | u32::from(filtered_q0[row]) << 16;
+        let replacement = u32::from(filtered_p0[row]) << 8 | u32::from(filtered_q0[row]) << 16;
         *samples = (*samples & !REPLACED_BYTES) | replacement;
         // SAFETY: This is the same validated four-byte row loaded above.
         unsafe {

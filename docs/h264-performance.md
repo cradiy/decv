@@ -1819,6 +1819,31 @@ On the long-GOP seek source, seven native first-frame pairs changed the median
 from 836.7 to 813.0 ms (2.8%); this is useful but confirms that ordinary
 motion-compensation tuning alone cannot make long-GOP exact seek immediate.
 
+## Lazy Deblock Threshold Preparation
+
+Picture deblocking formerly prepared luma, Cb, and Cr threshold tables for
+every permitted macroblock boundary before checking whether any derived
+boundary strength was non-zero. Direct and skip-heavy inter pictures contain
+many legal boundaries that require no sample filtering. The traversal now
+derives all boundary strengths first, then prepares left, top, internal-luma,
+and internal-chroma thresholds only for edge groups that will actually be
+visited. Internal chroma thresholds are also omitted when only luma-only
+internal edges are active.
+
+On the 48-frame 4K comparison stream, twelve alternating PGO pairs reduced
+median wall time from 1.015 to 0.980 seconds, increasing measured throughput
+from about 47.3 to 49.0 fps. Eleven-run `perf stat` means reduced task-clock
+from 1.619 to 1.581 seconds (2.3%), instructions from 13.381 to 12.974 billion
+(3.0%), branches from 1.726 to 1.687 billion (2.2%), and branch misses by
+0.8%. Cycles were effectively unchanged, while mean wall time fell from 1.032
+to 0.998 seconds (3.3%). The full 570 MiB NV12 output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`.
+
+The same change was nearly neutral for the 1440x2560 long-GOP exact-seek
+first-frame benchmark, where ten PGO pairs changed the median from 751.3 to
+748.0 ms. That path remains dominated by required reference-picture
+reconstruction rather than threshold preparation.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
