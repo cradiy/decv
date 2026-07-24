@@ -2,7 +2,7 @@ use std::{num::NonZeroUsize, sync::Arc};
 
 use decv::{
     BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, CpuFrame, CpuPlane,
-    DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket, FrameStorage,
+    DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket, FourCc, FrameStorage,
     H264Decoder, H264Error, H264Parallelism, MediaTime, Mp4Demuxer, PixelFormat, Rect, Size,
     TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
@@ -123,6 +123,70 @@ fn facade_decodes_a_real_h264_access_unit_end_to_end() {
 }
 
 #[test]
+fn facade_demuxes_and_decodes_a_real_mp4_in_presentation_order() {
+    // Three 16x16 High-profile CABAC pictures in MP4 decode order I, P, B.
+    // FFmpeg independently produced the expected presentation order and NV12
+    // CRC below. The test intentionally uses no implementation-crate APIs.
+    let mp4 = decode_hex(include_str!("fixtures/three-frame-high-b.mp4.hex"));
+    let demuxer = Mp4Demuxer::open(mp4).unwrap();
+    let track_index = demuxer
+        .movie()
+        .tracks()
+        .iter()
+        .position(|track| track.handler() == FourCc::new(*b"vide"))
+        .unwrap();
+    let mut cursor = demuxer.packet_cursor(track_index).unwrap();
+    assert_eq!(cursor.track().samples().len(), 3);
+
+    let config = cursor.decoder_config().unwrap().unwrap();
+    assert_eq!(
+        config.bitstream_format,
+        BitstreamFormat::LengthPrefixed { length_size: 4 }
+    );
+    assert!(config.codec_data.is_some());
+
+    let mut decoder = H264Decoder::new();
+    decoder.configure(config).unwrap();
+    let mut format = None;
+    let mut frames = Vec::new();
+    while let Some(mut packet) = cursor.next_packet().unwrap() {
+        loop {
+            match decoder.send_packet(packet).unwrap() {
+                DecodeInputStatus::Accepted => break,
+                DecodeInputStatus::NeedOutput(unconsumed) => {
+                    packet = unconsumed;
+                    assert!(!pull_available(&mut decoder, &mut format, &mut frames));
+                }
+                _ => panic!("unexpected decoder input status"),
+            }
+        }
+        assert!(!pull_available(&mut decoder, &mut format, &mut frames));
+    }
+
+    decoder.drain().unwrap();
+    assert!(pull_available(&mut decoder, &mut format, &mut frames));
+    let format = format.unwrap();
+    assert_eq!(format.coded_size, Size::new(16, 16));
+    assert_eq!(format.pixel_format, PixelFormat::Nv12);
+    assert_eq!(frames.len(), 3);
+
+    let expected_pts = [0, 512, 1024];
+    for ((index, frame), expected_pts) in frames.iter().enumerate().zip(expected_pts) {
+        frame.validate().unwrap();
+        assert_eq!(frame.id, u64::try_from(index + 1).unwrap());
+        assert_eq!(frame.pts.unwrap().value, expected_pts);
+        assert_eq!(frame.pts.unwrap().timescale.get(), 15_360);
+        assert_eq!(frame.duration.unwrap().value, 512);
+        assert_eq!(frame.format, format);
+        let cpu = match &frame.storage {
+            FrameStorage::Cpu(cpu) => cpu,
+            _ => panic!("expected CPU-backed frame"),
+        };
+        assert_eq!(crc32(&tightly_packed_bytes(cpu)), 3_859_821_206);
+    }
+}
+
+#[test]
 fn frame_storage_requires_forward_compatible_matching() {
     fn storage_kind(storage: &FrameStorage) -> &'static str {
         match storage {
@@ -158,6 +222,24 @@ fn frame_storage_requires_forward_compatible_matching() {
     frame.validate().unwrap();
 }
 
+fn pull_available(
+    decoder: &mut H264Decoder,
+    format: &mut Option<VideoFormat>,
+    frames: &mut Vec<DecodedVideoFrame>,
+) -> bool {
+    loop {
+        match decoder.receive_frame().unwrap() {
+            DecodeOutput::FormatChanged(changed) => {
+                assert!(format.replace(changed).is_none());
+            }
+            DecodeOutput::Frame(frame) => frames.push(frame),
+            DecodeOutput::NeedInput => return false,
+            DecodeOutput::EndOfStream => return true,
+            _ => panic!("unexpected decoder output"),
+        }
+    }
+}
+
 fn tightly_packed_bytes(frame: &CpuFrame) -> Vec<u8> {
     let mut bytes = Vec::new();
     for plane in &frame.planes {
@@ -178,4 +260,25 @@ fn crc32(bytes: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+fn decode_hex(text: &str) -> Vec<u8> {
+    let digits = text
+        .bytes()
+        .filter(|byte| !byte.is_ascii_whitespace())
+        .collect::<Vec<_>>();
+    assert!(digits.len().is_multiple_of(2));
+    digits
+        .chunks_exact(2)
+        .map(|pair| hex_digit(pair[0]) << 4 | hex_digit(pair[1]))
+        .collect()
+}
+
+fn hex_digit(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => panic!("fixture contains a non-hex byte"),
+    }
 }
