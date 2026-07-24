@@ -955,6 +955,18 @@ useful when its lane layout matches the codec operation without expensive
 cross-lane packing; a DSP backend must keep the narrower SSE2 kernel when that
 is faster.
 
+Pre-scanning Spatial Direct co-located-zero flags into a bit mask was tested
+to bypass constructing and then coalescing a uniform 4x4/8x8 partition grid.
+The uniform case could commit one 16x16 motion partition directly, while the
+non-uniform case reused the mask without loading the co-located field twice.
+It passed the motion tests and native byte-exact H.264 corpus, and reduced
+whole-decoder instructions about 0.69% and branches about 1.12%. The extra
+pre-scan and uniformity branch grew native `.text` by about 1.6 KiB, however.
+Across fourteen pinned CABAC Serial pairs only six improved; average reference
+cycles increased about 0.05% and task-clock about 0.42%. The bit-mask path was
+fully reverted. For this stream, producing partitions in one pass and
+coalescing afterward schedules better than a speculative classification pass.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
