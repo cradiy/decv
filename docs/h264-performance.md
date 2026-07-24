@@ -1567,6 +1567,33 @@ shrunk by 542 bytes. The exact 597,196,800-byte 4K output retained SHA-256
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
 and both generated verification corpora remained byte-exact.
 
+Spatial Direct reconstruction now records the co-located zero flags in one
+16-bit mask before constructing output partitions. An all-clear or all-set
+mask produces one uniform 16x16 partition and one uniform motion-state fill;
+only a genuinely mixed mask constructs the 4x4 or 8x8 partition grid. This
+also preserves complete co-located-grid validation before any picture state
+changes.
+
+The opt-in internal profile explains why the branch matters. On the 48-frame
+4K stream, 369,785 of 691,900 Spatial Direct macroblocks already had
+predictions that could not be changed by the co-located zero flag. Of the
+remaining macroblocks, 318,891 masks were all clear, 1,747 were all set, and
+only 1,477 were mixed. The 300-frame 1080p stream reported 1,135,509
+prediction-uniform macroblocks, 340,716 all-clear masks, 12,418 all-set masks,
+and 1,777 mixed masks out of 1,490,420 total.
+
+Fifteen alternating native 4K `Auto` pairs reduced mean wall time about
+1.83%, task-clock about 1.51%, reference cycles about 1.44%, instructions
+about 1.35%, and branches about 1.44%. All fifteen instruction and branch
+pairs improved. With byte-identical PGO training manifests, the stable final
+fourteen pairs reduced mean wall time about 3.00%, task-clock about 2.25%,
+reference cycles about 2.31%, instructions about 1.37%, and branches about
+1.51%; twelve wall-time pairs improved, while all fourteen instruction and
+branch pairs improved. The streamed 597,196,800-byte 4K output retained
+SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+and the generated H.264 corpus remained byte-exact.
+
 ## Frame Service Timing
 
 `decv-cli` has an opt-in `frame-timing` feature for measuring decoder

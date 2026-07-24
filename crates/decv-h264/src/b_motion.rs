@@ -333,39 +333,62 @@ impl BMotionState {
                 reference_index,
                 motion_vector,
             });
-            let partition = ResolvedBPartition {
-                x: 0,
-                y: 0,
-                width: 16,
-                height: 16,
+            #[cfg(feature = "internal-profiling")]
+            crate::profiling::record_spatial_direct_uniform_prediction();
+            return Ok(self.commit_uniform_direct_macroblock(
+                macroblock_address,
+                slice_id,
                 list0,
                 list1,
-            };
-            let mut partitions = SmallVec::new();
-            partitions.push(partition);
-            self.commit_local_cells(
-                macroblock_address,
-                [Some(MotionCell {
-                    slice_id,
-                    list0,
-                    list1,
-                }); 16],
-            );
-            return Ok(ResolvedBMacroblock {
-                direct: true,
-                partitions,
-            });
+            ));
         }
-        let mut local = [None; 16];
-        let mut partitions = SmallVec::with_capacity(direct_grid.len());
-        for &(x, y, cell_x, cell_y) in direct_grid {
+
+        let mut col_zero_mask = 0u16;
+        for (index, &(_, _, cell_x, cell_y)) in direct_grid.iter().enumerate() {
             let colocated = context
                 .colocated_motion
                 .cell(macroblock_x * 4 + cell_x, macroblock_y * 4 + cell_y)
                 .ok_or(H264Error::InvalidSyntax(
                     "spatial Direct co-located block lies outside the reference motion field",
                 ))?;
-            let col_zero = colocated_zero_flag(colocated, context.colocated_long_term);
+            if colocated_zero_flag(colocated, context.colocated_long_term) {
+                col_zero_mask |= 1 << index;
+            }
+        }
+        #[cfg(feature = "internal-profiling")]
+        crate::profiling::record_spatial_direct_col_zero_grid(direct_grid.len(), col_zero_mask);
+
+        let all_col_zero = u16::MAX >> (u16::BITS as usize - direct_grid.len());
+        if col_zero_mask == 0 || col_zero_mask == all_col_zero {
+            let force_zero = col_zero_mask != 0;
+            let list0 = predicted_l0.map(|(reference_index, vector)| ResolvedBListMotion {
+                reference_index,
+                motion_vector: if force_zero && reference_index == 0 {
+                    MotionVector::default()
+                } else {
+                    vector
+                },
+            });
+            let list1 = predicted_l1.map(|(reference_index, vector)| ResolvedBListMotion {
+                reference_index,
+                motion_vector: if force_zero && reference_index == 0 {
+                    MotionVector::default()
+                } else {
+                    vector
+                },
+            });
+            return Ok(self.commit_uniform_direct_macroblock(
+                macroblock_address,
+                slice_id,
+                list0,
+                list1,
+            ));
+        }
+
+        let mut local = [None; 16];
+        let mut partitions = SmallVec::with_capacity(direct_grid.len());
+        for (index, &(x, y, _, _)) in direct_grid.iter().enumerate() {
+            let col_zero = col_zero_mask & (1 << index) != 0;
             let list0 = predicted_l0.map(|(reference_index, vector)| ResolvedBListMotion {
                 reference_index,
                 motion_vector: if col_zero && reference_index == 0 {
@@ -393,12 +416,42 @@ impl BMotionState {
             fill_direct_partition_cells(&mut local, slice_id, partition);
             partitions.push(partition);
         }
-        coalesce_uniform_direct_grid(&mut partitions);
         self.commit_local_cells(macroblock_address, local);
         Ok(ResolvedBMacroblock {
             direct: true,
             partitions,
         })
+    }
+
+    fn commit_uniform_direct_macroblock(
+        &mut self,
+        macroblock_address: usize,
+        slice_id: u32,
+        list0: Option<ResolvedBListMotion>,
+        list1: Option<ResolvedBListMotion>,
+    ) -> ResolvedBMacroblock {
+        let partition = ResolvedBPartition {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            list0,
+            list1,
+        };
+        let mut partitions = SmallVec::new();
+        partitions.push(partition);
+        self.commit_local_cells(
+            macroblock_address,
+            [Some(MotionCell {
+                slice_id,
+                list0,
+                list1,
+            }); 16],
+        );
+        ResolvedBMacroblock {
+            direct: true,
+            partitions,
+        }
     }
 
     pub fn resolve_temporal_direct_macroblock(
@@ -1881,9 +1934,94 @@ mod tests {
                 },
             )
             .unwrap();
+        assert_eq!(resolved.partitions.len(), 1);
         assert!(resolved.partitions.iter().all(|partition| {
             partition.list0.unwrap().motion_vector == MotionVector::default()
                 && partition.list1.unwrap().motion_vector == MotionVector::default()
+        }));
+    }
+
+    #[test]
+    fn spatial_direct_retains_a_mixed_colocated_zero_grid() {
+        let mut colocated = MotionFieldBuilder::new(Size::new(32, 16)).unwrap();
+        let zero = ResolvedPMacroblock {
+            skipped: true,
+            partitions: vec![ResolvedPPartition {
+                x: 0,
+                y: 0,
+                width: 16,
+                height: 16,
+                reference_index: 0,
+                motion_vector: MotionVector::default(),
+            }]
+            .into(),
+        };
+        colocated.record_p(0, &zero, None).unwrap();
+        let mixed = ResolvedPMacroblock {
+            skipped: false,
+            partitions: [
+                (0, 0, MotionVector::default()),
+                (8, 0, MotionVector { x: 4, y: 0 }),
+                (0, 8, MotionVector { x: 0, y: 4 }),
+                (8, 8, MotionVector { x: 4, y: 4 }),
+            ]
+            .map(|(x, y, motion_vector)| ResolvedPPartition {
+                x,
+                y,
+                width: 8,
+                height: 8,
+                reference_index: 0,
+                motion_vector,
+            })
+            .into_iter()
+            .collect(),
+        };
+        colocated.record_p(1, &mixed, None).unwrap();
+        let colocated = colocated.finish().unwrap();
+
+        let mut state = BMotionState::new(2, 1).unwrap();
+        state
+            .resolve_inter_macroblock(
+                0,
+                1,
+                &header(
+                    BPartitionMode::SixteenBySixteen,
+                    vec![partition(
+                        BPredictionMode::Bi,
+                        Some(0),
+                        Some(0),
+                        vec![difference(4, 2)],
+                        vec![difference(-2, 6)],
+                    )],
+                ),
+            )
+            .unwrap();
+        let resolved = state
+            .resolve_spatial_direct_macroblock(
+                1,
+                1,
+                SpatialDirectContext {
+                    colocated_motion: &colocated,
+                    colocated_long_term: false,
+                    direct_8x8_inference: true,
+                    num_ref_idx_l0_active: 1,
+                    num_ref_idx_l1_active: 1,
+                },
+            )
+            .unwrap();
+
+        assert_eq!(resolved.partitions.len(), 4);
+        assert_eq!(
+            resolved.partitions[0].list0.unwrap().motion_vector,
+            MotionVector::default()
+        );
+        assert_eq!(
+            resolved.partitions[0].list1.unwrap().motion_vector,
+            MotionVector::default()
+        );
+        assert!(resolved.partitions[1..].iter().all(|partition| {
+            partition.list0.unwrap().motion_vector == MotionVector { x: 4, y: 2 }
+                && partition.list1.unwrap().motion_vector == MotionVector { x: -2, y: 6 }
         }));
     }
 

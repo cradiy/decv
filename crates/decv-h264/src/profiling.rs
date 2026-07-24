@@ -27,7 +27,12 @@ const CHROMA_CLIPPED_CALLS: usize = 18;
 const CHROMA_INTEGER_PIXELS: usize = 19;
 const CHROMA_BILINEAR_PIXELS: usize = 20;
 const CHROMA_CLIPPED_PIXELS: usize = 21;
-const COUNTER_COUNT: usize = 22;
+const SPATIAL_DIRECT_MACROBLOCKS: usize = 22;
+const SPATIAL_DIRECT_UNIFORM_PREDICTION: usize = 23;
+const SPATIAL_DIRECT_COL_ZERO_CLEAR: usize = 24;
+const SPATIAL_DIRECT_COL_ZERO_SET: usize = 25;
+const SPATIAL_DIRECT_COL_ZERO_MIXED: usize = 26;
+const COUNTER_COUNT: usize = 27;
 
 static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
 
@@ -91,7 +96,7 @@ impl fmt::Display for InterPredictionProfile {
             self.counter(CHROMA_BILINEAR_CALLS),
             self.counter(CHROMA_CLIPPED_CALLS)
         )?;
-        write!(
+        writeln!(
             formatter,
             "  chroma pixels: integer={} ({:.1}%) bilinear={} ({:.1}%) \
              clipped={} ({:.1}%)",
@@ -101,6 +106,16 @@ impl fmt::Display for InterPredictionProfile {
             percent(self.counter(CHROMA_BILINEAR_PIXELS), chroma_pixels),
             self.counter(CHROMA_CLIPPED_PIXELS),
             percent(self.counter(CHROMA_CLIPPED_PIXELS), chroma_pixels)
+        )?;
+        write!(
+            formatter,
+            "spatial Direct: macroblocks={} prediction-uniform={} \
+             col-zero-clear={} col-zero-set={} col-zero-mixed={}",
+            self.counter(SPATIAL_DIRECT_MACROBLOCKS),
+            self.counter(SPATIAL_DIRECT_UNIFORM_PREDICTION),
+            self.counter(SPATIAL_DIRECT_COL_ZERO_CLEAR),
+            self.counter(SPATIAL_DIRECT_COL_ZERO_SET),
+            self.counter(SPATIAL_DIRECT_COL_ZERO_MIXED)
         )
     }
 }
@@ -164,6 +179,24 @@ pub(crate) fn record_inter_prediction(
     }
 }
 
+pub(crate) fn record_spatial_direct_uniform_prediction() {
+    increment(SPATIAL_DIRECT_MACROBLOCKS, 1);
+    increment(SPATIAL_DIRECT_UNIFORM_PREDICTION, 1);
+}
+
+pub(crate) fn record_spatial_direct_col_zero_grid(cell_count: usize, mask: u16) {
+    increment(SPATIAL_DIRECT_MACROBLOCKS, 1);
+    let all_set = u16::MAX >> (u16::BITS as usize - cell_count);
+    increment(
+        match mask {
+            0 => SPATIAL_DIRECT_COL_ZERO_CLEAR,
+            mask if mask == all_set => SPATIAL_DIRECT_COL_ZERO_SET,
+            _ => SPATIAL_DIRECT_COL_ZERO_MIXED,
+        },
+        1,
+    );
+}
+
 fn increment(index: usize, value: u64) {
     COUNTERS[index].fetch_add(value, Ordering::Relaxed);
 }
@@ -191,5 +224,6 @@ mod tests {
         let formatted = InterPredictionProfile::default().to_string();
         assert!(formatted.contains("0 calls"));
         assert!(formatted.contains("(0.0%)"));
+        assert!(formatted.contains("spatial Direct: macroblocks=0"));
     }
 }
