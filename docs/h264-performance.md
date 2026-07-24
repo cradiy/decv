@@ -544,6 +544,16 @@ was faster. A preliminary version that zero-filled the slots on the main
 thread removed the same result copies but made cycles slightly worse,
 confirming that first-touch placement is part of the optimization.
 
+Shrinking `ResolvedBMacroblock` from four inline `SmallVec` partitions to one
+was rejected. Although Direct and Skip macroblocks often coalesce to one
+partition, real x264 B pictures also use enough multi-partition macroblocks
+that spilling them to the allocator increased whole-decoder instructions
+about 0.34%, branches about 0.54%, and branch misses about 3%. Four of five
+paired CABAC runs used more reference cycles. The four-partition inline
+capacity remains the better representation; future work on its visible
+`memmove` cost must eliminate moves without introducing per-macroblock
+allocations.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
