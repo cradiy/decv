@@ -466,6 +466,13 @@ returns `Result<Option<CabacCoefficientBlock>>` with an approximately
 pinned runs reduced CABAC instructions about 0.4%, branches about 0.9%, and
 reference cycles about 0.7%. CAVLC instructions were neutral.
 
+CABAC 8x8 luma coefficient splitting also writes its four `ResidualBlock`
+values directly into their final macroblock slots. This removes the temporary
+four-block return and its subsequent 288-byte copy. Five alternating pinned
+runs reduced instructions and branches by about 0.04% to 0.05%; median
+reference cycles improved about 0.7%. The full byte-exact FFmpeg corpus still
+matches.
+
 The adjacent 65-byte significance-map return was also converted to a
 caller-owned buffer and rejected. It increased CABAC instructions about 0.1%
 and reference cycles about 0.3%, indicating that LLVM already handles this
