@@ -481,6 +481,13 @@ cycles about 1.6% in serial mode and 0.6% with the two-worker `Auto` mode.
 Instructions remained effectively flat, while branches fell about 0.06% in
 serial mode and 0.08% in `Auto`.
 
+Hoisting integer-motion row-width dispatch out of the luma and chroma copy
+loops was rejected. Compile-time-width row kernels removed about 1.9% of
+whole-decoder instructions and 5% of branches, but twelve alternating pinned
+runs showed reference cycles about 0.8% worse in the reversed-order set. The
+existing repeated branches are highly predictable; the shorter loop appears
+to lengthen the row-to-row dependency path.
+
 The adjacent 65-byte significance-map return was also converted to a
 caller-owned buffer and rejected. It increased CABAC instructions about 0.1%
 and reference cycles about 0.3%, indicating that LLVM already handles this
