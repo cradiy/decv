@@ -1224,6 +1224,17 @@ surrounding per-partition control overhead; the existing two-dimensional SSE2
 kernel remains appropriate until a materially different workload proves
 otherwise.
 
+A combined width-16 interior integer YUV path was tested against that profile.
+It recognized motion vectors with integer luma and chroma positions, validated
+one luma rectangle, and copied Y, Cb, and Cr through three fixed-width kernels
+before entering the general interpolation path. A focused all-plane oracle and
+strict Clippy passed. Seven alternating pinned 4K Serial pairs reduced
+instructions about 2.0% and branches about 1.4%, but increased average
+task-clock about 0.75%, reference cycles about 1.94%, CPU cycles about 2.45%,
+and sampled cache misses about 6.4%; only the first reference-cycle pair
+improved. The specialization was fully reverted. Even a dominant path should
+not be cloned when its extra entry layout harms the portable release build.
+
 LLVM profile-guided optimization is now available as a separate native build:
 
 ```text
