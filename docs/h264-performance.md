@@ -981,6 +981,16 @@ cycles increased about 0.05% and task-clock about 0.42%. The bit-mask path was
 fully reverted. For this stream, producing partitions in one pass and
 coalescing afterward schedules better than a speculative classification pass.
 
+Clearing only the category-visible prefix of the reusable 64-entry CABAC
+coefficient buffer was tested and rejected. Most blocks expose only 4, 15, or
+16 entries, so the candidate avoided zeroing the unused tail while retaining
+the complete 64-entry clear for 8x8 transforms. It passed the residual tests
+and native byte-exact H.264 corpus, but replaced an efficiently lowered fixed
+256-byte clear with a variable-length operation. Native `.text` grew by 48
+bytes; seven pinned CABAC Serial pairs increased reference cycles about 0.57%,
+task-clock about 1.05%, and branches about 0.12%, with only two pairs
+improving. The fixed-size clear was restored.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
