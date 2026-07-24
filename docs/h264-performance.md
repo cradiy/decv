@@ -429,6 +429,19 @@ Seven alternating pinned runs reduced CABAC reference cycles about 1.4% and
 CAVLC about 0.5%. Whole-decoder instructions were effectively neutral, while
 branches fell about 0.3%.
 
+Eight-luma-pixel chroma partitions now pack four Cb and four Cr source samples
+into one SSE2 vector, sharing each bilinear operation across both planes.
+One-axis fractional positions also avoid loading and multiplying the two
+unused diagonal sources. Scalar and original per-plane SIMD oracles cover all
+64 fractional positions. Whole-decoder instructions and branches each fell
+about 0.06% to 0.08%; CABAC reference cycles remained within measurement
+noise, while CAVLC samples were consistently no slower and often faster.
+
+Applying the same one-axis shortcut inside the AVX2 wide-partition loop was
+rejected. LLVM expanded the helper from about 405 bytes to 2.3 KiB, while
+CABAC did not show a stable cycle improvement. The compact four-source AVX2
+kernel remains preferable to trading instruction count for front-end pressure.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
