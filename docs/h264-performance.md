@@ -1761,6 +1761,60 @@ FFmpeg at the selected suffix. Repeated-seek tests also cover filter
 replacement, retained reference reconstruction, skipped B-picture reorder
 markers, and restoring ordinary unfiltered output with `flush`.
 
+## Exact Seek Cost Attribution
+
+The MP4 index lookup is not the limiting part of an exact seek. A probe against
+a 1440x2560, 60 fps, 132-second MP4 with one sync sample every 4.167 seconds
+measured ten complete demuxer opens at 3.9-8.1 ms, with a 6.0 ms median. Creating
+the packet cursor and binary-searching the presentation-sorted keyframe index
+both completed below the probe's one-microsecond reporting resolution. A real
+player normally retains the open demuxer, eliminating even the 6 ms parse cost.
+
+First-frame latency was measured by stopping the native decoder immediately
+after its first output. Five alternating runs at targets inside the final GOP
+produced these medians:
+
+| Target relative to preceding keyframe | First-frame latency |
+| ---: | ---: |
+| 0.000 s | 91.7 ms |
+| 1.000 s | 389.8 ms |
+| 2.000 s | 625.0 ms |
+| 2.733 s | 822.2 ms |
+
+The approximately linear growth, about 267 ms for each additional second of
+GOP distance over the complete interval, identifies dependency reconstruction
+as the dominant cost. Exact H.264 seek must rebuild every reference picture
+needed between the sync sample and the selected picture. The decoder already
+suppresses pre-target output storage and entirely skips pre-target
+non-reference pictures, so the remaining work is chiefly required reference
+P-picture reconstruction, entropy/residual decoding, motion compensation, and
+deblocking. Further acceleration of normal decode helps this path, but an
+interactive sub-100 ms response across a 4.167-second GOP requires a
+presentation strategy as well: following-keyframe preview, cached decoder
+checkpoints/reference pictures, request cancellation, or shorter source GOPs.
+
+## Integer Bidirectional Prediction Fusion
+
+Default bidirectional prediction with integer luma and chroma motion formerly
+copied both reference rectangles into separate scratch predictions, averaged
+one scratch into the other, then copied the result into macroblock staging.
+The interior fast path now averages both reference rows directly into the
+staged luma, Cb, and Cr blocks. SSE2 handles the fixed 2/4/8/16-byte row widths
+on x86_64; other targets retain the scalar normative equation. Fractional,
+clipped, single-list, explicit-weight, and implicit-weight cases continue
+through the general interpolation path.
+
+Eleven-run PGO `perf stat` means on the 48-frame 4K comparison stream reduced
+cycles from 6.211 billion to 6.136 billion (1.2%) and task-clock from 1.690 to
+1.680 seconds (0.6%). Mean wall time fell from 1.078 to 1.054 seconds (2.2%),
+although wall-time noise remains larger than the hardware-counter change.
+Instructions increased by 0.2% because of fast-path qualification. The
+complete 570 MiB NV12 output retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`.
+On the long-GOP seek source, seven native first-frame pairs changed the median
+from 836.7 to 813.0 ms (2.8%); this is useful but confirms that ordinary
+motion-compensation tuning alone cannot make long-GOP exact seek immediate.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

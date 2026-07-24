@@ -337,64 +337,77 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
         .as_ref()
         .map_or(motion.partitions.as_slice(), std::slice::from_ref);
     for partition in partitions {
-        let has_l0 = predict_b_partition_list_into(
+        if !predict_default_integer_bipred_into(
             references_l0,
-            current_size,
-            macroblock_x,
-            macroblock_y,
-            *partition,
-            partition.list0,
-            "B partition selects no reference picture in List 0",
-            prediction_l0,
-        )?;
-        let has_l1 = predict_b_partition_list_into(
             references_l1,
             current_size,
             macroblock_x,
             macroblock_y,
             *partition,
-            partition.list1,
-            "B partition selects no reference picture in List 1",
-            prediction_l1,
-        )?;
-        let prediction = merge_b_predictions(
-            has_l0.then_some(&mut *prediction_l0),
-            has_l1.then_some(&mut *prediction_l1),
-            partition.list0.map(|motion| motion.reference_index),
-            partition.list1.map(|motion| motion.reference_index),
             weight_mode,
-        )?;
-        for y in 0..usize::from(partition.height) {
-            let destination_y = usize::from(partition.y) + y;
-            // SAFETY: prediction validation guarantees a 4/8/16-byte luma
-            // partition within this macroblock and both fixed rows.
-            unsafe {
-                copy_fixed_row(
-                    predicted_luma[destination_y]
-                        .as_mut_ptr()
-                        .add(usize::from(partition.x)),
-                    prediction.luma[y].as_ptr(),
-                    usize::from(partition.width),
-                );
+            predicted_luma,
+            predicted_cb,
+            predicted_cr,
+        )? {
+            let has_l0 = predict_b_partition_list_into(
+                references_l0,
+                current_size,
+                macroblock_x,
+                macroblock_y,
+                *partition,
+                partition.list0,
+                "B partition selects no reference picture in List 0",
+                prediction_l0,
+            )?;
+            let has_l1 = predict_b_partition_list_into(
+                references_l1,
+                current_size,
+                macroblock_x,
+                macroblock_y,
+                *partition,
+                partition.list1,
+                "B partition selects no reference picture in List 1",
+                prediction_l1,
+            )?;
+            let prediction = merge_b_predictions(
+                has_l0.then_some(&mut *prediction_l0),
+                has_l1.then_some(&mut *prediction_l1),
+                partition.list0.map(|motion| motion.reference_index),
+                partition.list1.map(|motion| motion.reference_index),
+                weight_mode,
+            )?;
+            for y in 0..usize::from(partition.height) {
+                let destination_y = usize::from(partition.y) + y;
+                // SAFETY: prediction validation guarantees a 4/8/16-byte luma
+                // partition within this macroblock and both fixed rows.
+                unsafe {
+                    copy_fixed_row(
+                        predicted_luma[destination_y]
+                            .as_mut_ptr()
+                            .add(usize::from(partition.x)),
+                        prediction.luma[y].as_ptr(),
+                        usize::from(partition.width),
+                    );
+                }
             }
-        }
-        for y in 0..usize::from(partition.height / 2) {
-            let start = usize::from(partition.x / 2);
-            let destination_y = usize::from(partition.y / 2) + y;
-            let width = usize::from(partition.width / 2);
-            // SAFETY: prediction validation guarantees a 2/4/8-byte chroma
-            // partition within these fixed eight-byte rows.
-            unsafe {
-                copy_fixed_row(
-                    predicted_cb[destination_y].as_mut_ptr().add(start),
-                    prediction.cb[y].as_ptr(),
-                    width,
-                );
-                copy_fixed_row(
-                    predicted_cr[destination_y].as_mut_ptr().add(start),
-                    prediction.cr[y].as_ptr(),
-                    width,
-                );
+            for y in 0..usize::from(partition.height / 2) {
+                let start = usize::from(partition.x / 2);
+                let destination_y = usize::from(partition.y / 2) + y;
+                let width = usize::from(partition.width / 2);
+                // SAFETY: prediction validation guarantees a 2/4/8-byte chroma
+                // partition within these fixed eight-byte rows.
+                unsafe {
+                    copy_fixed_row(
+                        predicted_cb[destination_y].as_mut_ptr().add(start),
+                        prediction.cb[y].as_ptr(),
+                        width,
+                    );
+                    copy_fixed_row(
+                        predicted_cr[destination_y].as_mut_ptr().add(start),
+                        prediction.cr[y].as_ptr(),
+                        width,
+                    );
+                }
             }
         }
         for y in (partition.y..partition.y + partition.height).step_by(4) {
@@ -424,6 +437,260 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
         add_inter_residual_to_prediction(predicted_luma, predicted_cb, predicted_cr, residual);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_default_integer_bipred_into(
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    current_size: Size,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    partition: ResolvedBPartition,
+    weight_mode: BPredictionWeightMode<'_>,
+    predicted_luma: &mut [[u8; 16]; 16],
+    predicted_cb: &mut [[u8; 8]; 8],
+    predicted_cr: &mut [[u8; 8]; 8],
+) -> Result<bool> {
+    if !matches!(weight_mode, BPredictionWeightMode::Default)
+        || !matches!(partition.width, 4 | 8 | 16)
+        || !matches!(partition.height, 4 | 8 | 16)
+        || !partition.x.is_multiple_of(4)
+        || !partition.y.is_multiple_of(4)
+        || partition
+            .x
+            .checked_add(partition.width)
+            .is_none_or(|right| right > 16)
+        || partition
+            .y
+            .checked_add(partition.height)
+            .is_none_or(|bottom| bottom > 16)
+    {
+        return Ok(false);
+    }
+    let (Some(list0), Some(list1)) = (partition.list0, partition.list1) else {
+        return Ok(false);
+    };
+    if list0.motion_vector.x.rem_euclid(8) != 0
+        || list0.motion_vector.y.rem_euclid(8) != 0
+        || list1.motion_vector.x.rem_euclid(8) != 0
+        || list1.motion_vector.y.rem_euclid(8) != 0
+    {
+        return Ok(false);
+    }
+
+    let reference_l0 = references_l0
+        .get(usize::from(list0.reference_index))
+        .copied()
+        .flatten()
+        .ok_or(H264Error::InvalidSyntax(
+            "B partition selects no reference picture in List 0",
+        ))?;
+    let reference_l1 = references_l1
+        .get(usize::from(list1.reference_index))
+        .copied()
+        .flatten()
+        .ok_or(H264Error::InvalidSyntax(
+            "B partition selects no reference picture in List 1",
+        ))?;
+    if reference_l0.coded_size() != current_size || reference_l1.coded_size() != current_size {
+        return Err(H264Error::InvalidSyntax(
+            "B reference picture coded size does not match",
+        ));
+    }
+
+    let width = usize::try_from(current_size.width).map_err(|_| H264Error::IntegerOverflow)?;
+    let height = usize::try_from(current_size.height).map_err(|_| H264Error::IntegerOverflow)?;
+    let current_x = macroblock_x
+        .checked_mul(16)
+        .and_then(|x| x.checked_add(usize::from(partition.x)))
+        .ok_or(H264Error::IntegerOverflow)?;
+    let current_y = macroblock_y
+        .checked_mul(16)
+        .and_then(|y| y.checked_add(usize::from(partition.y)))
+        .ok_or(H264Error::IntegerOverflow)?;
+    let luma_width = usize::from(partition.width);
+    let luma_height = usize::from(partition.height);
+    let Some((luma_l0_x, luma_l0_y)) = integer_reference_origin(
+        current_x,
+        current_y,
+        list0.motion_vector,
+        4,
+        luma_width,
+        luma_height,
+        width,
+        height,
+    ) else {
+        return Ok(false);
+    };
+    let Some((luma_l1_x, luma_l1_y)) = integer_reference_origin(
+        current_x,
+        current_y,
+        list1.motion_vector,
+        4,
+        luma_width,
+        luma_height,
+        width,
+        height,
+    ) else {
+        return Ok(false);
+    };
+
+    let chroma_width = luma_width / 2;
+    let chroma_height = luma_height / 2;
+    let plane_chroma_width = width / 2;
+    let plane_chroma_height = height / 2;
+    let Some((chroma_l0_x, chroma_l0_y)) = integer_reference_origin(
+        current_x / 2,
+        current_y / 2,
+        list0.motion_vector,
+        8,
+        chroma_width,
+        chroma_height,
+        plane_chroma_width,
+        plane_chroma_height,
+    ) else {
+        return Ok(false);
+    };
+    let Some((chroma_l1_x, chroma_l1_y)) = integer_reference_origin(
+        current_x / 2,
+        current_y / 2,
+        list1.motion_vector,
+        8,
+        chroma_width,
+        chroma_height,
+        plane_chroma_width,
+        plane_chroma_height,
+    ) else {
+        return Ok(false);
+    };
+
+    let (luma_l0, cb_l0, cr_l0) = reference_l0.planes();
+    let (luma_l1, cb_l1, cr_l1) = reference_l1.planes();
+    let destination_x = usize::from(partition.x);
+    let destination_y = usize::from(partition.y);
+    for row in 0..luma_height {
+        let source_l0 = (luma_l0_y + row) * width + luma_l0_x;
+        let source_l1 = (luma_l1_y + row) * width + luma_l1_x;
+        // SAFETY: Both complete integer-sample reference rectangles and the
+        // destination partition were validated above.
+        unsafe {
+            average_fixed_row(
+                predicted_luma[destination_y + row]
+                    .as_mut_ptr()
+                    .add(destination_x),
+                luma_l0.as_ptr().add(source_l0),
+                luma_l1.as_ptr().add(source_l1),
+                luma_width,
+            );
+        }
+    }
+
+    let destination_chroma_x = destination_x / 2;
+    let destination_chroma_y = destination_y / 2;
+    for row in 0..chroma_height {
+        let source_l0 = (chroma_l0_y + row) * plane_chroma_width + chroma_l0_x;
+        let source_l1 = (chroma_l1_y + row) * plane_chroma_width + chroma_l1_x;
+        // SAFETY: Both chroma rectangles and fixed-size destinations were
+        // validated together with the luma partition.
+        unsafe {
+            average_fixed_row(
+                predicted_cb[destination_chroma_y + row]
+                    .as_mut_ptr()
+                    .add(destination_chroma_x),
+                cb_l0.as_ptr().add(source_l0),
+                cb_l1.as_ptr().add(source_l1),
+                chroma_width,
+            );
+            average_fixed_row(
+                predicted_cr[destination_chroma_y + row]
+                    .as_mut_ptr()
+                    .add(destination_chroma_x),
+                cr_l0.as_ptr().add(source_l0),
+                cr_l1.as_ptr().add(source_l1),
+                chroma_width,
+            );
+        }
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn integer_reference_origin(
+    current_x: usize,
+    current_y: usize,
+    motion: crate::MotionVector,
+    divisor: i64,
+    block_width: usize,
+    block_height: usize,
+    plane_width: usize,
+    plane_height: usize,
+) -> Option<(usize, usize)> {
+    let reference_x = i64::try_from(current_x)
+        .ok()?
+        .checked_add(i64::from(motion.x) / divisor)?;
+    let reference_y = i64::try_from(current_y)
+        .ok()?
+        .checked_add(i64::from(motion.y) / divisor)?;
+    let reference_x = usize::try_from(reference_x).ok()?;
+    let reference_y = usize::try_from(reference_y).ok()?;
+    (reference_x.checked_add(block_width)? <= plane_width
+        && reference_y.checked_add(block_height)? <= plane_height)
+        .then_some((reference_x, reference_y))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn average_fixed_row(destination: *mut u8, left: *const u8, right: *const u8, width: usize) {
+    use std::arch::x86_64::{
+        __m128i, _mm_avg_epu8, _mm_cvtsi32_si128, _mm_cvtsi128_si32, _mm_loadl_epi64,
+        _mm_loadu_si128, _mm_storel_epi64, _mm_storeu_si128,
+    };
+
+    match width {
+        2 => {
+            let left = unsafe { std::ptr::read_unaligned(left.cast::<u16>()) };
+            let right = unsafe { std::ptr::read_unaligned(right.cast::<u16>()) };
+            let left = _mm_cvtsi32_si128(i32::from(left));
+            let right = _mm_cvtsi32_si128(i32::from(right));
+            let averaged = _mm_cvtsi128_si32(_mm_avg_epu8(left, right)) as u16;
+            unsafe { std::ptr::write_unaligned(destination.cast::<u16>(), averaged) };
+        }
+        4 => {
+            let left = unsafe { std::ptr::read_unaligned(left.cast::<i32>()) };
+            let right = unsafe { std::ptr::read_unaligned(right.cast::<i32>()) };
+            let averaged = _mm_cvtsi128_si32(_mm_avg_epu8(
+                _mm_cvtsi32_si128(left),
+                _mm_cvtsi32_si128(right),
+            ));
+            unsafe { std::ptr::write_unaligned(destination.cast::<i32>(), averaged) };
+        }
+        8 => {
+            let left = unsafe { _mm_loadl_epi64(left.cast::<__m128i>()) };
+            let right = unsafe { _mm_loadl_epi64(right.cast::<__m128i>()) };
+            unsafe { _mm_storel_epi64(destination.cast::<__m128i>(), _mm_avg_epu8(left, right)) };
+        }
+        16 => {
+            let left = unsafe { _mm_loadu_si128(left.cast::<__m128i>()) };
+            let right = unsafe { _mm_loadu_si128(right.cast::<__m128i>()) };
+            unsafe {
+                _mm_storeu_si128(destination.cast::<__m128i>(), _mm_avg_epu8(left, right));
+            }
+        }
+        _ => unreachable!("validated 4:2:0 partition rows have fixed power-of-two widths"),
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn average_fixed_row(destination: *mut u8, left: *const u8, right: *const u8, width: usize) {
+    for index in 0..width {
+        unsafe {
+            destination.add(index).write(rounded_average(
+                left.add(index).read(),
+                right.add(index).read(),
+            ));
+        }
+    }
 }
 
 /// Coalesces an internally resolved Direct grid when every cell uses the same
@@ -1977,6 +2244,93 @@ mod tests {
         )
         .unwrap();
         assert_eq!(coalesced, partitioned);
+    }
+
+    #[test]
+    fn integer_default_biprediction_averages_reference_rectangles_directly() {
+        let size = Size {
+            width: 32,
+            height: 16,
+        };
+        let mut first = Yuv420Picture::new(size).unwrap();
+        let mut second = Yuv420Picture::new(size).unwrap();
+        {
+            let (luma, cb, cr) = first.planes_mut();
+            for (index, sample) in luma.iter_mut().enumerate() {
+                *sample = (index * 17 + index / 32 * 5) as u8;
+            }
+            for (index, sample) in cb.iter_mut().enumerate() {
+                *sample = (index * 11 + 7) as u8;
+            }
+            for (index, sample) in cr.iter_mut().enumerate() {
+                *sample = (index * 13 + 19) as u8;
+            }
+        }
+        {
+            let (luma, cb, cr) = second.planes_mut();
+            for (index, sample) in luma.iter_mut().enumerate() {
+                *sample = (index * 23 + index / 32 * 3 + 29) as u8;
+            }
+            for (index, sample) in cb.iter_mut().enumerate() {
+                *sample = (index * 7 + 31) as u8;
+            }
+            for (index, sample) in cr.iter_mut().enumerate() {
+                *sample = (index * 5 + 43) as u8;
+            }
+        }
+
+        let mut current = Yuv420Picture::new(size).unwrap();
+        reconstruct_b_macroblock_from_lists_420(
+            &mut current,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions: vec![b_partition(
+                    0,
+                    0,
+                    16,
+                    16,
+                    Some(ResolvedBListMotion {
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: 8, y: 0 },
+                    }),
+                    Some(ResolvedBListMotion {
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: 16, y: 0 },
+                    }),
+                )]
+                .into(),
+            },
+            &zero_residual(),
+        )
+        .unwrap();
+
+        let (actual_luma, actual_cb, actual_cr) = current.planes();
+        let (first_luma, first_cb, first_cr) = first.planes();
+        let (second_luma, second_cb, second_cr) = second.planes();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    actual_luma[y * 32 + x],
+                    rounded_average(first_luma[y * 32 + x + 2], second_luma[y * 32 + x + 4])
+                );
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(
+                    actual_cb[y * 16 + x],
+                    rounded_average(first_cb[y * 16 + x + 1], second_cb[y * 16 + x + 2])
+                );
+                assert_eq!(
+                    actual_cr[y * 16 + x],
+                    rounded_average(first_cr[y * 16 + x + 1], second_cr[y * 16 + x + 2])
+                );
+            }
+        }
     }
 
     #[test]
