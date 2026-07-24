@@ -397,6 +397,16 @@ the prepared reconstruction path. CABAC reference cycles were neutral while
 instructions fell 0.6%; CAVLC instructions fell 0.8% and reference cycles
 about 3.5%.
 
+Full-macroblock Spatial Direct prediction now loads its fixed A, B, C, and D
+4x4 neighbours directly from cells 3, 12, 12, and 15 of the adjacent
+macroblocks. The old general partition helper converted four pixel
+coordinates back into macroblock and local-cell coordinates with repeated
+bounds checks, division, and remainder operations. Slice filtering and
+top-right-to-top-left fallback are unchanged. Seven alternating pinned runs
+reduced CABAC reference cycles about 1.3%, instructions 0.3%, and branches
+0.4%; CAVLC reference cycles fell about 1.8% with a similar instruction
+reduction.
+
 ## BitReader Checkpoint
 
 The generic `bit-readers` crate is no longer a leading whole-decoder hotspot.
