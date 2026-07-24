@@ -1297,6 +1297,16 @@ reference cycles about 1.46% and wall time about 1.27%. Both implementations
 were fully reverted; fewer retired instructions did not compensate for their
 longer dependency paths and changed layout.
 
+Resolved P-macroblock partitions now use four-entry inline storage, matching
+the existing B-macroblock representation. Common P_Skip, 16x16, 16x8, 8x16,
+and 8x8 layouts therefore avoid a heap allocation; unusually subdivided 8x8
+layouts can still spill without changing semantics. Seven native 4K
+four-worker pairs reduced average wall time about 1.21%, reference cycles about
+0.82%, instructions about 0.86%, branches about 1.48%, and sampled cache misses
+about 1.55%. After PGO, the corresponding reductions were about 0.75%, 0.27%,
+0.93%, 1.76%, and 2.04%. The full workspace suite, strict Clippy, and exact
+4K hash passed.
+
 Large CABAC non-reference pictures now complete through a bounded cross-frame
 pipeline when a reconstruction pool is active. Picture completeness and the
 discarded reference-motion field are validated synchronously. Deblocking and

@@ -3447,7 +3447,8 @@ mod tests {
                     reference_index: 0,
                     motion_vector: MotionVector { x: 7, y: 8 },
                 },
-            ],
+            ]
+            .into(),
         };
         let quantizer = MacroblockQuantizer {
             luma: 31,

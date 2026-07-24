@@ -1752,7 +1752,8 @@ mod tests {
                 height: 16,
                 reference_index: 0,
                 motion_vector: MotionVector::default(),
-            }],
+            }]
+            .into(),
         };
         colocated.record_p(0, &zero, None).unwrap();
         colocated.record_p(1, &zero, None).unwrap();
@@ -1810,7 +1811,8 @@ mod tests {
                         height: 16,
                         reference_index: 0,
                         motion_vector: MotionVector { x: 8, y: 4 },
-                    }],
+                    }]
+                    .into(),
                 },
                 Some(&[Some(reference_id)]),
             )

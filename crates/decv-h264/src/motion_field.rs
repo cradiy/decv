@@ -568,7 +568,8 @@ mod tests {
                             height: 16,
                             reference_index: 0,
                             motion_vector: MotionVector::default(),
-                        }],
+                        }]
+                        .into(),
                     },
                     None,
                 )
@@ -600,7 +601,8 @@ mod tests {
                         height: 16,
                         reference_index: 0,
                         motion_vector: MotionVector { x: 3, y: -2 },
-                    }],
+                    }]
+                    .into(),
                 },
                 Some(&[Some(ReferenceId::new(9))]),
             )
@@ -628,7 +630,8 @@ mod tests {
                         height: 16,
                         reference_index: 0,
                         motion_vector: MotionVector { x: 3, y: -2 },
-                    }],
+                    }]
+                    .into(),
                 },
                 Some(&[Some(ReferenceId::new(9))]),
             )
@@ -653,7 +656,8 @@ mod tests {
                             height: 16,
                             reference_index: 0,
                             motion_vector: MotionVector::default(),
-                        }],
+                        }]
+                        .into(),
                     },
                     None,
                 )

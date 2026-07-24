@@ -1998,7 +1998,7 @@ mod tests {
             0,
             &ResolvedPMacroblock {
                 skipped: false,
-                partitions: vec![partition(0, 0, 16, 16, 0)],
+                partitions: vec![partition(0, 0, 16, 16, 0)].into(),
             },
             &residual,
         )
@@ -2020,7 +2020,7 @@ mod tests {
             0,
             &ResolvedPMacroblock {
                 skipped: false,
-                partitions: vec![partition(0, 0, 8, 16, 0), partition(8, 0, 8, 16, 1)],
+                partitions: vec![partition(0, 0, 8, 16, 0), partition(8, 0, 8, 16, 1)].into(),
             },
             &zero_residual(),
         )
@@ -2040,7 +2040,7 @@ mod tests {
             0,
             &ResolvedPMacroblock {
                 skipped: false,
-                partitions: vec![partition(0, 0, 16, 16, 0)],
+                partitions: vec![partition(0, 0, 16, 16, 0)].into(),
             },
             &zero_residual(),
             &PredictionWeightTable {
@@ -2077,7 +2077,7 @@ mod tests {
             0,
             &ResolvedPMacroblock {
                 skipped: false,
-                partitions: vec![partition(0, 0, 16, 16, 0)],
+                partitions: vec![partition(0, 0, 16, 16, 0)].into(),
             },
             &zero_residual(),
             &PredictionWeightTable {
@@ -2524,7 +2524,7 @@ mod tests {
             0,
             &ResolvedPMacroblock {
                 skipped: false,
-                partitions: vec![partition(0, 0, 8, 16, 0)],
+                partitions: vec![partition(0, 0, 8, 16, 0)].into(),
             },
             &zero_residual(),
         );

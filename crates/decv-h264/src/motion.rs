@@ -35,7 +35,7 @@ pub struct ResolvedPPartition {
 pub struct ResolvedPMacroblock {
     pub skipped: bool,
     /// Partitions are in macroblock/sub-macroblock decoding order.
-    pub partitions: Vec<ResolvedPPartition>,
+    pub partitions: SmallVec<[ResolvedPPartition; 4]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,7 +169,7 @@ impl PMotionState {
         self.ensure_macroblock_available_for_write(macroblock_address)?;
         let plans = partition_plans(header)?;
         let mut local = [None; 16];
-        let mut resolved = Vec::with_capacity(plans.len());
+        let mut resolved = SmallVec::with_capacity(plans.len());
 
         for (geometry, reference_index, difference) in plans {
             let predictor = self.predict_motion_vector(
@@ -263,7 +263,7 @@ impl PMotionState {
         self.commit_local_cells(macroblock_address, completed);
         Ok(ResolvedPMacroblock {
             skipped: true,
-            partitions: vec![partition],
+            partitions: smallvec::smallvec![partition],
         })
     }
 
