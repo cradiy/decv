@@ -279,13 +279,6 @@ impl BMotionState {
             macroblock_address,
             macroblock_y * self.width_in_macroblocks + macroblock_x
         );
-        let geometry = PartitionGeometry {
-            x: 0,
-            y: 0,
-            width: 16,
-            height: 16,
-            macroblock_partition_index: 0,
-        };
         let neighbour_cells = self.full_macroblock_neighbour_cells_at(
             macroblock_address,
             macroblock_x,
@@ -319,6 +312,33 @@ impl BMotionState {
                 zero,
             ));
         }
+        self.resolve_spatial_direct_macroblock_general(
+            macroblock_address,
+            macroblock_x,
+            macroblock_y,
+            slice_id,
+            context,
+            neighbour_cells,
+        )
+    }
+
+    #[inline(never)]
+    fn resolve_spatial_direct_macroblock_general(
+        &mut self,
+        macroblock_address: usize,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        slice_id: u32,
+        context: SpatialDirectContext<'_>,
+        neighbour_cells: [Option<MotionCell>; 4],
+    ) -> Result<ResolvedBMacroblock> {
+        let geometry = PartitionGeometry {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            macroblock_partition_index: 0,
+        };
         let (neighbours_l0, neighbours_l1) = neighbour_motion_lists(neighbour_cells);
         let mut reference_l0 = spatial_direct_reference_index_from(neighbours_l0);
         let mut reference_l1 = spatial_direct_reference_index_from(neighbours_l1);

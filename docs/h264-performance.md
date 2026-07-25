@@ -2294,6 +2294,22 @@ SHA-256
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
 and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
 
+The remaining complete Spatial Direct derivation is now explicitly outlined.
+Since the zero-neighbour fast path serves 94.7% of profiled macroblocks, this
+shrinks the PGO `BDirectPrediction::resolve` hot symbol from about 12.3 KiB to
+5.1 KiB; only the uncommon fallback enters the separate 7.7 KiB routine.
+Although aggregate code grows slightly and the call boundary retires 0.4% more
+instructions and 1.9% more branches on the first-frame workload, fifteen-run
+means reduced task-clock by 4.0%, cycles by 2.7%, branch misses by 2.8%, and
+cache misses by 6.6%. Its median moved from 0.54 to 0.53 seconds.
+
+Nine ordinary 4K pairs reduced the wall-time median from 1.06 to 1.05 seconds.
+Nine CAVLC pairs moved from 0.54 to 0.52 seconds, while eleven-run CAVLC
+counter means reduced task-clock and cycles by 3.1% and 3.2% with effectively
+neutral instructions and branches. Outlining is useful here because a measured
+dominant fast return already exists; earlier attempts to split work without
+such a dominant branch remained correctly rejected.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
