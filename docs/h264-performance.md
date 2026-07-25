@@ -2241,6 +2241,16 @@ but retaining per-frame checkpoints would spend unnecessary memory. The
 practical policy is a small time- or memory-bounded cache, with checkpoint
 spacing chosen against the application's latency budget.
 
+`H264SeekCheckpointCache<T>` now provides that bounded policy as a reusable
+library component. It pairs each checkpoint with a generic compressed-input
+position, applies independent entry-count and conservative reference-byte
+limits, replaces duplicate resume points, and returns the latest checkpoint
+strictly before a requested target. When a limit is exceeded it evicts the
+oldest resume points first, preserving the most recent decoded window. This
+does not change cold-seek codec work by itself; it makes the measured
+checkpoint restore path directly usable without every consumer independently
+implementing ordering, strict-bound selection, and memory eviction.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

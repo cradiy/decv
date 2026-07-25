@@ -77,7 +77,10 @@ pub use cavlc::{
     CoeffToken, CoeffTokenContext, ResidualBlock, decode_coeff_token, decode_residual_block,
 };
 pub use cavlc_context::CavlcNeighborState;
-pub use decoder::{H264Decoder, H264SeekCheckpoint, H264StreamParser, ParserEvent};
+pub use decoder::{
+    H264Decoder, H264SeekCheckpoint, H264SeekCheckpointCache, H264SeekCheckpointEntry,
+    H264StreamParser, ParserEvent,
+};
 pub use dpb::{
     ActiveBReferenceInfoLists, ActiveBReferenceLists, ActiveReferenceInfo, ActiveReferenceInfoList,
     ActiveReferenceList, DecodedPictureBuffer, DefaultBReferenceLists, DefaultReferenceList,

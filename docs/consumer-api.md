@@ -120,12 +120,19 @@ For repeated seeks in both directions, cache a decoder checkpoint together
 with its exact next-sample cursor position:
 
 ```rust,ignore
+let mut checkpoints = H264SeekCheckpointCache::new(
+    4,
+    128 * 1024 * 1024,
+);
 let resume_sample = cursor.next_sample_index();
 let checkpoint = decoder.create_seek_checkpoint()?;
+checkpoints.insert(checkpoint, resume_sample);
 
-// Later, for a target strictly after checkpoint.resume_time():
-cursor.seek_to_sample(resume_sample)?;
-decoder.restore_seek_checkpoint(&checkpoint, target)?;
+// Later, the cache enforces the strict resume-time bound:
+if let Some(cached) = checkpoints.latest_before(target) {
+    cursor.seek_to_sample(*cached.input_position())?;
+    decoder.restore_seek_checkpoint(cached.checkpoint(), target)?;
+}
 ```
 
 Call `create_seek_checkpoint` only after feeding a complete access unit. It
@@ -141,7 +148,11 @@ for every frame. `retained_reference_count()` and
 `estimated_retained_reference_bytes()` expose a conservative per-checkpoint
 cache cost. Summing the byte estimate can overcount allocations shared by
 multiple checkpoints, making it suitable for a simple upper-budget eviction
-policy.
+policy. `H264SeekCheckpointCache<T>` implements that policy with independent
+entry and byte limits. It stores a caller-defined input-position token, keeps
+entries ordered by resume time, selects the strict predecessor required by
+restore, replaces duplicate resume points, and evicts the oldest checkpoints
+first to retain the most recent decoded window.
 
 For one active decoder, choose the least destructive valid transition in this
 order:

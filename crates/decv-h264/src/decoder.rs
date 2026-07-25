@@ -136,6 +136,152 @@ impl H264SeekCheckpoint {
     }
 }
 
+/// One decoder checkpoint paired with the caller's matching input position.
+///
+/// The position is intentionally generic: an MP4 caller can store a sample
+/// index, while another container can retain its own cursor token.
+#[derive(Debug, Clone)]
+pub struct H264SeekCheckpointEntry<T> {
+    checkpoint: H264SeekCheckpoint,
+    input_position: T,
+}
+
+impl<T> H264SeekCheckpointEntry<T> {
+    /// Decoder state to restore before resuming from [`Self::input_position`].
+    pub const fn checkpoint(&self) -> &H264SeekCheckpoint {
+        &self.checkpoint
+    }
+
+    /// Exact compressed-input position immediately after the checkpoint.
+    pub const fn input_position(&self) -> &T {
+        &self.input_position
+    }
+
+    /// Exclusive lower presentation-time bound accepted by this checkpoint.
+    pub const fn resume_time(&self) -> MediaTime {
+        self.checkpoint.resume_time()
+    }
+
+    /// Conservative logical size charged against the cache byte budget.
+    pub fn estimated_retained_reference_bytes(&self) -> usize {
+        self.checkpoint.estimated_retained_reference_bytes()
+    }
+}
+
+/// A bounded cache of decoder checkpoints for repeated exact seeks.
+///
+/// Entries are ordered by resume time. When either limit is exceeded, the
+/// oldest resume points are evicted first, retaining the most recent decoded
+/// window. The byte accounting deliberately sums each checkpoint's
+/// conservative estimate even when checkpoints share `Arc` allocations.
+#[derive(Debug, Clone)]
+pub struct H264SeekCheckpointCache<T> {
+    entries: Vec<H264SeekCheckpointEntry<T>>,
+    maximum_entries: usize,
+    maximum_estimated_reference_bytes: usize,
+    estimated_retained_reference_bytes: usize,
+}
+
+impl<T> H264SeekCheckpointCache<T> {
+    /// Creates a cache with independent entry-count and conservative byte
+    /// limits. A zero limit disables retention.
+    pub const fn new(maximum_entries: usize, maximum_estimated_reference_bytes: usize) -> Self {
+        Self {
+            entries: Vec::new(),
+            maximum_entries,
+            maximum_estimated_reference_bytes,
+            estimated_retained_reference_bytes: 0,
+        }
+    }
+
+    /// Inserts or replaces the checkpoint at its resume time.
+    ///
+    /// Returns whether the inserted entry remains cached after enforcing both
+    /// limits. A checkpoint larger than the complete byte budget is rejected.
+    pub fn insert(&mut self, checkpoint: H264SeekCheckpoint, input_position: T) -> bool {
+        let resume_time = checkpoint.resume_time();
+        let estimated_bytes = checkpoint.estimated_retained_reference_bytes();
+        if self.maximum_entries == 0
+            || self.maximum_estimated_reference_bytes == 0
+            || estimated_bytes > self.maximum_estimated_reference_bytes
+        {
+            return false;
+        }
+
+        let insertion_index = self
+            .entries
+            .partition_point(|entry| entry.resume_time() < resume_time);
+        if self
+            .entries
+            .get(insertion_index)
+            .is_some_and(|entry| entry.resume_time() == resume_time)
+        {
+            let replaced = self.entries.remove(insertion_index);
+            self.estimated_retained_reference_bytes = self
+                .estimated_retained_reference_bytes
+                .saturating_sub(replaced.estimated_retained_reference_bytes());
+        }
+        self.estimated_retained_reference_bytes = self
+            .estimated_retained_reference_bytes
+            .saturating_add(estimated_bytes);
+        self.entries.insert(
+            insertion_index,
+            H264SeekCheckpointEntry {
+                checkpoint,
+                input_position,
+            },
+        );
+
+        while self.entries.len() > self.maximum_entries
+            || self.estimated_retained_reference_bytes > self.maximum_estimated_reference_bytes
+        {
+            let evicted = self.entries.remove(0);
+            self.estimated_retained_reference_bytes = self
+                .estimated_retained_reference_bytes
+                .saturating_sub(evicted.estimated_retained_reference_bytes());
+        }
+        self.entries
+            .binary_search_by_key(&resume_time, H264SeekCheckpointEntry::resume_time)
+            .is_ok()
+    }
+
+    /// Returns the latest checkpoint whose resume bound is strictly before
+    /// `target`, as required by [`H264Decoder::restore_seek_checkpoint`].
+    pub fn latest_before(&self, target: MediaTime) -> Option<&H264SeekCheckpointEntry<T>> {
+        let insertion_index = self
+            .entries
+            .partition_point(|entry| entry.resume_time() < target);
+        insertion_index
+            .checked_sub(1)
+            .and_then(|index| self.entries.get(index))
+    }
+
+    pub fn clear(&mut self) {
+        self.entries.clear();
+        self.estimated_retained_reference_bytes = 0;
+    }
+
+    pub const fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub const fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub const fn maximum_entries(&self) -> usize {
+        self.maximum_entries
+    }
+
+    pub const fn maximum_estimated_reference_bytes(&self) -> usize {
+        self.maximum_estimated_reference_bytes
+    }
+
+    pub const fn estimated_retained_reference_bytes(&self) -> usize {
+        self.estimated_retained_reference_bytes
+    }
+}
+
 impl Default for H264Decoder {
     fn default() -> Self {
         Self {
@@ -1344,7 +1490,9 @@ mod tests {
         Rect, Size, TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
     };
 
-    use super::{H264Decoder, H264StreamParser, ParserEvent, PictureIdentity};
+    use super::{
+        H264Decoder, H264SeekCheckpointCache, H264StreamParser, ParserEvent, PictureIdentity,
+    };
     use crate::{
         AnnexBReader, H264Error, H264Parallelism, IntraPictureReconstructor, MotionVector,
         NalHeader, NalUnit,
@@ -2256,6 +2404,91 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::EndOfStream
         ));
+    }
+
+    #[test]
+    fn seek_checkpoint_cache_selects_strict_predecessors_and_enforces_budgets() {
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        let zero = MediaTime::from_parts(0, 1).unwrap();
+        decoder.flush_for_seek(zero);
+        let mut anchor = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        anchor.pts = Some(zero);
+        anchor.discontinuity = true;
+        assert!(matches!(
+            decoder.send_packet(anchor).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+
+        let checkpoint_zero = decoder.create_seek_checkpoint().unwrap();
+        let estimated_bytes = checkpoint_zero.estimated_retained_reference_bytes();
+        assert!(estimated_bytes > 0);
+        let mut checkpoint_two = checkpoint_zero.clone();
+        checkpoint_two.resume_time = MediaTime::from_parts(2, 1).unwrap();
+        let mut checkpoint_four = checkpoint_zero.clone();
+        checkpoint_four.resume_time = MediaTime::from_parts(4, 1).unwrap();
+        let byte_budget = estimated_bytes.checked_mul(2).unwrap();
+        let mut cache = H264SeekCheckpointCache::new(2, byte_budget);
+
+        assert!(cache.insert(checkpoint_zero.clone(), 10usize));
+        assert!(cache.insert(checkpoint_two.clone(), 20usize));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(cache.estimated_retained_reference_bytes(), byte_budget);
+        assert_eq!(
+            cache
+                .latest_before(MediaTime::from_parts(1, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &10
+        );
+        assert_eq!(
+            cache
+                .latest_before(MediaTime::from_parts(2, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &10
+        );
+        assert_eq!(
+            cache
+                .latest_before(MediaTime::from_parts(3, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &20
+        );
+
+        assert!(cache.insert(checkpoint_four.clone(), 40usize));
+        assert_eq!(cache.len(), 2);
+        assert!(
+            cache
+                .latest_before(MediaTime::from_parts(2, 1).unwrap())
+                .is_none()
+        );
+        assert!(!cache.insert(checkpoint_zero.clone(), 11usize));
+        assert_eq!(cache.len(), 2);
+        assert!(cache.insert(checkpoint_four, 41usize));
+        assert_eq!(cache.len(), 2);
+        assert_eq!(
+            cache
+                .latest_before(MediaTime::from_parts(5, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &41
+        );
+
+        let mut undersized = H264SeekCheckpointCache::new(1, estimated_bytes - 1);
+        assert!(!undersized.insert(checkpoint_zero, 0usize));
+        assert!(undersized.is_empty());
+        let mut disabled = H264SeekCheckpointCache::new(1, 0);
+        assert!(!disabled.insert(checkpoint_two, 0usize));
+        assert!(disabled.is_empty());
+        cache.clear();
+        assert!(cache.is_empty());
+        assert_eq!(cache.estimated_retained_reference_bytes(), 0);
     }
 
     #[test]

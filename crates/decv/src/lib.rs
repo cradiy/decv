@@ -13,5 +13,8 @@ pub use decv_core::{
     MediaError, MediaInput, MediaTime, PixelFormat, Rect, Size, TransferFunction, VideoCodec,
     VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
-pub use decv_h264::{H264Decoder, H264Error, H264Parallelism, H264SeekCheckpoint};
+pub use decv_h264::{
+    H264Decoder, H264Error, H264Parallelism, H264SeekCheckpoint, H264SeekCheckpointCache,
+    H264SeekCheckpointEntry,
+};
 pub use decv_mp4::{FourCc, Movie, Mp4Demuxer, Mp4Error, PacketCursor, Sample, Track};

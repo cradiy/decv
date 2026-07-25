@@ -3,8 +3,9 @@ use std::{num::NonZeroUsize, sync::Arc};
 use decv::{
     BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, CpuFrame, CpuPlane,
     DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket, FourCc, FrameStorage,
-    H264Decoder, H264Error, H264Parallelism, MediaTime, Mp4Demuxer, PixelFormat, Rect, Size,
-    TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+    H264Decoder, H264Error, H264Parallelism, H264SeekCheckpointCache, MediaTime, Mp4Demuxer,
+    PixelFormat, Rect, Size, TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig,
+    VideoFormat,
 };
 
 fn accepts_consumer_decoder<D>(decoder: &mut D)
@@ -276,6 +277,14 @@ fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
     assert_eq!(checkpoint.retained_reference_count(), 1);
     assert!(checkpoint.estimated_retained_reference_bytes() > 0);
     let resume_sample = cursor.next_sample_index();
+    let mut checkpoints = H264SeekCheckpointCache::new(
+        4,
+        checkpoint
+            .estimated_retained_reference_bytes()
+            .checked_mul(4)
+            .unwrap(),
+    );
+    assert!(checkpoints.insert(checkpoint, resume_sample));
     let remaining_packets = std::iter::from_fn(|| cursor.next_packet().transpose())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -289,10 +298,11 @@ fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
     assert_eq!(frames[0].pts, Some(final_target));
 
     let earlier_target = MediaTime::from_parts(512, 15_360).unwrap();
+    let cached = checkpoints.latest_before(earlier_target).unwrap();
     decoder
-        .restore_seek_checkpoint(&checkpoint, earlier_target)
+        .restore_seek_checkpoint(cached.checkpoint(), earlier_target)
         .unwrap();
-    cursor.seek_to_sample(resume_sample).unwrap();
+    cursor.seek_to_sample(*cached.input_position()).unwrap();
     let replay_packets = std::iter::from_fn(|| cursor.next_packet().transpose())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
