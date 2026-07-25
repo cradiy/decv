@@ -956,6 +956,8 @@ impl BMotionState {
         let local_index = (y % 16) / 4 * 4 + (x % 16) / 4;
         let cell = if macroblock_address == current_macroblock_address {
             local[local_index]
+        } else if macroblock_address > current_macroblock_address {
+            None
         } else {
             self.stored_boundary_cell(macroblock_address, local_index)
         };
@@ -971,7 +973,8 @@ impl BMotionState {
         let slot = stored_boundary_cell_slot(local_index);
         debug_assert!(
             slot.is_some(),
-            "external B-motion neighbours must lie on a stored macroblock boundary"
+            "external B-motion neighbour {local_index} in macroblock {macroblock_address} \
+             must lie on a stored macroblock boundary"
         );
         let slot = slot?;
         self.cells[macroblock_address * STORED_CELLS_PER_MACROBLOCK + slot]
@@ -1717,6 +1720,42 @@ mod tests {
         assert_eq!(
             resolved.partitions[0].list1.unwrap().motion_vector,
             MotionVector { x: 0, y: 6 }
+        );
+    }
+
+    #[test]
+    fn lower_sixteen_by_eight_partition_ignores_the_future_right_macroblock() {
+        let mut state = BMotionState::new(2, 1).unwrap();
+        let resolved = state
+            .resolve_inter_macroblock(
+                0,
+                1,
+                &header(
+                    BPartitionMode::SixteenByEight,
+                    vec![
+                        partition(
+                            BPredictionMode::List0,
+                            Some(0),
+                            None,
+                            vec![difference(2, 0)],
+                            Vec::new(),
+                        ),
+                        partition(
+                            BPredictionMode::List0,
+                            Some(0),
+                            None,
+                            vec![difference(0, 0)],
+                            Vec::new(),
+                        ),
+                    ],
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(resolved.partitions.len(), 2);
+        assert_eq!(
+            resolved.partitions[1].list0.unwrap().motion_vector,
+            MotionVector { x: 2, y: 0 }
         );
     }
 
