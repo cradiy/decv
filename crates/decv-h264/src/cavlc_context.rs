@@ -1275,8 +1275,9 @@ mod tests {
             partition_mode: PPartitionMode::L0_16x16,
             partitions: vec![PPartitionMotion {
                 reference_index: 0,
-                differences: Vec::new(),
-            }],
+                differences: Vec::new().into(),
+            }]
+            .into(),
             coded_block_pattern: CodedBlockPattern { luma, chroma },
             transform_size_8x8,
             qp_delta: 0,

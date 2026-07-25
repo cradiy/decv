@@ -65,6 +65,7 @@ impl Yuv420Picture {
             .checked_add(usize::from(partition.height))
             .ok_or(H264Error::IntegerOverflow)?;
         let (picture_width, picture_height) = self.dimensions();
+        let (luma_stride, chroma_stride) = self.plane_strides();
         if current_right > picture_width || current_bottom > picture_height {
             return Err(H264Error::InvalidSyntax(
                 "inter prediction partition lies outside the current picture",
@@ -98,6 +99,7 @@ impl Yuv420Picture {
             predict_luma::<false>(
                 prediction,
                 luma,
+                luma_stride,
                 picture_width,
                 picture_height,
                 reference_luma_x,
@@ -109,6 +111,7 @@ impl Yuv420Picture {
             predict_luma::<true>(
                 prediction,
                 luma,
+                luma_stride,
                 picture_width,
                 picture_height,
                 reference_luma_x,
@@ -156,6 +159,7 @@ impl Yuv420Picture {
                 prediction,
                 cb,
                 cr,
+                chroma_stride,
                 chroma_width,
                 chroma_height,
                 reference_chroma_x,
@@ -168,6 +172,7 @@ impl Yuv420Picture {
                 prediction,
                 cb,
                 cr,
+                chroma_stride,
                 chroma_width,
                 chroma_height,
                 reference_chroma_x,
@@ -271,8 +276,9 @@ impl Yuv420Picture {
         let reference_chroma_y =
             usize::try_from(reference_chroma_y).map_err(|_| H264Error::IntegerOverflow)?;
         let (luma, cb, cr) = self.planes();
-        let luma_source = reference_luma_y * picture_width + reference_luma_x;
-        let chroma_source = reference_chroma_y * chroma_width + reference_chroma_x;
+        let (luma_stride, chroma_stride) = self.plane_strides();
+        let luma_source = reference_luma_y * luma_stride + reference_luma_x;
+        let chroma_source = reference_chroma_y * chroma_stride + reference_chroma_x;
         // SAFETY: the complete source rectangles were validated above, the
         // fixed staging planes contain all destination rows, and reference
         // pictures cannot overlap the staging macroblock.
@@ -280,19 +286,19 @@ impl Yuv420Picture {
             copy_fixed_rows::<16, 16>(
                 predicted_luma.as_mut_ptr().cast(),
                 luma.as_ptr().add(luma_source),
-                picture_width,
+                luma_stride,
                 16,
             );
             copy_fixed_rows::<8, 8>(
                 predicted_cb.as_mut_ptr().cast(),
                 cb.as_ptr().add(chroma_source),
-                chroma_width,
+                chroma_stride,
                 8,
             );
             copy_fixed_rows::<8, 8>(
                 predicted_cr.as_mut_ptr().cast(),
                 cr.as_ptr().add(chroma_source),
-                chroma_width,
+                chroma_stride,
                 8,
             );
         }
@@ -322,27 +328,27 @@ impl Yuv420Picture {
         debug_assert!(current_x + 16 <= picture_width);
         debug_assert!(current_y + 16 <= picture_height);
 
-        let chroma_width = picture_width / 2;
+        let (luma_stride, chroma_stride) = self.plane_strides();
         let (luma, cb, cr) = self.planes();
-        let luma_source = current_y * picture_width + current_x;
-        let chroma_source = (current_y / 2) * chroma_width + current_x / 2;
+        let luma_source = current_y * luma_stride + current_x;
+        let chroma_source = (current_y / 2) * chroma_stride + current_x / 2;
         unsafe {
             copy_fixed_rows::<16, 16>(
                 predicted_luma.as_mut_ptr().cast(),
                 luma.as_ptr().add(luma_source),
-                picture_width,
+                luma_stride,
                 16,
             );
             copy_fixed_rows::<8, 8>(
                 predicted_cb.as_mut_ptr().cast(),
                 cb.as_ptr().add(chroma_source),
-                chroma_width,
+                chroma_stride,
                 8,
             );
             copy_fixed_rows::<8, 8>(
                 predicted_cr.as_mut_ptr().cast(),
                 cr.as_ptr().add(chroma_source),
-                chroma_width,
+                chroma_stride,
                 8,
             );
         }
@@ -420,6 +426,7 @@ fn interpolation_window_is_inside(
 fn predict_luma<const CLIP: bool>(
     prediction: &mut InterPrediction420,
     plane: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     reference_x: i32,
@@ -432,7 +439,7 @@ fn predict_luma<const CLIP: bool>(
         let output_height = usize::from(prediction.height);
         let reference_x = reference_x as usize;
         let reference_y = reference_y as usize;
-        let start = reference_y * width + reference_x;
+        let start = reference_y * stride + reference_x;
         // SAFETY: The complete source rectangle was validated as interior,
         // every destination row has sixteen bytes, and the selected constant
         // width is the validated partition width.
@@ -441,19 +448,19 @@ fn predict_luma<const CLIP: bool>(
                 4 => copy_fixed_rows::<4, 16>(
                     prediction.luma.as_mut_ptr().cast(),
                     plane.as_ptr().add(start),
-                    width,
+                    stride,
                     output_height,
                 ),
                 8 => copy_fixed_rows::<8, 16>(
                     prediction.luma.as_mut_ptr().cast(),
                     plane.as_ptr().add(start),
-                    width,
+                    stride,
                     output_height,
                 ),
                 16 => copy_fixed_rows::<16, 16>(
                     prediction.luma.as_mut_ptr().cast(),
                     plane.as_ptr().add(start),
-                    width,
+                    stride,
                     output_height,
                 ),
                 _ => unreachable!("validated luma partition widths are 4, 8, or 16"),
@@ -475,7 +482,7 @@ fn predict_luma<const CLIP: bool>(
             predict_luma_axis_avx2(
                 prediction,
                 plane,
-                width,
+                stride,
                 reference_x as usize,
                 reference_y as usize,
                 x_fraction,
@@ -494,7 +501,7 @@ fn predict_luma<const CLIP: bool>(
             predict_luma_axis_sse2(
                 prediction,
                 plane,
-                width,
+                stride,
                 reference_x as usize,
                 reference_y as usize,
                 x_fraction,
@@ -513,7 +520,7 @@ fn predict_luma<const CLIP: bool>(
             predict_luma_two_dimensional_sse2(
                 prediction,
                 plane,
-                width,
+                stride,
                 reference_x as usize,
                 reference_y as usize,
                 x_fraction,
@@ -527,6 +534,7 @@ fn predict_luma<const CLIP: bool>(
         for x in 0..usize::from(prediction.width) {
             prediction.luma[y][x] = interpolate_luma_inner::<CLIP>(
                 plane,
+                stride,
                 width,
                 height,
                 reference_x + x as i32,
@@ -1041,6 +1049,7 @@ fn predict_chroma<const CLIP: bool>(
     prediction: &mut InterPrediction420,
     cb: &[u8],
     cr: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     reference_x: i32,
@@ -1053,7 +1062,7 @@ fn predict_chroma<const CLIP: bool>(
         let output_height = usize::from(prediction.height / 2);
         let reference_x = reference_x as usize;
         let reference_y = reference_y as usize;
-        let start = reference_y * width + reference_x;
+        let start = reference_y * stride + reference_x;
         // SAFETY: Both complete source rectangles were validated as interior,
         // each destination row has eight bytes, and the selected constant
         // width is the validated chroma partition width.
@@ -1063,13 +1072,13 @@ fn predict_chroma<const CLIP: bool>(
                     copy_fixed_rows::<2, 8>(
                         prediction.cb.as_mut_ptr().cast(),
                         cb.as_ptr().add(start),
-                        width,
+                        stride,
                         output_height,
                     );
                     copy_fixed_rows::<2, 8>(
                         prediction.cr.as_mut_ptr().cast(),
                         cr.as_ptr().add(start),
-                        width,
+                        stride,
                         output_height,
                     );
                 }
@@ -1077,13 +1086,13 @@ fn predict_chroma<const CLIP: bool>(
                     copy_fixed_rows::<4, 8>(
                         prediction.cb.as_mut_ptr().cast(),
                         cb.as_ptr().add(start),
-                        width,
+                        stride,
                         output_height,
                     );
                     copy_fixed_rows::<4, 8>(
                         prediction.cr.as_mut_ptr().cast(),
                         cr.as_ptr().add(start),
-                        width,
+                        stride,
                         output_height,
                     );
                 }
@@ -1091,13 +1100,13 @@ fn predict_chroma<const CLIP: bool>(
                     copy_fixed_rows::<8, 8>(
                         prediction.cb.as_mut_ptr().cast(),
                         cb.as_ptr().add(start),
-                        width,
+                        stride,
                         output_height,
                     );
                     copy_fixed_rows::<8, 8>(
                         prediction.cr.as_mut_ptr().cast(),
                         cr.as_ptr().add(start),
-                        width,
+                        stride,
                         output_height,
                     );
                 }
@@ -1117,7 +1126,7 @@ fn predict_chroma<const CLIP: bool>(
                 prediction,
                 cb,
                 cr,
-                width,
+                stride,
                 reference_x as usize,
                 reference_y as usize,
                 x_fraction,
@@ -1136,7 +1145,7 @@ fn predict_chroma<const CLIP: bool>(
                 prediction,
                 cb,
                 cr,
-                width,
+                stride,
                 reference_x as usize,
                 reference_y as usize,
                 x_fraction,
@@ -1156,7 +1165,7 @@ fn predict_chroma<const CLIP: bool>(
                 prediction,
                 cb,
                 cr,
-                width,
+                stride,
                 reference_x as usize,
                 reference_y as usize,
                 x_fraction,
@@ -1170,10 +1179,12 @@ fn predict_chroma<const CLIP: bool>(
         for output_x in 0..usize::from(prediction.width / 2) {
             let x = reference_x + output_x as i32;
             let y = reference_y + output_y as i32;
-            prediction.cb[output_y][output_x] =
-                interpolate_chroma_inner::<CLIP>(cb, width, height, x, y, x_fraction, y_fraction);
-            prediction.cr[output_y][output_x] =
-                interpolate_chroma_inner::<CLIP>(cr, width, height, x, y, x_fraction, y_fraction);
+            prediction.cb[output_y][output_x] = interpolate_chroma_inner::<CLIP>(
+                cb, stride, width, height, x, y, x_fraction, y_fraction,
+            );
+            prediction.cr[output_y][output_x] = interpolate_chroma_inner::<CLIP>(
+                cr, stride, width, height, x, y, x_fraction, y_fraction,
+            );
         }
     }
 }
@@ -1580,21 +1591,10 @@ unsafe fn copy_fixed_rows<const ROW_WIDTH: usize, const DESTINATION_STRIDE: usiz
     }
 }
 
-#[cfg(test)]
-fn interpolate_luma(
-    plane: &[u8],
-    width: usize,
-    height: usize,
-    x: i32,
-    y: i32,
-    x_fraction: u8,
-    y_fraction: u8,
-) -> u8 {
-    interpolate_luma_inner::<true>(plane, width, height, x, y, x_fraction, y_fraction)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn interpolate_luma_inner<const CLIP: bool>(
     plane: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     x: i32,
@@ -1603,56 +1603,62 @@ fn interpolate_luma_inner<const CLIP: bool>(
     y_fraction: u8,
 ) -> u8 {
     debug_assert!(x_fraction < 4 && y_fraction < 4);
-    let integer = sample::<CLIP>(plane, width, height, x, y);
+    let integer = sample::<CLIP>(plane, stride, width, height, x, y);
     if x_fraction == 0 && y_fraction == 0 {
         return integer;
     }
 
     match (x_fraction, y_fraction) {
-        (0, 1) => rounded_average(integer, half_vertical::<CLIP>(plane, width, height, x, y)),
-        (0, 2) => half_vertical::<CLIP>(plane, width, height, x, y),
-        (0, 3) => rounded_average(
-            sample::<CLIP>(plane, width, height, x, y + 1),
-            half_vertical::<CLIP>(plane, width, height, x, y),
+        (0, 1) => rounded_average(
+            integer,
+            half_vertical::<CLIP>(plane, stride, width, height, x, y),
         ),
-        (1, 0) => rounded_average(integer, half_horizontal::<CLIP>(plane, width, height, x, y)),
+        (0, 2) => half_vertical::<CLIP>(plane, stride, width, height, x, y),
+        (0, 3) => rounded_average(
+            sample::<CLIP>(plane, stride, width, height, x, y + 1),
+            half_vertical::<CLIP>(plane, stride, width, height, x, y),
+        ),
+        (1, 0) => rounded_average(
+            integer,
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y),
+        ),
         (1, 1) => rounded_average(
-            half_horizontal::<CLIP>(plane, width, height, x, y),
-            half_vertical::<CLIP>(plane, width, height, x, y),
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y),
+            half_vertical::<CLIP>(plane, stride, width, height, x, y),
         ),
         (1, 2) => rounded_average(
-            half_vertical::<CLIP>(plane, width, height, x, y),
-            half_diagonal::<CLIP>(plane, width, height, x, y),
+            half_vertical::<CLIP>(plane, stride, width, height, x, y),
+            half_diagonal::<CLIP>(plane, stride, width, height, x, y),
         ),
         (1, 3) => rounded_average(
-            half_vertical::<CLIP>(plane, width, height, x, y),
-            half_horizontal::<CLIP>(plane, width, height, x, y + 1),
+            half_vertical::<CLIP>(plane, stride, width, height, x, y),
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y + 1),
         ),
-        (2, 0) => half_horizontal::<CLIP>(plane, width, height, x, y),
+        (2, 0) => half_horizontal::<CLIP>(plane, stride, width, height, x, y),
         (2, 1) => rounded_average(
-            half_horizontal::<CLIP>(plane, width, height, x, y),
-            half_diagonal::<CLIP>(plane, width, height, x, y),
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y),
+            half_diagonal::<CLIP>(plane, stride, width, height, x, y),
         ),
-        (2, 2) => half_diagonal::<CLIP>(plane, width, height, x, y),
+        (2, 2) => half_diagonal::<CLIP>(plane, stride, width, height, x, y),
         (2, 3) => rounded_average(
-            half_diagonal::<CLIP>(plane, width, height, x, y),
-            half_horizontal::<CLIP>(plane, width, height, x, y + 1),
+            half_diagonal::<CLIP>(plane, stride, width, height, x, y),
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y + 1),
         ),
         (3, 0) => rounded_average(
-            sample::<CLIP>(plane, width, height, x + 1, y),
-            half_horizontal::<CLIP>(plane, width, height, x, y),
+            sample::<CLIP>(plane, stride, width, height, x + 1, y),
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y),
         ),
         (3, 1) => rounded_average(
-            half_horizontal::<CLIP>(plane, width, height, x, y),
-            half_vertical::<CLIP>(plane, width, height, x + 1, y),
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y),
+            half_vertical::<CLIP>(plane, stride, width, height, x + 1, y),
         ),
         (3, 2) => rounded_average(
-            half_diagonal::<CLIP>(plane, width, height, x, y),
-            half_vertical::<CLIP>(plane, width, height, x + 1, y),
+            half_diagonal::<CLIP>(plane, stride, width, height, x, y),
+            half_vertical::<CLIP>(plane, stride, width, height, x + 1, y),
         ),
         (3, 3) => rounded_average(
-            half_vertical::<CLIP>(plane, width, height, x + 1, y),
-            half_horizontal::<CLIP>(plane, width, height, x, y + 1),
+            half_vertical::<CLIP>(plane, stride, width, height, x + 1, y),
+            half_horizontal::<CLIP>(plane, stride, width, height, x, y + 1),
         ),
         _ => unreachable!("fractional luma positions are in 0..=3"),
     }
@@ -1661,80 +1667,72 @@ fn interpolate_luma_inner<const CLIP: bool>(
 #[inline]
 fn half_horizontal<const CLIP: bool>(
     plane: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     x: i32,
     y: i32,
 ) -> u8 {
-    ((horizontal_six_tap::<CLIP>(plane, width, height, x, y) + 16) >> 5).clamp(0, 255) as u8
+    ((horizontal_six_tap::<CLIP>(plane, stride, width, height, x, y) + 16) >> 5).clamp(0, 255) as u8
 }
 
 #[inline]
 fn half_vertical<const CLIP: bool>(
     plane: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     x: i32,
     y: i32,
 ) -> u8 {
-    let value = sample::<CLIP>(plane, width, height, x, y - 2) as i32
-        - 5 * sample::<CLIP>(plane, width, height, x, y - 1) as i32
-        + 20 * sample::<CLIP>(plane, width, height, x, y) as i32
-        + 20 * sample::<CLIP>(plane, width, height, x, y + 1) as i32
-        - 5 * sample::<CLIP>(plane, width, height, x, y + 2) as i32
-        + sample::<CLIP>(plane, width, height, x, y + 3) as i32;
+    let value = sample::<CLIP>(plane, stride, width, height, x, y - 2) as i32
+        - 5 * sample::<CLIP>(plane, stride, width, height, x, y - 1) as i32
+        + 20 * sample::<CLIP>(plane, stride, width, height, x, y) as i32
+        + 20 * sample::<CLIP>(plane, stride, width, height, x, y + 1) as i32
+        - 5 * sample::<CLIP>(plane, stride, width, height, x, y + 2) as i32
+        + sample::<CLIP>(plane, stride, width, height, x, y + 3) as i32;
     ((value + 16) >> 5).clamp(0, 255) as u8
 }
 
 #[inline]
 fn half_diagonal<const CLIP: bool>(
     plane: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     x: i32,
     y: i32,
 ) -> u8 {
-    let value = horizontal_six_tap::<CLIP>(plane, width, height, x, y - 2)
-        - 5 * horizontal_six_tap::<CLIP>(plane, width, height, x, y - 1)
-        + 20 * horizontal_six_tap::<CLIP>(plane, width, height, x, y)
-        + 20 * horizontal_six_tap::<CLIP>(plane, width, height, x, y + 1)
-        - 5 * horizontal_six_tap::<CLIP>(plane, width, height, x, y + 2)
-        + horizontal_six_tap::<CLIP>(plane, width, height, x, y + 3);
+    let value = horizontal_six_tap::<CLIP>(plane, stride, width, height, x, y - 2)
+        - 5 * horizontal_six_tap::<CLIP>(plane, stride, width, height, x, y - 1)
+        + 20 * horizontal_six_tap::<CLIP>(plane, stride, width, height, x, y)
+        + 20 * horizontal_six_tap::<CLIP>(plane, stride, width, height, x, y + 1)
+        - 5 * horizontal_six_tap::<CLIP>(plane, stride, width, height, x, y + 2)
+        + horizontal_six_tap::<CLIP>(plane, stride, width, height, x, y + 3);
     ((value + 512) >> 10).clamp(0, 255) as u8
 }
 
 #[inline]
 fn horizontal_six_tap<const CLIP: bool>(
     plane: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     x: i32,
     y: i32,
 ) -> i32 {
-    sample::<CLIP>(plane, width, height, x - 2, y) as i32
-        - 5 * sample::<CLIP>(plane, width, height, x - 1, y) as i32
-        + 20 * sample::<CLIP>(plane, width, height, x, y) as i32
-        + 20 * sample::<CLIP>(plane, width, height, x + 1, y) as i32
-        - 5 * sample::<CLIP>(plane, width, height, x + 2, y) as i32
-        + sample::<CLIP>(plane, width, height, x + 3, y) as i32
+    sample::<CLIP>(plane, stride, width, height, x - 2, y) as i32
+        - 5 * sample::<CLIP>(plane, stride, width, height, x - 1, y) as i32
+        + 20 * sample::<CLIP>(plane, stride, width, height, x, y) as i32
+        + 20 * sample::<CLIP>(plane, stride, width, height, x + 1, y) as i32
+        - 5 * sample::<CLIP>(plane, stride, width, height, x + 2, y) as i32
+        + sample::<CLIP>(plane, stride, width, height, x + 3, y) as i32
 }
 
-#[inline]
-#[cfg(test)]
-fn interpolate_chroma(
-    plane: &[u8],
-    width: usize,
-    height: usize,
-    x: i32,
-    y: i32,
-    x_fraction: u8,
-    y_fraction: u8,
-) -> u8 {
-    interpolate_chroma_inner::<true>(plane, width, height, x, y, x_fraction, y_fraction)
-}
-
+#[allow(clippy::too_many_arguments)]
 fn interpolate_chroma_inner<const CLIP: bool>(
     plane: &[u8],
+    stride: usize,
     width: usize,
     height: usize,
     x: i32,
@@ -1743,12 +1741,12 @@ fn interpolate_chroma_inner<const CLIP: bool>(
     y_fraction: u8,
 ) -> u8 {
     debug_assert!(x_fraction < 8 && y_fraction < 8);
-    let a = u32::from(sample::<CLIP>(plane, width, height, x, y));
+    let a = u32::from(sample::<CLIP>(plane, stride, width, height, x, y));
     if x_fraction == 0 && y_fraction == 0 {
         return a as u8;
     }
-    let b = u32::from(sample::<CLIP>(plane, width, height, x + 1, y));
-    let c = u32::from(sample::<CLIP>(plane, width, height, x, y + 1));
+    let b = u32::from(sample::<CLIP>(plane, stride, width, height, x + 1, y));
+    let c = u32::from(sample::<CLIP>(plane, stride, width, height, x, y + 1));
     let x_fraction = u32::from(x_fraction);
     let y_fraction = u32::from(y_fraction);
     if y_fraction == 0 {
@@ -1757,7 +1755,7 @@ fn interpolate_chroma_inner<const CLIP: bool>(
     if x_fraction == 0 {
         return (((8 - y_fraction) * a + y_fraction * c + 4) >> 3) as u8;
     }
-    let d = u32::from(sample::<CLIP>(plane, width, height, x + 1, y + 1));
+    let d = u32::from(sample::<CLIP>(plane, stride, width, height, x + 1, y + 1));
     (((8 - x_fraction) * (8 - y_fraction) * a
         + x_fraction * (8 - y_fraction) * b
         + (8 - x_fraction) * y_fraction * c
@@ -1767,24 +1765,31 @@ fn interpolate_chroma_inner<const CLIP: bool>(
 }
 
 #[inline(always)]
-fn sample<const CLIP: bool>(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
+fn sample<const CLIP: bool>(
+    plane: &[u8],
+    stride: usize,
+    width: usize,
+    height: usize,
+    x: i32,
+    y: i32,
+) -> u8 {
     if CLIP {
-        return sample_clipped(plane, width, height, x, y);
+        return sample_clipped(plane, stride, width, height, x, y);
     }
 
     debug_assert!(x >= 0 && x < width as i32);
     debug_assert!(y >= 0 && y < height as i32);
-    let index = y as usize * width + x as usize;
+    let index = y as usize * stride + x as usize;
     // SAFETY: the caller selects this specialization only after validating
     // the complete interpolation footprint against the plane dimensions.
     unsafe { *plane.get_unchecked(index) }
 }
 
 #[inline]
-fn sample_clipped(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> u8 {
+fn sample_clipped(plane: &[u8], stride: usize, width: usize, height: usize, x: i32, y: i32) -> u8 {
     let x = x.clamp(0, width as i32 - 1) as usize;
     let y = y.clamp(0, height as i32 - 1) as usize;
-    plane[y * width + x]
+    plane[y * stride + x]
 }
 
 #[inline]
@@ -1805,16 +1810,17 @@ mod tests {
             height: 16,
         })
         .unwrap();
+        let (luma_stride, chroma_stride) = picture.plane_strides();
         let (luma, cb, cr) = picture.planes_mut();
         for y in 0..16 {
             for x in 0..16 {
-                luma[y * 16 + x] = 20 + 4 * x as u8 + 8 * y as u8;
+                luma[y * luma_stride + x] = 20 + 4 * x as u8 + 8 * y as u8;
             }
         }
         for y in 0..8 {
             for x in 0..8 {
-                cb[y * 8 + x] = 10 + 8 * x as u8 + 16 * y as u8;
-                cr[y * 8 + x] = 11 + 8 * x as u8 + 16 * y as u8;
+                cb[y * chroma_stride + x] = 10 + 8 * x as u8 + 16 * y as u8;
+                cr[y * chroma_stride + x] = 11 + 8 * x as u8 + 16 * y as u8;
             }
         }
         picture
@@ -1972,10 +1978,20 @@ mod tests {
     fn interpolates_all_sixteen_luma_fractional_positions() {
         let picture = gradient_picture();
         let (luma, _, _) = picture.planes();
+        let (luma_stride, _) = picture.plane_strides();
         for y_fraction in 0..4 {
             for x_fraction in 0..4 {
                 assert_eq!(
-                    interpolate_luma(luma, 16, 16, 4, 4, x_fraction, y_fraction),
+                    interpolate_luma_inner::<true>(
+                        luma,
+                        luma_stride,
+                        16,
+                        16,
+                        4,
+                        4,
+                        x_fraction,
+                        y_fraction
+                    ),
                     68 + x_fraction + 2 * y_fraction
                 );
             }
@@ -2013,6 +2029,7 @@ mod tests {
                             prediction.luma[y][x],
                             interpolate_luma_inner::<false>(
                                 &plane,
+                                40,
                                 40,
                                 40,
                                 8 + x as i32,
@@ -2053,6 +2070,7 @@ mod tests {
                         prediction.luma[y][x],
                         interpolate_luma_inner::<false>(
                             &plane,
+                            40,
                             40,
                             40,
                             8 + x as i32,
@@ -2100,6 +2118,7 @@ mod tests {
                                     prediction.luma[y][x],
                                     interpolate_luma_inner::<false>(
                                         &plane,
+                                        40,
                                         40,
                                         40,
                                         8 + x as i32,
@@ -2192,6 +2211,7 @@ mod tests {
                                     &cb,
                                     40,
                                     40,
+                                    40,
                                     8 + x as i32,
                                     8 + y as i32,
                                     x_fraction,
@@ -2199,6 +2219,7 @@ mod tests {
                                 );
                                 let expected_cr = interpolate_chroma_inner::<false>(
                                     &cr,
+                                    40,
                                     40,
                                     40,
                                     8 + x as i32,
@@ -2280,10 +2301,20 @@ mod tests {
     fn interpolates_all_sixty_four_chroma_fractional_positions() {
         let picture = gradient_picture();
         let (_, cb, _) = picture.planes();
+        let (_, chroma_stride) = picture.plane_strides();
         for y_fraction in 0..8 {
             for x_fraction in 0..8 {
                 assert_eq!(
-                    interpolate_chroma(cb, 8, 8, 2, 2, x_fraction, y_fraction),
+                    interpolate_chroma_inner::<true>(
+                        cb,
+                        chroma_stride,
+                        8,
+                        8,
+                        2,
+                        2,
+                        x_fraction,
+                        y_fraction,
+                    ),
                     58 + x_fraction + 2 * y_fraction
                 );
             }
@@ -2343,6 +2374,7 @@ mod tests {
     fn single_axis_filters_remain_fast_at_the_other_picture_edge() {
         let picture = gradient_picture();
         let (luma, cb, cr) = picture.planes();
+        let (luma_stride, chroma_stride) = picture.plane_strides();
         for partition in [
             ResolvedPPartition {
                 x: 4,
@@ -2386,6 +2418,7 @@ mod tests {
                         prediction.luma[y][x],
                         interpolate_luma_inner::<true>(
                             luma,
+                            luma_stride,
                             16,
                             16,
                             reference_luma_x + x as i32,
@@ -2423,6 +2456,7 @@ mod tests {
                         prediction.cb[y][x],
                         interpolate_chroma_inner::<true>(
                             cb,
+                            chroma_stride,
                             8,
                             8,
                             sample_x,
@@ -2435,6 +2469,7 @@ mod tests {
                         prediction.cr[y][x],
                         interpolate_chroma_inner::<true>(
                             cr,
+                            chroma_stride,
                             8,
                             8,
                             sample_x,

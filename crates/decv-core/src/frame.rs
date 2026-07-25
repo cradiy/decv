@@ -1,12 +1,178 @@
-use std::sync::Arc;
+use std::{
+    fmt,
+    ops::{Deref, DerefMut},
+    sync::Arc,
+};
+
+use aligned_vec::AVec;
 
 use crate::{MediaError, MediaTime, PixelFormat, Result, Size, VideoFormat};
+
+pub const CPU_BUFFER_ALIGNMENT: usize = 64;
+
+/// Cache-line-aligned byte storage used by software codecs.
+///
+/// Keeping this type in `decv-core` lets codecs share their native aligned
+/// picture allocation with an output frame instead of copying into `Arc<[u8]>`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AlignedBytes {
+    inner: AVec<u8>,
+}
+
+impl AlignedBytes {
+    #[inline]
+    pub fn zeroed(len: usize) -> Self {
+        let mut inner = AVec::with_capacity(CPU_BUFFER_ALIGNMENT, len);
+        inner.resize(len, 0);
+        Self { inner }
+    }
+
+    #[inline]
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            inner: AVec::with_capacity(CPU_BUFFER_ALIGNMENT, capacity),
+        }
+    }
+
+    #[inline]
+    pub fn alignment(&self) -> usize {
+        self.inner.alignment()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.inner.capacity()
+    }
+
+    #[inline]
+    pub fn resize(&mut self, len: usize, value: u8) {
+        self.inner.resize(len, value);
+    }
+
+    /// Changes the initialized byte length.
+    ///
+    /// # Safety
+    ///
+    /// The newly exposed range must be completely initialized before it is
+    /// read or before this value is dropped.
+    #[inline]
+    pub unsafe fn set_len(&mut self, len: usize) {
+        // SAFETY: Forwarded to AVec with the caller's initialization contract.
+        unsafe { self.inner.set_len(len) };
+    }
+}
+
+impl fmt::Debug for AlignedBytes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("AlignedBytes")
+            .field("len", &self.len())
+            .field("capacity", &self.capacity())
+            .field("alignment", &self.alignment())
+            .finish()
+    }
+}
+
+impl Deref for AlignedBytes {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        self.inner.as_slice()
+    }
+}
+
+impl DerefMut for AlignedBytes {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.inner.as_mut_slice()
+    }
+}
+
+impl AsRef<[u8]> for AlignedBytes {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsMut<[u8]> for AlignedBytes {
+    #[inline]
+    fn as_mut(&mut self) -> &mut [u8] {
+        self
+    }
+}
+
+/// Immutable shared backing allocation for a CPU image plane.
+#[derive(Debug, Clone)]
+pub enum CpuBuffer {
+    Bytes(Arc<[u8]>),
+    Aligned(Arc<AlignedBytes>),
+}
+
+impl CpuBuffer {
+    #[inline]
+    pub fn ptr_eq(left: &Self, right: &Self) -> bool {
+        match (left, right) {
+            (Self::Bytes(left), Self::Bytes(right)) => Arc::ptr_eq(left, right),
+            (Self::Aligned(left), Self::Aligned(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+}
+
+impl Deref for CpuBuffer {
+    type Target = [u8];
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Aligned(bytes) => bytes,
+        }
+    }
+}
+
+impl AsRef<[u8]> for CpuBuffer {
+    #[inline]
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+
+impl From<Arc<[u8]>> for CpuBuffer {
+    #[inline]
+    fn from(bytes: Arc<[u8]>) -> Self {
+        Self::Bytes(bytes)
+    }
+}
+
+impl From<Vec<u8>> for CpuBuffer {
+    #[inline]
+    fn from(bytes: Vec<u8>) -> Self {
+        Self::Bytes(bytes.into())
+    }
+}
+
+impl From<Arc<AlignedBytes>> for CpuBuffer {
+    #[inline]
+    fn from(bytes: Arc<AlignedBytes>) -> Self {
+        Self::Aligned(bytes)
+    }
+}
+
+impl From<AlignedBytes> for CpuBuffer {
+    #[inline]
+    fn from(bytes: AlignedBytes) -> Self {
+        Self::Aligned(Arc::new(bytes))
+    }
+}
 
 /// One immutable CPU-backed image plane.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct CpuPlane {
-    pub bytes: Arc<[u8]>,
+    pub bytes: CpuBuffer,
     pub offset: usize,
     pub stride: usize,
     pub rows: usize,
@@ -14,7 +180,7 @@ pub struct CpuPlane {
 
 impl CpuPlane {
     #[inline]
-    pub fn new(bytes: impl Into<Arc<[u8]>>, offset: usize, stride: usize, rows: usize) -> Self {
+    pub fn new(bytes: impl Into<CpuBuffer>, offset: usize, stride: usize, rows: usize) -> Self {
         Self {
             bytes: bytes.into(),
             offset,
@@ -169,7 +335,10 @@ fn validate_plane(plane: &CpuPlane, row_bytes: u32, rows: u32) -> Result<()> {
 mod tests {
     use std::sync::Arc;
 
-    use super::{CpuFrame, CpuPlane, DecodedVideoFrame, FrameStorage};
+    use super::{
+        AlignedBytes, CPU_BUFFER_ALIGNMENT, CpuBuffer, CpuFrame, CpuPlane, DecodedVideoFrame,
+        FrameStorage,
+    };
     use crate::{ColorInfo, MediaError, PixelFormat, Rect, Size, VideoFormat};
 
     fn nv12_format() -> VideoFormat {
@@ -183,6 +352,17 @@ mod tests {
     }
 
     #[test]
+    fn aligned_buffers_preserve_alignment_and_shared_identity() {
+        let bytes = Arc::new(AlignedBytes::zeroed(257));
+        assert_eq!(bytes.as_ptr().addr() % CPU_BUFFER_ALIGNMENT, 0);
+        assert!(bytes.iter().all(|&byte| byte == 0));
+
+        let first = CpuBuffer::from(bytes.clone());
+        let second = CpuBuffer::from(bytes);
+        assert!(CpuBuffer::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn validates_strided_nv12_storage() {
         let allocation: Arc<[u8]> = vec![0; 48].into();
         let frame = DecodedVideoFrame {
@@ -193,13 +373,13 @@ mod tests {
             storage: FrameStorage::Cpu(CpuFrame {
                 planes: vec![
                     CpuPlane {
-                        bytes: allocation.clone(),
+                        bytes: allocation.clone().into(),
                         offset: 0,
                         stride: 8,
                         rows: 4,
                     },
                     CpuPlane {
-                        bytes: allocation,
+                        bytes: allocation.into(),
                         offset: 32,
                         stride: 8,
                         rows: 2,
@@ -222,13 +402,13 @@ mod tests {
             storage: FrameStorage::Cpu(CpuFrame {
                 planes: vec![
                     CpuPlane {
-                        bytes: allocation.clone(),
+                        bytes: allocation.clone().into(),
                         offset: 0,
                         stride: 8,
                         rows: 4,
                     },
                     CpuPlane {
-                        bytes: allocation,
+                        bytes: allocation.into(),
                         offset: 32,
                         stride: 8,
                         rows: 2,

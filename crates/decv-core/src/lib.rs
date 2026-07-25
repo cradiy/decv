@@ -24,7 +24,10 @@ pub use decoder::{
 };
 pub use error::{MediaError, Result};
 pub use format::{PixelFormat, Rect, Size, VideoFormat};
-pub use frame::{CpuFrame, CpuPlane, DecodedVideoFrame, FrameStorage};
+pub use frame::{
+    AlignedBytes, CPU_BUFFER_ALIGNMENT, CpuBuffer, CpuFrame, CpuPlane, DecodedVideoFrame,
+    FrameStorage,
+};
 pub use input::MediaInput;
 pub use packet::EncodedVideoPacket;
 pub use time::MediaTime;

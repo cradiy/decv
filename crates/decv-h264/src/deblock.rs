@@ -252,7 +252,7 @@ pub(crate) fn filter_420_picture(
         ));
     }
 
-    let chroma_stride = width / 2;
+    let (luma_stride, chroma_stride) = picture.plane_strides();
     let (luma, cb, cr) = picture.planes_mut();
     for (address, current) in macroblocks.iter().enumerate() {
         let macroblock_x = address % width_in_macroblocks;
@@ -358,7 +358,7 @@ pub(crate) fn filter_420_picture(
         if filter_left {
             filter_vertical_luma_edge(
                 luma,
-                width,
+                luma_stride,
                 luma_x,
                 luma_y,
                 vertical_strengths[0],
@@ -371,7 +371,7 @@ pub(crate) fn filter_420_picture(
             {
                 filter_vertical_luma_edge(
                     luma,
-                    width,
+                    luma_stride,
                     luma_x + block_column * 4,
                     luma_y,
                     vertical_strengths[block_column],
@@ -382,7 +382,7 @@ pub(crate) fn filter_420_picture(
         if filter_top {
             filter_horizontal_luma_edge(
                 luma,
-                width,
+                luma_stride,
                 luma_x,
                 luma_y,
                 horizontal_strengths[0],
@@ -395,7 +395,7 @@ pub(crate) fn filter_420_picture(
             {
                 filter_horizontal_luma_edge(
                     luma,
-                    width,
+                    luma_stride,
                     luma_x,
                     luma_y + block_row * 4,
                     horizontal_strengths[block_row],

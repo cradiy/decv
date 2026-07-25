@@ -2,6 +2,8 @@
 
 use std::iter::FusedIterator;
 
+use memchr::memchr;
+
 use crate::{H264Error, Result};
 
 /// One NAL unit borrowed directly from an Annex-B byte stream.
@@ -155,16 +157,20 @@ struct StartCode {
 
 #[inline]
 fn find_start_code(data: &[u8], from: usize) -> Option<StartCode> {
-    let mut index = from.checked_add(2)?;
+    let search_start = from.checked_add(2)?;
+    let mut candidates = data.get(search_start..)?;
+    let mut candidate_offset = search_start;
 
-    while index < data.len() {
+    while let Some(relative) = memchr(1, candidates) {
+        let index = candidate_offset + relative;
         if data[index] == 1 && data[index - 1] == 0 && data[index - 2] == 0 {
             return Some(StartCode {
                 prefix_start: index - 2,
                 nal_start: index + 1,
             });
         }
-        index += 1;
+        candidate_offset = index + 1;
+        candidates = &data[candidate_offset..];
     }
 
     None

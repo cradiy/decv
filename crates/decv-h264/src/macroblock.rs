@@ -1,6 +1,7 @@
 //! Macroblock syntax, state, and reconstruction orchestration.
 
 use bit_readers::BitReader;
+use smallvec::{SmallVec, smallvec};
 
 use crate::{H264Error, ResidualBlock, Result};
 
@@ -173,13 +174,13 @@ pub struct PPartitionMotion {
     pub reference_index: u8,
     /// One entry for ordinary macroblock partitions, or one per sub-partition
     /// for P_8x8/P_8x8ref0.
-    pub differences: Vec<MotionVectorDifference>,
+    pub differences: SmallVec<[MotionVectorDifference; 1]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PInterMacroblockHeader {
     pub partition_mode: PPartitionMode,
-    pub partitions: Vec<PPartitionMotion>,
+    pub partitions: SmallVec<[PPartitionMotion; 2]>,
     pub coded_block_pattern: CodedBlockPattern,
     pub transform_size_8x8: bool,
     /// Zero when `mb_qp_delta` is absent and inferred.
@@ -303,14 +304,14 @@ pub struct BPartitionMotion {
     pub reference_index_l1: Option<u8>,
     /// Empty for an unused list or Direct; otherwise one entry for an
     /// ordinary macroblock partition or one per sub-macroblock partition.
-    pub differences_l0: Vec<MotionVectorDifference>,
-    pub differences_l1: Vec<MotionVectorDifference>,
+    pub differences_l0: SmallVec<[MotionVectorDifference; 1]>,
+    pub differences_l1: SmallVec<[MotionVectorDifference; 1]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BInterMacroblockHeader {
     pub partition_mode: BPartitionMode,
-    pub partitions: Vec<BPartitionMotion>,
+    pub partitions: SmallVec<[BPartitionMotion; 2]>,
     pub coded_block_pattern: CodedBlockPattern,
     pub transform_size_8x8: bool,
     /// Zero when `mb_qp_delta` is absent and inferred.
@@ -556,9 +557,9 @@ fn parse_p_inter_macroblock(
                         parse_reference_index(reader, context.num_ref_idx_l0_active)?;
                 }
             }
-            let mut partitions = Vec::with_capacity(4);
+            let mut partitions = SmallVec::with_capacity(4);
             for (sub_type, reference_index) in sub_macroblocks.into_iter().zip(reference_indices) {
-                let mut differences = Vec::with_capacity(sub_type.partition_count());
+                let mut differences = SmallVec::with_capacity(sub_type.partition_count());
                 for _ in 0..sub_type.partition_count() {
                     differences.push(parse_motion_vector_difference(reader)?);
                 }
@@ -608,7 +609,7 @@ fn parse_b_inter_macroblock(
     let (partition_mode, partitions, permits_transform_8x8) = match mb_type {
         0 => (
             BPartitionMode::Direct16x16,
-            vec![empty_b_partition(BPredictionMode::Direct)],
+            smallvec![empty_b_partition(BPredictionMode::Direct)],
             context.direct_8x8_inference,
         ),
         1..=3 => {
@@ -676,12 +677,12 @@ fn parse_b_partition_motion(
     reader: &mut BitReader<'_>,
     predictions: &[BPredictionMode],
     context: BMacroblockContext,
-) -> Result<Vec<BPartitionMotion>> {
+) -> Result<SmallVec<[BPartitionMotion; 2]>> {
     let mut partitions = predictions
         .iter()
         .copied()
         .map(empty_b_partition)
-        .collect::<Vec<_>>();
+        .collect::<SmallVec<[BPartitionMotion; 2]>>();
     for partition in &mut partitions {
         if partition.prediction.uses_list0() {
             partition.reference_index_l0 = Some(parse_reference_index(
@@ -718,7 +719,7 @@ fn parse_b_partition_motion(
 fn parse_b_sub_macroblocks(
     reader: &mut BitReader<'_>,
     context: BMacroblockContext,
-) -> Result<(BPartitionMode, Vec<BPartitionMotion>, bool)> {
+) -> Result<(BPartitionMode, SmallVec<[BPartitionMotion; 2]>, bool)> {
     let mut sub_macroblocks = [BSubMacroblockType::Direct8x8; 4];
     for sub_type in &mut sub_macroblocks {
         *sub_type = parse_b_sub_macroblock_type(reader)?;
@@ -726,7 +727,7 @@ fn parse_b_sub_macroblocks(
     let mut partitions = sub_macroblocks
         .iter()
         .map(|sub_type| empty_b_partition(sub_type.prediction()))
-        .collect::<Vec<_>>();
+        .collect::<SmallVec<[BPartitionMotion; 2]>>();
     for partition in &mut partitions {
         if partition.prediction.uses_list0() {
             partition.reference_index_l0 = Some(parse_reference_index(
@@ -778,8 +779,8 @@ fn empty_b_partition(prediction: BPredictionMode) -> BPartitionMotion {
         prediction,
         reference_index_l0: None,
         reference_index_l1: None,
-        differences_l0: Vec::new(),
-        differences_l1: Vec::new(),
+        differences_l0: SmallVec::new(),
+        differences_l1: SmallVec::new(),
     }
 }
 
@@ -808,16 +809,16 @@ fn parse_macroblock_partition_motion(
     reader: &mut BitReader<'_>,
     partition_count: usize,
     num_ref_idx_l0_active: u8,
-) -> Result<Vec<PPartitionMotion>> {
-    let mut reference_indices = Vec::with_capacity(partition_count);
+) -> Result<SmallVec<[PPartitionMotion; 2]>> {
+    let mut reference_indices = SmallVec::<[u8; 4]>::with_capacity(partition_count);
     for _ in 0..partition_count {
         reference_indices.push(parse_reference_index(reader, num_ref_idx_l0_active)?);
     }
-    let mut partitions = Vec::with_capacity(partition_count);
+    let mut partitions = SmallVec::with_capacity(partition_count);
     for reference_index in reference_indices {
         partitions.push(PPartitionMotion {
             reference_index,
-            differences: vec![parse_motion_vector_difference(reader)?],
+            differences: smallvec![parse_motion_vector_difference(reader)?],
         });
     }
     Ok(partitions)
@@ -1128,8 +1129,9 @@ mod tests {
                 partition_mode: PPartitionMode::L0_16x16,
                 partitions: vec![PPartitionMotion {
                     reference_index: 0,
-                    differences: vec![MotionVectorDifference { x: 2, y: -1 }],
-                }],
+                    differences: vec![MotionVectorDifference { x: 2, y: -1 }].into(),
+                }]
+                .into(),
                 coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
                 transform_size_8x8: false,
                 qp_delta: 0,
@@ -1402,11 +1404,11 @@ mod tests {
         assert_eq!(header.partitions[1].reference_index_l1, Some(0));
         assert_eq!(
             header.partitions[0].differences_l0,
-            [MotionVectorDifference { x: 1, y: 2 }]
+            [MotionVectorDifference { x: 1, y: 2 }].into()
         );
         assert_eq!(
             header.partitions[0].differences_l1,
-            [MotionVectorDifference { x: -1, y: -2 }]
+            [MotionVectorDifference { x: -1, y: -2 }].into()
         );
         assert!(header.transform_size_8x8);
         assert_eq!(header.qp_delta, -1);

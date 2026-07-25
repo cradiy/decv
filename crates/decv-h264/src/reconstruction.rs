@@ -45,7 +45,10 @@ pub struct ReconstructedIntraResidual {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconstructedInterResidual {
-    data: Box<ReconstructedInterResidualData>,
+    // Kept inline so one P/B macroblock batch owns all residual samples in
+    // its single `Vec` allocation. The previous box performed a separate
+    // allocator round-trip for every inter macroblock carrying residuals.
+    data: ReconstructedInterResidualData,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,11 +76,11 @@ impl ReconstructedInterResidual {
         chroma_cr: [Block4x4; 4],
     ) -> Self {
         Self {
-            data: Box::new(ReconstructedInterResidualData {
+            data: ReconstructedInterResidualData {
                 luma: ReconstructedInterLumaResidual::FourByFour(luma),
                 chroma_cb,
                 chroma_cr,
-            }),
+            },
         }
     }
 
@@ -87,11 +90,11 @@ impl ReconstructedInterResidual {
         chroma_cr: [Block4x4; 4],
     ) -> Self {
         Self {
-            data: Box::new(ReconstructedInterResidualData {
+            data: ReconstructedInterResidualData {
                 luma: ReconstructedInterLumaResidual::EightByEight(luma),
                 chroma_cb,
                 chroma_cr,
-            }),
+            },
         }
     }
 
@@ -682,10 +685,10 @@ mod tests {
     }
 
     #[test]
-    fn reconstructed_inter_residual_handle_is_pointer_sized() {
+    fn reconstructed_inter_residual_is_stored_inline() {
         assert_eq!(
             std::mem::size_of::<super::ReconstructedInterResidual>(),
-            std::mem::size_of::<Box<()>>()
+            std::mem::size_of::<super::ReconstructedInterResidualData>()
         );
     }
 
@@ -748,8 +751,9 @@ mod tests {
             partition_mode: PPartitionMode::L0_16x16,
             partitions: vec![PPartitionMotion {
                 reference_index: 0,
-                differences: Vec::new(),
-            }],
+                differences: Vec::new().into(),
+            }]
+            .into(),
             coded_block_pattern: CodedBlockPattern { luma: 1, chroma: 0 },
             transform_size_8x8,
             qp_delta: 0,
@@ -763,9 +767,10 @@ mod tests {
                 prediction: BPredictionMode::Bi,
                 reference_index_l0: Some(0),
                 reference_index_l1: Some(0),
-                differences_l0: vec![MotionVectorDifference { x: 0, y: 0 }],
-                differences_l1: vec![MotionVectorDifference { x: 0, y: 0 }],
-            }],
+                differences_l0: vec![MotionVectorDifference { x: 0, y: 0 }].into(),
+                differences_l1: vec![MotionVectorDifference { x: 0, y: 0 }].into(),
+            }]
+            .into(),
             coded_block_pattern: CodedBlockPattern { luma: 1, chroma: 0 },
             transform_size_8x8,
             qp_delta: 0,

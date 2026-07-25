@@ -8,12 +8,8 @@ use crate::{
     ResolvedBMacroblock, ResolvedBPartition, Result,
 };
 
-const DIRECT_8X8_GRID: [(u8, u8, usize, usize); 4] = [
-    (0, 0, 0, 0),
-    (8, 0, 2, 0),
-    (0, 8, 0, 2),
-    (8, 8, 2, 2),
-];
+const DIRECT_8X8_GRID: [(u8, u8, usize, usize); 4] =
+    [(0, 0, 0, 0), (8, 0, 2, 0), (0, 8, 0, 2), (8, 8, 2, 2)];
 const DIRECT_4X4_GRID: [(u8, u8, usize, usize); 16] = [
     (0, 0, 0, 0),
     (4, 0, 1, 0),
@@ -1598,8 +1594,8 @@ mod tests {
             prediction,
             reference_index_l0,
             reference_index_l1,
-            differences_l0,
-            differences_l1,
+            differences_l0: differences_l0.into(),
+            differences_l1: differences_l1.into(),
         }
     }
 
@@ -1609,7 +1605,7 @@ mod tests {
     ) -> BInterMacroblockHeader {
         BInterMacroblockHeader {
             partition_mode,
-            partitions,
+            partitions: partitions.into(),
             coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
             transform_size_8x8: false,
             qp_delta: 0,

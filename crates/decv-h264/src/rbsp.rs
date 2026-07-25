@@ -3,6 +3,7 @@
 use std::borrow::Cow;
 
 use bit_readers::BitReader;
+use memchr::memchr;
 
 use crate::{H264Error, Result};
 
@@ -12,56 +13,47 @@ use crate::{H264Error, Result};
 /// An allocation is made only when at least one `00 00 03 xx` sequence must be
 /// transformed.
 pub fn decode_rbsp(ebsp: &[u8]) -> Result<Cow<'_, [u8]>> {
-    let mut output = None;
-    let mut zero_count = 0u8;
-    let mut index = 0;
+    let mut output: Option<Vec<u8>> = None;
+    let mut search_from = 0;
+    let mut copy_from = 0;
 
-    while index < ebsp.len() {
-        let byte = ebsp[index];
+    while let Some(relative) = memchr(0, &ebsp[search_from..]) {
+        let first_zero = search_from + relative;
+        if ebsp.get(first_zero + 1) != Some(&0) {
+            search_from = first_zero + 1;
+            continue;
+        }
 
-        if zero_count == 2 {
-            if byte == 0x03 {
+        let Some(&following) = ebsp.get(first_zero + 2) else {
+            break;
+        };
+        match following {
+            0x00..=0x02 => return Err(H264Error::InvalidRbspEscape),
+            0x03 => {
                 let next = ebsp
-                    .get(index + 1)
+                    .get(first_zero + 3)
                     .copied()
                     .ok_or(H264Error::InvalidRbspEscape)?;
                 if next > 0x03 {
                     return Err(H264Error::InvalidRbspEscape);
                 }
 
-                output.get_or_insert_with(|| {
-                    let mut decoded = Vec::with_capacity(ebsp.len() - 1);
-                    decoded.extend_from_slice(&ebsp[..index]);
-                    decoded
-                });
-
-                // The escape byte breaks the EBSP zero run, but is omitted
-                // from RBSP output.
-                zero_count = 0;
-                index += 1;
-                continue;
+                let decoded = output.get_or_insert_with(|| Vec::with_capacity(ebsp.len() - 1));
+                decoded.extend_from_slice(&ebsp[copy_from..first_zero + 2]);
+                copy_from = first_zero + 3;
+                search_from = copy_from;
             }
-
-            // Values 00..02 after two zero bytes must have been escaped.
-            if byte <= 0x02 {
-                return Err(H264Error::InvalidRbspEscape);
+            _ => {
+                search_from = first_zero + 2;
             }
         }
-
-        if let Some(decoded) = &mut output {
-            decoded.push(byte);
-        }
-
-        zero_count = if byte == 0 {
-            zero_count.saturating_add(1).min(2)
-        } else {
-            0
-        };
-        index += 1;
     }
 
     match output {
-        Some(output) => Ok(Cow::Owned(output)),
+        Some(mut output) => {
+            output.extend_from_slice(&ebsp[copy_from..]);
+            Ok(Cow::Owned(output))
+        }
         None => Ok(Cow::Borrowed(ebsp)),
     }
 }

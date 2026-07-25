@@ -11,12 +11,13 @@ mod seek;
 
 pub use decv_audio::{AacDecoder, AacError, AudioError, SoftwareAudioDecoder};
 pub use decv_core::{
-    AdpcmCodec, AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder,
-    AudioDecoderConfig, AudioFormat, AudioSampleFormat, BitstreamFormat, ChannelLayout, ColorInfo,
-    ColorMatrix, ColorPrimaries, ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput,
-    DecodedAudioFrame, DecodedVideoFrame, EncodedAudioPacket, EncodedVideoPacket, FrameStorage,
-    MediaError, MediaInput, MediaTime, PcmCodec, PixelFormat, Rect, Size, TransferFunction,
-    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+    AdpcmCodec, AlignedBytes, AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder,
+    AudioDecoderConfig, AudioFormat, AudioSampleFormat, BitstreamFormat, CPU_BUFFER_ALIGNMENT,
+    ChannelLayout, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, CpuBuffer, CpuFrame,
+    CpuPlane, DecodeInputStatus, DecodeOutput, DecodedAudioFrame, DecodedVideoFrame,
+    EncodedAudioPacket, EncodedVideoPacket, FrameStorage, MediaError, MediaInput, MediaTime,
+    PcmCodec, PixelFormat, Rect, Size, TransferFunction, VideoCodec, VideoDecoder,
+    VideoDecoderConfig, VideoFormat,
 };
 pub use decv_h264::{
     H264Decoder, H264Error, H264Parallelism, H264SeekCheckpoint, H264SeekCheckpointCache,

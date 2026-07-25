@@ -20,11 +20,12 @@ use crate::intra_reconstruction::{ReconstructionReferenceList, ReconstructionWor
 use crate::parallelism::{ReconstructionExecutor, WIDE_AUTO_PARALLELISM_MIN_PIXELS};
 use crate::reorder::PictureReorderBuffer;
 use crate::{
-    AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference, EntropyCodingMode,
-    H264Error, H264Parallelism, ImplicitWeightReference, IntraPictureReconstructor, NalHeader,
-    NalUnit, NalUnitType, ParameterSetStore, ParsedSliceHeader, PictureOrderCount,
-    PictureParameterSet, Profile, ReferenceKind, ReferencePictureMarking, Result,
-    SequenceParameterSet, SliceType, consume_rbsp_trailing_bits, decode_rbsp,
+    ActiveReferenceInfo, AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference,
+    EntropyCodingMode, H264Error, H264Parallelism, ImplicitWeightReference,
+    IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType, ParameterSetStore,
+    ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile, ReferenceKind,
+    ReferencePictureMarking, Result, SequenceParameterSet, SliceType, consume_rbsp_trailing_bits,
+    decode_rbsp,
 };
 
 #[cfg(not(test))]
@@ -37,6 +38,7 @@ const MIN_ASYNC_FINALIZATION_PIXELS: u64 = 1;
 #[derive(Debug)]
 struct PendingPicture {
     reconstructor: IntraPictureReconstructor,
+    deferred_b_slices: Option<Vec<DeferredBSlice>>,
     format: VideoFormat,
     pts: Option<MediaTime>,
     duration: Option<MediaTime>,
@@ -48,9 +50,24 @@ struct PendingPicture {
 }
 
 #[derive(Debug)]
+struct DeferredBSlice {
+    rbsp: Vec<u8>,
+    parsed: ParsedSliceHeader,
+    references_l0: Vec<Option<ActiveReferenceInfo>>,
+    references_l1: Vec<Option<ActiveReferenceInfo>>,
+    current_picture_order_count: i32,
+}
+
+#[derive(Debug)]
+struct AsyncPictureCompletion {
+    frame: Option<DecodedVideoFrame>,
+    reusable_workspace: Option<ReconstructionWorkspace>,
+}
+
+#[derive(Debug)]
 struct PendingNonReferenceFinalization {
     picture_order_count: i32,
-    receiver: Receiver<Result<Option<DecodedVideoFrame>>>,
+    receiver: Receiver<Result<AsyncPictureCompletion>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -92,7 +109,7 @@ pub struct H264Decoder {
     parallelism: H264Parallelism,
     reconstruction_executor: Option<ReconstructionExecutor>,
     auto_executor_size: Option<Size>,
-    reusable_workspace: Option<ReconstructionWorkspace>,
+    reusable_workspaces: Vec<ReconstructionWorkspace>,
     pending_non_reference_finalizations: VecDeque<PendingNonReferenceFinalization>,
     maximum_completed_pts: Option<MediaTime>,
     completed_picture_missing_pts: bool,
@@ -355,7 +372,7 @@ impl Default for H264Decoder {
             parallelism: H264Parallelism::Auto,
             reconstruction_executor: None,
             auto_executor_size: None,
-            reusable_workspace: None,
+            reusable_workspaces: Vec::new(),
             pending_non_reference_finalizations: VecDeque::new(),
             maximum_completed_pts: None,
             completed_picture_missing_pts: false,
@@ -612,9 +629,7 @@ impl H264Decoder {
                     && self.should_skip_non_reference_picture(nal_header, packet.pts)
                 {
                     self.current_skipped_picture = Some(SkippedNonReferencePicture {
-                        picture_order_count: picture_order_count
-                            .stored
-                            .picture_order_count(),
+                        picture_order_count: picture_order_count.stored.picture_order_count(),
                         pts: packet.pts,
                     });
                     return Ok(());
@@ -633,24 +648,35 @@ impl H264Decoder {
                             )?);
                         self.auto_executor_size = Some(coded_size);
                     }
-                    let reconstruction_executor =
-                        if self.should_use_serial_seek_preroll(coded_size, packet.pts) {
-                            ReconstructionExecutor::serial()
-                        } else {
-                            self.reconstruction_executor
-                                .as_ref()
-                                .expect("configure initializes the reconstruction executor")
-                                .clone()
-                        };
+                    let defer_b_picture = self.should_defer_non_reference_b_picture(
+                        parsed.header.slice_type,
+                        parsed.parameter_sets.picture.entropy_coding_mode,
+                        nal_header,
+                        coded_size,
+                    );
+                    let reconstruction_executor = if defer_b_picture {
+                        ReconstructionExecutor::serial()
+                    } else if self.should_use_pipelined_seek_preroll(coded_size, packet.pts) {
+                        self.reconstruction_executor
+                            .as_ref()
+                            .expect("configure initializes the reconstruction executor")
+                            .pipeline_only()
+                    } else {
+                        self.reconstruction_executor
+                            .as_ref()
+                            .expect("configure initializes the reconstruction executor")
+                            .clone()
+                    };
                     let reconstructor =
                         IntraPictureReconstructor::from_parameter_sets_with_executor_and_workspace(
                             &parsed.parameter_sets,
                             reconstruction_executor,
-                            self.reusable_workspace.take(),
+                            self.reusable_workspaces.pop(),
                             nal_header.nal_ref_idc != 0,
                         )?;
                     self.current_picture = Some(PendingPicture {
                         reconstructor,
+                        deferred_b_slices: defer_b_picture.then(Vec::new),
                         format,
                         pts: packet.pts,
                         duration: packet.duration,
@@ -739,6 +765,28 @@ impl H264Decoder {
                                 parsed.header.num_ref_idx_l1_active,
                                 &parsed.header.ref_pic_list_modifications_l1,
                             )?;
+                        if self
+                            .current_picture
+                            .as_ref()
+                            .is_some_and(|picture| picture.deferred_b_slices.is_some())
+                        {
+                            let picture = self
+                                .current_picture
+                                .as_mut()
+                                .expect("the picture is initialized above");
+                            picture
+                                .deferred_b_slices
+                                .as_mut()
+                                .expect("the deferred picture owns its slice list")
+                                .push(DeferredBSlice {
+                                    rbsp: rbsp.as_ref().to_vec(),
+                                    parsed: parsed.clone(),
+                                    references_l0,
+                                    references_l1,
+                                    current_picture_order_count: current_poc,
+                                });
+                            return Ok(());
+                        }
                         let borrowed_l0 = references_l0
                             .iter()
                             .map(|reference| {
@@ -891,6 +939,12 @@ impl H264Decoder {
         let Some(picture) = self.current_picture.take() else {
             return Ok(());
         };
+        if picture.deferred_b_slices.is_some() {
+            let pts = picture.pts;
+            self.dispatch_deferred_non_reference_picture(picture)?;
+            self.record_completed_picture_pts(pts);
+            return Ok(());
+        }
         let coded_pixels = u64::from(picture.format.coded_size.width)
             * u64::from(picture.format.coded_size.height);
         if picture.nal_header.nal_ref_idc == 0
@@ -911,7 +965,7 @@ impl H264Decoder {
         let (decoded, motion, reusable_workspace) = picture
             .reconstructor
             .into_deblocked_picture_with_optional_reference_motion()?;
-        self.reusable_workspace = Some(reusable_workspace);
+        self.reusable_workspaces.push(reusable_workspace);
         let decoded = Arc::new(decoded);
         let frame = self
             .should_materialize_output(picture.pts)
@@ -964,6 +1018,154 @@ impl H264Decoder {
         Ok(())
     }
 
+    fn dispatch_deferred_non_reference_picture(&mut self, picture: PendingPicture) -> Result<()> {
+        let executor = self
+            .reconstruction_executor
+            .clone()
+            .expect("deferred B-picture decoding requires a reconstruction pool");
+        let pool = executor
+            .pool()
+            .expect("deferred B-picture decoding requires a parallel executor");
+        let pending_limit = pool.current_num_threads().saturating_sub(1).max(1);
+        while self.pending_non_reference_finalizations.len() >= pending_limit {
+            self.finish_next_non_reference_finalization(true)?;
+        }
+
+        let PendingPicture {
+            mut reconstructor,
+            deferred_b_slices,
+            format,
+            pts,
+            duration,
+            picture_order_count,
+            ..
+        } = picture;
+        let slices = deferred_b_slices.expect("the deferred picture owns its slices");
+        if slices.is_empty() {
+            return Err(H264Error::InvalidSyntax(
+                "deferred H.264 B picture has no slices",
+            ));
+        }
+        let picture_order_count = picture_order_count.stored.picture_order_count();
+        let materialize_output = self.should_materialize_output(pts);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        pool.spawn(move || {
+            let result = (|| {
+                for slice in slices {
+                    let borrowed_l0 = slice
+                        .references_l0
+                        .iter()
+                        .map(|reference| {
+                            reference
+                                .as_ref()
+                                .map(|reference| reference.picture.as_ref())
+                        })
+                        .collect::<Vec<_>>();
+                    let borrowed_l1 = slice
+                        .references_l1
+                        .iter()
+                        .map(|reference| {
+                            reference
+                                .as_ref()
+                                .map(|reference| reference.picture.as_ref())
+                        })
+                        .collect::<Vec<_>>();
+                    let reference_ids_l0 = slice
+                        .references_l0
+                        .iter()
+                        .map(|reference| reference.as_ref().map(|reference| reference.id))
+                        .collect::<Vec<_>>();
+                    let reference_ids_l1 = slice
+                        .references_l1
+                        .iter()
+                        .map(|reference| reference.as_ref().map(|reference| reference.id))
+                        .collect::<Vec<_>>();
+                    let implicit_l0 = slice
+                        .references_l0
+                        .iter()
+                        .map(|reference| {
+                            reference.as_ref().map(|reference| ImplicitWeightReference {
+                                picture_order_count: reference.picture_order_count,
+                                long_term: matches!(reference.kind, ReferenceKind::LongTerm { .. }),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let implicit_l1 = slice
+                        .references_l1
+                        .iter()
+                        .map(|reference| {
+                            reference.as_ref().map(|reference| ImplicitWeightReference {
+                                picture_order_count: reference.picture_order_count,
+                                long_term: matches!(reference.kind, ReferenceKind::LongTerm { .. }),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let direct_l0 = slice
+                        .references_l0
+                        .iter()
+                        .map(|reference| {
+                            reference.as_ref().map(|reference| DirectReference {
+                                id: reference.id,
+                                picture_order_count: reference.picture_order_count,
+                                long_term: matches!(reference.kind, ReferenceKind::LongTerm { .. }),
+                                motion: reference.motion.as_ref(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let direct_l1 = slice
+                        .references_l1
+                        .iter()
+                        .map(|reference| {
+                            reference.as_ref().map(|reference| DirectReference {
+                                id: reference.id,
+                                picture_order_count: reference.picture_order_count,
+                                long_term: matches!(reference.kind, ReferenceKind::LongTerm { .. }),
+                                motion: reference.motion.as_ref(),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let list0 = ReconstructionReferenceList::with_metadata(
+                        &borrowed_l0,
+                        &reference_ids_l0,
+                        &implicit_l0,
+                        &direct_l0,
+                    );
+                    let list1 = ReconstructionReferenceList::with_metadata(
+                        &borrowed_l1,
+                        &reference_ids_l1,
+                        &implicit_l1,
+                        &direct_l1,
+                    );
+                    reconstructor.decode_cabac_b_slice(
+                        &slice.rbsp,
+                        &slice.parsed,
+                        list0,
+                        list1,
+                        slice.current_picture_order_count,
+                    )?;
+                }
+                let (finalization, reusable_workspace) =
+                    reconstructor.into_non_reference_finalization()?;
+                let frame = finalization.finish().and_then(|picture_data| {
+                    materialize_output
+                        .then(|| picture_data.into_nv12_frame(0, pts, duration, format))
+                        .transpose()
+                })?;
+                Ok(AsyncPictureCompletion {
+                    frame,
+                    reusable_workspace: Some(reusable_workspace),
+                })
+            })();
+            let _ = sender.send(result);
+        });
+        self.pending_non_reference_finalizations
+            .push_back(PendingNonReferenceFinalization {
+                picture_order_count,
+                receiver,
+            });
+        self.finish_pending_non_reference_finalizations(false)
+    }
+
     fn record_completed_picture_pts(&mut self, pts: Option<MediaTime>) {
         let Some(pts) = pts else {
             self.completed_picture_missing_pts = true;
@@ -1009,9 +1211,12 @@ impl H264Decoder {
                         .then(|| picture_data.into_nv12_frame(0, pts, duration, format))
                         .transpose()
                 });
-                let _ = sender.send(frame);
+                let _ = sender.send(frame.map(|frame| AsyncPictureCompletion {
+                    frame,
+                    reusable_workspace: None,
+                }));
             });
-        self.reusable_workspace = Some(reusable_workspace);
+        self.reusable_workspaces.push(reusable_workspace);
         self.pending_non_reference_finalizations
             .push_back(PendingNonReferenceFinalization {
                 picture_order_count,
@@ -1029,14 +1234,14 @@ impl H264Decoder {
         let Some(pending) = self.pending_non_reference_finalizations.front() else {
             return Ok(false);
         };
-        let frame = if wait {
+        let completion = if wait {
             pending
                 .receiver
                 .recv()
                 .map_err(|_| H264Error::UnsupportedFeature("H.264 finalization worker stopped"))?
         } else {
             match pending.receiver.try_recv() {
-                Ok(frame) => frame,
+                Ok(completion) => completion,
                 Err(TryRecvError::Empty) => return Ok(false),
                 Err(TryRecvError::Disconnected) => {
                     return Err(H264Error::UnsupportedFeature(
@@ -1049,10 +1254,13 @@ impl H264Decoder {
             .pending_non_reference_finalizations
             .pop_front()
             .expect("the pending finalization was inspected above");
-        let frame = frame?;
+        let completion = completion?;
+        if let Some(reusable_workspace) = completion.reusable_workspace {
+            self.reusable_workspaces.push(reusable_workspace);
+        }
         if let Some(frame) = self
             .reorder
-            .push(pending.picture_order_count, frame)?
+            .push(pending.picture_order_count, completion.frame)?
             .flatten()
         {
             self.queue_output_frame(frame)?;
@@ -1062,7 +1270,11 @@ impl H264Decoder {
 
     fn discard_pending_non_reference_finalizations(&mut self) {
         while let Some(pending) = self.pending_non_reference_finalizations.pop_front() {
-            let _ = pending.receiver.recv();
+            if let Ok(Ok(completion)) = pending.receiver.recv()
+                && let Some(reusable_workspace) = completion.reusable_workspace
+            {
+                self.reusable_workspaces.push(reusable_workspace);
+            }
         }
     }
 
@@ -1165,7 +1377,7 @@ impl H264Decoder {
     }
 
     #[inline]
-    fn should_use_serial_seek_preroll(&self, coded_size: Size, pts: Option<MediaTime>) -> bool {
+    fn should_use_pipelined_seek_preroll(&self, coded_size: Size, pts: Option<MediaTime>) -> bool {
         self.parallelism == H264Parallelism::Auto
             && u64::from(coded_size.width) * u64::from(coded_size.height)
                 < WIDE_AUTO_PARALLELISM_MIN_PIXELS
@@ -1173,6 +1385,28 @@ impl H264Decoder {
                 .output_start_time
                 .zip(pts)
                 .is_some_and(|(start, pts)| pts < start)
+    }
+
+    #[inline]
+    fn should_defer_non_reference_b_picture(
+        &self,
+        slice_type: SliceType,
+        entropy_coding_mode: EntropyCodingMode,
+        nal_header: NalHeader,
+        coded_size: Size,
+    ) -> bool {
+        self.parallelism == H264Parallelism::Auto
+            && self.output_start_time.is_none()
+            && nal_header.nal_ref_idc == 0
+            && slice_type == SliceType::B
+            && entropy_coding_mode == EntropyCodingMode::Cabac
+            && u64::from(coded_size.width) * u64::from(coded_size.height)
+                >= MIN_ASYNC_FINALIZATION_PIXELS
+            && self
+                .reconstruction_executor
+                .as_ref()
+                .and_then(ReconstructionExecutor::pool)
+                .is_some()
     }
 
     fn ensure_dpb(&mut self, parsed: &ParsedSliceHeader, nal_header: NalHeader) -> Result<()> {
@@ -1221,9 +1455,7 @@ impl VideoDecoder for H264Decoder {
             ));
         }
         self.reset_all_state();
-        if self.reconstruction_executor.is_none()
-            && self.parallelism != H264Parallelism::Auto
-        {
+        if self.reconstruction_executor.is_none() && self.parallelism != H264Parallelism::Auto {
             self.reconstruction_executor = Some(ReconstructionExecutor::try_new(self.parallelism)?);
         }
         self.bitstream_format = config.bitstream_format;
@@ -1547,9 +1779,10 @@ mod tests {
     use super::{
         H264Decoder, H264SeekCheckpointCache, H264StreamParser, ParserEvent, PictureIdentity,
     };
+    use crate::parallelism::ReconstructionExecutor;
     use crate::{
-        AnnexBReader, H264Error, H264Parallelism, IntraPictureReconstructor, MotionVector,
-        NalHeader, NalUnit,
+        AnnexBReader, EntropyCodingMode, H264Error, H264Parallelism, IntraPictureReconstructor,
+        MotionVector, NalHeader, NalUnit, SliceType,
     };
 
     fn exercise_decoder(bytes: Vec<u8>) {
@@ -1572,15 +1805,24 @@ mod tests {
         }
     }
 
-    fn tightly_packed_cpu_bytes(frame: &CpuFrame) -> Vec<u8> {
+    fn tightly_packed_cpu_bytes(frame: &CpuFrame, row_bytes: usize) -> Vec<u8> {
         let mut bytes = Vec::new();
         for plane in &frame.planes {
             for row in 0..plane.rows {
                 let start = plane.offset + row * plane.stride;
-                bytes.extend_from_slice(&plane.bytes[start..start + plane.stride]);
+                bytes.extend_from_slice(&plane.bytes[start..start + row_bytes]);
             }
         }
         bytes
+    }
+
+    fn visible_plane_is(plane: &decv_core::CpuPlane, row_bytes: usize, value: u8) -> bool {
+        (0..plane.rows).all(|row| {
+            let start = plane.offset + row * plane.stride;
+            plane.bytes[start..start + row_bytes]
+                .iter()
+                .all(|&sample| sample == value)
+        })
     }
 
     #[test]
@@ -1707,7 +1949,7 @@ mod tests {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU frame"),
         };
-        let bytes = tightly_packed_cpu_bytes(&cpu);
+        let bytes = tightly_packed_cpu_bytes(&cpu, 16);
         assert_eq!(bytes.len(), 384);
         assert!(bytes.iter().all(|&sample| sample == 128));
     }
@@ -1755,7 +1997,7 @@ mod tests {
         let FrameStorage::Cpu(cpu) = frame.storage else {
             panic!("expected CPU frame");
         };
-        let bytes = tightly_packed_cpu_bytes(&cpu);
+        let bytes = tightly_packed_cpu_bytes(&cpu, 16);
         assert_eq!(bytes.len(), 384);
         assert_eq!(crc32(&bytes), 2_320_103_694);
         assert!(matches!(
@@ -1799,10 +2041,11 @@ mod tests {
             loop {
                 match decoder.receive_frame().unwrap() {
                     DecodeOutput::Frame(frame) => {
+                        let row_bytes = frame.format.coded_size.width as usize;
                         let FrameStorage::Cpu(cpu) = frame.storage else {
                             panic!("expected CPU frame");
                         };
-                        frames.push(tightly_packed_cpu_bytes(&cpu));
+                        frames.push(tightly_packed_cpu_bytes(&cpu, row_bytes));
                     }
                     DecodeOutput::EndOfStream => break,
                     output => panic!("expected CABAC P frame, got {output:?}"),
@@ -1813,7 +2056,9 @@ mod tests {
 
         let serial_frames = decode(H264Parallelism::Serial);
         let parallel_frames = decode(H264Parallelism::Threads(NonZeroUsize::new(2).unwrap()));
+        let auto_frames = decode(H264Parallelism::Auto);
         assert_eq!(parallel_frames, serial_frames);
+        assert_eq!(auto_frames, serial_frames);
         for (frame, expected_crc) in serial_frames.iter().zip([3_812_764_094, 1_790_393_901]) {
             assert_eq!(frame.len(), 768);
             assert_eq!(crc32(frame), expected_crc);
@@ -1865,10 +2110,11 @@ mod tests {
             loop {
                 match decoder.receive_frame().unwrap() {
                     DecodeOutput::Frame(frame) => {
+                        let row_bytes = frame.format.coded_size.width as usize;
                         let FrameStorage::Cpu(cpu) = frame.storage else {
                             panic!("expected CPU frame");
                         };
-                        frames.push(tightly_packed_cpu_bytes(&cpu));
+                        frames.push(tightly_packed_cpu_bytes(&cpu, row_bytes));
                     }
                     DecodeOutput::EndOfStream => break,
                     output => panic!("expected CABAC B frame, got {output:?}"),
@@ -2153,8 +2399,10 @@ mod tests {
             DecodeInputStatus::Accepted
         ));
 
-        let mut discarded =
-            EncodedVideoPacket::new(annex_b_stream(&[(0x01, single_macroblock_explicit_b_rbsp())]));
+        let mut discarded = EncodedVideoPacket::new(annex_b_stream(&[(
+            0x01,
+            single_macroblock_explicit_b_rbsp(),
+        )]));
         discarded.pts = MediaTime::from_parts(2, 1);
         assert!(matches!(
             decoder.send_packet(discarded).unwrap(),
@@ -2381,10 +2629,7 @@ mod tests {
         let checkpoint = decoder.create_seek_checkpoint().unwrap();
         assert_eq!(checkpoint.resume_time(), anchor_pts);
         assert_eq!(checkpoint.retained_reference_count(), 1);
-        assert!(
-            checkpoint.estimated_retained_reference_bytes()
-                >= 16 * 16 + 2 * (8 * 8)
-        );
+        assert!(checkpoint.estimated_retained_reference_bytes() >= 16 * 16 + 2 * (8 * 8));
         assert_eq!(
             checkpoint.clone().estimated_retained_reference_bytes(),
             checkpoint.estimated_retained_reference_bytes()
@@ -2573,11 +2818,8 @@ mod tests {
         assert!(lru.insert(checkpoint_zero.clone(), 10usize));
         assert!(lru.insert(checkpoint_two.clone(), 20usize));
         assert_eq!(
-            lru.restore_latest_before(
-                &mut decoder,
-                MediaTime::from_parts(1, 1).unwrap()
-            )
-            .unwrap(),
+            lru.restore_latest_before(&mut decoder, MediaTime::from_parts(1, 1).unwrap())
+                .unwrap(),
             Some(&10)
         );
         assert!(lru.insert(checkpoint_four.clone(), 40usize));
@@ -2681,33 +2923,83 @@ mod tests {
             decoder.send_packet(timestamped).unwrap(),
             DecodeInputStatus::Accepted
         ));
-        assert_eq!(
-            decoder.create_seek_checkpoint().unwrap().resume_time(),
-            pts
-        );
+        assert_eq!(decoder.create_seek_checkpoint().unwrap().resume_time(), pts);
     }
 
     #[test]
-    fn auto_uses_serial_reconstruction_only_for_sub_4k_seek_preroll() {
+    fn auto_uses_pipelined_reconstruction_only_for_sub_4k_seek_preroll() {
         let mut decoder = H264Decoder::new();
         let target = MediaTime::from_parts(3, 1).unwrap();
         decoder.output_start_time = Some(target);
 
-        assert!(decoder.should_use_serial_seek_preroll(
-            Size::new(1440, 2560),
-            MediaTime::from_parts(2, 1),
-        ));
-        assert!(!decoder.should_use_serial_seek_preroll(Size::new(1440, 2560), Some(target),));
-        assert!(!decoder.should_use_serial_seek_preroll(
-            Size::new(3840, 2160),
-            MediaTime::from_parts(2, 1),
-        ));
-        assert!(!decoder.should_use_serial_seek_preroll(Size::new(1440, 2560), None));
+        assert!(
+            decoder.should_use_pipelined_seek_preroll(
+                Size::new(1440, 2560),
+                MediaTime::from_parts(2, 1),
+            )
+        );
+        assert!(!decoder.should_use_pipelined_seek_preroll(Size::new(1440, 2560), Some(target),));
+        assert!(
+            !decoder.should_use_pipelined_seek_preroll(
+                Size::new(3840, 2160),
+                MediaTime::from_parts(2, 1),
+            )
+        );
+        assert!(!decoder.should_use_pipelined_seek_preroll(Size::new(1440, 2560), None,));
 
         decoder.parallelism = H264Parallelism::Threads(NonZeroUsize::new(4).unwrap());
-        assert!(!decoder.should_use_serial_seek_preroll(
-            Size::new(1440, 2560),
-            MediaTime::from_parts(2, 1),
+        assert!(
+            !decoder.should_use_pipelined_seek_preroll(
+                Size::new(1440, 2560),
+                MediaTime::from_parts(2, 1),
+            )
+        );
+    }
+
+    #[test]
+    fn auto_defers_only_ordinary_non_reference_b_pictures() {
+        let mut decoder = H264Decoder::new();
+        decoder.reconstruction_executor = Some(
+            ReconstructionExecutor::try_new(H264Parallelism::Threads(
+                NonZeroUsize::new(2).unwrap(),
+            ))
+            .unwrap(),
+        );
+        let non_reference = NalHeader::parse(0x01).unwrap();
+        let reference = NalHeader::parse(0x41).unwrap();
+        let coded_size = Size::new(16, 16);
+
+        assert!(decoder.should_defer_non_reference_b_picture(
+            SliceType::B,
+            EntropyCodingMode::Cabac,
+            non_reference,
+            coded_size,
+        ));
+        assert!(!decoder.should_defer_non_reference_b_picture(
+            SliceType::P,
+            EntropyCodingMode::Cabac,
+            non_reference,
+            coded_size,
+        ));
+        assert!(!decoder.should_defer_non_reference_b_picture(
+            SliceType::B,
+            EntropyCodingMode::Cavlc,
+            non_reference,
+            coded_size,
+        ));
+        assert!(!decoder.should_defer_non_reference_b_picture(
+            SliceType::B,
+            EntropyCodingMode::Cabac,
+            reference,
+            coded_size,
+        ));
+
+        decoder.output_start_time = MediaTime::from_parts(1, 1);
+        assert!(!decoder.should_defer_non_reference_b_picture(
+            SliceType::B,
+            EntropyCodingMode::Cabac,
+            non_reference,
+            coded_size,
         ));
     }
 
@@ -2753,7 +3045,7 @@ mod tests {
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");
             };
-            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+            assert!(visible_plane_is(&cpu.planes[0], 16, 128));
         }
         assert!(matches!(
             decoder.receive_frame().unwrap(),
@@ -2794,7 +3086,7 @@ mod tests {
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");
             };
-            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+            assert!(visible_plane_is(&cpu.planes[0], 16, 128));
         }
         assert!(matches!(
             decoder.receive_frame().unwrap(),
@@ -2833,7 +3125,7 @@ mod tests {
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");
             };
-            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+            assert!(visible_plane_is(&cpu.planes[0], 16, 128));
         }
     }
 
@@ -2868,7 +3160,7 @@ mod tests {
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");
             };
-            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+            assert!(visible_plane_is(&cpu.planes[0], 16, 128));
         }
     }
 
@@ -2903,7 +3195,7 @@ mod tests {
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");
             };
-            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+            assert!(visible_plane_is(&cpu.planes[0], 16, 128));
         }
     }
 
@@ -2969,7 +3261,7 @@ mod tests {
             let FrameStorage::Cpu(cpu) = frame.storage else {
                 panic!("expected CPU frame");
             };
-            assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+            assert!(visible_plane_is(&cpu.planes[0], 16, 128));
         }
     }
 
@@ -3011,12 +3303,9 @@ mod tests {
             panic!("expected CPU frame");
         };
         let luma = &weighted_b.planes[0];
-        let luma_bytes = &luma.bytes[luma.offset..luma.offset + luma.stride * luma.rows];
-        assert!(luma_bytes.iter().all(|&sample| sample == 138));
+        assert!(visible_plane_is(luma, 16, 138));
         let chroma = &weighted_b.planes[1];
-        let chroma_bytes =
-            &chroma.bytes[chroma.offset..chroma.offset + chroma.stride * chroma.rows];
-        assert!(chroma_bytes.iter().all(|&sample| sample == 128));
+        assert!(visible_plane_is(chroma, 16, 128));
     }
 
     #[test]
@@ -3057,16 +3346,14 @@ mod tests {
             panic!("expected CPU frame");
         };
         let luma = &weighted_b.planes[0];
-        let luma_bytes = &luma.bytes[luma.offset..luma.offset + luma.stride * luma.rows];
-        assert!(luma_bytes.iter().all(|&sample| sample == 143));
+        assert!(visible_plane_is(luma, 16, 143));
         let chroma = &weighted_b.planes[1];
-        let chroma_bytes =
-            &chroma.bytes[chroma.offset..chroma.offset + chroma.stride * chroma.rows];
-        assert!(
-            chroma_bytes
+        assert!((0..chroma.rows).all(|row| {
+            let start = chroma.offset + row * chroma.stride;
+            chroma.bytes[start..start + 16]
                 .chunks_exact(2)
                 .all(|samples| samples == [126, 117])
-        );
+        }));
     }
 
     #[test]
@@ -3102,16 +3389,14 @@ mod tests {
         let FrameStorage::Cpu(cpu) = frame.storage else {
             panic!("expected CPU frame");
         };
-        assert!(
-            cpu.planes[0].bytes[..256]
-                .iter()
-                .all(|&sample| sample == 187)
-        );
-        assert!(
-            cpu.planes[1].bytes[..]
+        assert!(visible_plane_is(&cpu.planes[0], 16, 187));
+        assert!((0..cpu.planes[1].rows).all(|row| {
+            let plane = &cpu.planes[1];
+            let start = plane.offset + row * plane.stride;
+            plane.bytes[start..start + 16]
                 .chunks_exact(2)
                 .all(|samples| samples == [118, 84])
-        );
+        }));
     }
 
     #[test]

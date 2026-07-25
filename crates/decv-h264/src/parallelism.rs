@@ -15,8 +15,10 @@ pub enum H264Parallelism {
     Serial,
     /// Select a conservative worker count for the current implementation.
     ///
-    /// CABAC parsing remains serial. `Auto` uses at most two workers below
-    /// roughly eight megapixels and at most four workers for 4K-class pictures.
+    /// CABAC parsing within one reference picture remains serial. `Auto` uses
+    /// at most two workers below roughly eight megapixels and at most four
+    /// workers for 4K-class pictures, and may decode independent large
+    /// non-reference B pictures concurrently during ordinary playback.
     #[default]
     Auto,
     /// Use exactly this many reconstruction threads.
@@ -26,6 +28,7 @@ pub enum H264Parallelism {
 #[derive(Clone)]
 pub(crate) enum ReconstructionExecutor {
     Serial,
+    Pipeline(Arc<ThreadPool>),
     Parallel(Arc<ThreadPool>),
 }
 
@@ -74,14 +77,33 @@ impl ReconstructionExecutor {
 
     pub(crate) fn pool(&self) -> Option<&ThreadPool> {
         match self {
-            Self::Serial => None,
+            Self::Serial | Self::Pipeline(_) => None,
             Self::Parallel(pool) => Some(pool),
         }
     }
 
+    pub(crate) fn pipeline_only(&self) -> Self {
+        match self {
+            Self::Serial => Self::Serial,
+            Self::Pipeline(pool) | Self::Parallel(pool) => Self::Pipeline(pool.clone()),
+        }
+    }
+
+    pub(crate) fn pipeline_pool(&self) -> Option<&ThreadPool> {
+        match self {
+            Self::Serial => None,
+            Self::Pipeline(pool) | Self::Parallel(pool) => Some(pool),
+        }
+    }
+
+    pub(crate) const fn is_pipeline_only(&self) -> bool {
+        matches!(self, Self::Pipeline(_))
+    }
+
     #[cfg(test)]
     fn worker_count(&self) -> usize {
-        self.pool().map_or(1, ThreadPool::current_num_threads)
+        self.pipeline_pool()
+            .map_or(1, ThreadPool::current_num_threads)
     }
 }
 
@@ -89,6 +111,10 @@ impl fmt::Debug for ReconstructionExecutor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Serial => formatter.write_str("Serial"),
+            Self::Pipeline(pool) => formatter
+                .debug_tuple("Pipeline")
+                .field(&pool.current_num_threads())
+                .finish(),
             Self::Parallel(pool) => formatter
                 .debug_tuple("Parallel")
                 .field(&pool.current_num_threads())

@@ -3,7 +3,8 @@
 use std::sync::Arc;
 
 use decv_core::{
-    CpuFrame, CpuPlane, DecodedVideoFrame, FrameStorage, MediaTime, PixelFormat, Size, VideoFormat,
+    AlignedBytes, CpuFrame, CpuPlane, DecodedVideoFrame, FrameStorage, MediaTime, PixelFormat,
+    Size, VideoFormat,
 };
 
 use crate::{
@@ -37,9 +38,11 @@ pub struct Yuv420Picture {
     coded_size: Size,
     width: usize,
     height: usize,
-    luma: Arc<[u8]>,
-    cb: Vec<u8>,
-    cr: Vec<u8>,
+    luma_stride: usize,
+    chroma_stride: usize,
+    luma: Arc<AlignedBytes>,
+    cb: AlignedBytes,
+    cr: AlignedBytes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,19 +111,23 @@ impl Yuv420Picture {
 
         let width = usize::try_from(coded_size.width).map_err(|_| H264Error::IntegerOverflow)?;
         let height = usize::try_from(coded_size.height).map_err(|_| H264Error::IntegerOverflow)?;
-        let luma_len = width
+        let luma_stride = cache_line_stride(width)?;
+        let chroma_stride = cache_line_stride(width / 2)?;
+        let luma_len = luma_stride
             .checked_mul(height)
             .ok_or(H264Error::IntegerOverflow)?;
-        let chroma_len = (width / 2)
+        let chroma_len = chroma_stride
             .checked_mul(height / 2)
             .ok_or(H264Error::IntegerOverflow)?;
         Ok(Self {
             coded_size,
             width,
             height,
-            luma: vec![0; luma_len].into(),
-            cb: vec![0; chroma_len],
-            cr: vec![0; chroma_len],
+            luma_stride,
+            chroma_stride,
+            luma: Arc::new(AlignedBytes::zeroed(luma_len)),
+            cb: AlignedBytes::zeroed(chroma_len),
+            cr: AlignedBytes::zeroed(chroma_len),
         })
     }
 
@@ -142,8 +149,17 @@ impl Yuv420Picture {
     }
 
     #[inline]
+    pub(crate) const fn plane_strides(&self) -> (usize, usize) {
+        (self.luma_stride, self.chroma_stride)
+    }
+
+    #[inline]
     pub(crate) fn planes_mut(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
-        (Arc::make_mut(&mut self.luma), &mut self.cb, &mut self.cr)
+        (
+            Arc::make_mut(&mut self.luma).as_mut(),
+            &mut self.cb,
+            &mut self.cr,
+        )
     }
 
     #[inline]
@@ -160,9 +176,23 @@ impl Yuv420Picture {
         self.validate_luma_block(x, y, 4)?;
         let top = if availability.top {
             let mut samples = [0; 8];
-            self.copy_top(&self.luma, self.width, x, y, &mut samples[..4])?;
+            self.copy_top(
+                &self.luma,
+                self.luma_stride,
+                self.width,
+                x,
+                y,
+                &mut samples[..4],
+            )?;
             if availability.top_right {
-                self.copy_top(&self.luma, self.width, x + 4, y, &mut samples[4..])?;
+                self.copy_top(
+                    &self.luma,
+                    self.luma_stride,
+                    self.width,
+                    x + 4,
+                    y,
+                    &mut samples[4..],
+                )?;
             } else {
                 let substitute = samples[3];
                 samples[4..].fill(substitute);
@@ -173,11 +203,11 @@ impl Yuv420Picture {
         };
         let left = availability
             .left
-            .then(|| self.copy_left::<4>(&self.luma, self.width, x, y))
+            .then(|| self.copy_left::<4>(&self.luma, self.luma_stride, x, y))
             .transpose()?;
         let top_left = availability
             .top_left
-            .then(|| self.sample_top_left(&self.luma, self.width, x, y))
+            .then(|| self.sample_top_left(&self.luma, self.luma_stride, x, y))
             .transpose()?;
         Ok(Intra4x4References {
             top,
@@ -195,9 +225,23 @@ impl Yuv420Picture {
         self.validate_luma_block(x, y, 8)?;
         let top = if availability.top {
             let mut samples = [0; 16];
-            self.copy_top(&self.luma, self.width, x, y, &mut samples[..8])?;
+            self.copy_top(
+                &self.luma,
+                self.luma_stride,
+                self.width,
+                x,
+                y,
+                &mut samples[..8],
+            )?;
             if availability.top_right {
-                self.copy_top(&self.luma, self.width, x + 8, y, &mut samples[8..])?;
+                self.copy_top(
+                    &self.luma,
+                    self.luma_stride,
+                    self.width,
+                    x + 8,
+                    y,
+                    &mut samples[8..],
+                )?;
             } else {
                 let substitute = samples[7];
                 samples[8..].fill(substitute);
@@ -208,11 +252,11 @@ impl Yuv420Picture {
         };
         let left = availability
             .left
-            .then(|| self.copy_left::<8>(&self.luma, self.width, x, y))
+            .then(|| self.copy_left::<8>(&self.luma, self.luma_stride, x, y))
             .transpose()?;
         let top_left = availability
             .top_left
-            .then(|| self.sample_top_left(&self.luma, self.width, x, y))
+            .then(|| self.sample_top_left(&self.luma, self.luma_stride, x, y))
             .transpose()?;
         Ok(Intra8x8References {
             top,
@@ -238,17 +282,17 @@ impl Yuv420Picture {
             .top
             .then(|| {
                 let mut samples = [0; 16];
-                self.copy_top(&self.luma, self.width, x, y, &mut samples)?;
+                self.copy_top(&self.luma, self.luma_stride, self.width, x, y, &mut samples)?;
                 Ok::<_, H264Error>(samples)
             })
             .transpose()?;
         let left = availability
             .left
-            .then(|| self.copy_left::<16>(&self.luma, self.width, x, y))
+            .then(|| self.copy_left::<16>(&self.luma, self.luma_stride, x, y))
             .transpose()?;
         let top_left = availability
             .top_left
-            .then(|| self.sample_top_left(&self.luma, self.width, x, y))
+            .then(|| self.sample_top_left(&self.luma, self.luma_stride, x, y))
             .transpose()?;
         Ok(Intra16x16References {
             top,
@@ -270,15 +314,15 @@ impl Yuv420Picture {
         let y = macroblock_y
             .checked_mul(8)
             .ok_or(H264Error::IntegerOverflow)?;
-        let stride = self.width / 2;
+        let stride = self.chroma_stride;
         let height = self.height / 2;
-        validate_block_bounds(stride, height, x, y, 8)?;
+        validate_block_bounds(self.width / 2, height, x, y, 8)?;
         let samples = self.chroma(plane);
         let top = availability
             .top
             .then(|| {
                 let mut top = [0; 8];
-                self.copy_top(samples, stride, x, y, &mut top)?;
+                self.copy_top(samples, stride, self.width / 2, x, y, &mut top)?;
                 Ok::<_, H264Error>(top)
             })
             .transpose()?;
@@ -306,8 +350,8 @@ impl Yuv420Picture {
     ) -> Result<()> {
         self.validate_luma_block(x, y, 4)?;
         add_block(
-            Arc::make_mut(&mut self.luma),
-            self.width,
+            Arc::make_mut(&mut self.luma).as_mut(),
+            self.luma_stride,
             x,
             y,
             prediction,
@@ -325,8 +369,8 @@ impl Yuv420Picture {
     ) -> Result<()> {
         self.validate_luma_block(x, y, 8)?;
         add_block(
-            Arc::make_mut(&mut self.luma),
-            self.width,
+            Arc::make_mut(&mut self.luma).as_mut(),
+            self.luma_stride,
             x,
             y,
             prediction,
@@ -350,8 +394,8 @@ impl Yuv420Picture {
             .ok_or(H264Error::IntegerOverflow)?;
         self.validate_luma_block(x, y, 16)?;
         add_block(
-            Arc::make_mut(&mut self.luma),
-            self.width,
+            Arc::make_mut(&mut self.luma).as_mut(),
+            self.luma_stride,
             x,
             y,
             prediction,
@@ -374,8 +418,8 @@ impl Yuv420Picture {
         let y = macroblock_y
             .checked_mul(8)
             .ok_or(H264Error::IntegerOverflow)?;
-        let stride = self.width / 2;
-        validate_block_bounds(stride, self.height / 2, x, y, 8)?;
+        let stride = self.chroma_stride;
+        validate_block_bounds(self.width / 2, self.height / 2, x, y, 8)?;
         add_block(self.chroma_mut(plane), stride, x, y, prediction, residual);
         Ok(())
     }
@@ -394,8 +438,8 @@ impl Yuv420Picture {
             .ok_or(H264Error::IntegerOverflow)?;
         self.validate_luma_block(luma_x, luma_y, 16)?;
         copy_block(
-            Arc::make_mut(&mut self.luma),
-            self.width,
+            Arc::make_mut(&mut self.luma).as_mut(),
+            self.luma_stride,
             luma_x,
             luma_y,
             pcm.luma.as_slice(),
@@ -408,7 +452,7 @@ impl Yuv420Picture {
         let chroma_y = macroblock_y
             .checked_mul(8)
             .ok_or(H264Error::IntegerOverflow)?;
-        let chroma_stride = self.width / 2;
+        let chroma_stride = self.chroma_stride;
         copy_block(
             &mut self.cb,
             chroma_stride,
@@ -447,9 +491,9 @@ impl Yuv420Picture {
             .checked_mul(8)
             .ok_or(H264Error::IntegerOverflow)?;
         Ok(MacroblockPixels {
-            luma: read_block(&self.luma, self.width, luma_x, luma_y),
-            cb: read_block(&self.cb, self.width / 2, chroma_x, chroma_y),
-            cr: read_block(&self.cr, self.width / 2, chroma_x, chroma_y),
+            luma: read_block(&self.luma, self.luma_stride, luma_x, luma_y),
+            cb: read_block(&self.cb, self.chroma_stride, chroma_x, chroma_y),
+            cr: read_block(&self.cr, self.chroma_stride, chroma_x, chroma_y),
         })
     }
 
@@ -463,13 +507,13 @@ impl Yuv420Picture {
             macroblock_x < self.width / 16 && macroblock_y < self.height / 16,
             "restored macroblock must lie inside the picture"
         );
-        let chroma_stride = self.width / 2;
+        let chroma_stride = self.chroma_stride;
         // SAFETY: The assertion above and macroblock-aligned picture
         // dimensions prove that all three rectangles fit their planes.
         unsafe {
             write_block(
-                Arc::make_mut(&mut self.luma),
-                self.width,
+                Arc::make_mut(&mut self.luma).as_mut(),
+                self.luma_stride,
                 macroblock_x * 16,
                 macroblock_y * 16,
                 &snapshot.luma,
@@ -518,8 +562,8 @@ impl Yuv420Picture {
             return Ok(());
         }
 
-        let luma = Arc::make_mut(&mut self.luma);
-        let chroma_stride = self.width / 2;
+        let luma = Arc::make_mut(&mut self.luma).as_mut();
+        let chroma_stride = self.chroma_stride;
         let mut expected_address = staged[0].address;
         let mut macroblock_x = expected_address % width_in_macroblocks;
         let mut macroblock_y = expected_address / width_in_macroblocks;
@@ -534,7 +578,7 @@ impl Yuv420Picture {
             unsafe {
                 write_block(
                     luma,
-                    self.width,
+                    self.luma_stride,
                     macroblock_x * 16,
                     macroblock_y * 16,
                     &entry.pixels.luma,
@@ -597,20 +641,26 @@ impl Yuv420Picture {
         format.validate()?;
 
         let chroma_len = self
-            .cb
-            .len()
-            .checked_mul(2)
+            .luma_stride
+            .checked_mul(self.height / 2)
             .ok_or(H264Error::IntegerOverflow)?;
-        let chroma = interleave_chroma(&self.cb, &self.cr, chroma_len);
-        let chroma: Arc<[u8]> = chroma.into();
+        let chroma = interleave_chroma(
+            &self.cb,
+            &self.cr,
+            self.chroma_stride,
+            self.width / 2,
+            self.height / 2,
+            self.luma_stride,
+            chroma_len,
+        );
         let frame = DecodedVideoFrame::new(
             id,
             pts,
             duration,
             format,
             FrameStorage::Cpu(CpuFrame::new(vec![
-                CpuPlane::new(self.luma.clone(), 0, self.width, self.height),
-                CpuPlane::new(chroma, 0, self.width, self.height / 2),
+                CpuPlane::new(self.luma.clone(), 0, self.luma_stride, self.height),
+                CpuPlane::new(chroma, 0, self.luma_stride, self.height / 2),
             ])),
         );
         frame.validate()?;
@@ -639,6 +689,7 @@ impl Yuv420Picture {
         &self,
         plane: &[u8],
         stride: usize,
+        width: usize,
         x: usize,
         y: usize,
         output: &mut [u8],
@@ -646,7 +697,7 @@ impl Yuv420Picture {
         let row_end = x
             .checked_add(output.len())
             .ok_or(H264Error::IntegerOverflow)?;
-        if row_end > stride {
+        if row_end > width {
             return Err(H264Error::InvalidSyntax(
                 "top reference crosses the picture row",
             ));
@@ -708,17 +759,46 @@ impl Yuv420Picture {
     }
 }
 
-fn interleave_chroma(cb: &[u8], cr: &[u8], output_len: usize) -> Vec<u8> {
-    assert_eq!(cb.len(), cr.len());
-    assert_eq!(cb.len().checked_mul(2), Some(output_len));
+#[inline]
+fn cache_line_stride(row_bytes: usize) -> Result<usize> {
+    row_bytes
+        .checked_add(decv_core::CPU_BUFFER_ALIGNMENT - 1)
+        .map(|value| value & !(decv_core::CPU_BUFFER_ALIGNMENT - 1))
+        .ok_or(H264Error::IntegerOverflow)
+}
 
-    let mut output = Vec::with_capacity(output_len);
-    // SAFETY: `output` has capacity for exactly two bytes per input sample.
-    // The selected implementation writes every byte before `set_len` exposes
-    // the initialized allocation.
-    unsafe {
-        interleave_chroma_into(cb.as_ptr(), cr.as_ptr(), output.as_mut_ptr(), cb.len());
-        output.set_len(output_len);
+#[allow(clippy::too_many_arguments)]
+fn interleave_chroma(
+    cb: &[u8],
+    cr: &[u8],
+    input_stride: usize,
+    input_row_samples: usize,
+    rows: usize,
+    output_stride: usize,
+    output_len: usize,
+) -> AlignedBytes {
+    assert_eq!(cb.len(), cr.len());
+    assert!(input_row_samples * 2 <= output_stride);
+    assert_eq!(input_stride.checked_mul(rows), Some(cb.len()));
+    assert_eq!(output_stride.checked_mul(rows), Some(output_len));
+
+    let mut output = AlignedBytes::with_capacity(output_len);
+    // Zero the row padding before exposing the allocation. Visible chroma
+    // bytes are overwritten by the SIMD interleave below.
+    output.resize(output_len, 0);
+    for row in 0..rows {
+        let input_offset = row * input_stride;
+        let output_offset = row * output_stride;
+        // SAFETY: The stride/length assertions above guarantee one complete
+        // readable input row and two writable bytes per visible sample.
+        unsafe {
+            interleave_chroma_into(
+                cb.as_ptr().add(input_offset),
+                cr.as_ptr().add(input_offset),
+                output.as_mut_ptr().add(output_offset),
+                input_row_samples,
+            );
+        }
     }
     output
 }
@@ -938,7 +1018,10 @@ mod tests {
                 .map(|index| (index as u8).wrapping_mul(17).wrapping_add(3))
                 .collect();
             let expected: Vec<_> = cb.iter().zip(&cr).flat_map(|(&cb, &cr)| [cb, cr]).collect();
-            assert_eq!(interleave_chroma(&cb, &cr, len * 2), expected);
+            assert_eq!(
+                interleave_chroma(&cb, &cr, len, len, 1, len * 2, len * 2).as_ref(),
+                expected.as_slice()
+            );
         }
     }
 
@@ -996,12 +1079,12 @@ mod tests {
         {
             let luma = Arc::make_mut(&mut picture.luma);
             for column in 0..16 {
-                luma[15 * 32 + 16 + column] = 10 + column as u8;
+                luma[15 * picture.luma_stride + 16 + column] = 10 + column as u8;
             }
             for row in 0..16 {
-                luma[(16 + row) * 32 + 15] = 40 + row as u8;
+                luma[(16 + row) * picture.luma_stride + 15] = 40 + row as u8;
             }
-            luma[15 * 32 + 15] = 99;
+            luma[15 * picture.luma_stride + 15] = 99;
         }
 
         let references = picture.intra16x16_references(1, 1, ALL_REFERENCES).unwrap();
@@ -1016,12 +1099,12 @@ mod tests {
         assert_eq!(references.top_left, Some(99));
 
         for column in 0..8 {
-            picture.cb[7 * 16 + 8 + column] = 60 + column as u8;
+            picture.cb[7 * picture.chroma_stride + 8 + column] = 60 + column as u8;
         }
         for row in 0..8 {
-            picture.cb[(8 + row) * 16 + 7] = 80 + row as u8;
+            picture.cb[(8 + row) * picture.chroma_stride + 7] = 80 + row as u8;
         }
-        picture.cb[7 * 16 + 7] = 70;
+        picture.cb[7 * picture.chroma_stride + 7] = 70;
         let chroma = picture
             .intra_chroma_references(ChromaPlane::Cb, 1, 1, ALL_REFERENCES)
             .unwrap();
@@ -1035,7 +1118,7 @@ mod tests {
         let mut picture = Yuv420Picture::new(Size::new(32, 32)).unwrap();
         let luma = Arc::make_mut(&mut picture.luma);
         for column in 0..16 {
-            luma[7 * 32 + 8 + column] = 20 + column as u8;
+            luma[7 * picture.luma_stride + 8 + column] = 20 + column as u8;
         }
         let availability = IntraReferenceAvailability {
             top: true,
@@ -1096,7 +1179,7 @@ mod tests {
             .write_chroma_8x8(ChromaPlane::Cr, 0, 0, &[[100; 8]; 8], &chroma_residual)
             .unwrap();
         assert_eq!(picture.cr[0], 100);
-        assert_eq!(picture.cr[63], 0);
+        assert_eq!(picture.cr[7 * picture.chroma_stride + 7], 0);
     }
 
     #[test]
@@ -1155,9 +1238,9 @@ mod tests {
 
         assert_eq!(picture.luma[16], 10);
         assert_eq!(picture.luma[32], 20);
-        assert_eq!(picture.luma[16 * 48], 30);
-        assert_eq!(picture.luma[16 * 48 + 16], 0);
-        assert_eq!(picture.luma[16 * 48 + 32], 50);
+        assert_eq!(picture.luma[16 * picture.luma_stride], 30);
+        assert_eq!(picture.luma[16 * picture.luma_stride + 16], 0);
+        assert_eq!(picture.luma[16 * picture.luma_stride + 32], 50);
     }
 
     #[test]
@@ -1195,9 +1278,14 @@ mod tests {
             _ => panic!("expected CPU frame"),
         };
         assert_eq!(cpu.planes.len(), 2);
-        assert_eq!(cpu.planes[0].bytes.len(), 256);
-        assert_eq!(cpu.planes[1].bytes.len(), 128);
-        assert!(!Arc::ptr_eq(&cpu.planes[0].bytes, &cpu.planes[1].bytes));
+        assert_eq!(cpu.planes[0].bytes.len(), 64 * 16);
+        assert_eq!(cpu.planes[1].bytes.len(), 64 * 8);
+        assert_eq!(cpu.planes[0].stride, 64);
+        assert_eq!(cpu.planes[1].stride, 64);
+        assert!(!decv_core::CpuBuffer::ptr_eq(
+            &cpu.planes[0].bytes,
+            &cpu.planes[1].bytes
+        ));
         assert_eq!(&cpu.planes[0].bytes[..4], &[0, 1, 2, 3]);
         assert_eq!(cpu.planes[1].offset, 0);
         assert_eq!(&cpu.planes[1].bytes[..8], &[10, 20, 10, 20, 10, 20, 10, 20]);

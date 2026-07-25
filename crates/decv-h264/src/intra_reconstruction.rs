@@ -62,9 +62,11 @@ const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
 ];
 const LUMA_8X8_COORDINATES: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
 #[cfg(not(test))]
-const B_INTER_PIPELINE_MIN_PIXELS: u64 = 8_000_000;
+const INTER_PIPELINE_MIN_PIXELS: u64 = 8_000_000;
 #[cfg(test)]
-const B_INTER_PIPELINE_MIN_PIXELS: u64 = 1;
+const INTER_PIPELINE_MIN_PIXELS: u64 = 1;
+const INTER_BATCH_ROWS: usize = 4;
+const SEEK_INTER_BATCH_ROWS: usize = 8;
 
 #[derive(Debug, Clone, Copy)]
 struct IntraSliceConfig {
@@ -180,6 +182,10 @@ struct PendingPInterMacroblock {
 
 type CompletedBInterBatch = (
     Vec<PendingBInterMacroblock>,
+    Result<Vec<StagedMacroblockPixels>>,
+);
+type CompletedPInterBatch = (
+    Vec<PendingPInterMacroblock>,
     Result<Vec<StagedMacroblockPixels>>,
 );
 
@@ -1234,171 +1240,246 @@ impl IntraPictureReconstructor {
         let mut macroblock_address = config.first_macroblock;
         let mut decoded_count = 0usize;
         let mut previous_qp_delta_nonzero = false;
+        let executor = self.reconstruction_executor.clone();
+        let inter_batch_rows = if executor.is_pipeline_only() {
+            SEEK_INTER_BATCH_ROWS
+        } else {
+            INTER_BATCH_ROWS
+        };
         let inter_batch_limit = self
             .width_in_macroblocks
-            .checked_mul(8)
+            .checked_mul(inter_batch_rows)
             .ok_or(H264Error::IntegerOverflow)?;
         let mut pending_inter = Vec::with_capacity(inter_batch_limit);
 
-        loop {
-            let (macroblock_x, macroblock_y) = self.macroblock_coordinates(macroblock_address)?;
-            let decoded = macroblocks.decode_macroblock_terminal(
-                &mut cabac,
-                &mut self.cabac_residual,
-                macroblock_address,
-                slice_id,
-                CabacPMacroblockContext {
-                    num_ref_idx_l0_active,
-                    transform_8x8_mode_enabled: config.transform_8x8_mode,
-                    previous_qp_delta_nonzero,
-                },
-            )?;
-            let qp_delta = decoded.macroblock.qp_delta();
-            let reconstruction =
-                quantizers.with_macroblock(qp_delta, |quantizer| match &decoded.macroblock {
-                    CabacPMacroblock::Skip => {
-                        let motion = self.motion.resolve_skip_macroblock_at(
-                            macroblock_address,
-                            macroblock_x,
-                            macroblock_y,
+        macro_rules! decode_loop {
+            ($scope:expr) => {{
+                let scope = $scope;
+                let mut in_flight: Option<Receiver<CompletedPInterBatch>> = None;
+                let mut spare_jobs = if scope.is_some() {
+                    Vec::with_capacity(inter_batch_limit)
+                } else {
+                    Vec::new()
+                };
+                let mut spare_staged = if scope.is_some() {
+                    Vec::with_capacity(inter_batch_limit)
+                } else {
+                    Vec::new()
+                };
+                loop {
+                    let (macroblock_x, macroblock_y) =
+                        self.macroblock_coordinates(macroblock_address)?;
+                    let decoded = macroblocks.decode_macroblock_terminal(
+                        &mut cabac,
+                        &mut self.cabac_residual,
+                        macroblock_address,
+                        slice_id,
+                        CabacPMacroblockContext {
+                            num_ref_idx_l0_active,
+                            transform_8x8_mode_enabled: config.transform_8x8_mode,
+                            previous_qp_delta_nonzero,
+                        },
+                    )?;
+                    let qp_delta = decoded.macroblock.qp_delta();
+                    let reconstruction = quantizers.with_macroblock(qp_delta, |quantizer| {
+                        match &decoded.macroblock {
+                            CabacPMacroblock::Skip => {
+                                let motion = self.motion.resolve_skip_macroblock_at(
+                                    macroblock_address,
+                                    macroblock_x,
+                                    macroblock_y,
+                                    slice_id,
+                                )?;
+                                if let Err(error) = self.reference_motion.record_p(
+                                    macroblock_address,
+                                    &motion,
+                                    reference_ids_l0,
+                                ) {
+                                    self.motion.clear_macroblock(macroblock_address)?;
+                                    return Err(error);
+                                }
+                                if let Err(error) = write_inter_deblock_info(
+                                    &mut self.deblock[macroblock_address],
+                                    slice_id,
+                                    quantizer,
+                                    false,
+                                    config.deblocking_filter,
+                                    &motion,
+                                    None,
+                                    &deblock_references_l0,
+                                ) {
+                                    self.motion.clear_macroblock(macroblock_address)?;
+                                    self.reference_motion.clear_macroblock(macroblock_address)?;
+                                    return Err(error);
+                                }
+                                pending_inter.push(PendingPInterMacroblock {
+                                    address: macroblock_address,
+                                    macroblock_x,
+                                    macroblock_y,
+                                    motion,
+                                    residual: None,
+                                });
+                                Ok(())
+                            }
+                            CabacPMacroblock::Decoded(decoded) => match decoded.as_ref() {
+                                DecodedPSliceMacroblock::Inter { header, residual } => {
+                                    // A zero coded-block pattern normatively carries no
+                                    // residual samples. `None` has that exact meaning
+                                    // to the staged reconstruction path, and avoids
+                                    // allocating an all-zero transformed residual.
+                                    let reconstructed = header
+                                        .coded_block_pattern
+                                        .has_residual()
+                                        .then(|| {
+                                            reconstruct_inter_residual(
+                                                header,
+                                                residual,
+                                                quantizer,
+                                                &self.scaling_lists,
+                                                &self.scaling_lists_8x8,
+                                                self.scan_mode,
+                                            )
+                                        })
+                                        .transpose()?;
+                                    let motion = self.motion.resolve_inter_macroblock(
+                                        macroblock_address,
+                                        slice_id,
+                                        header,
+                                    )?;
+                                    if let Err(error) = self.reference_motion.record_p(
+                                        macroblock_address,
+                                        &motion,
+                                        reference_ids_l0,
+                                    ) {
+                                        self.motion.clear_macroblock(macroblock_address)?;
+                                        return Err(error);
+                                    }
+                                    if let Err(error) = write_inter_deblock_info(
+                                        &mut self.deblock[macroblock_address],
+                                        slice_id,
+                                        quantizer,
+                                        header.transform_size_8x8,
+                                        config.deblocking_filter,
+                                        &motion,
+                                        Some(residual),
+                                        &deblock_references_l0,
+                                    ) {
+                                        self.motion.clear_macroblock(macroblock_address)?;
+                                        self.reference_motion
+                                            .clear_macroblock(macroblock_address)?;
+                                        return Err(error);
+                                    }
+                                    pending_inter.push(PendingPInterMacroblock {
+                                        address: macroblock_address,
+                                        macroblock_x,
+                                        macroblock_y,
+                                        motion,
+                                        residual: reconstructed,
+                                    });
+                                    Ok(())
+                                }
+                                DecodedPSliceMacroblock::Intra(decoded) => {
+                                    self.finish_in_flight_p_inter(
+                                        &mut in_flight,
+                                        &mut spare_jobs,
+                                        &mut spare_staged,
+                                        slice_id,
+                                    )?;
+                                    self.finish_pending_p_inter(
+                                        &mut pending_inter,
+                                        references_l0,
+                                        prediction_weights,
+                                        slice_id,
+                                    )?;
+                                    self.reconstruct_macroblock_with_deblocking(
+                                        macroblock_address,
+                                        slice_id,
+                                        decoded,
+                                        quantizer,
+                                        config.deblocking_filter,
+                                        pcm_chroma_qp,
+                                    )
+                                }
+                            },
+                        }
+                    });
+                    reconstruction?;
+                    if pending_inter.len() >= inter_batch_limit {
+                        self.finish_in_flight_p_inter(
+                            &mut in_flight,
+                            &mut spare_jobs,
+                            &mut spare_staged,
                             slice_id,
                         )?;
-                        if let Err(error) = self.reference_motion.record_p(
-                            macroblock_address,
-                            &motion,
-                            reference_ids_l0,
-                        ) {
-                            self.motion.clear_macroblock(macroblock_address)?;
-                            return Err(error);
-                        }
-                        if let Err(error) = write_inter_deblock_info(
-                            &mut self.deblock[macroblock_address],
-                            slice_id,
-                            quantizer,
-                            false,
-                            config.deblocking_filter,
-                            &motion,
-                            None,
-                            &deblock_references_l0,
-                        ) {
-                            self.motion.clear_macroblock(macroblock_address)?;
-                            self.reference_motion.clear_macroblock(macroblock_address)?;
-                            return Err(error);
-                        }
-                        pending_inter.push(PendingPInterMacroblock {
-                            address: macroblock_address,
-                            macroblock_x,
-                            macroblock_y,
-                            motion,
-                            residual: None,
-                        });
-                        Ok(())
-                    }
-                    CabacPMacroblock::Decoded(decoded) => match decoded.as_ref() {
-                        DecodedPSliceMacroblock::Inter { header, residual } => {
-                            // A zero coded-block pattern normatively carries no
-                            // residual samples. `None` has that exact meaning
-                            // to the staged reconstruction path, and avoids
-                            // allocating an all-zero transformed residual.
-                            let reconstructed = header
-                                .coded_block_pattern
-                                .has_residual()
-                                .then(|| {
-                                    reconstruct_inter_residual(
-                                        header,
-                                        residual,
-                                        quantizer,
-                                        &self.scaling_lists,
-                                        &self.scaling_lists_8x8,
-                                        self.scan_mode,
-                                    )
-                                })
-                                .transpose()?;
-                            let motion = self.motion.resolve_inter_macroblock(
-                                macroblock_address,
-                                slice_id,
-                                header,
-                            )?;
-                            if let Err(error) = self.reference_motion.record_p(
-                                macroblock_address,
-                                &motion,
-                                reference_ids_l0,
-                            ) {
-                                self.motion.clear_macroblock(macroblock_address)?;
-                                return Err(error);
-                            }
-                            if let Err(error) = write_inter_deblock_info(
-                                &mut self.deblock[macroblock_address],
-                                slice_id,
-                                quantizer,
-                                header.transform_size_8x8,
-                                config.deblocking_filter,
-                                &motion,
-                                Some(residual),
-                                &deblock_references_l0,
-                            ) {
-                                self.motion.clear_macroblock(macroblock_address)?;
-                                self.reference_motion.clear_macroblock(macroblock_address)?;
-                                return Err(error);
-                            }
-                            pending_inter.push(PendingPInterMacroblock {
-                                address: macroblock_address,
-                                macroblock_x,
-                                macroblock_y,
-                                motion,
-                                residual: reconstructed,
+                        if let Some(scope) = scope {
+                            let jobs = std::mem::replace(&mut pending_inter, spare_jobs);
+                            spare_jobs = Vec::new();
+                            let staged = std::mem::take(&mut spare_staged);
+                            let (sender, receiver) = sync_channel(1);
+                            let coded_size = self.picture.coded_size();
+                            let default_weight_reference_mask =
+                                default_p_prediction_weight_reference_mask(prediction_weights);
+                            scope.spawn(move |_| {
+                                let staged = reconstruct_p_inter_batch_parallel(
+                                    coded_size,
+                                    &jobs,
+                                    staged,
+                                    references_l0,
+                                    prediction_weights,
+                                    default_weight_reference_mask,
+                                );
+                                let _ = sender.send((jobs, staged));
                             });
-                            Ok(())
-                        }
-                        DecodedPSliceMacroblock::Intra(decoded) => {
+                            in_flight = Some(receiver);
+                        } else {
                             self.finish_pending_p_inter(
                                 &mut pending_inter,
                                 references_l0,
                                 prediction_weights,
                                 slice_id,
                             )?;
-                            self.reconstruct_macroblock_with_deblocking(
-                                macroblock_address,
-                                slice_id,
-                                decoded,
-                                quantizer,
-                                config.deblocking_filter,
-                                pcm_chroma_qp,
-                            )
                         }
-                    },
-                });
-            reconstruction?;
-            if pending_inter.len() >= inter_batch_limit {
-                self.finish_pending_p_inter(
-                    &mut pending_inter,
-                    references_l0,
-                    prediction_weights,
-                    slice_id,
-                )?;
-            }
+                    }
 
-            previous_qp_delta_nonzero = qp_delta != 0;
-            macroblock_address = macroblock_address
-                .checked_add(1)
-                .ok_or(H264Error::IntegerOverflow)?;
-            decoded_count = decoded_count
-                .checked_add(1)
-                .ok_or(H264Error::IntegerOverflow)?;
-            if decoded.end_of_slice {
-                self.finish_pending_p_inter(
-                    &mut pending_inter,
-                    references_l0,
-                    prediction_weights,
-                    slice_id,
-                )?;
-                return Ok(decoded_count);
-            }
-            if macroblock_address >= self.completed.len() {
-                return Err(H264Error::InvalidSyntax(
-                    "CABAC P slice has no terminating end_of_slice_flag",
-                ));
-            }
+                    previous_qp_delta_nonzero = qp_delta != 0;
+                    macroblock_address = macroblock_address
+                        .checked_add(1)
+                        .ok_or(H264Error::IntegerOverflow)?;
+                    decoded_count = decoded_count
+                        .checked_add(1)
+                        .ok_or(H264Error::IntegerOverflow)?;
+                    if decoded.end_of_slice {
+                        self.finish_in_flight_p_inter(
+                            &mut in_flight,
+                            &mut spare_jobs,
+                            &mut spare_staged,
+                            slice_id,
+                        )?;
+                        self.finish_pending_p_inter(
+                            &mut pending_inter,
+                            references_l0,
+                            prediction_weights,
+                            slice_id,
+                        )?;
+                        return Ok(decoded_count);
+                    }
+                    if macroblock_address >= self.completed.len() {
+                        return Err(H264Error::InvalidSyntax(
+                            "CABAC P slice has no terminating end_of_slice_flag",
+                        ));
+                    }
+                }
+            }};
+        }
+
+        let coded_size = self.picture.coded_size();
+        let coded_pixels = u64::from(coded_size.width) * u64::from(coded_size.height);
+        if (executor.is_pipeline_only() || coded_pixels >= INTER_PIPELINE_MIN_PIXELS)
+            && let Some(pool) = executor.pipeline_pool()
+        {
+            pool.in_place_scope(|scope| decode_loop!(Some(scope)))
+        } else {
+            decode_loop!(None::<&rayon::Scope<'_>>)
         }
     }
 
@@ -1700,17 +1781,33 @@ impl IntraPictureReconstructor {
         ];
         let mut macroblock_address = config.first_macroblock;
         let mut decoded_count = 0usize;
+        let executor = self.reconstruction_executor.clone();
+        let inter_batch_rows = if executor.is_pipeline_only() {
+            SEEK_INTER_BATCH_ROWS
+        } else {
+            INTER_BATCH_ROWS
+        };
         let inter_batch_limit = self
             .width_in_macroblocks
-            .checked_mul(8)
+            .checked_mul(inter_batch_rows)
             .ok_or(H264Error::IntegerOverflow)?;
         let mut pending_inter = Vec::with_capacity(inter_batch_limit);
 
-        let executor = self.reconstruction_executor.clone();
+        let pipeline_only = executor.is_pipeline_only();
         macro_rules! decode_loop {
             ($scope:expr) => {{
                 let scope = $scope;
                 let mut in_flight: Option<Receiver<CompletedBInterBatch>> = None;
+                let mut spare_jobs = if scope.is_some() {
+                    Vec::with_capacity(inter_batch_limit)
+                } else {
+                    Vec::new()
+                };
+                let mut spare_staged = if scope.is_some() {
+                    Vec::with_capacity(inter_batch_limit)
+                } else {
+                    Vec::new()
+                };
                 loop {
                     let (macroblock_x, macroblock_y) =
                         self.macroblock_coordinates(macroblock_address)?;
@@ -1845,7 +1942,12 @@ impl IntraPictureReconstructor {
                                     Ok(())
                                 }
                                 DecodedBSliceMacroblock::Intra(decoded) => {
-                                    self.finish_in_flight_b_inter(&mut in_flight, slice_id)?;
+                                    self.finish_in_flight_b_inter(
+                                        &mut in_flight,
+                                        &mut spare_jobs,
+                                        &mut spare_staged,
+                                        slice_id,
+                                    )?;
                                     self.finish_pending_b_inter(
                                         &mut pending_inter,
                                         references_l0,
@@ -1867,12 +1969,16 @@ impl IntraPictureReconstructor {
                     });
                     reconstruction?;
                     if pending_inter.len() >= inter_batch_limit {
-                        self.finish_in_flight_b_inter(&mut in_flight, slice_id)?;
+                        self.finish_in_flight_b_inter(
+                            &mut in_flight,
+                            &mut spare_jobs,
+                            &mut spare_staged,
+                            slice_id,
+                        )?;
                         if let Some(scope) = scope {
-                            let jobs = std::mem::replace(
-                                &mut pending_inter,
-                                Vec::with_capacity(inter_batch_limit),
-                            );
+                            let jobs = std::mem::replace(&mut pending_inter, spare_jobs);
+                            spare_jobs = Vec::new();
+                            let staged = std::mem::take(&mut spare_staged);
                             let (sender, receiver) = sync_channel(1);
                             let coded_size = self.picture.coded_size();
                             let weight_mode = b_prediction_weight_mode(modes.weights);
@@ -1880,6 +1986,7 @@ impl IntraPictureReconstructor {
                                 let staged = reconstruct_b_inter_batch_parallel(
                                     coded_size,
                                     &jobs,
+                                    staged,
                                     references_l0,
                                     references_l1,
                                     weight_mode,
@@ -1906,7 +2013,12 @@ impl IntraPictureReconstructor {
                         .checked_add(1)
                         .ok_or(H264Error::IntegerOverflow)?;
                     if decoded.end_of_slice {
-                        self.finish_in_flight_b_inter(&mut in_flight, slice_id)?;
+                        self.finish_in_flight_b_inter(
+                            &mut in_flight,
+                            &mut spare_jobs,
+                            &mut spare_staged,
+                            slice_id,
+                        )?;
                         self.finish_pending_b_inter(
                             &mut pending_inter,
                             references_l0,
@@ -1927,7 +2039,9 @@ impl IntraPictureReconstructor {
 
         let coded_size = self.picture.coded_size();
         let coded_pixels = u64::from(coded_size.width) * u64::from(coded_size.height);
-        if coded_pixels >= B_INTER_PIPELINE_MIN_PIXELS
+        if pipeline_only && let Some(pool) = executor.pipeline_pool() {
+            pool.in_place_scope(|scope| decode_loop!(Some(scope)))
+        } else if coded_pixels >= INTER_PIPELINE_MIN_PIXELS
             && let Some(pool) = executor.pool()
         {
             pool.in_place_scope(|scope| decode_loop!(Some(scope)))
@@ -1986,23 +2100,19 @@ impl IntraPictureReconstructor {
                 let mb_y = u32::try_from(macroblock_y).map_err(|_| H264Error::IntegerOverflow)?;
                 let cavlc_snapshot = self.cavlc.snapshot_macroblock(mb_x, mb_y)?;
                 self.cavlc.record_zero_macroblock(mb_x, mb_y)?;
-                let motion =
-                    match modes
-                        .direct
-                        .resolve(
-                            &mut self.b_motion,
-                            macroblock_address,
-                            macroblock_x,
-                            macroblock_y,
-                            slice_id,
-                        )
-                    {
-                        Ok(motion) => motion,
-                        Err(error) => {
-                            self.cavlc.restore_macroblock(mb_x, mb_y, cavlc_snapshot);
-                            return Err(error);
-                        }
-                    };
+                let motion = match modes.direct.resolve(
+                    &mut self.b_motion,
+                    macroblock_address,
+                    macroblock_x,
+                    macroblock_y,
+                    slice_id,
+                ) {
+                    Ok(motion) => motion,
+                    Err(error) => {
+                        self.cavlc.restore_macroblock(mb_x, mb_y, cavlc_snapshot);
+                        return Err(error);
+                    }
+                };
                 if let Err(error) = self.reference_motion.record_b_at(
                     macroblock_address,
                     macroblock_x,
@@ -2094,15 +2204,13 @@ impl IntraPictureReconstructor {
                         self.scan_mode,
                     )?;
                     let motion = if is_fully_direct_b_macroblock(header) {
-                        modes
-                            .direct
-                            .resolve(
-                                &mut self.b_motion,
-                                macroblock_address,
-                                macroblock_x,
-                                macroblock_y,
-                                slice_id,
-                            )?
+                        modes.direct.resolve(
+                            &mut self.b_motion,
+                            macroblock_address,
+                            macroblock_x,
+                            macroblock_y,
+                            slice_id,
+                        )?
                     } else if has_direct_b_sub_macroblock(header) {
                         modes.direct.resolve_mixed(
                             &mut self.b_motion,
@@ -2266,62 +2374,59 @@ impl IntraPictureReconstructor {
         let staged = if jobs.len() > 1
             && let Some(pool) = self.reconstruction_executor.pool()
         {
-            let mut staged = Box::<[StagedMacroblockPixels]>::new_uninit_slice(jobs.len());
-            let reconstructed: Vec<Result<()>> = pool.install(|| {
-                staged
-                    .par_iter_mut()
-                    .zip(jobs.par_iter())
-                    .map_init(InterPrediction420::empty, |scratch, (output, job)| {
-                        let output = output.write(StagedMacroblockPixels::empty(job.address));
-                        reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
-                            coded_size,
-                            references_l0,
-                            job.macroblock_x,
-                            job.macroblock_y,
-                            &job.motion,
-                            job.residual.as_ref(),
-                            weights,
-                            default_weight_reference_mask,
-                            scratch,
-                            output.pixels_mut(),
-                        )
-                    })
-                    .collect()
-            });
-            // Every indexed `map` item initializes its slot before performing
-            // fallible reconstruction. `collect` does not short-circuit on an
-            // `Err`, so all slots are initialized when `install` returns.
-            let staged = unsafe { staged.assume_init() }.into_vec();
-            // Indexed parallel collection preserves job order, so malformed
-            // streams still report the first error by macroblock address.
-            for result in reconstructed {
-                result?;
-            }
-            staged
-        } else {
-            let mut scratch = InterPrediction420::empty();
-            let mut staged = Vec::with_capacity(jobs.len());
-            for job in jobs.iter() {
-                staged.push(StagedMacroblockPixels::empty(job.address));
-                reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
+            pool.install(|| {
+                reconstruct_p_inter_batch_parallel(
                     coded_size,
+                    jobs,
+                    Vec::new(),
                     references_l0,
-                    job.macroblock_x,
-                    job.macroblock_y,
-                    &job.motion,
-                    job.residual.as_ref(),
                     weights,
                     default_weight_reference_mask,
-                    &mut scratch,
-                    staged
-                        .last_mut()
-                        .expect("the staged macroblock was just appended")
-                        .pixels_mut(),
-                )?;
-            }
-            staged
+                )
+            })?
+        } else {
+            reconstruct_p_inter_batch_serial(
+                coded_size,
+                jobs,
+                references_l0,
+                weights,
+                default_weight_reference_mask,
+            )?
         };
 
+        self.commit_p_inter_batch(jobs, &staged, slice_id)?;
+        jobs.clear();
+        Ok(())
+    }
+
+    fn finish_in_flight_p_inter(
+        &mut self,
+        in_flight: &mut Option<Receiver<CompletedPInterBatch>>,
+        spare_jobs: &mut Vec<PendingPInterMacroblock>,
+        spare_staged: &mut Vec<StagedMacroblockPixels>,
+        slice_id: u32,
+    ) -> Result<()> {
+        let Some(receiver) = in_flight.take() else {
+            return Ok(());
+        };
+        let (mut jobs, staged) = receiver.recv().map_err(|_| {
+            H264Error::UnsupportedFeature("H.264 reconstruction worker terminated unexpectedly")
+        })?;
+        let mut staged = staged?;
+        self.commit_p_inter_batch(&jobs, &staged, slice_id)?;
+        jobs.clear();
+        staged.clear();
+        *spare_jobs = jobs;
+        *spare_staged = staged;
+        Ok(())
+    }
+
+    fn commit_p_inter_batch(
+        &mut self,
+        jobs: &[PendingPInterMacroblock],
+        staged: &[StagedMacroblockPixels],
+        slice_id: u32,
+    ) -> Result<()> {
         for (recorded_modes, job) in jobs.iter().enumerate() {
             if let Err(error) = self.modes.record_inter(job.address, slice_id) {
                 for recorded in &jobs[..recorded_modes] {
@@ -2330,7 +2435,7 @@ impl IntraPictureReconstructor {
                 return Err(error);
             }
         }
-        if let Err(error) = self.picture.commit_macroblock_batch(&staged) {
+        if let Err(error) = self.picture.commit_macroblock_batch(staged) {
             for job in jobs.iter() {
                 self.modes.clear_macroblock(job.address)?;
             }
@@ -2339,7 +2444,6 @@ impl IntraPictureReconstructor {
         for job in jobs.iter() {
             self.completed[job.address] = true;
         }
-        jobs.clear();
         Ok(())
     }
 
@@ -2363,35 +2467,20 @@ impl IntraPictureReconstructor {
                 reconstruct_b_inter_batch_parallel(
                     coded_size,
                     jobs,
+                    Vec::new(),
                     references_l0,
                     references_l1,
                     weight_mode,
                 )
             })?
         } else {
-            let mut scratch = (InterPrediction420::empty(), InterPrediction420::empty());
-            let mut staged = Vec::with_capacity(jobs.len());
-            for job in jobs.iter() {
-                staged.push(StagedMacroblockPixels::empty(job.address));
-                let (prediction_l0, prediction_l1) = &mut scratch;
-                reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
-                    coded_size,
-                    references_l0,
-                    references_l1,
-                    job.macroblock_x,
-                    job.macroblock_y,
-                    &job.motion,
-                    job.residual.as_ref(),
-                    weight_mode,
-                    prediction_l0,
-                    prediction_l1,
-                    staged
-                        .last_mut()
-                        .expect("the staged macroblock was just appended")
-                        .pixels_mut(),
-                )?;
-            }
-            staged
+            reconstruct_b_inter_batch_serial(
+                coded_size,
+                jobs,
+                references_l0,
+                references_l1,
+                weight_mode,
+            )?
         };
 
         self.commit_b_inter_batch(jobs, &staged, slice_id)?;
@@ -2402,16 +2491,23 @@ impl IntraPictureReconstructor {
     fn finish_in_flight_b_inter(
         &mut self,
         in_flight: &mut Option<Receiver<CompletedBInterBatch>>,
+        spare_jobs: &mut Vec<PendingBInterMacroblock>,
+        spare_staged: &mut Vec<StagedMacroblockPixels>,
         slice_id: u32,
     ) -> Result<()> {
         let Some(receiver) = in_flight.take() else {
             return Ok(());
         };
-        let (jobs, staged) = receiver.recv().map_err(|_| {
+        let (mut jobs, staged) = receiver.recv().map_err(|_| {
             H264Error::UnsupportedFeature("H.264 reconstruction worker terminated unexpectedly")
         })?;
-        let staged = staged?;
-        self.commit_b_inter_batch(&jobs, &staged, slice_id)
+        let mut staged = staged?;
+        self.commit_b_inter_batch(&jobs, &staged, slice_id)?;
+        jobs.clear();
+        staged.clear();
+        *spare_jobs = jobs;
+        *spare_staged = staged;
+        Ok(())
     }
 
     fn commit_b_inter_batch(
@@ -3123,22 +3219,121 @@ fn b_prediction_weight_mode(weights: BSlicePredictionWeights<'_>) -> BPrediction
     }
 }
 
-fn reconstruct_b_inter_batch_parallel(
+fn reconstruct_p_inter_batch_serial(
+    coded_size: Size,
+    jobs: &[PendingPInterMacroblock],
+    references_l0: &[Option<&Yuv420Picture>],
+    weights: Option<&PredictionWeightTable>,
+    default_weight_reference_mask: u32,
+) -> Result<Vec<StagedMacroblockPixels>> {
+    let mut scratch = InterPrediction420::empty();
+    let mut staged = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        staged.push(StagedMacroblockPixels::empty(job.address));
+        reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
+            coded_size,
+            references_l0,
+            job.macroblock_x,
+            job.macroblock_y,
+            &job.motion,
+            job.residual.as_ref(),
+            weights,
+            default_weight_reference_mask,
+            &mut scratch,
+            staged
+                .last_mut()
+                .expect("the staged macroblock was just appended")
+                .pixels_mut(),
+        )?;
+    }
+    Ok(staged)
+}
+
+fn reconstruct_p_inter_batch_parallel(
+    coded_size: Size,
+    jobs: &[PendingPInterMacroblock],
+    mut staged: Vec<StagedMacroblockPixels>,
+    references_l0: &[Option<&Yuv420Picture>],
+    weights: Option<&PredictionWeightTable>,
+    default_weight_reference_mask: u32,
+) -> Result<Vec<StagedMacroblockPixels>> {
+    staged.clear();
+    staged.extend(
+        jobs.iter()
+            .map(|job| StagedMacroblockPixels::empty(job.address)),
+    );
+    staged
+        .par_iter_mut()
+        .zip(jobs.par_iter())
+        .try_for_each_init(InterPrediction420::empty, |scratch, (output, job)| {
+            reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
+                coded_size,
+                references_l0,
+                job.macroblock_x,
+                job.macroblock_y,
+                &job.motion,
+                job.residual.as_ref(),
+                weights,
+                default_weight_reference_mask,
+                scratch,
+                output.pixels_mut(),
+            )
+        })?;
+    Ok(staged)
+}
+
+fn reconstruct_b_inter_batch_serial(
     coded_size: Size,
     jobs: &[PendingBInterMacroblock],
     references_l0: &[Option<&Yuv420Picture>],
     references_l1: &[Option<&Yuv420Picture>],
     weight_mode: BPredictionWeightMode<'_>,
 ) -> Result<Vec<StagedMacroblockPixels>> {
-    let mut staged = Box::<[StagedMacroblockPixels]>::new_uninit_slice(jobs.len());
-    let reconstructed: Vec<Result<()>> = staged
+    let mut scratch = (InterPrediction420::empty(), InterPrediction420::empty());
+    let mut staged = Vec::with_capacity(jobs.len());
+    for job in jobs {
+        staged.push(StagedMacroblockPixels::empty(job.address));
+        let (prediction_l0, prediction_l1) = &mut scratch;
+        reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
+            coded_size,
+            references_l0,
+            references_l1,
+            job.macroblock_x,
+            job.macroblock_y,
+            &job.motion,
+            job.residual.as_ref(),
+            weight_mode,
+            prediction_l0,
+            prediction_l1,
+            staged
+                .last_mut()
+                .expect("the staged macroblock was just appended")
+                .pixels_mut(),
+        )?;
+    }
+    Ok(staged)
+}
+
+fn reconstruct_b_inter_batch_parallel(
+    coded_size: Size,
+    jobs: &[PendingBInterMacroblock],
+    mut staged: Vec<StagedMacroblockPixels>,
+    references_l0: &[Option<&Yuv420Picture>],
+    references_l1: &[Option<&Yuv420Picture>],
+    weight_mode: BPredictionWeightMode<'_>,
+) -> Result<Vec<StagedMacroblockPixels>> {
+    staged.clear();
+    staged.extend(
+        jobs.iter()
+            .map(|job| StagedMacroblockPixels::empty(job.address)),
+    );
+    staged
         .par_iter_mut()
         .zip(jobs.par_iter())
-        .map_init(
+        .try_for_each_init(
             || (InterPrediction420::empty(), InterPrediction420::empty()),
             |scratch, (output, job)| {
                 let (prediction_l0, prediction_l1) = scratch;
-                let output = output.write(StagedMacroblockPixels::empty(job.address));
                 reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
                     coded_size,
                     references_l0,
@@ -3153,14 +3348,7 @@ fn reconstruct_b_inter_batch_parallel(
                     output.pixels_mut(),
                 )
             },
-        )
-        .collect();
-    // Indexed parallel collection runs every job and initializes its output
-    // before fallible reconstruction. It also preserves macroblock order.
-    let staged = unsafe { staged.assume_init() }.into_vec();
-    for result in reconstructed {
-        result?;
-    }
+        )?;
     Ok(staged)
 }
 
@@ -4011,11 +4199,29 @@ mod tests {
 
     fn constant_picture(value: u8) -> crate::Yuv420Picture {
         let mut picture = crate::Yuv420Picture::new(Size::new(16, 16)).unwrap();
+        let (luma_stride, chroma_stride) = picture.plane_strides();
         let (luma, cb, cr) = picture.planes_mut();
-        luma.fill(value);
-        cb.fill(value + 1);
-        cr.fill(value + 2);
+        for row in luma.chunks_exact_mut(luma_stride).take(16) {
+            row[..16].fill(value);
+        }
+        for row in cb.chunks_exact_mut(chroma_stride).take(8) {
+            row[..8].fill(value + 1);
+        }
+        for row in cr.chunks_exact_mut(chroma_stride).take(8) {
+            row[..8].fill(value + 2);
+        }
         picture
+    }
+
+    fn plane_is(bytes: &[u8], stride: usize, row_bytes: usize, rows: usize, value: u8) -> bool {
+        bytes
+            .chunks_exact(stride)
+            .take(rows)
+            .all(|row| row[..row_bytes].iter().all(|&sample| sample == value))
+    }
+
+    fn cpu_plane_is(plane: &decv_core::CpuPlane, row_bytes: usize, rows: usize, value: u8) -> bool {
+        plane_is(plane.bytes.as_ref(), plane.stride, row_bytes, rows, value)
     }
 
     #[test]
@@ -4069,10 +4275,11 @@ mod tests {
             ),
             Ok(1)
         );
+        let (luma_stride, chroma_stride) = inter.picture().plane_strides();
         let (luma, cb, cr) = inter.picture().planes();
-        assert!(luma.iter().all(|&sample| sample == 70));
-        assert!(cb.iter().all(|&sample| sample == 71));
-        assert!(cr.iter().all(|&sample| sample == 72));
+        assert!(plane_is(luma, luma_stride, 16, 16, 70));
+        assert!(plane_is(cb, chroma_stride, 8, 8, 71));
+        assert!(plane_is(cr, chroma_stride, 8, 8, 72));
         assert!(
             inter
                 .into_nv12_frame(1, None, None, format(Size::new(16, 16)))
@@ -4091,14 +4298,14 @@ mod tests {
             ),
             Ok(1)
         );
-        assert!(
-            skipped
-                .picture()
-                .planes()
-                .0
-                .iter()
-                .all(|&sample| sample == 70)
-        );
+        let (luma_stride, _) = skipped.picture().plane_strides();
+        assert!(plane_is(
+            skipped.picture().planes().0,
+            luma_stride,
+            16,
+            16,
+            70
+        ));
         assert!(
             skipped
                 .into_nv12_frame(2, None, None, format(Size::new(16, 16)))
@@ -4126,10 +4333,11 @@ mod tests {
             ),
             Ok(1)
         );
+        let (luma_stride, chroma_stride) = list0.picture().plane_strides();
         let (luma, cb, cr) = list0.picture().planes();
-        assert!(luma.iter().all(|&sample| sample == 40));
-        assert!(cb.iter().all(|&sample| sample == 41));
-        assert!(cr.iter().all(|&sample| sample == 42));
+        assert!(plane_is(luma, luma_stride, 16, 16, 40));
+        assert!(plane_is(cb, chroma_stride, 8, 8, 41));
+        assert!(plane_is(cr, chroma_stride, 8, 8, 42));
 
         // mb_skip_run=0, B_Bi_16x16, zero MVDs for both lists, CBP=0.
         let mut bidirectional = reconstructor(Size::new(16, 16));
@@ -4144,10 +4352,11 @@ mod tests {
             ),
             Ok(1)
         );
+        let (luma_stride, chroma_stride) = bidirectional.picture().plane_strides();
         let (luma, cb, cr) = bidirectional.picture().planes();
-        assert!(luma.iter().all(|&sample| sample == 70));
-        assert!(cb.iter().all(|&sample| sample == 71));
-        assert!(cr.iter().all(|&sample| sample == 72));
+        assert!(plane_is(luma, luma_stride, 16, 16, 70));
+        assert!(plane_is(cb, chroma_stride, 8, 8, 71));
+        assert!(plane_is(cr, chroma_stride, 8, 8, 72));
 
         let mut direct = reconstructor(Size::new(16, 16));
         assert!(matches!(
@@ -4187,7 +4396,7 @@ mod tests {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU frame"),
         };
-        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        assert!(cpu_plane_is(&cpu.planes[0], 16, 16, 128));
     }
 
     #[test]
@@ -4220,7 +4429,7 @@ mod tests {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU frame"),
         };
-        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        assert!(cpu_plane_is(&cpu.planes[0], 16, 16, 128));
     }
 
     #[test]
@@ -4268,7 +4477,7 @@ mod tests {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU frame"),
         };
-        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        assert!(cpu_plane_is(&cpu.planes[0], 16, 16, 128));
     }
 
     #[test]
@@ -4297,7 +4506,7 @@ mod tests {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU frame"),
         };
-        assert!(cpu.planes[0].bytes.iter().all(|&sample| sample == 128));
+        assert!(cpu_plane_is(&cpu.planes[0], 16, 16, 128));
     }
 
     #[test]
@@ -4414,7 +4623,7 @@ mod tests {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU frame"),
         };
-        assert!(cpu.planes[0].bytes[..256].iter().all(|&sample| sample == 5));
+        assert!(cpu_plane_is(&cpu.planes[0], 16, 16, 5));
         assert_eq!(&cpu.planes[1].bytes[..4], &[10, 20, 10, 20]);
     }
 }

@@ -1,5 +1,7 @@
 //! Complete progressive P-macroblock assembly from CABAC syntax elements.
 
+use smallvec::SmallVec;
+
 use crate::{
     CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary, CabacMotionPartition,
     CabacMotionSyntaxState, CabacPMacroblockType, CabacResidualState, CabacSliceDecoder,
@@ -295,7 +297,7 @@ impl CabacPMacroblockState {
         let (partition_mode, plans, permits_transform_8x8) =
             self.decode_partition_plans(cabac, macroblock_type)?;
 
-        let mut reference_indices = Vec::with_capacity(plans.len());
+        let mut reference_indices = SmallVec::<[u8; 4]>::with_capacity(plans.len());
         {
             let mut syntax = cabac.syntax();
             for plan in &plans {
@@ -310,11 +312,11 @@ impl CabacPMacroblockState {
             }
         }
 
-        let mut partitions = Vec::with_capacity(plans.len());
+        let mut partitions = SmallVec::with_capacity(plans.len());
         {
             let mut syntax = cabac.syntax();
             for (plan, reference_index) in plans.iter().zip(reference_indices) {
-                let mut differences = Vec::with_capacity(plan.motion.len());
+                let mut differences = SmallVec::with_capacity(plan.motion.len());
                 for &partition in &plan.motion {
                     differences.push(self.motion_l0.decode_motion_vector_difference(
                         &mut syntax,

@@ -737,7 +737,7 @@ mod tests {
     ) -> PInterMacroblockHeader {
         PInterMacroblockHeader {
             partition_mode,
-            partitions,
+            partitions: partitions.into(),
             coded_block_pattern: CodedBlockPattern { luma: 0, chroma: 0 },
             transform_size_8x8: false,
             qp_delta: 0,

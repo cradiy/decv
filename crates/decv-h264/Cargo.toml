@@ -9,6 +9,7 @@ internal-profiling = []
 [dependencies]
 bit-readers = { path = "../bit-readers" }
 decv-core = { path = "../decv-core" }
+memchr = "2.8.0"
 rayon = "1.12.0"
 smallvec = "1.15.1"
 

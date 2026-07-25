@@ -68,7 +68,8 @@ pub fn reconstruct_p_macroblock_420(
     motion: &ResolvedPMacroblock,
     residual: &ReconstructedInterResidual,
 ) -> Result<()> {
-    let references = references_l0.iter().copied().map(Some).collect::<Vec<_>>();
+    let references: smallvec::SmallVec<[Option<&Yuv420Picture>; 4]> =
+        references_l0.iter().copied().map(Some).collect();
     reconstruct_p_macroblock_from_list_420(
         current,
         &references,
@@ -781,11 +782,13 @@ fn predict_default_integer_bipred_into(
 
     let (luma_l0, cb_l0, cr_l0) = reference_l0.planes();
     let (luma_l1, cb_l1, cr_l1) = reference_l1.planes();
+    let (luma_stride_l0, chroma_stride_l0) = reference_l0.plane_strides();
+    let (luma_stride_l1, chroma_stride_l1) = reference_l1.plane_strides();
     let destination_x = usize::from(partition.x);
     let destination_y = usize::from(partition.y);
     for row in 0..luma_height {
-        let source_l0 = (luma_l0_y + row) * width + luma_l0_x;
-        let source_l1 = (luma_l1_y + row) * width + luma_l1_x;
+        let source_l0 = (luma_l0_y + row) * luma_stride_l0 + luma_l0_x;
+        let source_l1 = (luma_l1_y + row) * luma_stride_l1 + luma_l1_x;
         // SAFETY: Both complete integer-sample reference rectangles and the
         // destination partition were validated above.
         unsafe {
@@ -803,8 +806,8 @@ fn predict_default_integer_bipred_into(
     let destination_chroma_x = destination_x / 2;
     let destination_chroma_y = destination_y / 2;
     for row in 0..chroma_height {
-        let source_l0 = (chroma_l0_y + row) * plane_chroma_width + chroma_l0_x;
-        let source_l1 = (chroma_l1_y + row) * plane_chroma_width + chroma_l1_x;
+        let source_l0 = (chroma_l0_y + row) * chroma_stride_l0 + chroma_l0_x;
+        let source_l1 = (chroma_l1_y + row) * chroma_stride_l1 + chroma_l1_x;
         // SAFETY: Both chroma rectangles and fixed-size destinations were
         // validated together with the luma partition.
         unsafe {
@@ -1203,9 +1206,16 @@ fn reconstruct_p_macroblock_from_list_inner(
 
     let chroma_x = macroblock_x * 8;
     let chroma_y = macroblock_y * 8;
-    let chroma_stride = width / 2;
+    let (luma_stride, chroma_stride) = current.plane_strides();
     let (luma, cb, cr) = current.planes_mut();
-    add_prediction_and_residual(luma, width, luma_x, luma_y, &predicted_luma, &residual_luma);
+    add_prediction_and_residual(
+        luma,
+        luma_stride,
+        luma_x,
+        luma_y,
+        &predicted_luma,
+        &residual_luma,
+    );
     add_prediction_and_residual(
         cb,
         chroma_stride,
@@ -2422,10 +2432,17 @@ mod tests {
             height: 16,
         })
         .unwrap();
+        let (luma_stride, chroma_stride) = picture.plane_strides();
         let (luma, cb, cr) = picture.planes_mut();
-        luma.fill(value);
-        cb.fill(value + 1);
-        cr.fill(value + 2);
+        for row in luma.chunks_exact_mut(luma_stride).take(16) {
+            row[..16].fill(value);
+        }
+        for row in cb.chunks_exact_mut(chroma_stride).take(8) {
+            row[..8].fill(value + 1);
+        }
+        for row in cr.chunks_exact_mut(chroma_stride).take(8) {
+            row[..8].fill(value + 2);
+        }
         picture
     }
 
@@ -2642,27 +2659,33 @@ mod tests {
         let mut first = Yuv420Picture::new(size).unwrap();
         let mut second = Yuv420Picture::new(size).unwrap();
         {
+            let (luma_stride, chroma_stride) = first.plane_strides();
             let (luma, cb, cr) = first.planes_mut();
-            for (index, sample) in luma.iter_mut().enumerate() {
-                *sample = (index * 17 + index / 32 * 5) as u8;
+            for y in 0..16 {
+                for x in 0..32 {
+                    luma[y * luma_stride + x] = ((y * 32 + x) * 17 + y * 5) as u8;
+                }
             }
-            for (index, sample) in cb.iter_mut().enumerate() {
-                *sample = (index * 11 + 7) as u8;
-            }
-            for (index, sample) in cr.iter_mut().enumerate() {
-                *sample = (index * 13 + 19) as u8;
+            for y in 0..8 {
+                for x in 0..16 {
+                    cb[y * chroma_stride + x] = ((y * 16 + x) * 11 + 7) as u8;
+                    cr[y * chroma_stride + x] = ((y * 16 + x) * 13 + 19) as u8;
+                }
             }
         }
         {
+            let (luma_stride, chroma_stride) = second.plane_strides();
             let (luma, cb, cr) = second.planes_mut();
-            for (index, sample) in luma.iter_mut().enumerate() {
-                *sample = (index * 23 + index / 32 * 3 + 29) as u8;
+            for y in 0..16 {
+                for x in 0..32 {
+                    luma[y * luma_stride + x] = ((y * 32 + x) * 23 + y * 3 + 29) as u8;
+                }
             }
-            for (index, sample) in cb.iter_mut().enumerate() {
-                *sample = (index * 7 + 31) as u8;
-            }
-            for (index, sample) in cr.iter_mut().enumerate() {
-                *sample = (index * 5 + 43) as u8;
+            for y in 0..8 {
+                for x in 0..16 {
+                    cb[y * chroma_stride + x] = ((y * 16 + x) * 7 + 31) as u8;
+                    cr[y * chroma_stride + x] = ((y * 16 + x) * 5 + 43) as u8;
+                }
             }
         }
 
@@ -2698,23 +2721,33 @@ mod tests {
         let (actual_luma, actual_cb, actual_cr) = current.planes();
         let (first_luma, first_cb, first_cr) = first.planes();
         let (second_luma, second_cb, second_cr) = second.planes();
+        let (luma_stride, chroma_stride) = current.plane_strides();
         for y in 0..16 {
             for x in 0..16 {
                 assert_eq!(
-                    actual_luma[y * 32 + x],
-                    rounded_average(first_luma[y * 32 + x + 2], second_luma[y * 32 + x + 4])
+                    actual_luma[y * luma_stride + x],
+                    rounded_average(
+                        first_luma[y * luma_stride + x + 2],
+                        second_luma[y * luma_stride + x + 4]
+                    )
                 );
             }
         }
         for y in 0..8 {
             for x in 0..8 {
                 assert_eq!(
-                    actual_cb[y * 16 + x],
-                    rounded_average(first_cb[y * 16 + x + 1], second_cb[y * 16 + x + 2])
+                    actual_cb[y * chroma_stride + x],
+                    rounded_average(
+                        first_cb[y * chroma_stride + x + 1],
+                        second_cb[y * chroma_stride + x + 2]
+                    )
                 );
                 assert_eq!(
-                    actual_cr[y * 16 + x],
-                    rounded_average(first_cr[y * 16 + x + 1], second_cr[y * 16 + x + 2])
+                    actual_cr[y * chroma_stride + x],
+                    rounded_average(
+                        first_cr[y * chroma_stride + x + 1],
+                        second_cr[y * chroma_stride + x + 2]
+                    )
                 );
             }
         }
@@ -2729,27 +2762,33 @@ mod tests {
         let mut first = Yuv420Picture::new(size).unwrap();
         let mut second = Yuv420Picture::new(size).unwrap();
         {
+            let (luma_stride, chroma_stride) = first.plane_strides();
             let (luma, cb, cr) = first.planes_mut();
-            for (index, sample) in luma.iter_mut().enumerate() {
-                *sample = (index * 17 + index / 32 * 5) as u8;
+            for y in 0..16 {
+                for x in 0..32 {
+                    luma[y * luma_stride + x] = ((y * 32 + x) * 17 + y * 5) as u8;
+                }
             }
-            for (index, sample) in cb.iter_mut().enumerate() {
-                *sample = (index * 11 + 7) as u8;
-            }
-            for (index, sample) in cr.iter_mut().enumerate() {
-                *sample = (index * 13 + 19) as u8;
+            for y in 0..8 {
+                for x in 0..16 {
+                    cb[y * chroma_stride + x] = ((y * 16 + x) * 11 + 7) as u8;
+                    cr[y * chroma_stride + x] = ((y * 16 + x) * 13 + 19) as u8;
+                }
             }
         }
         {
+            let (luma_stride, chroma_stride) = second.plane_strides();
             let (luma, cb, cr) = second.planes_mut();
-            for (index, sample) in luma.iter_mut().enumerate() {
-                *sample = (index * 23 + index / 32 * 3 + 29) as u8;
+            for y in 0..16 {
+                for x in 0..32 {
+                    luma[y * luma_stride + x] = ((y * 32 + x) * 23 + y * 3 + 29) as u8;
+                }
             }
-            for (index, sample) in cb.iter_mut().enumerate() {
-                *sample = (index * 7 + 31) as u8;
-            }
-            for (index, sample) in cr.iter_mut().enumerate() {
-                *sample = (index * 5 + 43) as u8;
+            for y in 0..8 {
+                for x in 0..16 {
+                    cb[y * chroma_stride + x] = ((y * 16 + x) * 7 + 31) as u8;
+                    cr[y * chroma_stride + x] = ((y * 16 + x) * 5 + 43) as u8;
+                }
             }
         }
 
@@ -2809,13 +2848,14 @@ mod tests {
         let (actual_luma, actual_cb, actual_cr) = current.planes();
         let (first_luma, first_cb, first_cr) = first.planes();
         let (second_luma, second_cb, second_cr) = second.planes();
+        let (luma_stride, chroma_stride) = current.plane_strides();
         for y in 0..16 {
             for x in 0..16 {
                 assert_eq!(
-                    actual_luma[y * 32 + x],
+                    actual_luma[y * luma_stride + x],
                     weighted_bipred_sample(
-                        first_luma[y * 32 + x + 2],
-                        second_luma[y * 32 + x + 4],
+                        first_luma[y * luma_stride + x + 2],
+                        second_luma[y * luma_stride + x + 4],
                         weight_l0,
                         weight_l1,
                         5,
@@ -2826,20 +2866,20 @@ mod tests {
         for y in 0..8 {
             for x in 0..8 {
                 assert_eq!(
-                    actual_cb[y * 16 + x],
+                    actual_cb[y * chroma_stride + x],
                     weighted_bipred_sample(
-                        first_cb[y * 16 + x + 1],
-                        second_cb[y * 16 + x + 2],
+                        first_cb[y * chroma_stride + x + 1],
+                        second_cb[y * chroma_stride + x + 2],
                         weight_l0,
                         weight_l1,
                         5,
                     )
                 );
                 assert_eq!(
-                    actual_cr[y * 16 + x],
+                    actual_cr[y * chroma_stride + x],
                     weighted_bipred_sample(
-                        first_cr[y * 16 + x + 1],
-                        second_cr[y * 16 + x + 2],
+                        first_cr[y * chroma_stride + x + 1],
+                        second_cr[y * chroma_stride + x + 2],
                         weight_l0,
                         weight_l1,
                         5,
@@ -3021,10 +3061,11 @@ mod tests {
             &zero_residual(),
         )
         .unwrap();
+        let (luma_stride, chroma_stride) = current.plane_strides();
         let (luma, cb, cr) = current.planes();
-        assert_eq!((luma[0], luma[8], luma[8 * 16]), (20, 80, 50));
-        assert_eq!((cb[0], cb[4], cb[4 * 8]), (21, 81, 51));
-        assert_eq!(cr[4 * 8], 52);
+        assert_eq!((luma[0], luma[8], luma[8 * luma_stride]), (20, 80, 50));
+        assert_eq!((cb[0], cb[4], cb[4 * chroma_stride]), (21, 81, 51));
+        assert_eq!(cr[4 * chroma_stride], 52);
         assert_eq!(rounded_average(20, 81), 51);
     }
 
@@ -3122,10 +3163,11 @@ mod tests {
             },
         )
         .unwrap();
+        let (luma_stride, chroma_stride) = current.plane_strides();
         let (luma, cb, cr) = current.planes();
-        assert_eq!((luma[0], luma[8], luma[8 * 16]), (30, 238, 134));
-        assert_eq!((cb[0], cb[4], cb[4 * 8]), (26, 76, 51));
-        assert_eq!((cr[0], cr[4], cr[4 * 8]), (27, 77, 52));
+        assert_eq!((luma[0], luma[8], luma[8 * luma_stride]), (30, 238, 134));
+        assert_eq!((cb[0], cb[4], cb[4 * chroma_stride]), (26, 76, 51));
+        assert_eq!((cr[0], cr[4], cr[4 * chroma_stride]), (27, 77, 52));
     }
 
     #[test]
@@ -3364,10 +3406,11 @@ mod tests {
             },
         )
         .unwrap();
+        let (luma_stride, chroma_stride) = current.plane_strides();
         let (luma, cb, cr) = current.planes();
-        assert_eq!((luma[0], luma[8], luma[8 * 16]), (20, 80, 35));
-        assert_eq!((cb[0], cb[4], cb[4 * 8]), (21, 81, 36));
-        assert_eq!(cr[4 * 8], 37);
+        assert_eq!((luma[0], luma[8], luma[8 * luma_stride]), (20, 80, 35));
+        assert_eq!((cb[0], cb[4], cb[4 * chroma_stride]), (21, 81, 36));
+        assert_eq!(cr[4 * chroma_stride], 37);
     }
 
     #[test]

@@ -180,9 +180,11 @@ fn facade_decodes_a_real_h264_access_unit_end_to_end() {
         _ => panic!("expected CPU-backed frame"),
     };
     assert_eq!(cpu.planes.len(), 2);
-    assert_eq!((cpu.planes[0].stride, cpu.planes[0].rows), (16, 16));
-    assert_eq!((cpu.planes[1].stride, cpu.planes[1].rows), (16, 8));
-    assert_eq!(crc32(&tightly_packed_bytes(cpu)), 2_320_103_694);
+    assert!(cpu.planes[0].stride >= 16);
+    assert_eq!(cpu.planes[0].rows, 16);
+    assert!(cpu.planes[1].stride >= 16);
+    assert_eq!(cpu.planes[1].rows, 8);
+    assert_eq!(crc32(&tightly_packed_bytes(cpu, 16)), 2_320_103_694);
     assert!(matches!(
         decoder.receive_frame().unwrap(),
         DecodeOutput::EndOfStream
@@ -256,7 +258,7 @@ fn facade_demuxes_and_decodes_a_real_mp4_in_presentation_order() {
             FrameStorage::Cpu(cpu) => cpu,
             _ => panic!("expected CPU-backed frame"),
         };
-        assert_eq!(crc32(&tightly_packed_bytes(cpu)), 3_859_821_206);
+        assert_eq!(crc32(&tightly_packed_bytes(cpu, 16)), 3_859_821_206);
     }
 }
 
@@ -275,7 +277,9 @@ fn facade_retargets_an_active_exact_seek_without_rewinding_mp4() {
     assert_eq!(cursor.seek_to_keyframe(zero).unwrap(), Some(0));
 
     let mut decoder = H264Decoder::new();
-    decoder.configure(cursor.decoder_config().unwrap().unwrap()).unwrap();
+    decoder
+        .configure(cursor.decoder_config().unwrap().unwrap())
+        .unwrap();
     decoder.flush_for_seek(zero);
 
     let mut first = cursor.next_packet().unwrap().unwrap();
@@ -329,7 +333,9 @@ fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
     assert_eq!(cursor.seek_to_keyframe(anchor_time).unwrap(), Some(0));
 
     let mut decoder = H264Decoder::new();
-    decoder.configure(cursor.decoder_config().unwrap().unwrap()).unwrap();
+    decoder
+        .configure(cursor.decoder_config().unwrap().unwrap())
+        .unwrap();
     let final_target = MediaTime::from_parts(1024, 15_360).unwrap();
     decoder.flush_for_seek(final_target);
     let mut anchor = cursor.next_packet().unwrap().unwrap();
@@ -394,9 +400,7 @@ fn facade_controller_selects_keyframe_checkpoint_and_forward_retarget() {
     let mut seeks = H264Mp4SeekController::new(track_index, 4, 128 * 1024 * 1024);
 
     let final_target = MediaTime::from_parts(1024, 15_360).unwrap();
-    let cold_plan = seeks
-        .plan_exact_seek(&cursor, final_target, false)
-        .unwrap();
+    let cold_plan = seeks.plan_exact_seek(&cursor, final_target, false).unwrap();
     assert_eq!(cold_plan.source(), H264Mp4SeekSource::Keyframe);
     assert_eq!(cold_plan.resume_sample_index(), 0);
     assert_eq!(cold_plan.selected_sample_index(), Some(1));
@@ -436,13 +440,8 @@ fn facade_controller_selects_keyframe_checkpoint_and_forward_retarget() {
     assert!(!restored.requires_discontinuity());
     assert_eq!(cursor.next_sample_index(), 1);
 
-    let forward_plan = seeks
-        .plan_exact_seek(&cursor, final_target, true)
-        .unwrap();
-    assert_eq!(
-        forward_plan.source(),
-        H264Mp4SeekSource::ForwardRetarget
-    );
+    let forward_plan = seeks.plan_exact_seek(&cursor, final_target, true).unwrap();
+    assert_eq!(forward_plan.source(), H264Mp4SeekSource::ForwardRetarget);
     assert_eq!(forward_plan.resume_sample_index(), 1);
     assert_eq!(forward_plan.estimated_input_samples(), 2);
     let retargeted = seeks
@@ -580,12 +579,12 @@ fn send_packets(
     }
 }
 
-fn tightly_packed_bytes(frame: &CpuFrame) -> Vec<u8> {
+fn tightly_packed_bytes(frame: &CpuFrame, row_bytes: usize) -> Vec<u8> {
     let mut bytes = Vec::new();
     for plane in &frame.planes {
         for row in 0..plane.rows {
             let start = plane.offset + row * plane.stride;
-            bytes.extend_from_slice(&plane.bytes[start..start + plane.stride]);
+            bytes.extend_from_slice(&plane.bytes[start..start + row_bytes]);
         }
     }
     bytes

@@ -1,5 +1,7 @@
 //! Complete progressive B-macroblock assembly from CABAC syntax elements.
 
+use smallvec::SmallVec;
+
 use crate::{
     BInterMacroblockHeader, BPartitionMode, BPartitionMotion, BPredictionMode, BSubMacroblockType,
     CabacBMacroblockType, CabacIntraMacroblockSyntax, CabacMacroblockState, CabacMacroblockSummary,
@@ -314,10 +316,10 @@ impl CabacBMacroblockState {
                 prediction: plan.prediction,
                 reference_index_l0: None,
                 reference_index_l1: None,
-                differences_l0: Vec::new(),
-                differences_l1: Vec::new(),
+                differences_l0: SmallVec::new(),
+                differences_l1: SmallVec::new(),
             })
-            .collect::<Vec<_>>();
+            .collect::<SmallVec<[BPartitionMotion; 2]>>();
 
         {
             let mut syntax = cabac.syntax();
