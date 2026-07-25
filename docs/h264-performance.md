@@ -1999,6 +1999,50 @@ decode remained neutral because it does not enter the seek-specific serial
 path. The complete native and PGO H.264/MP4 verification corpora remained
 byte-exact.
 
+## Implicit-Weighted Scratch-to-Staging Fusion
+
+The long-GOP seek source uses implicit weighted bidirectional B prediction.
+Almost all sampled Direct macroblocks resolve to one uniform 16x16 partition,
+and about 99% of their motion-compensated luma and chroma pixels use integer
+reference positions. The general path generated complete List-0 and List-1
+scratch predictions, applied implicit weights in place to List 0, then copied
+the merged pixels into macroblock staging.
+
+The decoder now retains the cache-friendly sequential reference-prediction
+passes but combines implicit weighting and the final copy: an SSE2 rectangle
+kernel reads both hot scratch planes and writes the weighted result directly
+into staged luma, Cb, and Cr. The kernel supports independent source and
+destination strides, so the same implementation handles fractional, clipped,
+and integer bidirectional predictions after their normal interpolation step.
+Single-list and explicit-weight cases remain unchanged, and a scalar
+implementation preserves the normative equation on non-x86_64 targets.
+
+An earlier experiment read both reference rectangles directly into staging.
+Although that removed more instructions, interleaving the two cold reference
+streams increased last-level cache misses by about 10% and raised native
+task-clock by about 3%, so that variant was rejected. Keeping the existing
+reference-loading order while fusing only the hot-scratch merge avoids that
+memory-latency regression.
+
+On the 1440x2560 exact-seek workload, nine alternating native pairs reduced
+median end-to-end time from about 0.67 to 0.66 seconds. Seven-run counters
+reduced mean task-clock from 702 to 687 ms (2.2%), cycles from 3.146 to 3.108
+billion (1.2%), instructions from 7.861 to 7.563 billion (3.8%), branches from
+1.067 billion to 989 million (7.4%), and sampled cache misses by 1.7%.
+
+After retraining PGO, wall-time median remained about 0.64 seconds while
+seven-run counters reduced task-clock by 0.9%, instructions by 2.7%, branches
+by 5.5%, and branch misses by 1.2%. Cycles rose 1.7% with a lower measured IPC,
+so this smaller PGO result is treated as counter-level work reduction rather
+than a claimed latency improvement. Seven alternating PGO pairs kept ordinary
+4K decoding neutral to slightly faster, and the CAVLC control workload stayed
+instruction-neutral with 0.9% lower task-clock.
+
+The complete 4K output and exact-seek suffix retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534` and
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`;
+the CAVLC control stream also remained byte-exact.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

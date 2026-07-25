@@ -369,44 +369,57 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
                 "B partition selects no reference picture in List 1",
                 prediction_l1,
             )?;
-            let prediction = merge_b_predictions(
-                has_l0.then_some(&mut *prediction_l0),
-                has_l1.then_some(&mut *prediction_l1),
-                partition.list0.map(|motion| motion.reference_index),
-                partition.list1.map(|motion| motion.reference_index),
+            let wrote_implicit = write_implicit_biprediction_into(
+                has_l0,
+                has_l1,
+                prediction_l0,
+                prediction_l1,
+                *partition,
                 weight_mode,
+                predicted_luma,
+                predicted_cb,
+                predicted_cr,
             )?;
-            for y in 0..usize::from(partition.height) {
-                let destination_y = usize::from(partition.y) + y;
-                // SAFETY: prediction validation guarantees a 4/8/16-byte luma
-                // partition within this macroblock and both fixed rows.
-                unsafe {
-                    copy_fixed_row(
-                        predicted_luma[destination_y]
-                            .as_mut_ptr()
-                            .add(usize::from(partition.x)),
-                        prediction.luma[y].as_ptr(),
-                        usize::from(partition.width),
-                    );
+            if !wrote_implicit {
+                let prediction = merge_b_predictions(
+                    has_l0.then_some(&mut *prediction_l0),
+                    has_l1.then_some(&mut *prediction_l1),
+                    partition.list0.map(|motion| motion.reference_index),
+                    partition.list1.map(|motion| motion.reference_index),
+                    weight_mode,
+                )?;
+                for y in 0..usize::from(partition.height) {
+                    let destination_y = usize::from(partition.y) + y;
+                    // SAFETY: prediction validation guarantees a 4/8/16-byte
+                    // luma partition within this macroblock and both rows.
+                    unsafe {
+                        copy_fixed_row(
+                            predicted_luma[destination_y]
+                                .as_mut_ptr()
+                                .add(usize::from(partition.x)),
+                            prediction.luma[y].as_ptr(),
+                            usize::from(partition.width),
+                        );
+                    }
                 }
-            }
-            for y in 0..usize::from(partition.height / 2) {
-                let start = usize::from(partition.x / 2);
-                let destination_y = usize::from(partition.y / 2) + y;
-                let width = usize::from(partition.width / 2);
-                // SAFETY: prediction validation guarantees a 2/4/8-byte chroma
-                // partition within these fixed eight-byte rows.
-                unsafe {
-                    copy_fixed_row(
-                        predicted_cb[destination_y].as_mut_ptr().add(start),
-                        prediction.cb[y].as_ptr(),
-                        width,
-                    );
-                    copy_fixed_row(
-                        predicted_cr[destination_y].as_mut_ptr().add(start),
-                        prediction.cr[y].as_ptr(),
-                        width,
-                    );
+                for y in 0..usize::from(partition.height / 2) {
+                    let start = usize::from(partition.x / 2);
+                    let destination_y = usize::from(partition.y / 2) + y;
+                    let width = usize::from(partition.width / 2);
+                    // SAFETY: validation guarantees a 2/4/8-byte chroma
+                    // partition within these fixed eight-byte rows.
+                    unsafe {
+                        copy_fixed_row(
+                            predicted_cb[destination_y].as_mut_ptr().add(start),
+                            prediction.cb[y].as_ptr(),
+                            width,
+                        );
+                        copy_fixed_row(
+                            predicted_cr[destination_y].as_mut_ptr().add(start),
+                            prediction.cr[y].as_ptr(),
+                            width,
+                        );
+                    }
                 }
             }
         }
@@ -437,6 +450,93 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
         add_inter_residual_to_prediction(predicted_luma, predicted_cb, predicted_cr, residual);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_implicit_biprediction_into(
+    has_l0: bool,
+    has_l1: bool,
+    prediction_l0: &InterPrediction420,
+    prediction_l1: &InterPrediction420,
+    partition: ResolvedBPartition,
+    weight_mode: BPredictionWeightMode<'_>,
+    predicted_luma: &mut [[u8; 16]; 16],
+    predicted_cb: &mut [[u8; 8]; 8],
+    predicted_cr: &mut [[u8; 8]; 8],
+) -> Result<bool> {
+    let BPredictionWeightMode::Implicit {
+        current_picture_order_count,
+        list0: metadata_l0,
+        list1: metadata_l1,
+    } = weight_mode
+    else {
+        return Ok(false);
+    };
+    let (true, true, Some(list0), Some(list1)) = (has_l0, has_l1, partition.list0, partition.list1)
+    else {
+        return Ok(false);
+    };
+    let metadata_l0 = implicit_weight_reference(metadata_l0, list0.reference_index, "List 0")?;
+    let metadata_l1 = implicit_weight_reference(metadata_l1, list1.reference_index, "List 1")?;
+    let (weight_l0, weight_l1) =
+        derive_implicit_bipred_weights(current_picture_order_count, metadata_l0, metadata_l1);
+
+    let destination_x = usize::from(partition.x);
+    let destination_y = usize::from(partition.y);
+    let luma_width = usize::from(partition.width);
+    let luma_height = usize::from(partition.height);
+    let destination_chroma_x = destination_x / 2;
+    let destination_chroma_y = destination_y / 2;
+    let chroma_width = luma_width / 2;
+    let chroma_height = luma_height / 2;
+    // SAFETY: The general prediction path validated both scratch prediction
+    // dimensions. Partition validation guarantees the complete destination
+    // rectangles, and scratch storage cannot alias macroblock staging.
+    unsafe {
+        implicit_bipred_rectangle(
+            predicted_luma[destination_y]
+                .as_mut_ptr()
+                .add(destination_x),
+            16,
+            prediction_l0.luma.as_ptr().cast::<u8>(),
+            16,
+            prediction_l1.luma.as_ptr().cast::<u8>(),
+            16,
+            luma_width,
+            luma_height,
+            weight_l0,
+            weight_l1,
+        );
+        implicit_bipred_rectangle(
+            predicted_cb[destination_chroma_y]
+                .as_mut_ptr()
+                .add(destination_chroma_x),
+            8,
+            prediction_l0.cb.as_ptr().cast::<u8>(),
+            8,
+            prediction_l1.cb.as_ptr().cast::<u8>(),
+            8,
+            chroma_width,
+            chroma_height,
+            weight_l0,
+            weight_l1,
+        );
+        implicit_bipred_rectangle(
+            predicted_cr[destination_chroma_y]
+                .as_mut_ptr()
+                .add(destination_chroma_x),
+            8,
+            prediction_l0.cr.as_ptr().cast::<u8>(),
+            8,
+            prediction_l1.cr.as_ptr().cast::<u8>(),
+            8,
+            chroma_width,
+            chroma_height,
+            weight_l0,
+            weight_l1,
+        );
+    }
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -498,7 +598,6 @@ fn predict_default_integer_bipred_into(
             "B reference picture coded size does not match",
         ));
     }
-
     let width = usize::try_from(current_size.width).map_err(|_| H264Error::IntegerOverflow)?;
     let height = usize::try_from(current_size.height).map_err(|_| H264Error::IntegerOverflow)?;
     let current_x = macroblock_x
@@ -1671,28 +1770,84 @@ fn implicit_bipred_plane<const STRIDE: usize, const ROWS: usize>(
     debug_assert!(width <= STRIDE);
     debug_assert!(height <= ROWS);
 
+    // SAFETY: Both fixed-capacity planes have identical validated dimensions.
+    // In-place List-0 output is supported because each source row is loaded
+    // before the corresponding destination bytes are stored.
+    unsafe {
+        implicit_bipred_rectangle(
+            list0.as_mut_ptr().cast::<u8>(),
+            STRIDE,
+            list0.as_ptr().cast::<u8>(),
+            STRIDE,
+            list1.as_ptr().cast::<u8>(),
+            STRIDE,
+            width,
+            height,
+            weight_l0.weight,
+            weight_l1.weight,
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn implicit_bipred_rectangle(
+    destination: *mut u8,
+    destination_stride: usize,
+    list0: *const u8,
+    list0_stride: usize,
+    list1: *const u8,
+    list1_stride: usize,
+    width: usize,
+    height: usize,
+    weight_l0: i32,
+    weight_l1: i32,
+) {
     #[cfg(target_arch = "x86_64")]
-    if matches!(width, 2 | 4 | 8 | 16) {
-        // SAFETY: SSE2 is part of the x86_64 baseline. Both fixed-capacity
-        // planes have identical layout, the dimensions are bounded above,
-        // and the helper has an exact kernel for every H.264 partition width.
+    {
+        // SAFETY: SSE2 is part of the x86_64 baseline. The caller validated
+        // all rectangles and dispatches only fixed H.264 partition widths.
         unsafe {
-            implicit_bipred_plane_sse2(
-                list0.as_mut_ptr().cast::<u8>(),
-                list1.as_ptr().cast::<u8>(),
-                STRIDE,
+            implicit_bipred_rectangle_sse2(
+                destination,
+                destination_stride,
+                list0,
+                list0_stride,
+                list1,
+                list1_stride,
                 width,
                 height,
-                weight_l0.weight,
-                weight_l1.weight,
+                weight_l0,
+                weight_l1,
             );
         }
-        return;
     }
 
-    for y in 0..height {
-        for x in 0..width {
-            list0[y][x] = weighted_bipred_sample(list0[y][x], list1[y][x], weight_l0, weight_l1, 5);
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let weight_l0 = WeightOffset {
+            weight: weight_l0,
+            offset: 0,
+        };
+        let weight_l1 = WeightOffset {
+            weight: weight_l1,
+            offset: 0,
+        };
+        for y in 0..height {
+            for x in 0..width {
+                // SAFETY: The caller validated each complete source and
+                // destination rectangle.
+                unsafe {
+                    destination
+                        .add(y * destination_stride + x)
+                        .write(weighted_bipred_sample(
+                            list0.add(y * list0_stride + x).read(),
+                            list1.add(y * list1_stride + x).read(),
+                            weight_l0,
+                            weight_l1,
+                            5,
+                        ));
+                }
+            }
         }
     }
 }
@@ -1700,10 +1855,13 @@ fn implicit_bipred_plane<const STRIDE: usize, const ROWS: usize>(
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "sse2")]
 #[allow(clippy::too_many_arguments)]
-unsafe fn implicit_bipred_plane_sse2(
-    list0: *mut u8,
+unsafe fn implicit_bipred_rectangle_sse2(
+    destination: *mut u8,
+    destination_stride: usize,
+    list0: *const u8,
+    list0_stride: usize,
     list1: *const u8,
-    stride: usize,
+    list1_stride: usize,
     width: usize,
     height: usize,
     weight_l0: i32,
@@ -1739,12 +1897,16 @@ unsafe fn implicit_bipred_plane_sse2(
     match width {
         16 => {
             for row in 0..height {
-                let offset = row * stride;
+                let destination_offset = row * destination_stride;
+                let list0_offset = row * list0_stride;
+                let list1_offset = row * list1_stride;
                 // SAFETY: The caller validates height, and this arm exactly
                 // matches the 16-byte fixed row width.
-                let samples_l0 = unsafe { _mm_loadu_si128(list0.add(offset).cast::<__m128i>()) };
-                // SAFETY: Both planes have the same validated dimensions.
-                let samples_l1 = unsafe { _mm_loadu_si128(list1.add(offset).cast::<__m128i>()) };
+                let samples_l0 =
+                    unsafe { _mm_loadu_si128(list0.add(list0_offset).cast::<__m128i>()) };
+                // SAFETY: The List-1 rectangle has the same validated size.
+                let samples_l1 =
+                    unsafe { _mm_loadu_si128(list1.add(list1_offset).cast::<__m128i>()) };
                 // SAFETY: This function and helper are SSE2-enabled.
                 let low = unsafe {
                     merge(
@@ -1768,7 +1930,7 @@ unsafe fn implicit_bipred_plane_sse2(
                 // SAFETY: The destination row has sixteen writable bytes.
                 unsafe {
                     _mm_storeu_si128(
-                        list0.add(offset).cast::<__m128i>(),
+                        destination.add(destination_offset).cast::<__m128i>(),
                         _mm_packus_epi16(low, high),
                     );
                 }
@@ -1776,11 +1938,15 @@ unsafe fn implicit_bipred_plane_sse2(
         }
         8 => {
             for row in 0..height {
-                let offset = row * stride;
+                let destination_offset = row * destination_stride;
+                let list0_offset = row * list0_stride;
+                let list1_offset = row * list1_stride;
                 // SAFETY: This arm reads exactly eight validated row bytes.
-                let samples_l0 = unsafe { _mm_loadl_epi64(list0.add(offset).cast::<__m128i>()) };
-                // SAFETY: Both planes have the same validated dimensions.
-                let samples_l1 = unsafe { _mm_loadl_epi64(list1.add(offset).cast::<__m128i>()) };
+                let samples_l0 =
+                    unsafe { _mm_loadl_epi64(list0.add(list0_offset).cast::<__m128i>()) };
+                // SAFETY: The List-1 rectangle has the same validated size.
+                let samples_l1 =
+                    unsafe { _mm_loadl_epi64(list1.add(list1_offset).cast::<__m128i>()) };
                 // SAFETY: This function and helper are SSE2-enabled.
                 let low = unsafe {
                     merge(
@@ -1794,7 +1960,7 @@ unsafe fn implicit_bipred_plane_sse2(
                 // SAFETY: The destination row has eight writable bytes.
                 unsafe {
                     _mm_storel_epi64(
-                        list0.add(offset).cast::<__m128i>(),
+                        destination.add(destination_offset).cast::<__m128i>(),
                         _mm_packus_epi16(low, zero),
                     );
                 }
@@ -1802,14 +1968,16 @@ unsafe fn implicit_bipred_plane_sse2(
         }
         4 => {
             for row in 0..height {
-                let offset = row * stride;
+                let destination_offset = row * destination_stride;
+                let list0_offset = row * list0_stride;
+                let list1_offset = row * list1_stride;
                 // SAFETY: This arm reads exactly four validated row bytes.
                 let samples_l0 = _mm_cvtsi32_si128(unsafe {
-                    std::ptr::read_unaligned(list0.add(offset).cast::<i32>())
+                    std::ptr::read_unaligned(list0.add(list0_offset).cast::<i32>())
                 });
-                // SAFETY: Both planes have the same validated dimensions.
+                // SAFETY: The List-1 rectangle has the same validated size.
                 let samples_l1 = _mm_cvtsi32_si128(unsafe {
-                    std::ptr::read_unaligned(list1.add(offset).cast::<i32>())
+                    std::ptr::read_unaligned(list1.add(list1_offset).cast::<i32>())
                 });
                 // SAFETY: This function and helper are SSE2-enabled.
                 let low = unsafe {
@@ -1824,20 +1992,25 @@ unsafe fn implicit_bipred_plane_sse2(
                 let packed = _mm_cvtsi128_si32(_mm_packus_epi16(low, zero));
                 // SAFETY: The destination row has four writable bytes.
                 unsafe {
-                    std::ptr::write_unaligned(list0.add(offset).cast::<i32>(), packed);
+                    std::ptr::write_unaligned(
+                        destination.add(destination_offset).cast::<i32>(),
+                        packed,
+                    );
                 }
             }
         }
         2 => {
             for row in 0..height {
-                let offset = row * stride;
+                let destination_offset = row * destination_stride;
+                let list0_offset = row * list0_stride;
+                let list1_offset = row * list1_stride;
                 // SAFETY: This arm reads exactly two validated row bytes.
                 let samples_l0 = _mm_cvtsi32_si128(i32::from(unsafe {
-                    std::ptr::read_unaligned(list0.add(offset).cast::<u16>())
+                    std::ptr::read_unaligned(list0.add(list0_offset).cast::<u16>())
                 }));
-                // SAFETY: Both planes have the same validated dimensions.
+                // SAFETY: The List-1 rectangle has the same validated size.
                 let samples_l1 = _mm_cvtsi32_si128(i32::from(unsafe {
-                    std::ptr::read_unaligned(list1.add(offset).cast::<u16>())
+                    std::ptr::read_unaligned(list1.add(list1_offset).cast::<u16>())
                 }));
                 // SAFETY: This function and helper are SSE2-enabled.
                 let low = unsafe {
@@ -1852,7 +2025,10 @@ unsafe fn implicit_bipred_plane_sse2(
                 let packed = _mm_cvtsi128_si32(_mm_packus_epi16(low, zero)) as u16;
                 // SAFETY: The destination row has two writable bytes.
                 unsafe {
-                    std::ptr::write_unaligned(list0.add(offset).cast::<u16>(), packed);
+                    std::ptr::write_unaligned(
+                        destination.add(destination_offset).cast::<u16>(),
+                        packed,
+                    );
                 }
             }
         }
@@ -2328,6 +2504,135 @@ mod tests {
                 assert_eq!(
                     actual_cr[y * 16 + x],
                     rounded_average(first_cr[y * 16 + x + 1], second_cr[y * 16 + x + 2])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn implicit_biprediction_weights_scratch_rectangles_into_staging() {
+        let size = Size {
+            width: 32,
+            height: 16,
+        };
+        let mut first = Yuv420Picture::new(size).unwrap();
+        let mut second = Yuv420Picture::new(size).unwrap();
+        {
+            let (luma, cb, cr) = first.planes_mut();
+            for (index, sample) in luma.iter_mut().enumerate() {
+                *sample = (index * 17 + index / 32 * 5) as u8;
+            }
+            for (index, sample) in cb.iter_mut().enumerate() {
+                *sample = (index * 11 + 7) as u8;
+            }
+            for (index, sample) in cr.iter_mut().enumerate() {
+                *sample = (index * 13 + 19) as u8;
+            }
+        }
+        {
+            let (luma, cb, cr) = second.planes_mut();
+            for (index, sample) in luma.iter_mut().enumerate() {
+                *sample = (index * 23 + index / 32 * 3 + 29) as u8;
+            }
+            for (index, sample) in cb.iter_mut().enumerate() {
+                *sample = (index * 7 + 31) as u8;
+            }
+            for (index, sample) in cr.iter_mut().enumerate() {
+                *sample = (index * 5 + 43) as u8;
+            }
+        }
+
+        let reference_l0 = ImplicitWeightReference {
+            picture_order_count: 0,
+            long_term: false,
+        };
+        let reference_l1 = ImplicitWeightReference {
+            picture_order_count: 8,
+            long_term: false,
+        };
+        let current_picture_order_count = 2;
+        let mut current = Yuv420Picture::new(size).unwrap();
+        reconstruct_b_macroblock_from_lists_with_mode(
+            &mut current,
+            &[Some(&first)],
+            &[Some(&second)],
+            0,
+            0,
+            &ResolvedBMacroblock {
+                direct: false,
+                partitions: vec![b_partition(
+                    0,
+                    0,
+                    16,
+                    16,
+                    Some(ResolvedBListMotion {
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: 8, y: 0 },
+                    }),
+                    Some(ResolvedBListMotion {
+                        reference_index: 0,
+                        motion_vector: MotionVector { x: 16, y: 0 },
+                    }),
+                )]
+                .into(),
+            },
+            Some(&zero_residual()),
+            BPredictionWeightMode::Implicit {
+                current_picture_order_count,
+                list0: &[Some(reference_l0)],
+                list1: &[Some(reference_l1)],
+            },
+        )
+        .unwrap();
+
+        let (weight_l0, weight_l1) =
+            derive_implicit_bipred_weights(current_picture_order_count, reference_l0, reference_l1);
+        let weight_l0 = WeightOffset {
+            weight: weight_l0,
+            offset: 0,
+        };
+        let weight_l1 = WeightOffset {
+            weight: weight_l1,
+            offset: 0,
+        };
+        let (actual_luma, actual_cb, actual_cr) = current.planes();
+        let (first_luma, first_cb, first_cr) = first.planes();
+        let (second_luma, second_cb, second_cr) = second.planes();
+        for y in 0..16 {
+            for x in 0..16 {
+                assert_eq!(
+                    actual_luma[y * 32 + x],
+                    weighted_bipred_sample(
+                        first_luma[y * 32 + x + 2],
+                        second_luma[y * 32 + x + 4],
+                        weight_l0,
+                        weight_l1,
+                        5,
+                    )
+                );
+            }
+        }
+        for y in 0..8 {
+            for x in 0..8 {
+                assert_eq!(
+                    actual_cb[y * 16 + x],
+                    weighted_bipred_sample(
+                        first_cb[y * 16 + x + 1],
+                        second_cb[y * 16 + x + 2],
+                        weight_l0,
+                        weight_l1,
+                        5,
+                    )
+                );
+                assert_eq!(
+                    actual_cr[y * 16 + x],
+                    weighted_bipred_sample(
+                        first_cr[y * 16 + x + 1],
+                        second_cr[y * 16 + x + 2],
+                        weight_l0,
+                        weight_l1,
+                        5,
+                    )
                 );
             }
         }
