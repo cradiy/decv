@@ -336,6 +336,91 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
     let partitions = uniform_direct
         .as_ref()
         .map_or(motion.partitions.as_slice(), std::slice::from_ref);
+    if let [partition] = partitions
+        && partition.x == 0
+        && partition.y == 0
+        && partition.width == 16
+        && partition.height == 16
+        && matches!(weight_mode, BPredictionWeightMode::Implicit { .. })
+        && let (Some(list0), Some(list1)) = (partition.list0, partition.list1)
+    {
+        let reference_l0 = references_l0
+            .get(usize::from(list0.reference_index))
+            .copied()
+            .flatten()
+            .ok_or(H264Error::InvalidSyntax(
+                "B partition selects no reference picture in List 0",
+            ))?;
+        let reference_l1 = references_l1
+            .get(usize::from(list1.reference_index))
+            .copied()
+            .flatten()
+            .ok_or(H264Error::InvalidSyntax(
+                "B partition selects no reference picture in List 1",
+            ))?;
+        if reference_l0.coded_size() != current_size || reference_l1.coded_size() != current_size {
+            return Err(H264Error::InvalidSyntax(
+                "B reference picture coded size does not match",
+            ));
+        }
+        let (luma_l0, cb_l0, cr_l0) = (
+            &mut prediction_l0.luma,
+            &mut prediction_l0.cb,
+            &mut prediction_l0.cr,
+        );
+        let copied_l0 = reference_l0.try_copy_integer_macroblock_420_into(
+            macroblock_x,
+            macroblock_y,
+            list0.motion_vector,
+            luma_l0,
+            cb_l0,
+            cr_l0,
+        )?;
+        let copied_l1 = if copied_l0 {
+            let (luma_l1, cb_l1, cr_l1) = (
+                &mut prediction_l1.luma,
+                &mut prediction_l1.cb,
+                &mut prediction_l1.cr,
+            );
+            reference_l1.try_copy_integer_macroblock_420_into(
+                macroblock_x,
+                macroblock_y,
+                list1.motion_vector,
+                luma_l1,
+                cb_l1,
+                cr_l1,
+            )?
+        } else {
+            false
+        };
+        if copied_l1 {
+            prediction_l0.width = 16;
+            prediction_l0.height = 16;
+            prediction_l1.width = 16;
+            prediction_l1.height = 16;
+            let wrote = write_implicit_biprediction_into(
+                true,
+                true,
+                prediction_l0,
+                prediction_l1,
+                *partition,
+                weight_mode,
+                predicted_luma,
+                predicted_cb,
+                predicted_cr,
+            )?;
+            debug_assert!(wrote);
+            if let Some(residual) = residual {
+                add_inter_residual_to_prediction(
+                    predicted_luma,
+                    predicted_cb,
+                    predicted_cr,
+                    residual,
+                );
+            }
+            return Ok(());
+        }
+    }
     for partition in partitions {
         if !predict_default_integer_bipred_into(
             references_l0,

@@ -2111,6 +2111,39 @@ their byte-exact SHA-256 hashes
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
 and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
 
+## Integer Implicit-Biprediction Scratch Copies
+
+The long-GOP exact-seek source uses implicit weighted bidirectional prediction,
+so the direct default-weight averaging path cannot apply. Its coalesced Direct
+macroblocks nevertheless overwhelmingly use one 16x16 partition with integer
+luma and chroma motion. The general path recalculated partition geometry,
+fractional positions, interpolation windows, and SIMD dispatch separately for
+both reference lists before copying the already-integer rectangles into the
+two scratch predictions.
+
+For a full 16x16 implicit-biprediction partition, the decoder now attempts the
+validated integer macroblock-copy path for List 0 and then List 1. This
+preserves the cache-friendly sequential reference access and the existing
+scratch-to-staging weighted merge; fractional motion, clipped rectangles,
+single-list prediction, smaller partitions, and explicit/default weights
+retain the general path.
+
+Native builds consistently retired about 2.6% fewer instructions and 3.1%
+fewer branches on the exact-seek workload, but did not improve cycles before
+profile-guided layout. After retraining PGO, nine fixed-CPU counter pairs
+reduced mean task-clock from 566 to 540 ms (4.5%), cycles by 3.1%,
+instructions by 2.4%, branches by 3.5%, and sampled cache misses by 10.3%.
+Across twelve first-frame pairs, median exact-seek wall time fell from 0.64 to
+0.615 seconds and mean wall time from 0.630 to 0.599 seconds.
+
+Seven alternating 48-frame 4K pairs reduced median wall time from 1.02 to
+0.96 seconds and mean CPU time from 1.507 to 1.427 seconds. The generated H.264
+and MP4 corpora remained byte-exact. The complete 4K output, six-frame
+post-seek suffix, and CAVLC control stream retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
+and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
