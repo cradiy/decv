@@ -195,6 +195,60 @@ fn facade_demuxes_and_decodes_a_real_mp4_in_presentation_order() {
 }
 
 #[test]
+fn facade_retargets_an_active_exact_seek_without_rewinding_mp4() {
+    let mp4 = decode_hex(include_str!("fixtures/three-frame-high-b.mp4.hex"));
+    let demuxer = Mp4Demuxer::open(mp4).unwrap();
+    let track_index = demuxer
+        .movie()
+        .tracks()
+        .iter()
+        .position(|track| track.handler() == FourCc::new(*b"vide"))
+        .unwrap();
+    let mut cursor = demuxer.packet_cursor(track_index).unwrap();
+    let zero = MediaTime::from_parts(0, 15_360).unwrap();
+    assert_eq!(cursor.seek_to_keyframe(zero).unwrap(), Some(0));
+
+    let mut decoder = H264Decoder::new();
+    decoder.configure(cursor.decoder_config().unwrap().unwrap()).unwrap();
+    decoder.flush_for_seek(zero);
+
+    let mut first = cursor.next_packet().unwrap().unwrap();
+    first.discontinuity = true;
+    assert!(matches!(
+        decoder.send_packet(first).unwrap(),
+        DecodeInputStatus::Accepted
+    ));
+    assert!(matches!(
+        decoder.receive_frame().unwrap(),
+        DecodeOutput::NeedInput
+    ));
+
+    let final_target = MediaTime::from_parts(1024, 15_360).unwrap();
+    decoder.retarget_seek_forward(final_target).unwrap();
+    let mut format = None;
+    let mut frames = Vec::new();
+    while let Some(mut packet) = cursor.next_packet().unwrap() {
+        loop {
+            match decoder.send_packet(packet).unwrap() {
+                DecodeInputStatus::Accepted => break,
+                DecodeInputStatus::NeedOutput(unconsumed) => {
+                    packet = unconsumed;
+                    assert!(!pull_available(&mut decoder, &mut format, &mut frames));
+                }
+                _ => panic!("unexpected decoder input status"),
+            }
+        }
+        assert!(!pull_available(&mut decoder, &mut format, &mut frames));
+    }
+
+    decoder.drain().unwrap();
+    assert!(pull_available(&mut decoder, &mut format, &mut frames));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].pts, Some(final_target));
+    frames[0].validate().unwrap();
+}
+
+#[test]
 fn frame_storage_requires_forward_compatible_matching() {
     fn storage_kind(storage: &FrameStorage) -> &'static str {
         match storage {
