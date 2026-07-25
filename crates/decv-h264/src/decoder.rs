@@ -170,6 +170,61 @@ impl H264Decoder {
         self.output_start_time = Some(target);
     }
 
+    /// Advances an active exact-seek target without discarding decoded
+    /// references or restarting preroll from the preceding keyframe.
+    ///
+    /// The caller must continue feeding packets from the decoder's current
+    /// position. Only a target at or after the current seek target is valid:
+    /// frames suppressed for an earlier target cannot be recovered without
+    /// [`Self::flush_for_seek`] and a container seek. Pending output below the
+    /// new target is discarded.
+    pub fn retarget_seek_forward(&mut self, target: MediaTime) -> Result<()> {
+        let current = self.output_start_time.ok_or(H264Error::InvalidSyntax(
+            "H.264 seek retargeting requires an active exact seek",
+        ))?;
+        if target < current {
+            return Err(H264Error::InvalidSyntax(
+                "H.264 seek retargeting cannot move backward",
+            ));
+        }
+        if self.draining {
+            return Err(H264Error::InvalidSyntax(
+                "H.264 seek retargeting cannot resume a drained decoder",
+            ));
+        }
+        if target == current {
+            return Ok(());
+        }
+
+        self.output_start_time = Some(target);
+        let has_qualifying_frame = self.outputs.iter().any(|output| {
+            matches!(
+                output,
+                DecodeOutput::Frame(frame)
+                    if frame.pts.is_none_or(|pts| pts >= target)
+            )
+        });
+        if has_qualifying_frame {
+            self.outputs.retain(|output| {
+                !matches!(
+                    output,
+                    DecodeOutput::Frame(frame)
+                        if frame.pts.is_some_and(|pts| pts < target)
+                )
+            });
+        } else {
+            let dropped_unannounced_format = self
+                .outputs
+                .iter()
+                .any(|output| matches!(output, DecodeOutput::FormatChanged(_)));
+            self.outputs.clear();
+            if dropped_unannounced_format {
+                self.announced_format = None;
+            }
+        }
+        Ok(())
+    }
+
     fn process_packet(&mut self, packet: &EncodedVideoPacket) -> Result<()> {
         match self.bitstream_format {
             BitstreamFormat::ByteStream => {
@@ -680,6 +735,9 @@ impl H264Decoder {
     }
 
     fn queue_output_frame(&mut self, mut frame: DecodedVideoFrame) -> Result<()> {
+        if !self.should_materialize_output(frame.pts) {
+            return Ok(());
+        }
         self.next_frame_id = self
             .next_frame_id
             .checked_add(1)
@@ -1816,6 +1874,126 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::Frame(frame)
                 if frame.id == 3 && frame.pts == MediaTime::from_parts(0, 1)
+        ));
+    }
+
+    #[test]
+    fn forward_seek_retarget_reuses_references_and_filters_delayed_output() {
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        let zero = MediaTime::from_parts(0, 1).unwrap();
+        let target = MediaTime::from_parts(3, 1).unwrap();
+
+        assert!(decoder.retarget_seek_forward(target).is_err());
+        decoder.flush_for_seek(zero);
+        assert!(decoder.retarget_seek_forward(target).is_ok());
+        assert!(decoder.retarget_seek_forward(zero).is_err());
+
+        decoder.flush_for_seek(zero);
+        let mut preroll = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x67, single_macroblock_main_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        preroll.pts = Some(zero);
+        preroll.discontinuity = true;
+        assert!(matches!(
+            decoder.send_packet(preroll).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert_eq!(decoder.reorder.len(), 1);
+        let retained_reference_count = decoder.dpb.as_ref().unwrap().len();
+
+        decoder.retarget_seek_forward(target).unwrap();
+        assert_eq!(
+            decoder.dpb.as_ref().unwrap().len(),
+            retained_reference_count
+        );
+        assert_eq!(decoder.reorder.len(), 1);
+
+        let selected_pts = MediaTime::from_parts(4, 1).unwrap();
+        let mut selected = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x41, single_macroblock_p_skip_at_poc_rbsp(4)),
+            (0x09, vec![0x10]),
+        ]));
+        selected.pts = Some(selected_pts);
+        assert!(matches!(
+            decoder.send_packet(selected).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        decoder.drain().unwrap();
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame)
+                if frame.id == 1 && frame.pts == Some(selected_pts)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::EndOfStream
+        ));
+        assert!(decoder.retarget_seek_forward(target).is_err());
+    }
+
+    #[test]
+    fn forward_seek_retarget_discards_already_queued_stale_output() {
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        let zero = MediaTime::from_parts(0, 1).unwrap();
+        decoder.flush_for_seek(zero);
+
+        let mut preroll = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x67, single_macroblock_sps_rbsp()),
+            (0x68, single_macroblock_pps_rbsp()),
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        preroll.pts = Some(zero);
+        preroll.discontinuity = true;
+        assert!(matches!(
+            decoder.send_packet(preroll).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert_eq!(decoder.outputs.len(), 2);
+        assert!(decoder.announced_format.is_some());
+        let retained_reference_count = decoder.dpb.as_ref().unwrap().len();
+
+        let target = MediaTime::from_parts(1, 1).unwrap();
+        decoder.retarget_seek_forward(target).unwrap();
+        assert!(decoder.outputs.is_empty());
+        assert!(decoder.announced_format.is_none());
+        assert_eq!(
+            decoder.dpb.as_ref().unwrap().len(),
+            retained_reference_count
+        );
+
+        let selected_pts = MediaTime::from_parts(2, 1).unwrap();
+        let mut selected = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x41, single_macroblock_p_skip_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        selected.pts = Some(selected_pts);
+        assert!(matches!(
+            decoder.send_packet(selected).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::FormatChanged(_)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::Frame(frame) if frame.pts == Some(selected_pts)
+        ));
+        assert!(matches!(
+            decoder.receive_frame().unwrap(),
+            DecodeOutput::NeedInput
         ));
     }
 

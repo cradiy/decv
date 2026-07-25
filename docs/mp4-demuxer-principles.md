@@ -530,6 +530,16 @@ its PTS filter as a defensive check.
 The demuxer does not flush the decoder itself. That would couple the container
 crate to a particular codec instance and higher-level state.
 
+When an in-progress exact seek is retargeted to a later presentation time, the
+packet cursor does not need to move backward. A direct H.264 consumer can call
+`H264Decoder::retarget_seek_forward(later_target)` and continue feeding from
+its current sample. The decoder preserves parsed history, reference pictures,
+and display reordering, then filters pending output against the newer target.
+This reuses work already completed within the GOP. Moving the target backward
+still requires selecting a preceding sync sample and calling
+`flush_for_seek`, because previously suppressed pictures cannot be recreated
+from decoder state.
+
 ### Low-latency preview seek
 
 Interactive scrubbing often values response time over exact frame selection.

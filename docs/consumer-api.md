@@ -107,6 +107,15 @@ and skips pixel reconstruction for pre-target non-reference pictures. This
 avoids work whose result cannot affect the selected frame. The ordinary
 trait-level `flush` clears this filter.
 
+If an exact seek is already decoding forward and the requested target moves
+later, call `retarget_seek_forward(later_target)` and keep feeding packets from
+the current cursor. The decoder keeps its DPB, parser history, current picture,
+and reorder state while dropping output below the newer target. This avoids
+restarting the same GOP from its preceding keyframe for every forward scrub
+update. Retargeting cannot move backward because frames suppressed for the old
+target are no longer recoverable; use a container seek followed by
+`flush_for_seek` for a backward target or a different decode timeline.
+
 For a low-latency scrub preview, callers may instead use
 `seek_to_nearest_keyframe`. That path begins at the independently decodable
 picture closest to the requested presentation time and avoids preroll. It may
