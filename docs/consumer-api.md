@@ -143,6 +143,25 @@ cache cost. Summing the byte estimate can overcount allocations shared by
 multiple checkpoints, making it suitable for a simple upper-budget eviction
 policy.
 
+For one active decoder, choose the least destructive valid transition in this
+order:
+
+1. If the new target is later and the current packet cursor can continue,
+   call `retarget_seek_forward`.
+2. Otherwise, restore the latest cached checkpoint whose `resume_time()` is
+   strictly before the target and reposition the cursor with
+   `seek_to_sample`.
+3. If neither applies, seek the container to the preceding keyframe and call
+   `flush_for_seek`.
+
+Decoder mutation remains single-threaded and synchronous. A request scheduler
+should stop feeding stale work between compressed packets and tag
+consumer-owned results with its own request generation, because a frame
+already returned to the consumer cannot be recalled. The first packet after a
+keyframe seek must carry `discontinuity = true`. The first packet after
+`restore_seek_checkpoint` must not: discontinuity handling deliberately clears
+the DPB and would destroy the state that was just restored.
+
 For a low-latency scrub preview, callers may instead use
 `seek_to_nearest_keyframe`. That path begins at the independently decodable
 picture closest to the requested presentation time and avoids preroll. It may

@@ -563,6 +563,18 @@ reference pixels, although those handles keep their referenced pictures alive.
 conservative logical cost for an upper-budget eviction policy; shared
 allocations may be counted by more than one checkpoint.
 
+The first packet read after a checkpoint restore is a continuation of the
+saved decode timeline and must not be marked discontinuous. By contrast, a
+packet read after repositioning to a keyframe for a fresh exact seek must be
+marked discontinuous. Mixing these cases silently discards the restored DPB
+and turns the following inter picture into an invalid random-access start.
+
+Cancellation is performed between samples: stop the stale packet loop, select
+forward retarget, checkpoint restore, or keyframe restart in that order, then
+resume feeding on the decoder's owning thread. Container reads are random
+access and decoder calls are synchronous, so no container or codec task needs
+to mutate the cursor concurrently.
+
 ### Low-latency preview seek
 
 Interactive scrubbing often values response time over exact frame selection.
