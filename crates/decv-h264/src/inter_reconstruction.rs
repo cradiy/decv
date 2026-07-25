@@ -1119,6 +1119,7 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
     motion: &ResolvedPMacroblock,
     residual: Option<&ReconstructedInterResidual>,
     weights: Option<&PredictionWeightTable>,
+    default_weight_reference_mask: u32,
     prediction: &mut InterPrediction420,
     pixels: &mut MacroblockPixels,
 ) -> Result<()> {
@@ -1139,6 +1140,48 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
     }
 
     let (predicted_luma, predicted_cb, predicted_cr) = pixels.planes_mut();
+    if let [partition] = motion.partitions.as_slice()
+        && partition.x == 0
+        && partition.y == 0
+        && partition.width == 16
+        && partition.height == 16
+    {
+        let default_weights = 1u32
+            .checked_shl(u32::from(partition.reference_index))
+            .is_some_and(|reference| default_weight_reference_mask & reference != 0);
+        let reference = references_l0
+            .get(usize::from(partition.reference_index))
+            .copied()
+            .flatten()
+            .ok_or(H264Error::InvalidSyntax(
+                "P partition selects no reference picture in List 0",
+            ))?;
+        if reference.coded_size() != current_size {
+            return Err(H264Error::InvalidSyntax(
+                "P reference picture coded size does not match",
+            ));
+        }
+        if default_weights
+            && reference.try_copy_integer_macroblock_420_into(
+                macroblock_x,
+                macroblock_y,
+                partition.motion_vector,
+                predicted_luma,
+                predicted_cb,
+                predicted_cr,
+            )?
+        {
+            if let Some(residual) = residual {
+                add_inter_residual_to_prediction(
+                    predicted_luma,
+                    predicted_cb,
+                    predicted_cr,
+                    residual,
+                );
+            }
+            return Ok(());
+        }
+    }
     let mut covered = 0u16;
     for partition in &motion.partitions {
         let reference = references_l0
@@ -1410,6 +1453,43 @@ fn apply_prediction_weights(
     table: &PredictionWeightTable,
 ) -> Result<()> {
     apply_prediction_weights_for_list(prediction, reference_index, table, false)
+}
+
+pub(crate) fn default_p_prediction_weight_reference_mask(
+    table: Option<&PredictionWeightTable>,
+) -> u32 {
+    let Some(table) = table else {
+        return u32::MAX;
+    };
+    table
+        .list0
+        .iter()
+        .take(u32::BITS as usize)
+        .enumerate()
+        .fold(0u32, |mask, (index, weights)| {
+            if p_prediction_weight_is_default(table, weights) {
+                mask | (1u32 << index)
+            } else {
+                mask
+            }
+        })
+}
+
+fn p_prediction_weight_is_default(
+    table: &PredictionWeightTable,
+    weights: &PredictionWeight,
+) -> bool {
+    let default_luma = 1i32 << table.luma_log2_weight_denom;
+    let luma_is_default = weights
+        .luma
+        .is_none_or(|weight| weight.weight == default_luma && weight.offset == 0);
+    let default_chroma = 1i32 << table.chroma_log2_weight_denom;
+    let chroma_is_default = weights.chroma.is_none_or(|chroma| {
+        chroma
+            .iter()
+            .all(|weight| weight.weight == default_chroma && weight.offset == 0)
+    });
+    luma_is_default && chroma_is_default
 }
 
 fn apply_prediction_weights_for_list(

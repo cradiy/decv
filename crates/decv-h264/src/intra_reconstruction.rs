@@ -11,7 +11,8 @@ use rayon::prelude::*;
 
 use crate::deblock::{DeblockListMotion, DeblockMotion, MacroblockDeblockInfo, filter_420_picture};
 use crate::inter_reconstruction::{
-    BPredictionWeightMode, ImplicitWeightReference, reconstruct_b_macroblock_from_lists_with_mode,
+    BPredictionWeightMode, ImplicitWeightReference, default_p_prediction_weight_reference_mask,
+    reconstruct_b_macroblock_from_lists_with_mode,
     reconstruct_b_macroblock_pixels_from_lists_into_with_scratch,
     reconstruct_p_macroblock_pixels_from_list_into_with_scratch,
     reconstruct_p_skip_macroblock_from_list_420, reconstruct_weighted_p_macroblock_from_list_420,
@@ -2242,6 +2243,7 @@ impl IntraPictureReconstructor {
             return Ok(());
         }
         let coded_size = self.picture.coded_size();
+        let default_weight_reference_mask = default_p_prediction_weight_reference_mask(weights);
         let staged = if jobs.len() > 1
             && let Some(pool) = self.reconstruction_executor.pool()
         {
@@ -2260,6 +2262,7 @@ impl IntraPictureReconstructor {
                             &job.motion,
                             job.residual.as_ref(),
                             weights,
+                            default_weight_reference_mask,
                             scratch,
                             output.pixels_mut(),
                         )
@@ -2289,6 +2292,7 @@ impl IntraPictureReconstructor {
                     &job.motion,
                     job.residual.as_ref(),
                     weights,
+                    default_weight_reference_mask,
                     &mut scratch,
                     staged
                         .last_mut()

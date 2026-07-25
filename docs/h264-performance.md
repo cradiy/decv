@@ -2080,6 +2080,37 @@ their byte-exact SHA-256 hashes
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
 and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
 
+## Direct Integer P-Macroblock Staging
+
+Internal counters on the 1440x2560 long-GOP source showed that 99.3% of luma
+prediction work and 99.0% of chroma prediction work used integer sample
+positions. Every recorded prediction was 16x16 after the existing uniform
+Direct reduction. P pictures in this source also signal a prediction-weight
+table whose active entries resolve to identity weights.
+
+The staged P reconstruction path now detects a single full-macroblock
+partition with identity weights and integer luma/chroma motion. When its
+reference rectangle is interior, it copies the Y, Cb, and Cr rectangles
+directly from the reference picture into the staged macroblock and applies the
+residual there. Fractional motion, non-identity weights, split partitions, and
+edge extension retain the normative general path. Identity-weight references
+are classified once per reconstruction batch instead of once per macroblock.
+
+On the exact-seek workload this bypassed about 591,000 of 3.23 million
+prediction calls in a near-end profiling run. Eight alternating fixed-CPU PGO
+pairs reduced instructions by about 2.3% and branches by about 3.4%. Median
+first-frame latency remained approximately 0.56 seconds in both builds because
+the workload is sensitive to reference-picture cache latency, but ordinary
+48-frame 4K decoding improved from a 0.94-second median to 0.92 seconds across
+seven alternating pairs. The CAVLC control workload remained effectively
+neutral.
+
+The complete 4K output, exact-seek suffix, and CAVLC control stream retained
+their byte-exact SHA-256 hashes
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
+and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

@@ -1,6 +1,6 @@
 //! Fractional-sample inter prediction for progressive 8-bit 4:2:0 pictures.
 
-use crate::{H264Error, ResolvedPPartition, Result, Yuv420Picture};
+use crate::{H264Error, MotionVector, ResolvedPPartition, Result, Yuv420Picture};
 
 /// Fixed-capacity prediction storage for one P partition.
 ///
@@ -177,6 +177,112 @@ impl Yuv420Picture {
             );
         }
         Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn try_copy_integer_macroblock_420_into(
+        &self,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        motion: MotionVector,
+        predicted_luma: &mut [[u8; 16]; 16],
+        predicted_cb: &mut [[u8; 8]; 8],
+        predicted_cr: &mut [[u8; 8]; 8],
+    ) -> Result<bool> {
+        let motion_x = i32::from(motion.x);
+        let motion_y = i32::from(motion.y);
+        if motion_x.rem_euclid(8) != 0 || motion_y.rem_euclid(8) != 0 {
+            return Ok(false);
+        }
+        let current_x = macroblock_x
+            .checked_mul(16)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let current_y = macroblock_y
+            .checked_mul(16)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let (picture_width, picture_height) = self.dimensions();
+        if current_x
+            .checked_add(16)
+            .is_none_or(|right| right > picture_width)
+            || current_y
+                .checked_add(16)
+                .is_none_or(|bottom| bottom > picture_height)
+        {
+            return Err(H264Error::InvalidSyntax(
+                "inter prediction macroblock lies outside the current picture",
+            ));
+        }
+        let reference_luma_x = usize_to_i32(current_x)? + motion_x.div_euclid(4);
+        let reference_luma_y = usize_to_i32(current_y)? + motion_y.div_euclid(4);
+        if !interpolation_window_is_inside(
+            reference_luma_x,
+            reference_luma_y,
+            16,
+            16,
+            picture_width,
+            picture_height,
+            0,
+            0,
+            0,
+            0,
+        ) {
+            return Ok(false);
+        }
+
+        let chroma_width = picture_width / 2;
+        let chroma_height = picture_height / 2;
+        let reference_chroma_x = usize_to_i32(current_x / 2)? + motion_x.div_euclid(8);
+        let reference_chroma_y = usize_to_i32(current_y / 2)? + motion_y.div_euclid(8);
+        if !interpolation_window_is_inside(
+            reference_chroma_x,
+            reference_chroma_y,
+            8,
+            8,
+            chroma_width,
+            chroma_height,
+            0,
+            0,
+            0,
+            0,
+        ) {
+            return Ok(false);
+        }
+
+        let reference_luma_x =
+            usize::try_from(reference_luma_x).map_err(|_| H264Error::IntegerOverflow)?;
+        let reference_luma_y =
+            usize::try_from(reference_luma_y).map_err(|_| H264Error::IntegerOverflow)?;
+        let reference_chroma_x =
+            usize::try_from(reference_chroma_x).map_err(|_| H264Error::IntegerOverflow)?;
+        let reference_chroma_y =
+            usize::try_from(reference_chroma_y).map_err(|_| H264Error::IntegerOverflow)?;
+        let (luma, cb, cr) = self.planes();
+        let luma_source = reference_luma_y * picture_width + reference_luma_x;
+        let chroma_source = reference_chroma_y * chroma_width + reference_chroma_x;
+        // SAFETY: the complete source rectangles were validated above, the
+        // fixed staging planes contain all destination rows, and reference
+        // pictures cannot overlap the staging macroblock.
+        unsafe {
+            copy_fixed_rows::<16, 16>(
+                predicted_luma.as_mut_ptr().cast(),
+                luma.as_ptr().add(luma_source),
+                picture_width,
+                16,
+            );
+            copy_fixed_rows::<8, 8>(
+                predicted_cb.as_mut_ptr().cast(),
+                cb.as_ptr().add(chroma_source),
+                chroma_width,
+                8,
+            );
+            copy_fixed_rows::<8, 8>(
+                predicted_cr.as_mut_ptr().cast(),
+                cr.as_ptr().add(chroma_source),
+                chroma_width,
+                8,
+            );
+        }
+        Ok(true)
     }
 }
 
@@ -1649,6 +1755,77 @@ mod tests {
             }
         }
         picture
+    }
+
+    #[test]
+    fn integer_macroblock_copy_matches_normative_prediction_and_falls_back() {
+        let mut picture = Yuv420Picture::new(Size {
+            width: 48,
+            height: 48,
+        })
+        .unwrap();
+        let (luma, cb, cr) = picture.planes_mut();
+        for (index, sample) in luma.iter_mut().enumerate() {
+            *sample = (index * 73 + index / 17 * 29) as u8;
+        }
+        for (index, sample) in cb.iter_mut().enumerate() {
+            *sample = (index * 31 + 7) as u8;
+        }
+        for (index, sample) in cr.iter_mut().enumerate() {
+            *sample = (index * 43 + 19) as u8;
+        }
+        let partition = ResolvedPPartition {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+            reference_index: 0,
+            motion_vector: MotionVector { x: 8, y: -8 },
+        };
+        let expected = picture.predict_inter_420(1, 1, partition).unwrap();
+        let mut luma = [[0xa5; 16]; 16];
+        let mut cb = [[0xa5; 8]; 8];
+        let mut cr = [[0xa5; 8]; 8];
+        assert!(
+            picture
+                .try_copy_integer_macroblock_420_into(
+                    1,
+                    1,
+                    partition.motion_vector,
+                    &mut luma,
+                    &mut cb,
+                    &mut cr,
+                )
+                .unwrap()
+        );
+        assert_eq!(luma, expected.luma);
+        assert_eq!(cb, expected.cb);
+        assert_eq!(cr, expected.cr);
+
+        assert!(
+            !picture
+                .try_copy_integer_macroblock_420_into(
+                    1,
+                    1,
+                    MotionVector { x: 4, y: 0 },
+                    &mut luma,
+                    &mut cb,
+                    &mut cr,
+                )
+                .unwrap()
+        );
+        assert!(
+            !picture
+                .try_copy_integer_macroblock_420_into(
+                    0,
+                    0,
+                    MotionVector { x: -8, y: 0 },
+                    &mut luma,
+                    &mut cb,
+                    &mut cr,
+                )
+                .unwrap()
+        );
     }
 
     #[test]
