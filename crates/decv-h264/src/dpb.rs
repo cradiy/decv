@@ -1,6 +1,6 @@
 //! Decoded Picture Buffer and reference-picture management.
 
-use std::{num::NonZeroU32, sync::Arc};
+use std::{mem::size_of, num::NonZeroU32, sync::Arc};
 
 use crate::{
     H264Error, MAX_DPB_FRAMES, MemoryManagementOperation, ReferenceListModification, Result,
@@ -100,6 +100,21 @@ impl DecodedPictureBuffer {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.references.is_empty()
+    }
+
+    pub(crate) fn retained_reference_bytes(&self) -> usize {
+        self.references
+            .iter()
+            .fold(
+                self.references
+                    .capacity()
+                    .saturating_mul(size_of::<DpbReference>()),
+                |bytes, reference| {
+                    bytes
+                        .saturating_add(reference.picture.retained_allocation_bytes())
+                        .saturating_add(reference.motion.retained_allocation_bytes())
+                },
+            )
     }
 
     pub fn clear(&mut self) {

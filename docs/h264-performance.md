@@ -2232,11 +2232,14 @@ the target.
 | Checkpoint creation median | - | 0.49 ms | - |
 
 Execution order alternated, and each restored final frame matched the
-independent exact-seek CRC. A second, denser best-case checkpoint only 66.7 ms
-before the target reduced the same operation to tens of milliseconds, but
-retaining per-frame checkpoints would spend unnecessary memory. The practical
-policy is a small time- or memory-bounded cache, with checkpoint spacing chosen
-against the application's latency budget.
+independent exact-seek CRC. The measured checkpoint held three references with
+a conservative logical reference-state estimate of 39.6 MiB. Multiple
+checkpoints share some `Arc` allocations, so summed estimates intentionally
+overcount unique resident memory. A second, denser best-case checkpoint only
+66.7 ms before the target reduced the same operation to tens of milliseconds,
+but retaining per-frame checkpoints would spend unnecessary memory. The
+practical policy is a small time- or memory-bounded cache, with checkpoint
+spacing chosen against the application's latency budget.
 
 ## Interpretation
 

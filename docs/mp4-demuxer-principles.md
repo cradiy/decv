@@ -559,6 +559,9 @@ reference pictures encountered before earlier B pictures in decode order. A
 bounded sparse cache can retain several points within a long GOP. Each
 checkpoint clones compact state and `Arc` handles rather than complete
 reference pixels, although those handles keep their referenced pictures alive.
+`H264SeekCheckpoint::estimated_retained_reference_bytes` provides a
+conservative logical cost for an upper-budget eviction policy; shared
+allocations may be counted by more than one checkpoint.
 
 ### Low-latency preview seek
 

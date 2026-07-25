@@ -129,6 +129,13 @@ impl Yuv420Picture {
         self.coded_size
     }
 
+    pub(crate) fn retained_allocation_bytes(&self) -> usize {
+        self.luma
+            .len()
+            .saturating_add(self.cb.capacity())
+            .saturating_add(self.cr.capacity())
+    }
+
     #[inline]
     pub(crate) const fn dimensions(&self) -> (usize, usize) {
         (self.width, self.height)

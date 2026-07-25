@@ -1,6 +1,6 @@
 //! Immutable per-4x4 motion metadata retained with reference pictures.
 
-use std::mem::{ManuallyDrop, MaybeUninit};
+use std::mem::{ManuallyDrop, MaybeUninit, size_of};
 
 use decv_core::Size;
 
@@ -60,6 +60,12 @@ impl ReferenceMotionField {
     #[inline]
     pub const fn height_in_4x4_blocks(&self) -> usize {
         self.height_in_4x4_blocks
+    }
+
+    pub(crate) fn retained_allocation_bytes(&self) -> usize {
+        self.cells
+            .capacity()
+            .saturating_mul(size_of::<MotionFieldCell>())
     }
 
     pub fn cell(&self, x: usize, y: usize) -> Option<MotionFieldCell> {

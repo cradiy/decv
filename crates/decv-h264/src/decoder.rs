@@ -119,6 +119,21 @@ impl H264SeekCheckpoint {
     pub const fn resume_time(&self) -> MediaTime {
         self.resume_time
     }
+
+    /// Number of decoded reference pictures retained by this checkpoint.
+    pub fn retained_reference_count(&self) -> usize {
+        self.dpb.len()
+    }
+
+    /// Conservative logical size of reference-picture and motion-field
+    /// allocations retained by this checkpoint.
+    ///
+    /// Checkpoints often share these allocations through `Arc`. Summing this
+    /// value across a cache can therefore overestimate its unique memory, which
+    /// is useful for enforcing a simple conservative cache budget.
+    pub fn estimated_retained_reference_bytes(&self) -> usize {
+        self.dpb.retained_reference_bytes()
+    }
 }
 
 impl Default for H264Decoder {
@@ -2163,6 +2178,15 @@ mod tests {
         ));
         let checkpoint = decoder.create_seek_checkpoint().unwrap();
         assert_eq!(checkpoint.resume_time(), anchor_pts);
+        assert_eq!(checkpoint.retained_reference_count(), 1);
+        assert!(
+            checkpoint.estimated_retained_reference_bytes()
+                >= 16 * 16 + 2 * (8 * 8)
+        );
+        assert_eq!(
+            checkpoint.clone().estimated_retained_reference_bytes(),
+            checkpoint.estimated_retained_reference_bytes()
+        );
         assert!(
             decoder
                 .restore_seek_checkpoint(&checkpoint, anchor_pts)

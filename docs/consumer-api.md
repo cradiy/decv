@@ -137,7 +137,11 @@ the restored target must be later than that bound. Reference pictures and
 motion fields are stored behind `Arc`, so checkpoint cloning does not copy full
 pixel planes. Checkpoints can still retain old reference pictures, so
 consumers should use a bounded, sparsely sampled cache rather than keeping one
-for every frame.
+for every frame. `retained_reference_count()` and
+`estimated_retained_reference_bytes()` expose a conservative per-checkpoint
+cache cost. Summing the byte estimate can overcount allocations shared by
+multiple checkpoints, making it suitable for a simple upper-budget eviction
+policy.
 
 For a low-latency scrub preview, callers may instead use
 `seek_to_nearest_keyframe`. That path begins at the independently decodable
