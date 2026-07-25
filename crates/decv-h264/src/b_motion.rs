@@ -32,6 +32,11 @@ const DIRECT_4X4_GRID: [(u8, u8, usize, usize); 16] = [
     (8, 12, 2, 3),
     (12, 12, 3, 3),
 ];
+// Once a macroblock is complete, future spatial predictors can only observe
+// its right column or bottom row. Interior cells remain in the local
+// transaction while resolving the current macroblock and are then discarded.
+const STORED_BOUNDARY_CELL_INDICES: [usize; 7] = [3, 7, 11, 12, 13, 14, 15];
+const STORED_CELLS_PER_MACROBLOCK: usize = STORED_BOUNDARY_CELL_INDICES.len();
 
 #[derive(Debug, Clone, Copy)]
 pub struct DirectReference<'a> {
@@ -127,6 +132,7 @@ pub struct BMotionState {
     width_in_macroblocks: usize,
     height_in_macroblocks: usize,
     first_slice_id: u32,
+    /// Right-column and bottom-row cells for every completed macroblock.
     cells: Vec<Option<MotionCell>>,
 }
 
@@ -138,8 +144,22 @@ fn b_motion_cell_count(width_in_macroblocks: usize, height_in_macroblocks: usize
     }
     width_in_macroblocks
         .checked_mul(height_in_macroblocks)
-        .and_then(|value| value.checked_mul(16))
+        .and_then(|value| value.checked_mul(STORED_CELLS_PER_MACROBLOCK))
         .ok_or(H264Error::IntegerOverflow)
+}
+
+#[inline(always)]
+const fn stored_boundary_cell_slot(local_index: usize) -> Option<usize> {
+    match local_index {
+        3 => Some(0),
+        7 => Some(1),
+        11 => Some(2),
+        12 => Some(3),
+        13 => Some(4),
+        14 => Some(5),
+        15 => Some(6),
+        _ => None,
+    }
 }
 
 impl BMotionState {
@@ -625,8 +645,8 @@ impl BMotionState {
                 "B motion-state macroblock address exceeds the picture",
             ));
         }
-        let start = macroblock_address * 16;
-        self.cells[start..start + 16].fill(None);
+        let start = macroblock_address * STORED_CELLS_PER_MACROBLOCK;
+        self.cells[start..start + STORED_CELLS_PER_MACROBLOCK].fill(None);
         Ok(())
     }
 
@@ -870,16 +890,20 @@ impl BMotionState {
         );
         let same_slice = |cell: Option<MotionCell>| cell.filter(|cell| cell.slice_id == slice_id);
         let left = (macroblock_x > 0)
-            .then(|| self.cells[(macroblock_address - 1) * 16 + 3])
+            .then(|| self.stored_boundary_cell(macroblock_address - 1, 3))
             .flatten();
         let top = (macroblock_y > 0)
-            .then(|| self.cells[(macroblock_address - self.width_in_macroblocks) * 16 + 12])
+            .then(|| self.stored_boundary_cell(macroblock_address - self.width_in_macroblocks, 12))
             .flatten();
         let top_right = (macroblock_y > 0 && macroblock_x + 1 < self.width_in_macroblocks)
-            .then(|| self.cells[(macroblock_address - self.width_in_macroblocks + 1) * 16 + 12])
+            .then(|| {
+                self.stored_boundary_cell(macroblock_address - self.width_in_macroblocks + 1, 12)
+            })
             .flatten();
         let top_left = (macroblock_y > 0 && macroblock_x > 0)
-            .then(|| self.cells[(macroblock_address - self.width_in_macroblocks - 1) * 16 + 15])
+            .then(|| {
+                self.stored_boundary_cell(macroblock_address - self.width_in_macroblocks - 1, 15)
+            })
             .flatten();
         [
             same_slice(left),
@@ -933,9 +957,24 @@ impl BMotionState {
         let cell = if macroblock_address == current_macroblock_address {
             local[local_index]
         } else {
-            self.cells[macroblock_address * 16 + local_index]
+            self.stored_boundary_cell(macroblock_address, local_index)
         };
         cell.filter(|cell| cell.slice_id == slice_id)
+    }
+
+    #[inline(always)]
+    fn stored_boundary_cell(
+        &self,
+        macroblock_address: usize,
+        local_index: usize,
+    ) -> Option<MotionCell> {
+        let slot = stored_boundary_cell_slot(local_index);
+        debug_assert!(
+            slot.is_some(),
+            "external B-motion neighbours must lie on a stored macroblock boundary"
+        );
+        let slot = slot?;
+        self.cells[macroblock_address * STORED_CELLS_PER_MACROBLOCK + slot]
     }
 
     fn ensure_macroblock_available_for_write(
@@ -949,12 +988,15 @@ impl BMotionState {
             ));
         }
         debug_assert!(slice_id >= self.first_slice_id);
-        let start = macroblock_address * 16;
+        let start = macroblock_address * STORED_CELLS_PER_MACROBLOCK;
         let recorded = self.cells[start].is_some_and(|cell| cell.slice_id >= self.first_slice_id);
         debug_assert!(
-            self.cells[start..start + 16].iter().all(|cell| cell
-                .is_some_and(|cell| cell.slice_id >= self.first_slice_id)
-                == recorded),
+            self.cells[start..start + STORED_CELLS_PER_MACROBLOCK]
+                .iter()
+                .all(
+                    |cell| cell.is_some_and(|cell| cell.slice_id >= self.first_slice_id)
+                        == recorded
+                ),
             "B motion-state macroblocks are recorded atomically"
         );
         if recorded {
@@ -970,8 +1012,9 @@ impl BMotionState {
             local.iter().all(Option::is_some),
             "completed B macroblocks contain all sixteen motion cells"
         );
-        let start = macroblock_address * 16;
-        self.cells[start..start + 16].copy_from_slice(&local);
+        let start = macroblock_address * STORED_CELLS_PER_MACROBLOCK;
+        let stored = STORED_BOUNDARY_CELL_INDICES.map(|index| local[index]);
+        self.cells[start..start + STORED_CELLS_PER_MACROBLOCK].copy_from_slice(&stored);
     }
 }
 
@@ -1533,12 +1576,47 @@ mod tests {
         state.reset_for_picture(2, 1, 2, false).unwrap();
 
         assert_eq!(state.cells.as_ptr(), allocation);
-        assert_eq!(state.cells.len(), 32);
+        assert_eq!(state.cells.len(), 14);
         assert!(state.cells.iter().any(Option::is_some));
         assert_eq!(state.width_in_macroblocks, 2);
         assert_eq!(state.height_in_macroblocks, 1);
         state.record_intra_macroblock(0, 2).unwrap();
         assert!(state.record_intra_macroblock(0, 3).is_err());
+    }
+
+    #[test]
+    fn persisted_boundaries_preserve_every_external_neighbour_cell() {
+        let mut state = BMotionState::new(2, 2).unwrap();
+        let local = std::array::from_fn(|index| {
+            Some(MotionCell {
+                slice_id: 1,
+                list0: Some(ResolvedBListMotion {
+                    reference_index: 0,
+                    motion_vector: MotionVector {
+                        x: index as i16,
+                        y: 0,
+                    },
+                }),
+                list1: None,
+            })
+        });
+        state.commit_local_cells(0, local);
+        let empty_local = [None; 16];
+        let motion_x = |cell: Option<MotionCell>| {
+            cell.expect("the committed boundary cell is available")
+                .list0
+                .expect("the test records List 0")
+                .motion_vector
+                .x
+        };
+
+        let left =
+            [0, 4, 8, 12].map(|y| motion_x(state.neighbour_cell_at(15, y, 1, 1, &empty_local)));
+        let top =
+            [0, 4, 8, 12].map(|x| motion_x(state.neighbour_cell_at(x, 15, 2, 1, &empty_local)));
+
+        assert_eq!(left, [3, 7, 11, 15]);
+        assert_eq!(top, [12, 13, 14, 15]);
     }
 
     #[test]

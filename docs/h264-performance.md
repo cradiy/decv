@@ -2043,6 +2043,43 @@ The complete 4K output and exact-seek suffix retained SHA-256
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`;
 the CAVLC control stream also remained byte-exact.
 
+## Boundary-Only B-Motion Persistence
+
+B-macroblock resolution uses a temporary 4x4 motion-cell grid because later
+partitions in the same macroblock can depend on earlier partitions. After the
+macroblock is complete, however, H.264 spatial prediction can only observe the
+right column from a left neighbour and the bottom row from a top neighbour.
+The previous persistent grid retained all sixteen cells per macroblock even
+though nine interior cells could never be read again.
+
+The reusable B-motion state now commits only the union of those observable
+boundaries: four right-column cells plus four bottom-row cells with the shared
+bottom-right cell stored once, for seven cells per macroblock. Current-
+macroblock resolution still uses all sixteen transactional cells, so explicit,
+mixed Direct, rollback, slice-boundary, and malformed-stream behaviour is
+unchanged. Generation reuse and dimension-change reallocation continue to
+apply to the smaller persistent grid.
+
+Across eighteen fixed-CPU native exact-seek counter pairs, mean task-clock fell
+from 671 to 660 ms (1.7%), cycles from 3.142 to 3.085 billion (1.8%), and
+sampled cache misses by 7.0%. Instructions were nearly neutral at a 0.2%
+reduction. Native wall time was noisy, but peak RSS consistently fell by about
+2.6 MiB.
+
+After retraining PGO, twelve fixed-CPU wall-time pairs reduced exact-seek
+median from 0.67 to 0.65 seconds (3.0%). Ten counter pairs reduced task-clock
+from 677 to 650 ms (4.0%), cycles from 3.141 to 3.061 billion (2.5%),
+instructions by 0.6%, and sampled cache misses by 5.3%. The ordinary 48-frame
+4K median fell from about 0.995 to 0.960 seconds (3.5%) while median peak RSS
+fell by about 5.7 MiB. The CAVLC control median changed from about 0.555 to
+0.550 seconds and peak RSS fell by about 1.3 MiB.
+
+The complete 4K output, exact-seek suffix, and CAVLC control stream retained
+their byte-exact SHA-256 hashes
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
+and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
