@@ -1,6 +1,9 @@
 //! Stateful reconstruction of progressive 8-bit 4:2:0 intra pictures.
 
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::{
+    mem::MaybeUninit,
+    sync::mpsc::{Receiver, sync_channel},
+};
 
 use bit_readers::BitReader;
 use decv_core::{DecodedVideoFrame, MediaTime, Size, VideoFormat};
@@ -251,7 +254,7 @@ pub struct IntraPictureReconstructor {
     b_motion: BMotionState,
     reference_motion: MotionFieldBuilder,
     completed: Vec<bool>,
-    deblock: Vec<MacroblockDeblockInfo>,
+    deblock: Vec<MaybeUninit<MacroblockDeblockInfo>>,
     // Stable picture-local tokens preserve reference identity across slices
     // without storing pointer-sized addresses in every deblocking grid cell.
     deblock_reference_addresses: [usize; 32],
@@ -329,14 +332,25 @@ impl ReconstructionWorkspace {
 pub(crate) struct NonReferencePictureFinalization {
     width_in_macroblocks: usize,
     picture: Yuv420Picture,
-    deblock: Vec<MacroblockDeblockInfo>,
+    deblock: Vec<MaybeUninit<MacroblockDeblockInfo>>,
 }
 
 impl NonReferencePictureFinalization {
     pub(crate) fn finish(mut self) -> Result<Yuv420Picture> {
-        filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
+        // SAFETY: finalizations are created only after the reconstructor has
+        // validated that every macroblock completed.
+        let deblock = unsafe { initialized_deblock_slice(&self.deblock) };
+        filter_420_picture(&mut self.picture, deblock, self.width_in_macroblocks)?;
         Ok(self.picture)
     }
+}
+
+#[inline]
+unsafe fn initialized_deblock_slice(
+    deblock: &[MaybeUninit<MacroblockDeblockInfo>],
+) -> &[MacroblockDeblockInfo] {
+    // SAFETY: guaranteed by the caller for the complete slice.
+    unsafe { std::slice::from_raw_parts(deblock.as_ptr().cast(), deblock.len()) }
 }
 
 impl IntraPictureReconstructor {
@@ -408,7 +422,7 @@ impl IntraPictureReconstructor {
             b_motion: workspace.b_motion,
             reference_motion,
             completed: vec![false; macroblock_count],
-            deblock: vec![MacroblockDeblockInfo::default(); macroblock_count],
+            deblock: vec![MaybeUninit::uninit(); macroblock_count],
             deblock_reference_addresses: [0; 32],
             deblock_reference_count: 0,
             scaling_lists,
@@ -2126,7 +2140,7 @@ impl IntraPictureReconstructor {
         macroblock_address: usize,
         deblock: MacroblockDeblockInfo,
     ) {
-        self.deblock[macroblock_address] = deblock;
+        self.deblock[macroblock_address].write(deblock);
         self.completed[macroblock_address] = true;
     }
 
@@ -2452,7 +2466,7 @@ impl IntraPictureReconstructor {
             self.reference_motion.clear_macroblock(macroblock_address)?;
             return Err(error);
         }
-        self.deblock[macroblock_address] = MacroblockDeblockInfo {
+        self.deblock[macroblock_address].write(MacroblockDeblockInfo {
             slice_id,
             is_intra: true,
             luma_qp: if is_pcm { 0 } else { quantizer.luma },
@@ -2471,7 +2485,7 @@ impl IntraPictureReconstructor {
             luma_nonzero: 0,
             motion: [DeblockMotion::default(); 16],
             filter: deblocking_filter,
-        };
+        });
         self.completed[macroblock_address] = true;
         Ok(())
     }
@@ -2651,7 +2665,10 @@ impl IntraPictureReconstructor {
         ReconstructionWorkspace,
     )> {
         self.validate_picture_complete()?;
-        filter_420_picture(&mut self.picture, &self.deblock, self.width_in_macroblocks)?;
+        // SAFETY: the preceding validation proves every macroblock completed,
+        // and completion is recorded only after writing its deblocking entry.
+        let deblock = unsafe { initialized_deblock_slice(&self.deblock) };
+        filter_420_picture(&mut self.picture, deblock, self.width_in_macroblocks)?;
         let motion = self.reference_motion.finish_optional()?;
         Ok((
             self.picture,
@@ -2698,6 +2715,12 @@ impl IntraPictureReconstructor {
             ));
         }
         Ok(())
+    }
+
+    #[inline]
+    unsafe fn completed_deblock_info_unchecked(&self, address: usize) -> &MacroblockDeblockInfo {
+        // SAFETY: guaranteed by the caller for this entry.
+        unsafe { self.deblock[address].assume_init_ref() }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2944,9 +2967,12 @@ impl IntraPictureReconstructor {
     }
 
     fn is_available(&self, address: usize, slice_id: u32) -> bool {
-        self.completed[address]
-            && self.deblock[address].slice_id == slice_id
-            && (!self.constrained_intra_prediction || self.deblock[address].is_intra)
+        if !self.completed[address] {
+            return false;
+        }
+        // SAFETY: the completed flag is set only after this entry is written.
+        let deblock = unsafe { self.completed_deblock_info_unchecked(address) };
+        deblock.slice_id == slice_id && (!self.constrained_intra_prediction || deblock.is_intra)
     }
 
     fn validate_new_macroblock(&self, address: usize) -> Result<(usize, usize)> {
@@ -3162,7 +3188,7 @@ fn inter_deblock_info(
 // one out-parameter helper measurably regressed the CAVLC instruction count.
 #[allow(clippy::too_many_arguments)]
 fn write_inter_deblock_info(
-    output: &mut MacroblockDeblockInfo,
+    output: &mut MaybeUninit<MacroblockDeblockInfo>,
     slice_id: u32,
     quantizer: MacroblockQuantizer,
     transform_8x8: bool,
@@ -3173,6 +3199,7 @@ fn write_inter_deblock_info(
 ) -> Result<()> {
     #[cfg(debug_assertions)]
     let mut covered = 0u16;
+    let mut motion = [DeblockMotion::default(); 16];
     let mut first_motion = None;
     let mut uniform_motion = true;
     for partition in &resolved.partitions {
@@ -3223,11 +3250,11 @@ fn write_inter_deblock_info(
             && end_x == 4
             && end_y == 4
         {
-            output.motion.fill(partition_motion);
+            motion.fill(partition_motion);
         } else {
             for y in start_y..end_y {
                 for x in start_x..end_x {
-                    output.motion[y * 4 + x] = partition_motion;
+                    motion[y * 4 + x] = partition_motion;
                 }
             }
         }
@@ -3236,15 +3263,18 @@ fn write_inter_deblock_info(
     debug_assert_eq!(covered, u16::MAX);
 
     let luma_nonzero = inter_luma_nonzero(transform_8x8, residual);
-    output.slice_id = slice_id;
-    output.is_intra = false;
-    output.luma_qp = quantizer.luma;
-    output.cb_qp = quantizer.chroma_cb;
-    output.cr_qp = quantizer.chroma_cr;
-    output.transform_8x8 = transform_8x8;
-    output.internal_edges_zero = luma_nonzero == 0 && first_motion.is_some() && uniform_motion;
-    output.luma_nonzero = luma_nonzero;
-    output.filter = filter;
+    output.write(MacroblockDeblockInfo {
+        slice_id,
+        is_intra: false,
+        luma_qp: quantizer.luma,
+        cb_qp: quantizer.chroma_cb,
+        cr_qp: quantizer.chroma_cr,
+        transform_8x8,
+        internal_edges_zero: luma_nonzero == 0 && first_motion.is_some() && uniform_motion,
+        luma_nonzero,
+        motion,
+        filter,
+    });
     Ok(())
 }
 
@@ -3320,7 +3350,7 @@ fn b_inter_deblock_info(
 // partitions cover the complete 4x4 grid, checked without release-mode cost.
 #[allow(clippy::too_many_arguments)]
 fn write_b_inter_deblock_info(
-    output: &mut MacroblockDeblockInfo,
+    output: &mut MaybeUninit<MacroblockDeblockInfo>,
     slice_id: u32,
     quantizer: MacroblockQuantizer,
     transform_8x8: bool,
@@ -3332,6 +3362,7 @@ fn write_b_inter_deblock_info(
 ) -> Result<()> {
     #[cfg(debug_assertions)]
     let mut covered = 0u16;
+    let mut motion = [DeblockMotion::default(); 16];
     let mut first_motion = None;
     let mut uniform_motion = true;
     for partition in &resolved.partitions {
@@ -3372,11 +3403,11 @@ fn write_b_inter_deblock_info(
             && end_x == 4
             && end_y == 4
         {
-            output.motion.fill(partition_motion);
+            motion.fill(partition_motion);
         } else {
             for y in start_y..end_y {
                 for x in start_x..end_x {
-                    output.motion[y * 4 + x] = partition_motion;
+                    motion[y * 4 + x] = partition_motion;
                 }
             }
         }
@@ -3384,15 +3415,18 @@ fn write_b_inter_deblock_info(
     #[cfg(debug_assertions)]
     debug_assert_eq!(covered, u16::MAX);
     let luma_nonzero = inter_luma_nonzero(transform_8x8, residual);
-    output.slice_id = slice_id;
-    output.is_intra = false;
-    output.luma_qp = quantizer.luma;
-    output.cb_qp = quantizer.chroma_cb;
-    output.cr_qp = quantizer.chroma_cr;
-    output.transform_8x8 = transform_8x8;
-    output.internal_edges_zero = luma_nonzero == 0 && first_motion.is_some() && uniform_motion;
-    output.luma_nonzero = luma_nonzero;
-    output.filter = filter;
+    output.write(MacroblockDeblockInfo {
+        slice_id,
+        is_intra: false,
+        luma_qp: quantizer.luma,
+        cb_qp: quantizer.chroma_cb,
+        cr_qp: quantizer.chroma_cr,
+        transform_8x8,
+        internal_edges_zero: luma_nonzero == 0 && first_motion.is_some() && uniform_motion,
+        luma_nonzero,
+        motion,
+        filter,
+    });
     Ok(())
 }
 
@@ -3495,13 +3529,15 @@ fn assemble_chroma_residual(blocks: &[[[i32; 4]; 4]; 4]) -> [[i32; 8]; 8] {
 
 #[cfg(test)]
 mod tests {
+    use std::mem::MaybeUninit;
+
     use decv_core::{ColorInfo, FrameStorage, PixelFormat, Rect, Size, VideoFormat};
 
     use super::{
         BDirectPrediction, BReconstructionModes, BSlicePredictionWeights, DeblockReferenceList,
-        IntraPictureReconstructor, IntraSliceConfig, MacroblockDeblockInfo,
-        ReconstructionReferenceList, ReconstructionWorkspace, b_inter_deblock_info,
-        inter_deblock_info, write_b_inter_deblock_info, write_inter_deblock_info,
+        IntraPictureReconstructor, IntraSliceConfig, ReconstructionReferenceList,
+        ReconstructionWorkspace, b_inter_deblock_info, inter_deblock_info,
+        write_b_inter_deblock_info, write_inter_deblock_info,
     };
     use crate::{
         BMacroblockContext, CabacResidualBlock, CodedBlockPattern, DeblockingFilter,
@@ -3619,7 +3655,7 @@ mod tests {
         let filter = DeblockingFilter::default();
         let expected =
             inter_deblock_info(3, quantizer, true, filter, &p_motion, None, &references).unwrap();
-        let mut written = MacroblockDeblockInfo::default();
+        let mut written = MaybeUninit::uninit();
         write_inter_deblock_info(
             &mut written,
             3,
@@ -3631,7 +3667,8 @@ mod tests {
             &references,
         )
         .unwrap();
-        assert_eq!(written, expected);
+        // SAFETY: the successful writer initializes the complete value.
+        assert_eq!(unsafe { written.assume_init() }, expected);
 
         let b_motion = ResolvedBMacroblock {
             direct: false,
@@ -3669,7 +3706,7 @@ mod tests {
             &references,
         )
         .unwrap();
-        let mut written = MacroblockDeblockInfo::default();
+        let mut written = MaybeUninit::uninit();
         write_b_inter_deblock_info(
             &mut written,
             4,
@@ -3682,7 +3719,8 @@ mod tests {
             &references,
         )
         .unwrap();
-        assert_eq!(written, expected);
+        // SAFETY: the successful writer initializes the complete value.
+        assert_eq!(unsafe { written.assume_init() }, expected);
     }
 
     fn predicted(luma_mode: u8, chroma_mode: u8) -> DecodedIntraMacroblock {
@@ -3786,6 +3824,17 @@ mod tests {
             weights: BSlicePredictionWeights::Default,
             direct: BDirectPrediction::Temporal(None),
         }
+    }
+
+    #[test]
+    fn incomplete_picture_is_rejected_before_deblock_initialization() {
+        let error = reconstructor(Size::new(32, 16))
+            .into_deblocked_picture()
+            .unwrap_err();
+        assert_eq!(
+            error,
+            H264Error::InvalidSyntax("cannot output an incomplete reconstructed picture")
+        );
     }
 
     fn constant_picture(value: u8) -> crate::Yuv420Picture {

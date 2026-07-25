@@ -1874,6 +1874,38 @@ task-clock by 1.4%, cycles by 0.7%, wall time by 2.2%, and minor faults by
 page-fault overhead. The full 570 MiB NV12 output retained SHA-256
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`.
 
+## Write-Once Deblocking Metadata
+
+Each picture previously initialized the complete deblocking-metadata vector
+with `MacroblockDeblockInfo::default()` before reconstruction, even though
+every successfully completed macroblock replaces its entire entry. At 4K the
+redundant initialization touches about 5.5 MiB per picture. The vector now
+stores `MaybeUninit<MacroblockDeblockInfo>` internally and initializes one
+entry when that macroblock completes. The existing completion bitmap remains
+the safety boundary: neighbour reads require the corresponding completion
+flag, and finalization rejects an incomplete picture before converting the
+metadata into an initialized slice. Focused tests cover both complete direct
+writers and rejection of an incomplete picture.
+
+The native build retained byte-exact output and reduced mean 4K task-clock by
+about 1.3%, CPU cycles by 2.0%, and wall time by 1.2% across seven counter
+runs. Nine native exact-seek counter runs reduced task-clock and wall time by
+about 1.9%. After retraining PGO, nine 4K counter runs reduced task-clock by
+2.6% and wall time by 4.1%; instructions were neutral, branch misses fell
+0.6%, and sampled cache misses fell 2.1%. Eleven exact-seek counter runs
+reduced task-clock by 5.2% and wall time by 6.2%, while instructions remained
+within 0.1%. CPU cycles increased about 1.0% in that seek sample because the
+candidate ran at a lower average effective frequency, so the retained result
+is based on task-clock and alternating end-to-end timings rather than cycles
+alone.
+
+The complete 48-frame 4K NV12 stream retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`.
+The six-frame post-seek suffix retained SHA-256
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
+and the complete native H.264 and MP4 verification corpora remained
+byte-exact.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
