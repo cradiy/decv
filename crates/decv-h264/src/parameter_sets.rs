@@ -18,7 +18,7 @@ struct StoredPictureParameterSet {
     picture: Arc<PictureParameterSet>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ParameterSetStore {
     sequence: [Option<Arc<SequenceParameterSet>>; 32],
     picture: [Option<StoredPictureParameterSet>; 256],

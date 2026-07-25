@@ -1057,6 +1057,19 @@ mod tests {
         assert!(cursor.next_packet().unwrap().is_some());
         assert!(cursor.next_packet().unwrap().is_none());
         assert!(cursor.decoder_config().unwrap().is_none());
+        cursor.seek_to_sample(1).unwrap();
+        assert_eq!(cursor.next_sample_index(), 1);
+        assert!(cursor.next_packet().unwrap().is_some());
+        assert_eq!(cursor.next_sample_index(), 2);
+        cursor.seek_to_sample(3).unwrap();
+        assert!(cursor.next_packet().unwrap().is_none());
+        assert!(matches!(
+            cursor.seek_to_sample(4),
+            Err(Mp4Error::IndexOutOfRange {
+                kind: "sample cursor",
+                index: 4
+            })
+        ));
         cursor.rewind();
         assert_eq!(cursor.next_sample_index(), 0);
     }

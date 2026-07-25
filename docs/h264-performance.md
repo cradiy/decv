@@ -2200,6 +2200,42 @@ public-facade regression also exercises length-prefixed MP4 input with I/P/B
 presentation reordering: it decodes the first target, retargets without
 rewinding the packet cursor, and emits only the final selected frame.
 
+## Reusable Exact-Seek Checkpoints
+
+Forward retargeting cannot serve a request that moves behind the decoder's
+current state. `H264SeekCheckpoint` captures parser history, the reference
+DPB, and display reordering at a complete access-unit boundary. The matching
+`PacketCursor::next_sample_index` identifies the next compressed sample.
+Restoring both pieces can resume at a non-sync sample without rebuilding every
+earlier dependency.
+
+Checkpoint creation finishes the current access unit and waits for any pending
+non-reference finalization. The snapshot then clones parameter-set and
+reference metadata plus `Arc` handles to immutable pixels and motion fields;
+it does not copy complete reference planes. The restore target must be strictly
+later than the checkpoint's conservative resume time. Consumers should retain
+a bounded sparse set because each checkpoint can keep reference pictures that
+would otherwise leave the live DPB.
+
+A nine-pair native release test used the same 1440x2560, 60 fps long-GOP
+source. While seeking to 131.900 seconds, it retained a checkpoint at
+130.166667 seconds and its next MP4 sample index. A later request moved
+backward to 130.700 seconds. The control path independently decoded from the
+129.166667-second keyframe; the checkpoint path restored about 533 ms before
+the target.
+
+| Measurement | Independent exact seek | Checkpoint restore | Change |
+| --- | ---: | ---: | ---: |
+| First-frame median | 494.39 ms | 169.17 ms | -65.8% |
+| Checkpoint creation median | - | 0.63 ms | - |
+
+Execution order alternated, and each restored final frame matched the
+independent exact-seek CRC. A second, denser best-case checkpoint only 66.7 ms
+before the target reduced the same operation to tens of milliseconds, but
+retaining per-frame checkpoints would spend unnecessary memory. The practical
+policy is a small time- or memory-bounded cache, with checkpoint spacing chosen
+against the application's latency budget.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

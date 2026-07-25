@@ -7,7 +7,7 @@
 
 use crate::{H264Error, Result};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct PendingOutput<T> {
     picture_order_count: i32,
     decode_index: u64,
@@ -15,7 +15,7 @@ struct PendingOutput<T> {
 }
 
 /// Holds at most the signalled reorder depth before releasing the lowest POC.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct PictureReorderBuffer<T> {
     max_num_reorder_frames: usize,
     next_decode_index: u64,

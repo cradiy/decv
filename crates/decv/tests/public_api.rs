@@ -249,6 +249,63 @@ fn facade_retargets_an_active_exact_seek_without_rewinding_mp4() {
 }
 
 #[test]
+fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
+    let mp4 = decode_hex(include_str!("fixtures/three-frame-high-b.mp4.hex"));
+    let demuxer = Mp4Demuxer::open(mp4).unwrap();
+    let track_index = demuxer
+        .movie()
+        .tracks()
+        .iter()
+        .position(|track| track.handler() == FourCc::new(*b"vide"))
+        .unwrap();
+    let mut cursor = demuxer.packet_cursor(track_index).unwrap();
+    let anchor_time = MediaTime::from_parts(0, 15_360).unwrap();
+    assert_eq!(cursor.seek_to_keyframe(anchor_time).unwrap(), Some(0));
+
+    let mut decoder = H264Decoder::new();
+    decoder.configure(cursor.decoder_config().unwrap().unwrap()).unwrap();
+    let final_target = MediaTime::from_parts(1024, 15_360).unwrap();
+    decoder.flush_for_seek(final_target);
+    let mut anchor = cursor.next_packet().unwrap().unwrap();
+    anchor.discontinuity = true;
+    assert!(matches!(
+        decoder.send_packet(anchor).unwrap(),
+        DecodeInputStatus::Accepted
+    ));
+    let checkpoint = decoder.create_seek_checkpoint(anchor_time).unwrap();
+    let resume_sample = cursor.next_sample_index();
+    let remaining_packets = std::iter::from_fn(|| cursor.next_packet().transpose())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
+    let mut format = None;
+    let mut frames = Vec::new();
+    send_packets(&mut decoder, remaining_packets, &mut format, &mut frames);
+    decoder.drain().unwrap();
+    assert!(pull_available(&mut decoder, &mut format, &mut frames));
+    assert_eq!(frames.len(), 1);
+    assert_eq!(frames[0].pts, Some(final_target));
+
+    let earlier_target = MediaTime::from_parts(512, 15_360).unwrap();
+    decoder
+        .restore_seek_checkpoint(&checkpoint, earlier_target)
+        .unwrap();
+    cursor.seek_to_sample(resume_sample).unwrap();
+    let replay_packets = std::iter::from_fn(|| cursor.next_packet().transpose())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    frames.clear();
+    send_packets(&mut decoder, replay_packets, &mut format, &mut frames);
+    decoder.drain().unwrap();
+    assert!(pull_available(&mut decoder, &mut format, &mut frames));
+    assert_eq!(
+        frames.iter().map(|frame| frame.pts).collect::<Vec<_>>(),
+        [Some(earlier_target), Some(final_target)]
+    );
+    assert!(frames.iter().all(|frame| frame.validate().is_ok()));
+}
+
+#[test]
 fn frame_storage_requires_forward_compatible_matching() {
     fn storage_kind(storage: &FrameStorage) -> &'static str {
         match storage {
@@ -299,6 +356,27 @@ fn pull_available(
             DecodeOutput::EndOfStream => return true,
             _ => panic!("unexpected decoder output"),
         }
+    }
+}
+
+fn send_packets(
+    decoder: &mut H264Decoder,
+    packets: impl IntoIterator<Item = EncodedVideoPacket>,
+    format: &mut Option<VideoFormat>,
+    frames: &mut Vec<DecodedVideoFrame>,
+) {
+    for mut packet in packets {
+        loop {
+            match decoder.send_packet(packet).unwrap() {
+                DecodeInputStatus::Accepted => break,
+                DecodeInputStatus::NeedOutput(unconsumed) => {
+                    packet = unconsumed;
+                    assert!(!pull_available(decoder, format, frames));
+                }
+                _ => panic!("unexpected decoder input status"),
+            }
+        }
+        assert!(!pull_available(decoder, format, frames));
     }
 }
 

@@ -68,8 +68,10 @@ untrusted input must not panic or silently produce a known-wrong frame.
 including track enumeration, AVC sample descriptions, DTS/PTS/duration,
 binary-searchable sync-sample indexes, simple linear edit lists, packet
 cursors, exact-seek preroll from a preceding keyframe, and low-latency preview
-seeks to a following keyframe. Fragmented MP4, audio decoding, and encrypted
-media are not yet implemented.
+seeks to a following keyframe. The H.264 decoder additionally exposes
+forward-target retargeting and reusable decode-state checkpoints for
+interactive exact seeks. Fragmented MP4, audio decoding, and encrypted media
+are not yet implemented.
 
 ## Decoder Contract
 

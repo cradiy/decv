@@ -536,9 +536,28 @@ packet cursor does not need to move backward. A direct H.264 consumer can call
 its current sample. The decoder preserves parsed history, reference pictures,
 and display reordering, then filters pending output against the newer target.
 This reuses work already completed within the GOP. Moving the target backward
-still requires selecting a preceding sync sample and calling
-`flush_for_seek`, because previously suppressed pictures cannot be recreated
-from decoder state.
+requires either an older saved decoder checkpoint or selecting a preceding
+sync sample and calling `flush_for_seek`, because pictures suppressed after
+the retained state cannot be recreated from the current decoder state.
+
+An H.264 checkpoint must be paired with the exact cursor position immediately
+after its completed access unit:
+
+```rust,ignore
+let resume_sample = cursor.next_sample_index();
+let checkpoint = decoder.create_seek_checkpoint(maximum_consumed_pts)?;
+
+cursor.seek_to_sample(resume_sample)?;
+decoder.restore_seek_checkpoint(&checkpoint, new_target)?;
+```
+
+`PacketCursor::seek_to_sample` does not make an arbitrary non-sync sample
+independently decodable; it only restores the container half of the saved
+state. `maximum_consumed_pts` is an exclusive lower bound for future targets
+and must cover every packet already decoded when the checkpoint is created.
+A bounded sparse cache can retain several points within a long GOP. Each
+checkpoint clones compact state and `Arc` handles rather than complete
+reference pixels, although those handles keep their referenced pictures alive.
 
 ### Low-latency preview seek
 

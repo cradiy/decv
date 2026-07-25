@@ -155,6 +155,23 @@ where
         Ok(sample_index)
     }
 
+    /// Repositions the cursor to an exact sample boundary.
+    ///
+    /// Starting at an arbitrary non-sync sample is only decodable when the
+    /// codec state that precedes that sample is restored as well. This is
+    /// intended for pairing a saved cursor index with a decoder seek
+    /// checkpoint. The index one past the final sample is the valid EOF cursor.
+    pub fn seek_to_sample(&mut self, sample_index: usize) -> Result<()> {
+        if sample_index > self.track().samples().len() {
+            return Err(Mp4Error::IndexOutOfRange {
+                kind: "sample cursor",
+                index: sample_index,
+            });
+        }
+        self.next_sample_index = sample_index;
+        Ok(())
+    }
+
     #[inline]
     pub const fn rewind(&mut self) {
         self.next_sample_index = 0;
