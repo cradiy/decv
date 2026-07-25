@@ -121,7 +121,7 @@ with its exact next-sample cursor position:
 
 ```rust,ignore
 let resume_sample = cursor.next_sample_index();
-let checkpoint = decoder.create_seek_checkpoint(maximum_consumed_pts)?;
+let checkpoint = decoder.create_seek_checkpoint()?;
 
 // Later, for a target strictly after checkpoint.resume_time():
 cursor.seek_to_sample(resume_sample)?;
@@ -130,12 +130,14 @@ decoder.restore_seek_checkpoint(&checkpoint, target)?;
 
 Call `create_seek_checkpoint` only after feeding a complete access unit. It
 finishes that unit before snapshotting parser history, the DPB, and display
-reordering. `maximum_consumed_pts` must conservatively cover every access unit
-already supplied to the decoder; the restored target must be later. Reference
-pictures and motion fields are stored behind `Arc`, so checkpoint cloning does
-not copy full pixel planes. Checkpoints can still retain old reference
-pictures, so consumers should use a bounded, sparsely sampled cache rather
-than keeping one for every frame.
+reordering. The decoder derives `checkpoint.resume_time()` as the maximum PTS
+of every completed access unit, rather than trusting decode order to match
+presentation order. Every completed picture must therefore carry a PTS, and
+the restored target must be later than that bound. Reference pictures and
+motion fields are stored behind `Arc`, so checkpoint cloning does not copy full
+pixel planes. Checkpoints can still retain old reference pictures, so
+consumers should use a bounded, sparsely sampled cache rather than keeping one
+for every frame.
 
 For a low-latency scrub preview, callers may instead use
 `seek_to_nearest_keyframe`. That path begins at the independently decodable

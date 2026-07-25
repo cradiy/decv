@@ -2213,8 +2213,10 @@ Checkpoint creation finishes the current access unit and waits for any pending
 non-reference finalization. The snapshot then clones parameter-set and
 reference metadata plus `Arc` handles to immutable pixels and motion fields;
 it does not copy complete reference planes. The restore target must be strictly
-later than the checkpoint's conservative resume time. Consumers should retain
-a bounded sparse set because each checkpoint can keep reference pictures that
+later than the checkpoint's conservative resume time. The decoder derives that
+bound from the maximum PTS of every completed picture, so decode-ordered future
+references cannot make a B-frame checkpoint unsafe. Consumers should retain a
+bounded sparse set because each checkpoint can keep reference pictures that
 would otherwise leave the live DPB.
 
 A nine-pair native release test used the same 1440x2560, 60 fps long-GOP
@@ -2226,8 +2228,8 @@ the target.
 
 | Measurement | Independent exact seek | Checkpoint restore | Change |
 | --- | ---: | ---: | ---: |
-| First-frame median | 494.39 ms | 169.17 ms | -65.8% |
-| Checkpoint creation median | - | 0.63 ms | - |
+| First-frame median | 372.08 ms | 128.23 ms | -65.5% |
+| Checkpoint creation median | - | 0.49 ms | - |
 
 Execution order alternated, and each restored final frame matched the
 independent exact-seek CRC. A second, denser best-case checkpoint only 66.7 ms

@@ -56,6 +56,7 @@ struct PendingNonReferenceFinalization {
 #[derive(Debug, Clone, Copy)]
 struct SkippedNonReferencePicture {
     picture_order_count: i32,
+    pts: Option<MediaTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,6 +94,8 @@ pub struct H264Decoder {
     auto_executor_size: Option<Size>,
     reusable_workspace: Option<ReconstructionWorkspace>,
     pending_non_reference_finalizations: VecDeque<PendingNonReferenceFinalization>,
+    maximum_completed_pts: Option<MediaTime>,
+    completed_picture_missing_pts: bool,
 }
 
 /// A cheaply cloned H.264 decode-state snapshot for repeated exact seeks.
@@ -139,6 +142,8 @@ impl Default for H264Decoder {
             auto_executor_size: None,
             reusable_workspace: None,
             pending_non_reference_finalizations: VecDeque::new(),
+            maximum_completed_pts: None,
+            completed_picture_missing_pts: false,
         }
     }
 }
@@ -251,13 +256,12 @@ impl H264Decoder {
     /// Finishes the current access unit and snapshots the state needed to
     /// resume decoding from the following packet.
     ///
-    /// The caller must retain the matching container cursor position and pass
-    /// a conservative `resume_time` strictly earlier than every future
-    /// restore target. A checkpoint may be reused and cheaply cloned.
-    pub fn create_seek_checkpoint(
-        &mut self,
-        resume_time: MediaTime,
-    ) -> Result<H264SeekCheckpoint> {
+    /// The caller must retain the matching container cursor position. The
+    /// decoder derives a conservative presentation-time bound from every
+    /// completed access unit, including future reference pictures decoded
+    /// before earlier B pictures. A checkpoint may be reused and cheaply
+    /// cloned.
+    pub fn create_seek_checkpoint(&mut self) -> Result<H264SeekCheckpoint> {
         if !self.configured {
             return Err(H264Error::InvalidSyntax(
                 "H.264 decoder must be configured before checkpointing",
@@ -270,6 +274,14 @@ impl H264Decoder {
         }
         self.finish_current_picture()?;
         self.finish_pending_non_reference_finalizations(true)?;
+        if self.completed_picture_missing_pts {
+            return Err(H264Error::InvalidSyntax(
+                "H.264 seek checkpoint requires PTS on every completed picture",
+            ));
+        }
+        let resume_time = self.maximum_completed_pts.ok_or(H264Error::InvalidSyntax(
+            "H.264 seek checkpoint requires a completed picture",
+        ))?;
         let dpb = self.dpb.as_ref().ok_or(H264Error::InvalidSyntax(
             "H.264 seek checkpoint requires a decoded picture",
         ))?;
@@ -329,6 +341,8 @@ impl H264Decoder {
             self.announced_format = None;
         }
         self.output_start_time = Some(target);
+        self.maximum_completed_pts = Some(checkpoint.resume_time);
+        self.completed_picture_missing_pts = false;
         self.draining = false;
         Ok(())
     }
@@ -386,6 +400,7 @@ impl H264Decoder {
                         picture_order_count: picture_order_count
                             .stored
                             .picture_order_count(),
+                        pts: packet.pts,
                     });
                     return Ok(());
                 }
@@ -655,6 +670,7 @@ impl H264Decoder {
             {
                 self.queue_output_frame(frame)?;
             }
+            self.record_completed_picture_pts(skipped.pts);
             return Ok(());
         }
         let Some(picture) = self.current_picture.take() else {
@@ -671,7 +687,10 @@ impl H264Decoder {
                 .and_then(ReconstructionExecutor::pool)
                 .is_some()
         {
-            return self.dispatch_non_reference_finalization(picture);
+            let pts = picture.pts;
+            self.dispatch_non_reference_finalization(picture)?;
+            self.record_completed_picture_pts(pts);
+            return Ok(());
         }
         self.finish_pending_non_reference_finalizations(true)?;
         let (decoded, motion, reusable_workspace) = picture
@@ -726,7 +745,19 @@ impl H264Decoder {
         if let Some(frame) = self.reorder.push(picture_order_count, frame)?.flatten() {
             self.queue_output_frame(frame)?;
         }
+        self.record_completed_picture_pts(picture.pts);
         Ok(())
+    }
+
+    fn record_completed_picture_pts(&mut self, pts: Option<MediaTime>) {
+        let Some(pts) = pts else {
+            self.completed_picture_missing_pts = true;
+            return;
+        };
+        self.maximum_completed_pts = Some(
+            self.maximum_completed_pts
+                .map_or(pts, |maximum| maximum.max(pts)),
+        );
     }
 
     fn dispatch_non_reference_finalization(&mut self, picture: PendingPicture) -> Result<()> {
@@ -880,6 +911,8 @@ impl H264Decoder {
         self.announced_format = None;
         self.output_start_time = None;
         self.next_frame_id = 0;
+        self.maximum_completed_pts = None;
+        self.completed_picture_missing_pts = false;
         self.draining = false;
     }
 
@@ -891,6 +924,8 @@ impl H264Decoder {
         self.clear_dpb();
         self.outputs.clear();
         self.reorder.clear();
+        self.maximum_completed_pts = None;
+        self.completed_picture_missing_pts = false;
         self.draining = false;
     }
 
@@ -2109,11 +2144,7 @@ mod tests {
     fn seek_checkpoint_restores_an_earlier_target_without_redecoding_anchor() {
         let mut decoder = H264Decoder::new();
         decoder.configure(byte_stream_config()).unwrap();
-        assert!(
-            decoder
-                .create_seek_checkpoint(MediaTime::from_parts(0, 1).unwrap())
-                .is_err()
-        );
+        assert!(decoder.create_seek_checkpoint().is_err());
 
         let anchor_pts = MediaTime::from_parts(0, 1).unwrap();
         let later_target = MediaTime::from_parts(4, 1).unwrap();
@@ -2130,7 +2161,7 @@ mod tests {
             decoder.send_packet(anchor).unwrap(),
             DecodeInputStatus::Accepted
         ));
-        let checkpoint = decoder.create_seek_checkpoint(anchor_pts).unwrap();
+        let checkpoint = decoder.create_seek_checkpoint().unwrap();
         assert_eq!(checkpoint.resume_time(), anchor_pts);
         assert!(
             decoder
@@ -2158,6 +2189,8 @@ mod tests {
             decoder.send_packet(b_picture.clone()).unwrap(),
             DecodeInputStatus::Accepted
         ));
+        let reordered_checkpoint = decoder.create_seek_checkpoint().unwrap();
+        assert_eq!(reordered_checkpoint.resume_time(), later_target);
         decoder.drain().unwrap();
         assert!(matches!(
             decoder.receive_frame().unwrap(),
@@ -2223,7 +2256,7 @@ mod tests {
             decoder.outputs.front(),
             Some(DecodeOutput::FormatChanged(_))
         ));
-        let checkpoint = decoder.create_seek_checkpoint(anchor_pts).unwrap();
+        let checkpoint = decoder.create_seek_checkpoint().unwrap();
 
         let selected_pts = MediaTime::from_parts(2, 1).unwrap();
         decoder
@@ -2246,6 +2279,41 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::Frame(frame) if frame.pts == Some(selected_pts)
         ));
+    }
+
+    #[test]
+    fn seek_checkpoint_requires_complete_pts_history_and_flush_resets_it() {
+        let mut decoder = H264Decoder::new();
+        decoder.configure(byte_stream_config()).unwrap();
+        assert!(matches!(
+            decoder
+                .send_packet(EncodedVideoPacket::new(annex_b_stream(&[
+                    (0x67, single_macroblock_sps_rbsp()),
+                    (0x68, single_macroblock_pps_rbsp()),
+                    (0x65, single_macroblock_idr_rbsp()),
+                    (0x09, vec![0x10]),
+                ])))
+                .unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert!(decoder.create_seek_checkpoint().is_err());
+
+        let pts = MediaTime::from_parts(0, 1).unwrap();
+        decoder.flush_for_seek(pts);
+        let mut timestamped = EncodedVideoPacket::new(annex_b_stream(&[
+            (0x65, single_macroblock_idr_rbsp()),
+            (0x09, vec![0x10]),
+        ]));
+        timestamped.pts = Some(pts);
+        timestamped.discontinuity = true;
+        assert!(matches!(
+            decoder.send_packet(timestamped).unwrap(),
+            DecodeInputStatus::Accepted
+        ));
+        assert_eq!(
+            decoder.create_seek_checkpoint().unwrap().resume_time(),
+            pts
+        );
     }
 
     #[test]

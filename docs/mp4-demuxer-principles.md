@@ -545,7 +545,7 @@ after its completed access unit:
 
 ```rust,ignore
 let resume_sample = cursor.next_sample_index();
-let checkpoint = decoder.create_seek_checkpoint(maximum_consumed_pts)?;
+let checkpoint = decoder.create_seek_checkpoint()?;
 
 cursor.seek_to_sample(resume_sample)?;
 decoder.restore_seek_checkpoint(&checkpoint, new_target)?;
@@ -553,9 +553,10 @@ decoder.restore_seek_checkpoint(&checkpoint, new_target)?;
 
 `PacketCursor::seek_to_sample` does not make an arbitrary non-sync sample
 independently decodable; it only restores the container half of the saved
-state. `maximum_consumed_pts` is an exclusive lower bound for future targets
-and must cover every packet already decoded when the checkpoint is created.
-A bounded sparse cache can retain several points within a long GOP. Each
+state. The decoder computes `checkpoint.resume_time()` as an exclusive lower
+bound from the maximum PTS of all completed pictures, including future
+reference pictures encountered before earlier B pictures in decode order. A
+bounded sparse cache can retain several points within a long GOP. Each
 checkpoint clones compact state and `Arc` handles rather than complete
 reference pixels, although those handles keep their referenced pictures alive.
 

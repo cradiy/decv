@@ -272,7 +272,7 @@ fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
         decoder.send_packet(anchor).unwrap(),
         DecodeInputStatus::Accepted
     ));
-    let checkpoint = decoder.create_seek_checkpoint(anchor_time).unwrap();
+    let checkpoint = decoder.create_seek_checkpoint().unwrap();
     let resume_sample = cursor.next_sample_index();
     let remaining_packets = std::iter::from_fn(|| cursor.next_packet().transpose())
         .collect::<Result<Vec<_>, _>>()
