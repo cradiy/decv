@@ -2314,6 +2314,28 @@ neutral instructions and branches. Outlining is useful here because a measured
 dominant fast return already exists; earlier attempts to split work without
 such a dominant branch remained correctly rejected.
 
+## Zero-Motion Integer Macroblock Copy
+
+The long-GOP exact-seek source resolves most full-macroblock P and B
+predictions to zero motion. The existing integer-copy path still repeated
+motion divisibility, signed-coordinate conversion, interpolation-window, and
+reference-bound checks for both reference lists after the reconstruction layer
+had already validated the current macroblock and matching coded sizes.
+
+Full-macroblock reconstruction now dispatches zero motion to a narrow internal
+copy primitive after those shared checks. The general integer-motion path
+retains its complete validation for non-zero vectors and independent callers.
+On the 1440x2560, 60 fps seek source, eleven steady alternating native pairs
+reduced mean first-frame time at 3.3 seconds from about 1.006 to 0.988 seconds;
+ten of eleven pairs improved. Adjacent eight-run hardware-counter means reduced
+task-clock by 3.7%, cycles by 3.8%, instructions by 2.5%, branches by 2.1%,
+and sampled cache misses by 3.9%. The formerly 9.6% generic integer-copy
+symbol fell below the four-percent reporting threshold.
+
+The complete H.264 unit suite passed, and six selected output frames retained
+the baseline SHA-256
+`a1e90f9a5397f984d5b89eec46d9b73cef279bdb53db783156475db10fba32fb`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

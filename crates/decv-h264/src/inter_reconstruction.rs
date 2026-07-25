@@ -368,28 +368,58 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
             &mut prediction_l0.cb,
             &mut prediction_l0.cr,
         );
-        let copied_l0 = reference_l0.try_copy_integer_macroblock_420_into(
-            macroblock_x,
-            macroblock_y,
-            list0.motion_vector,
-            luma_l0,
-            cb_l0,
-            cr_l0,
-        )?;
+        let copied_l0 = if list0.motion_vector.x == 0 && list0.motion_vector.y == 0 {
+            // SAFETY: current-picture bounds and matching reference coded
+            // sizes were validated above. Scratch storage is independent.
+            unsafe {
+                reference_l0.copy_zero_motion_macroblock_420_into_unchecked(
+                    macroblock_x,
+                    macroblock_y,
+                    luma_l0,
+                    cb_l0,
+                    cr_l0,
+                );
+            }
+            true
+        } else {
+            reference_l0.try_copy_integer_macroblock_420_into(
+                macroblock_x,
+                macroblock_y,
+                list0.motion_vector,
+                luma_l0,
+                cb_l0,
+                cr_l0,
+            )?
+        };
         let copied_l1 = if copied_l0 {
             let (luma_l1, cb_l1, cr_l1) = (
                 &mut prediction_l1.luma,
                 &mut prediction_l1.cb,
                 &mut prediction_l1.cr,
             );
-            reference_l1.try_copy_integer_macroblock_420_into(
-                macroblock_x,
-                macroblock_y,
-                list1.motion_vector,
-                luma_l1,
-                cb_l1,
-                cr_l1,
-            )?
+            if list1.motion_vector.x == 0 && list1.motion_vector.y == 0 {
+                // SAFETY: the same geometry and ownership guarantees as List
+                // 0 apply to the second immutable reference picture.
+                unsafe {
+                    reference_l1.copy_zero_motion_macroblock_420_into_unchecked(
+                        macroblock_x,
+                        macroblock_y,
+                        luma_l1,
+                        cb_l1,
+                        cr_l1,
+                    );
+                }
+                true
+            } else {
+                reference_l1.try_copy_integer_macroblock_420_into(
+                    macroblock_x,
+                    macroblock_y,
+                    list1.motion_vector,
+                    luma_l1,
+                    cb_l1,
+                    cr_l1,
+                )?
+            }
         } else {
             false
         };
@@ -1246,8 +1276,23 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
                 "P reference picture coded size does not match",
             ));
         }
-        if default_weights
-            && reference.try_copy_integer_macroblock_420_into(
+        let copied = if !default_weights {
+            false
+        } else if partition.motion_vector.x == 0 && partition.motion_vector.y == 0 {
+            // SAFETY: current-picture bounds and matching reference coded
+            // sizes were validated above. Staging storage is independent.
+            unsafe {
+                reference.copy_zero_motion_macroblock_420_into_unchecked(
+                    macroblock_x,
+                    macroblock_y,
+                    predicted_luma,
+                    predicted_cb,
+                    predicted_cr,
+                );
+            }
+            true
+        } else {
+            reference.try_copy_integer_macroblock_420_into(
                 macroblock_x,
                 macroblock_y,
                 partition.motion_vector,
@@ -1255,7 +1300,8 @@ pub(crate) fn reconstruct_p_macroblock_pixels_from_list_into_with_scratch(
                 predicted_cb,
                 predicted_cr,
             )?
-        {
+        };
+        if copied {
             if let Some(residual) = residual {
                 add_inter_residual_to_prediction(
                     predicted_luma,

@@ -212,6 +212,20 @@ impl Yuv420Picture {
                 "inter prediction macroblock lies outside the current picture",
             ));
         }
+        if motion_x == 0 && motion_y == 0 {
+            // SAFETY: the complete current rectangle was validated above.
+            // Zero motion selects that same rectangle in this reference.
+            unsafe {
+                self.copy_zero_motion_macroblock_420_into_unchecked(
+                    macroblock_x,
+                    macroblock_y,
+                    predicted_luma,
+                    predicted_cb,
+                    predicted_cr,
+                );
+            }
+            return Ok(true);
+        }
         let reference_luma_x = usize_to_i32(current_x)? + motion_x.div_euclid(4);
         let reference_luma_y = usize_to_i32(current_y)? + motion_y.div_euclid(4);
         if !interpolation_window_is_inside(
@@ -283,6 +297,55 @@ impl Yuv420Picture {
             );
         }
         Ok(true)
+    }
+
+    /// Copies the same-position reference macroblock after the caller has
+    /// validated current-picture geometry and matching coded sizes.
+    ///
+    /// # Safety
+    ///
+    /// `(macroblock_x, macroblock_y)` must select a complete 16x16 macroblock
+    /// inside this picture. Destination planes must not alias this immutable
+    /// reference picture.
+    #[inline]
+    pub(crate) unsafe fn copy_zero_motion_macroblock_420_into_unchecked(
+        &self,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        predicted_luma: &mut [[u8; 16]; 16],
+        predicted_cb: &mut [[u8; 8]; 8],
+        predicted_cr: &mut [[u8; 8]; 8],
+    ) {
+        let (picture_width, picture_height) = self.dimensions();
+        let current_x = macroblock_x * 16;
+        let current_y = macroblock_y * 16;
+        debug_assert!(current_x + 16 <= picture_width);
+        debug_assert!(current_y + 16 <= picture_height);
+
+        let chroma_width = picture_width / 2;
+        let (luma, cb, cr) = self.planes();
+        let luma_source = current_y * picture_width + current_x;
+        let chroma_source = (current_y / 2) * chroma_width + current_x / 2;
+        unsafe {
+            copy_fixed_rows::<16, 16>(
+                predicted_luma.as_mut_ptr().cast(),
+                luma.as_ptr().add(luma_source),
+                picture_width,
+                16,
+            );
+            copy_fixed_rows::<8, 8>(
+                predicted_cb.as_mut_ptr().cast(),
+                cb.as_ptr().add(chroma_source),
+                chroma_width,
+                8,
+            );
+            copy_fixed_rows::<8, 8>(
+                predicted_cr.as_mut_ptr().cast(),
+                cr.as_ptr().add(chroma_source),
+                chroma_width,
+                8,
+            );
+        }
     }
 }
 
@@ -1792,6 +1855,30 @@ mod tests {
                     1,
                     1,
                     partition.motion_vector,
+                    &mut luma,
+                    &mut cb,
+                    &mut cr,
+                )
+                .unwrap()
+        );
+        assert_eq!(luma, expected.luma);
+        assert_eq!(cb, expected.cb);
+        assert_eq!(cr, expected.cr);
+
+        let zero_partition = ResolvedPPartition {
+            motion_vector: MotionVector { x: 0, y: 0 },
+            ..partition
+        };
+        let expected = picture.predict_inter_420(1, 1, zero_partition).unwrap();
+        luma.fill([0xa5; 16]);
+        cb.fill([0xa5; 8]);
+        cr.fill([0xa5; 8]);
+        assert!(
+            picture
+                .try_copy_integer_macroblock_420_into(
+                    1,
+                    1,
+                    zero_partition.motion_vector,
                     &mut luma,
                     &mut cb,
                     &mut cr,
