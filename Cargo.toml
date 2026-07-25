@@ -8,6 +8,7 @@ members = [
   "crates/decv-core",
   "crates/decv-h264",
   "crates/decv-mp4",
+  "crates/decv-network",
 ]
 [workspace.package]
 publish = false

@@ -3,8 +3,12 @@ name = "decv"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+network = ["dep:decv-network"]
+
 [dependencies]
 decv-audio = { path = "../decv-audio" }
 decv-core = { path = "../decv-core" }
 decv-h264 = { path = "../decv-h264" }
 decv-mp4 = { path = "../decv-mp4" }
+decv-network = { path = "../decv-network", optional = true }

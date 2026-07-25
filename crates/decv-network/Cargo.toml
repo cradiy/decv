@@ -1,0 +1,17 @@
+[package]
+name = "decv-network"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[features]
+default = ["http"]
+http = ["dep:ureq"]
+
+[dependencies]
+decv-core = { path = "../decv-core" }
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"], optional = true }
+
+[dev-dependencies]
+decv-mp4 = { path = "../decv-mp4" }

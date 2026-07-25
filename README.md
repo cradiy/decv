@@ -12,6 +12,7 @@ The workspace provides deterministic media primitives:
 - synchronous `Send` decoder objects with no async-runtime dependency;
 - random-access input implemented for files and memory and extensible to other
   storage sources;
+- optional cached HTTP Range input for known-length remote MP4 files;
 - explicit errors for unsupported, corrupt, and truncated input;
 - byte-exact software reconstruction with bounded decoder state.
 
@@ -27,6 +28,7 @@ the `0.1.0` crates as a complete H.264 conformance implementation.
 | `decv-core` | Codec-independent time, audio/video packet, frame, input, and synchronous decoder contracts |
 | `decv-h264` | Pure-Rust H.264 parsing, reconstruction, deblocking, DPB management, and NV12 output |
 | `decv-mp4` | Synchronous random-access MP4 parsing, audio/video sample indexing, packet timestamps, and seek |
+| `decv-network` | Optional strict HTTP Range input and reusable bounded range cache |
 | `bit-readers` | Allocation-free MSB-first bit reading and Exp-Golomb primitives |
 | `decv-cli` | Annex-B/MP4 decoding, seek, verification, and benchmark command |
 
@@ -121,6 +123,8 @@ that planes are adjacent or tightly packed.
 
 See [Consumer API boundary](docs/consumer-api.md) for the supported facade,
 packet backpressure loop, seek lifecycle, and frame ownership rules.
+See [Network media input](docs/network-input.md) for remote MP4 boundaries and
+the optional `network` feature.
 
 ## Basic Use
 
@@ -216,3 +220,4 @@ independent native binaries are measured on the same inputs.
 - [H.264 reconstruction parallelism](docs/h264-parallel-decoding-plan.md)
 - [MP4 demuxer principles](docs/mp4-demuxer-principles.md)
 - [Audio decoder principles](docs/audio-decoder-principles.md)
+- [Network media input](docs/network-input.md)

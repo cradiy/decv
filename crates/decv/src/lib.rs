@@ -26,6 +26,11 @@ pub use decv_mp4::{
     AacSampleEntry, AudioPacketCursor, FourCc, Movie, Mp4Demuxer, Mp4Error, PacketCursor, Sample,
     SampleDescription, Track, TrackKind,
 };
+#[cfg(feature = "network")]
+pub use decv_network::{
+    CachedRangeInput, HttpRangeInput, HttpRangeInputBuilder, RangeCacheConfig, RangeCacheStats,
+    RangeFetcher, RangeInputStats,
+};
 pub use seek::{
     H264Mp4InteractiveSeekOutcome, H264Mp4SeekController, H264Mp4SeekError, H264Mp4SeekOutcome,
     H264Mp4SeekPlan, H264Mp4SeekSource,
