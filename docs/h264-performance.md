@@ -1906,6 +1906,31 @@ The six-frame post-seek suffix retained SHA-256
 and the complete native H.264 and MP4 verification corpora remained
 byte-exact.
 
+## Entropy-Selective CAVLC State
+
+The picture reconstructor previously allocated CAVLC neighbour grids for every
+picture, including CABAC pictures that cannot use them. A 4K picture's luma
+and two chroma coefficient grids contain 783,360 `u32` entries, about 3.0 MiB
+of zeroed state. Reconstruction now selects the state from the active PPS:
+CAVLC pictures retain the original fully allocated concrete state, while
+CABAC pictures construct the same concrete type with inactive, allocation-free
+grids. The CABAC-only constructor is kept out of line so the CAVLC decode hot
+path gains neither an `Option` branch nor a changed field representation.
+
+After retraining the mixed CABAC/CAVLC PGO profile, nine 4K counter runs
+reduced task-clock by 1.9%, cycles by 2.0%, wall time by 2.2%, and page faults
+by 10.1%. Eleven long-GOP exact-seek runs reduced task-clock by 2.7%, cycles by
+1.7%, wall time by 3.4%, and page faults by 18.1%. Instructions were neutral
+in both workloads. A separate fifteen-run, fixed-CPU serial CAVLC comparison
+also remained instruction-neutral while reducing task-clock by 2.8%, cycles
+by 1.8%, and wall time by 2.4%; this guards against improving CABAC by taxing
+the other entropy mode.
+
+The complete 48-frame 4K output and six-frame exact-seek suffix retained their
+respective SHA-256 hashes
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534` and
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

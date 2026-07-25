@@ -381,9 +381,11 @@ impl IntraPictureReconstructor {
             ReconstructionExecutor::serial(),
             None,
             true,
+            true,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_executor(
         coded_size: Size,
         scaling_lists: ResolvedScalingLists4x4,
@@ -391,6 +393,7 @@ impl IntraPictureReconstructor {
         constrained_intra_prediction: bool,
         reconstruction_executor: ReconstructionExecutor,
         reusable_workspace: Option<ReconstructionWorkspace>,
+        retain_cavlc_state: bool,
         retain_reference_motion: bool,
     ) -> Result<Self> {
         let picture = Yuv420Picture::new(coded_size)?;
@@ -412,10 +415,15 @@ impl IntraPictureReconstructor {
         } else {
             MotionFieldBuilder::new_discarding(coded_size)?
         };
+        let cavlc = if retain_cavlc_state {
+            CavlcNeighborState::new(coded_size.width / 16, coded_size.height / 16)?
+        } else {
+            CavlcNeighborState::new_inactive(coded_size.width / 16, coded_size.height / 16)?
+        };
         Ok(Self {
             width_in_macroblocks,
             picture,
-            cavlc: CavlcNeighborState::new(coded_size.width / 16, coded_size.height / 16)?,
+            cavlc,
             cabac_residual: workspace.cabac_residual,
             modes: workspace.modes,
             motion: workspace.motion,
@@ -473,6 +481,7 @@ impl IntraPictureReconstructor {
             pps.constrained_intra_prediction,
             reconstruction_executor,
             reusable_workspace,
+            pps.entropy_coding_mode == EntropyCodingMode::Cavlc,
             retain_reference_motion,
         )
     }
@@ -3545,6 +3554,7 @@ mod tests {
         IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer,
         MotionVector, PcmMacroblock, ResidualBlock, ResolvedBListMotion, ResolvedBMacroblock,
         ResolvedBPartition, ResolvedPMacroblock, ResolvedPPartition, resolve_scaling_lists_4x4,
+        resolve_scaling_lists_8x8,
     };
 
     const PREDICTED_MODE: IntraPredictionModeSyntax = IntraPredictionModeSyntax {
@@ -3835,6 +3845,23 @@ mod tests {
             error,
             H264Error::InvalidSyntax("cannot output an incomplete reconstructed picture")
         );
+    }
+
+    #[test]
+    fn cabac_picture_can_omit_the_cavlc_neighbor_grid() {
+        let cabac = IntraPictureReconstructor::new_with_executor(
+            Size::new(16, 16),
+            resolve_scaling_lists_4x4(None, None).unwrap(),
+            resolve_scaling_lists_8x8(None, None).unwrap(),
+            false,
+            crate::parallelism::ReconstructionExecutor::serial(),
+            None,
+            false,
+            true,
+        )
+        .unwrap();
+        assert!(!cabac.cavlc.has_backing_storage());
+        assert!(reconstructor(Size::new(16, 16)).cavlc.has_backing_storage());
     }
 
     fn constant_picture(value: u8) -> crate::Yuv420Picture {

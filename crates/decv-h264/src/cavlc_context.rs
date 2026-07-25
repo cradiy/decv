@@ -100,6 +100,14 @@ impl BlockGrid {
     fn clear(&mut self) {
         self.entries.fill(0);
     }
+
+    fn inactive(width: usize, height: usize) -> Self {
+        Self {
+            width,
+            height,
+            entries: Vec::new(),
+        }
+    }
 }
 
 /// Per-picture CAVLC context state for 4:2:0 streams.
@@ -147,6 +155,45 @@ impl CavlcNeighborState {
             chroma_cb: BlockGrid::new(chroma_width, chroma_height)?,
             chroma_cr: BlockGrid::new(chroma_width, chroma_height)?,
         })
+    }
+
+    #[inline(never)]
+    pub(crate) fn new_inactive(width_in_mbs: u32, height_in_mbs: u32) -> Result<Self> {
+        let width_in_mbs = usize::try_from(width_in_mbs).map_err(|_| H264Error::IntegerOverflow)?;
+        let height_in_mbs =
+            usize::try_from(height_in_mbs).map_err(|_| H264Error::IntegerOverflow)?;
+        if width_in_mbs == 0 || height_in_mbs == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "CAVLC context dimensions must be non-zero",
+            ));
+        }
+        let luma_width = width_in_mbs
+            .checked_mul(4)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let luma_height = height_in_mbs
+            .checked_mul(4)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let chroma_width = width_in_mbs
+            .checked_mul(2)
+            .ok_or(H264Error::IntegerOverflow)?;
+        let chroma_height = height_in_mbs
+            .checked_mul(2)
+            .ok_or(H264Error::IntegerOverflow)?;
+        Ok(Self {
+            width_in_mbs,
+            height_in_mbs,
+            slice_id: 0,
+            luma: BlockGrid::inactive(luma_width, luma_height),
+            chroma_cb: BlockGrid::inactive(chroma_width, chroma_height),
+            chroma_cr: BlockGrid::inactive(chroma_width, chroma_height),
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_backing_storage(&self) -> bool {
+        !self.luma.entries.is_empty()
+            && !self.chroma_cb.entries.is_empty()
+            && !self.chroma_cr.entries.is_empty()
     }
 
     /// Starts a new slice and invalidates cross-slice neighbour availability.
