@@ -5,9 +5,10 @@ use decv::{
     AudioDecoderConfig, BitstreamFormat, ChannelLayout, ColorInfo, ColorMatrix, ColorPrimaries,
     ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput, DecodedVideoFrame,
     EncodedAudioPacket, EncodedVideoPacket, FourCc, FrameStorage, H264Decoder, H264Error,
-    H264Mp4SeekController, H264Mp4SeekOutcome, H264Parallelism, H264SeekCheckpointCache, MediaTime,
-    Mp4Demuxer, PcmCodec, PixelFormat, Rect, Size, SoftwareAudioDecoder, TransferFunction,
-    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+    H264Mp4InteractiveSeekOutcome, H264Mp4SeekController, H264Mp4SeekOutcome, H264Mp4SeekSource,
+    H264Parallelism, H264SeekCheckpointCache, MediaTime, Mp4Demuxer, PcmCodec, PixelFormat, Rect,
+    Size, SoftwareAudioDecoder, TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig,
+    VideoFormat,
 };
 
 fn accepts_consumer_decoder<D>(decoder: &mut D)
@@ -393,6 +394,13 @@ fn facade_controller_selects_keyframe_checkpoint_and_forward_retarget() {
     let mut seeks = H264Mp4SeekController::new(track_index, 4, 128 * 1024 * 1024);
 
     let final_target = MediaTime::from_parts(1024, 15_360).unwrap();
+    let cold_plan = seeks
+        .plan_exact_seek(&cursor, final_target, false)
+        .unwrap();
+    assert_eq!(cold_plan.source(), H264Mp4SeekSource::Keyframe);
+    assert_eq!(cold_plan.resume_sample_index(), 0);
+    assert_eq!(cold_plan.selected_sample_index(), Some(1));
+    assert_eq!(cold_plan.estimated_input_samples(), 3);
     let cold = seeks
         .begin_exact_seek(&mut decoder, &mut cursor, final_target, false)
         .unwrap();
@@ -414,6 +422,13 @@ fn facade_controller_selects_keyframe_checkpoint_and_forward_retarget() {
     );
 
     let earlier_target = MediaTime::from_parts(512, 15_360).unwrap();
+    let checkpoint_plan = seeks
+        .plan_exact_seek(&cursor, earlier_target, false)
+        .unwrap();
+    assert_eq!(checkpoint_plan.source(), H264Mp4SeekSource::Checkpoint);
+    assert_eq!(checkpoint_plan.resume_sample_index(), 1);
+    assert_eq!(checkpoint_plan.selected_sample_index(), Some(2));
+    assert_eq!(checkpoint_plan.estimated_input_samples(), 2);
     let restored = seeks
         .begin_exact_seek(&mut decoder, &mut cursor, earlier_target, false)
         .unwrap();
@@ -421,6 +436,15 @@ fn facade_controller_selects_keyframe_checkpoint_and_forward_retarget() {
     assert!(!restored.requires_discontinuity());
     assert_eq!(cursor.next_sample_index(), 1);
 
+    let forward_plan = seeks
+        .plan_exact_seek(&cursor, final_target, true)
+        .unwrap();
+    assert_eq!(
+        forward_plan.source(),
+        H264Mp4SeekSource::ForwardRetarget
+    );
+    assert_eq!(forward_plan.resume_sample_index(), 1);
+    assert_eq!(forward_plan.estimated_input_samples(), 2);
     let retargeted = seeks
         .begin_exact_seek(&mut decoder, &mut cursor, final_target, true)
         .unwrap();
@@ -447,14 +471,38 @@ fn facade_controller_uses_a_discontinuous_keyframe_for_preview() {
     let mut seeks = H264Mp4SeekController::new(track_index, 2, 64 * 1024 * 1024);
 
     let target = MediaTime::from_parts(512, 15_360).unwrap();
-    assert_eq!(
-        seeks
-            .begin_nearest_preview(&mut decoder, &mut cursor, target)
-            .unwrap(),
-        0
-    );
+    let preview = seeks
+        .begin_interactive_seek(&mut decoder, &mut cursor, target, false, 2)
+        .unwrap();
+    let H264Mp4InteractiveSeekOutcome::Preview {
+        exact_plan,
+        sample_index,
+    } = preview
+    else {
+        panic!("three input samples should exceed the interactive budget");
+    };
+    assert_eq!(sample_index, 0);
+    assert_eq!(exact_plan.source(), H264Mp4SeekSource::Keyframe);
+    assert_eq!(exact_plan.estimated_input_samples(), 3);
+    assert!(!preview.is_exact());
+    assert!(preview.requires_discontinuity());
     assert_eq!(cursor.next_sample_index(), 0);
     assert_eq!(seeks.active_exact_target(), None);
+
+    let cheap_target = MediaTime::from_parts(0, 15_360).unwrap();
+    let exact = seeks
+        .begin_interactive_seek(&mut decoder, &mut cursor, cheap_target, false, 1)
+        .unwrap();
+    assert!(matches!(
+        exact,
+        H264Mp4InteractiveSeekOutcome::Exact {
+            outcome: H264Mp4SeekOutcome::Keyframe { sample_index: 0 },
+            ..
+        }
+    ));
+    assert!(exact.is_exact());
+    assert!(exact.requires_discontinuity());
+    assert_eq!(exact.exact_plan().estimated_input_samples(), 1);
 }
 
 #[test]

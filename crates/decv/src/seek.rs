@@ -2,7 +2,68 @@ use std::{fmt, num::NonZeroUsize};
 
 use decv_core::{MediaInput, MediaTime, VideoDecoder};
 use decv_h264::{H264Decoder, H264Error, H264SeekCheckpointCache};
-use decv_mp4::{Mp4Error, PacketCursor};
+use decv_mp4::{Mp4Error, PacketCursor, Track};
+
+/// Decoder state from which an exact H.264 MP4 seek will resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum H264Mp4SeekSource {
+    ForwardRetarget,
+    Checkpoint,
+    Keyframe,
+}
+
+impl H264Mp4SeekSource {
+    pub const fn requires_discontinuity(self) -> bool {
+        matches!(self, Self::Keyframe)
+    }
+}
+
+/// Read-only cost estimate for an exact H.264 MP4 seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct H264Mp4SeekPlan {
+    source: H264Mp4SeekSource,
+    resume_sample_index: usize,
+    selected_sample_index: Option<usize>,
+    estimated_input_samples: usize,
+}
+
+impl H264Mp4SeekPlan {
+    pub const fn source(self) -> H264Mp4SeekSource {
+        self.source
+    }
+
+    /// First compressed sample used by the selected resume strategy.
+    pub const fn resume_sample_index(self) -> usize {
+        self.resume_sample_index
+    }
+
+    /// Presentation-first sample at or after the requested target.
+    ///
+    /// `None` means the target has no following presentation sample and an
+    /// exact seek would consume the remaining input without producing a frame.
+    pub const fn selected_sample_index(self) -> Option<usize> {
+        self.selected_sample_index
+    }
+
+    /// Estimated number of compressed samples needed before selected output.
+    ///
+    /// This includes decode-ordered B pictures needed to release the selected
+    /// frame from presentation reordering. Zero means retained decoder output
+    /// may already satisfy the newer forward target without additional input.
+    pub const fn estimated_input_samples(self) -> usize {
+        self.estimated_input_samples
+    }
+
+    pub const fn requires_discontinuity(self) -> bool {
+        self.source.requires_discontinuity()
+    }
+
+    /// Whether an interactive seek should use a keyframe preview instead.
+    pub const fn exceeds_exact_sample_budget(self, maximum_input_samples: usize) -> bool {
+        self.selected_sample_index.is_none() || self.estimated_input_samples > maximum_input_samples
+    }
+}
 
 /// The decoder/container state selected for an exact H.264 MP4 seek.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,12 +78,72 @@ pub enum H264Mp4SeekOutcome {
 }
 
 impl H264Mp4SeekOutcome {
+    pub const fn source(self) -> H264Mp4SeekSource {
+        match self {
+            Self::ForwardRetarget => H264Mp4SeekSource::ForwardRetarget,
+            Self::Checkpoint { .. } => H264Mp4SeekSource::Checkpoint,
+            Self::Keyframe { .. } => H264Mp4SeekSource::Keyframe,
+        }
+    }
+
     /// Whether the first packet after the seek must be marked discontinuous.
     ///
     /// A checkpoint and a forward retarget preserve the decoder timeline.
     /// Marking their next packet discontinuous would discard the retained DPB.
     pub const fn requires_discontinuity(self) -> bool {
-        matches!(self, Self::Keyframe { .. })
+        self.source().requires_discontinuity()
+    }
+}
+
+/// Result of a budget-aware seek intended for pointer scrubbing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum H264Mp4InteractiveSeekOutcome {
+    /// The estimated input work fit the supplied budget.
+    Exact {
+        plan: H264Mp4SeekPlan,
+        outcome: H264Mp4SeekOutcome,
+    },
+    /// Exact work exceeded the budget, so the cursor selected a nearby sync
+    /// sample for immediate approximate presentation.
+    Preview {
+        exact_plan: H264Mp4SeekPlan,
+        sample_index: usize,
+    },
+}
+
+impl H264Mp4InteractiveSeekOutcome {
+    pub const fn exact_plan(self) -> H264Mp4SeekPlan {
+        match self {
+            Self::Exact { plan, .. } => plan,
+            Self::Preview { exact_plan, .. } => exact_plan,
+        }
+    }
+
+    pub const fn is_exact(self) -> bool {
+        matches!(self, Self::Exact { .. })
+    }
+
+    pub const fn exact_outcome(self) -> Option<H264Mp4SeekOutcome> {
+        match self {
+            Self::Exact { outcome, .. } => Some(outcome),
+            Self::Preview { .. } => None,
+        }
+    }
+
+    pub const fn preview_sample_index(self) -> Option<usize> {
+        match self {
+            Self::Exact { .. } => None,
+            Self::Preview { sample_index, .. } => Some(sample_index),
+        }
+    }
+
+    /// Whether the first packet after this operation must be discontinuous.
+    pub const fn requires_discontinuity(self) -> bool {
+        match self {
+            Self::Exact { outcome, .. } => outcome.requires_discontinuity(),
+            Self::Preview { .. } => true,
+        }
     }
 }
 
@@ -161,6 +282,66 @@ impl H264Mp4SeekController {
         self.minimum_checkpoint_sample_distance
     }
 
+    /// Estimates the resume source and compressed-input work for an exact seek
+    /// without modifying the decoder, cursor, cache recency, or active target.
+    pub fn plan_exact_seek<I>(
+        &self,
+        cursor: &PacketCursor<'_, I>,
+        target: MediaTime,
+        allow_forward_retarget: bool,
+    ) -> Result<H264Mp4SeekPlan, H264Mp4SeekError>
+    where
+        I: MediaInput,
+    {
+        self.ensure_track(cursor)?;
+
+        let track = cursor.track();
+        let keyframe_sample_index = track
+            .keyframe_at_or_before(target)?
+            .ok_or(H264Mp4SeekError::NoKeyframeBeforeTarget)?;
+        let forward_sample_index = (allow_forward_retarget
+            && self
+                .active_exact_target
+                .is_some_and(|current| target > current))
+        .then(|| cursor.next_sample_index());
+        let checkpoint_sample_index = self
+            .checkpoints
+            .latest_before(target)
+            .map(|entry| *entry.input_position());
+        let source = select_exact_seek_source(
+            keyframe_sample_index,
+            checkpoint_sample_index,
+            forward_sample_index,
+        );
+        let resume_sample_index = match source {
+            ExactSeekSource::Forward => {
+                forward_sample_index.expect("forward source requires an active cursor")
+            }
+            ExactSeekSource::Checkpoint => {
+                checkpoint_sample_index.expect("checkpoint source requires a cache entry")
+            }
+            ExactSeekSource::Keyframe => keyframe_sample_index,
+        };
+        let target_sample = estimate_target_sample(track, keyframe_sample_index, target)?;
+        let estimated_input_samples = target_sample.map_or_else(
+            || track.samples().len().saturating_sub(resume_sample_index),
+            |target| {
+                if resume_sample_index > target.required_decode_sample_index {
+                    0
+                } else {
+                    target.required_decode_sample_index - resume_sample_index + 1
+                }
+            },
+        );
+
+        Ok(H264Mp4SeekPlan {
+            source: source.public(),
+            resume_sample_index,
+            selected_sample_index: target_sample.map(|target| target.selected_sample_index),
+            estimated_input_samples,
+        })
+    }
+
     /// Captures the decoder state after the most recently accepted MP4 sample.
     ///
     /// The cursor's next sample index is stored atomically with the checkpoint.
@@ -206,36 +387,58 @@ impl H264Mp4SeekController {
     where
         I: MediaInput,
     {
-        self.ensure_track(cursor)?;
+        let plan = self.plan_exact_seek(cursor, target, allow_forward_retarget)?;
+        self.execute_exact_seek_plan(decoder, cursor, target, plan)
+    }
 
-        let keyframe_sample_index = cursor
-            .track()
-            .keyframe_at_or_before(target)?
-            .ok_or(H264Mp4SeekError::NoKeyframeBeforeTarget)?;
-        let forward_sample_index = (allow_forward_retarget
-            && self
-                .active_exact_target
-                .is_some_and(|current| target > current))
-        .then(|| cursor.next_sample_index());
-        let checkpoint_sample_index = self
-            .checkpoints
-            .latest_before(target)
-            .map(|entry| *entry.input_position());
+    /// Starts a budget-aware seek for interactive timeline scrubbing.
+    ///
+    /// Exact seek is used when its estimated compressed-input count is within
+    /// `maximum_exact_input_samples`. More expensive requests select the
+    /// nearest keyframe for immediate preview. After pointer movement settles,
+    /// call [`Self::begin_exact_seek`] to resolve the final timestamp exactly.
+    pub fn begin_interactive_seek<I>(
+        &mut self,
+        decoder: &mut H264Decoder,
+        cursor: &mut PacketCursor<'_, I>,
+        target: MediaTime,
+        allow_forward_retarget: bool,
+        maximum_exact_input_samples: usize,
+    ) -> Result<H264Mp4InteractiveSeekOutcome, H264Mp4SeekError>
+    where
+        I: MediaInput,
+    {
+        let plan = self.plan_exact_seek(cursor, target, allow_forward_retarget)?;
+        if plan.exceeds_exact_sample_budget(maximum_exact_input_samples) {
+            let sample_index = self.begin_nearest_preview(decoder, cursor, target)?;
+            Ok(H264Mp4InteractiveSeekOutcome::Preview {
+                exact_plan: plan,
+                sample_index,
+            })
+        } else {
+            let outcome = self.execute_exact_seek_plan(decoder, cursor, target, plan)?;
+            Ok(H264Mp4InteractiveSeekOutcome::Exact { plan, outcome })
+        }
+    }
 
-        let outcome = match select_exact_seek_source(
-            keyframe_sample_index,
-            checkpoint_sample_index,
-            forward_sample_index,
-        ) {
-            ExactSeekSource::Forward => {
+    fn execute_exact_seek_plan<I>(
+        &mut self,
+        decoder: &mut H264Decoder,
+        cursor: &mut PacketCursor<'_, I>,
+        target: MediaTime,
+        plan: H264Mp4SeekPlan,
+    ) -> Result<H264Mp4SeekOutcome, H264Mp4SeekError>
+    where
+        I: MediaInput,
+    {
+        let outcome = match plan.source {
+            H264Mp4SeekSource::ForwardRetarget => {
                 decoder.retarget_seek_forward(target)?;
                 H264Mp4SeekOutcome::ForwardRetarget
             }
-            ExactSeekSource::Checkpoint => {
+            H264Mp4SeekSource::Checkpoint => {
                 let previous_sample_index = cursor.next_sample_index();
-                let checkpoint_sample_index = checkpoint_sample_index
-                    .expect("checkpoint source requires a matching cache entry");
-                cursor.seek_to_sample(checkpoint_sample_index)?;
+                cursor.seek_to_sample(plan.resume_sample_index)?;
                 let restored_sample_index = match self
                     .checkpoints
                     .restore_latest_before(decoder, target)
@@ -247,7 +450,7 @@ impl H264Mp4SeekController {
                         return Err(error.into());
                     }
                 };
-                if restored_sample_index != checkpoint_sample_index {
+                if restored_sample_index != plan.resume_sample_index {
                     // The stored position came from this cursor, so rollback
                     // should only fail if the caller changed the sample table.
                     let _ = cursor.seek_to_sample(previous_sample_index);
@@ -260,11 +463,11 @@ impl H264Mp4SeekController {
                     sample_index: cursor.next_sample_index(),
                 }
             }
-            ExactSeekSource::Keyframe => {
-                cursor.seek_to_sample(keyframe_sample_index)?;
+            H264Mp4SeekSource::Keyframe => {
+                cursor.seek_to_sample(plan.resume_sample_index)?;
                 decoder.flush_for_seek(target);
                 H264Mp4SeekOutcome::Keyframe {
-                    sample_index: keyframe_sample_index,
+                    sample_index: plan.resume_sample_index,
                 }
             }
         };
@@ -324,6 +527,76 @@ enum ExactSeekSource {
     Forward,
     Checkpoint,
     Keyframe,
+}
+
+impl ExactSeekSource {
+    const fn public(self) -> H264Mp4SeekSource {
+        match self {
+            Self::Forward => H264Mp4SeekSource::ForwardRetarget,
+            Self::Checkpoint => H264Mp4SeekSource::Checkpoint,
+            Self::Keyframe => H264Mp4SeekSource::Keyframe,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EstimatedTargetSample {
+    selected_sample_index: usize,
+    required_decode_sample_index: usize,
+}
+
+fn estimate_target_sample(
+    track: &Track,
+    keyframe_sample_index: usize,
+    target: MediaTime,
+) -> Result<Option<EstimatedTargetSample>, Mp4Error> {
+    let samples = track.samples();
+    let next_keyframe_position = track
+        .sync_sample_indices()
+        .partition_point(|&sample_index| sample_index <= keyframe_sample_index);
+    let scan_end = track
+        .sync_sample_indices()
+        .get(next_keyframe_position)
+        .and_then(|sample_index| sample_index.checked_add(1))
+        .unwrap_or(samples.len())
+        .min(samples.len());
+    let presentation_offset = track.presentation_time_offset()?.value;
+    let timescale = track.media_timescale();
+
+    let mut selected: Option<(MediaTime, usize)> = None;
+    for (relative_index, sample) in samples[keyframe_sample_index..scan_end].iter().enumerate() {
+        let sample_index = keyframe_sample_index + relative_index;
+        let presentation_value = sample
+            .presentation_time()
+            .checked_add(presentation_offset)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        let presentation_time = MediaTime::new(presentation_value, timescale);
+        if presentation_time >= target
+            && selected.is_none_or(|current| (presentation_time, sample_index) < current)
+        {
+            selected = Some((presentation_time, sample_index));
+        }
+    }
+    let Some((selected_time, selected_sample_index)) = selected else {
+        return Ok(None);
+    };
+
+    let mut required_decode_sample_index = selected_sample_index;
+    for (relative_index, sample) in samples[keyframe_sample_index..scan_end].iter().enumerate() {
+        let presentation_value = sample
+            .presentation_time()
+            .checked_add(presentation_offset)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        if MediaTime::new(presentation_value, timescale) <= selected_time {
+            required_decode_sample_index =
+                required_decode_sample_index.max(keyframe_sample_index + relative_index);
+        }
+    }
+
+    Ok(Some(EstimatedTargetSample {
+        selected_sample_index,
+        required_decode_sample_index,
+    }))
 }
 
 fn select_exact_seek_source(

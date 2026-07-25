@@ -198,6 +198,57 @@ decoder finalization. Do not capture after every packet unless that throughput
 cost is intentional. The default sample spacing can be changed with
 `with_minimum_checkpoint_sample_distance`.
 
+Before mutating decoder state, `plan_exact_seek` exposes the selected resume
+source and an estimate of compressed input needed to release the target frame:
+
+```rust,ignore
+let plan = seeks.plan_exact_seek(
+    &cursor,
+    target,
+    can_continue_current_input,
+)?;
+
+tracing::debug!(
+    source = ?plan.source(),
+    resume_sample = plan.resume_sample_index(),
+    selected_sample = ?plan.selected_sample_index(),
+    estimated_input_samples = plan.estimated_input_samples(),
+    "planned H.264 MP4 seek",
+);
+```
+
+The estimate accounts for decode-ordered B pictures that may follow the
+selected frame in the MP4 sample table but must be fed before presentation
+reordering can release it. `selected_sample_index() == None` means no frame
+exists at or after the requested target.
+
+For pointer movement, applications can delegate the exact-versus-preview
+choice to `begin_interactive_seek`:
+
+```rust,ignore
+let decision = seeks.begin_interactive_seek(
+    &mut decoder,
+    &mut cursor,
+    target,
+    can_continue_current_input,
+    12, // application-calibrated compressed-sample budget
+)?;
+
+let mut packet = cursor.next_packet()?.unwrap();
+packet.discontinuity = decision.requires_discontinuity();
+decoder.send_packet(packet)?;
+```
+
+If `decision.is_exact()` is false, stop after presenting the selected sync
+sample. When pointer movement settles, call `begin_exact_seek` for the final
+timestamp. If the interactive decision was already exact for that unchanged
+timestamp, reuse its output rather than requesting the same seek again.
+
+The sample budget is deliberately application-owned: resolution, profile, CPU
+and build tuning change the cost per sample. A player can start conservatively,
+record `plan.source()` and `estimated_input_samples()`, then calibrate the
+largest count that remains inside its interaction latency target.
+
 For pointer-move previews, `begin_nearest_preview` flushes the active exact
 timeline and selects the closest independently decodable sample. Its first
 packet must be marked discontinuous. Once the pointer settles, call
