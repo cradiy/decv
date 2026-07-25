@@ -17,23 +17,26 @@ use decv_core::{
 
 use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
 use crate::intra_reconstruction::{ReconstructionReferenceList, ReconstructionWorkspace};
-use crate::parallelism::{ReconstructionExecutor, WIDE_AUTO_PARALLELISM_MIN_PIXELS};
+use crate::parallelism::{
+    FRAME_AUTO_PARALLELISM_MIN_PIXELS, ReconstructionExecutor, WIDE_AUTO_PARALLELISM_MIN_PIXELS,
+};
 use crate::reorder::PictureReorderBuffer;
 use crate::{
     ActiveReferenceInfo, AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference,
     EntropyCodingMode, H264Error, H264Parallelism, ImplicitWeightReference,
     IntraPictureReconstructor, NalHeader, NalUnit, NalUnitType, ParameterSetStore,
     ParsedSliceHeader, PictureOrderCount, PictureParameterSet, Profile, ReferenceKind,
-    ReferencePictureMarking, Result, SequenceParameterSet, SliceType, consume_rbsp_trailing_bits,
-    decode_rbsp,
+    ReferencePictureMarking, Result, SequenceParameterSet, SliceType, Yuv420Picture,
+    consume_rbsp_trailing_bits, decode_rbsp,
 };
 
 #[cfg(not(test))]
-const MIN_ASYNC_FINALIZATION_PIXELS: u64 = 2_000_000;
+const MIN_ASYNC_NON_REFERENCE_PIXELS: u64 = FRAME_AUTO_PARALLELISM_MIN_PIXELS;
 // Exercise the complete asynchronous lifecycle with the compact embedded
 // CABAC B-picture fixture instead of carrying a multi-megapixel test asset.
 #[cfg(test)]
-const MIN_ASYNC_FINALIZATION_PIXELS: u64 = 1;
+const MIN_ASYNC_NON_REFERENCE_PIXELS: u64 = 1;
+const MIN_ASYNC_REFERENCE_OUTPUT_PIXELS: u64 = FRAME_AUTO_PARALLELISM_MIN_PIXELS;
 
 #[derive(Debug)]
 struct PendingPicture {
@@ -65,7 +68,7 @@ struct AsyncPictureCompletion {
 }
 
 #[derive(Debug)]
-struct PendingNonReferenceFinalization {
+struct PendingPictureCompletion {
     picture_order_count: i32,
     receiver: Receiver<Result<AsyncPictureCompletion>>,
 }
@@ -110,7 +113,7 @@ pub struct H264Decoder {
     reconstruction_executor: Option<ReconstructionExecutor>,
     auto_executor_size: Option<Size>,
     reusable_workspaces: Vec<ReconstructionWorkspace>,
-    pending_non_reference_finalizations: VecDeque<PendingNonReferenceFinalization>,
+    pending_picture_completions: VecDeque<PendingPictureCompletion>,
     maximum_completed_pts: Option<MediaTime>,
     completed_picture_missing_pts: bool,
 }
@@ -373,7 +376,7 @@ impl Default for H264Decoder {
             reconstruction_executor: None,
             auto_executor_size: None,
             reusable_workspaces: Vec::new(),
-            pending_non_reference_finalizations: VecDeque::new(),
+            pending_picture_completions: VecDeque::new(),
             maximum_completed_pts: None,
             completed_picture_missing_pts: false,
         }
@@ -395,7 +398,7 @@ impl H264Decoder {
             || self.current_skipped_picture.is_some()
             || self.dpb.is_some()
             || !self.outputs.is_empty()
-            || !self.pending_non_reference_finalizations.is_empty()
+            || !self.pending_picture_completions.is_empty()
             || self.next_frame_id != 0
             || self.draining
         {
@@ -505,7 +508,7 @@ impl H264Decoder {
             ));
         }
         self.finish_current_picture()?;
-        self.finish_pending_non_reference_finalizations(true)?;
+        self.finish_pending_picture_completions(true)?;
         if self.completed_picture_missing_pts {
             return Err(H264Error::InvalidSyntax(
                 "H.264 seek checkpoint requires PTS on every completed picture",
@@ -557,7 +560,7 @@ impl H264Decoder {
             ));
         }
 
-        self.discard_pending_non_reference_finalizations();
+        self.discard_pending_picture_completions();
         self.parser = checkpoint.parser.clone();
         self.current_picture = None;
         self.current_skipped_picture = None;
@@ -949,7 +952,7 @@ impl H264Decoder {
             * u64::from(picture.format.coded_size.height);
         if picture.nal_header.nal_ref_idc == 0
             && picture.entropy_coding_mode == EntropyCodingMode::Cabac
-            && coded_pixels >= MIN_ASYNC_FINALIZATION_PIXELS
+            && coded_pixels >= MIN_ASYNC_NON_REFERENCE_PIXELS
             && self
                 .reconstruction_executor
                 .as_ref()
@@ -961,16 +964,11 @@ impl H264Decoder {
             self.record_completed_picture_pts(pts);
             return Ok(());
         }
-        self.finish_pending_non_reference_finalizations(true)?;
         let (decoded, motion, reusable_workspace) = picture
             .reconstructor
             .into_deblocked_picture_with_optional_reference_motion()?;
         self.reusable_workspaces.push(reusable_workspace);
         let decoded = Arc::new(decoded);
-        let frame = self
-            .should_materialize_output(picture.pts)
-            .then(|| decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format))
-            .transpose()?;
         if picture.nal_header.nal_ref_idc != 0 {
             let motion = Arc::new(motion.ok_or(H264Error::InvalidSyntax(
                 "reference picture has no retained motion field",
@@ -1011,11 +1009,77 @@ impl H264Decoder {
             }
         }
         let picture_order_count = picture.picture_order_count.stored.picture_order_count();
+        if picture.nal_header.nal_ref_idc != 0
+            && coded_pixels >= MIN_ASYNC_REFERENCE_OUTPUT_PIXELS
+            && self.should_materialize_output(picture.pts)
+            && self
+                .reconstruction_executor
+                .as_ref()
+                .and_then(ReconstructionExecutor::pool)
+                .is_some()
+        {
+            self.dispatch_reference_picture_output(
+                decoded,
+                picture_order_count,
+                picture.pts,
+                picture.duration,
+                picture.format,
+            )?;
+            self.record_completed_picture_pts(picture.pts);
+            return Ok(());
+        }
+        // Pending picture workers retain only Arc-backed decoded storage from
+        // an earlier state. Finish this picture's independent deblocking,
+        // reference insertion, and output packing while they run, then join
+        // before committing presentation order.
+        self.finish_pending_picture_completions(true)?;
+        let frame = self
+            .should_materialize_output(picture.pts)
+            .then(|| decoded.to_nv12_frame(0, picture.pts, picture.duration, picture.format))
+            .transpose()?;
         if let Some(frame) = self.reorder.push(picture_order_count, frame)?.flatten() {
             self.queue_output_frame(frame)?;
         }
         self.record_completed_picture_pts(picture.pts);
         Ok(())
+    }
+
+    fn dispatch_reference_picture_output(
+        &mut self,
+        decoded: Arc<Yuv420Picture>,
+        picture_order_count: i32,
+        pts: Option<MediaTime>,
+        duration: Option<MediaTime>,
+        format: VideoFormat,
+    ) -> Result<()> {
+        let executor = self
+            .reconstruction_executor
+            .clone()
+            .expect("asynchronous reference output requires a reconstruction pool");
+        let pool = executor
+            .pool()
+            .expect("asynchronous reference output requires a parallel executor");
+        let pending_limit = pool.current_num_threads().saturating_sub(1).max(1);
+        while self.pending_picture_completions.len() >= pending_limit {
+            self.finish_next_picture_completion(true)?;
+        }
+
+        let (sender, receiver) = mpsc::sync_channel(1);
+        pool.spawn(move || {
+            let completion = decoded
+                .to_nv12_frame(0, pts, duration, format)
+                .map(|frame| AsyncPictureCompletion {
+                    frame: Some(frame),
+                    reusable_workspace: None,
+                });
+            let _ = sender.send(completion);
+        });
+        self.pending_picture_completions
+            .push_back(PendingPictureCompletion {
+                picture_order_count,
+                receiver,
+            });
+        self.finish_pending_picture_completions(false)
     }
 
     fn dispatch_deferred_non_reference_picture(&mut self, picture: PendingPicture) -> Result<()> {
@@ -1027,8 +1091,8 @@ impl H264Decoder {
             .pool()
             .expect("deferred B-picture decoding requires a parallel executor");
         let pending_limit = pool.current_num_threads().saturating_sub(1).max(1);
-        while self.pending_non_reference_finalizations.len() >= pending_limit {
-            self.finish_next_non_reference_finalization(true)?;
+        while self.pending_picture_completions.len() >= pending_limit {
+            self.finish_next_picture_completion(true)?;
         }
 
         let PendingPicture {
@@ -1158,12 +1222,12 @@ impl H264Decoder {
             })();
             let _ = sender.send(result);
         });
-        self.pending_non_reference_finalizations
-            .push_back(PendingNonReferenceFinalization {
+        self.pending_picture_completions
+            .push_back(PendingPictureCompletion {
                 picture_order_count,
                 receiver,
             });
-        self.finish_pending_non_reference_finalizations(false)
+        self.finish_pending_picture_completions(false)
     }
 
     fn record_completed_picture_pts(&mut self, pts: Option<MediaTime>) {
@@ -1186,8 +1250,8 @@ impl H264Decoder {
             .current_num_threads()
             .saturating_sub(1)
             .max(1);
-        while self.pending_non_reference_finalizations.len() >= pending_limit {
-            self.finish_next_non_reference_finalization(true)?;
+        while self.pending_picture_completions.len() >= pending_limit {
+            self.finish_next_picture_completion(true)?;
         }
         let PendingPicture {
             reconstructor,
@@ -1217,43 +1281,43 @@ impl H264Decoder {
                 }));
             });
         self.reusable_workspaces.push(reusable_workspace);
-        self.pending_non_reference_finalizations
-            .push_back(PendingNonReferenceFinalization {
+        self.pending_picture_completions
+            .push_back(PendingPictureCompletion {
                 picture_order_count,
                 receiver,
             });
-        self.finish_pending_non_reference_finalizations(false)
+        self.finish_pending_picture_completions(false)
     }
 
-    fn finish_pending_non_reference_finalizations(&mut self, wait: bool) -> Result<()> {
-        while self.finish_next_non_reference_finalization(wait)? {}
+    fn finish_pending_picture_completions(&mut self, wait: bool) -> Result<()> {
+        while self.finish_next_picture_completion(wait)? {}
         Ok(())
     }
 
-    fn finish_next_non_reference_finalization(&mut self, wait: bool) -> Result<bool> {
-        let Some(pending) = self.pending_non_reference_finalizations.front() else {
+    fn finish_next_picture_completion(&mut self, wait: bool) -> Result<bool> {
+        let Some(pending) = self.pending_picture_completions.front() else {
             return Ok(false);
         };
         let completion = if wait {
             pending
                 .receiver
                 .recv()
-                .map_err(|_| H264Error::UnsupportedFeature("H.264 finalization worker stopped"))?
+                .map_err(|_| H264Error::UnsupportedFeature("H.264 picture worker stopped"))?
         } else {
             match pending.receiver.try_recv() {
                 Ok(completion) => completion,
                 Err(TryRecvError::Empty) => return Ok(false),
                 Err(TryRecvError::Disconnected) => {
                     return Err(H264Error::UnsupportedFeature(
-                        "H.264 finalization worker stopped",
+                        "H.264 picture worker stopped",
                     ));
                 }
             }
         };
         let pending = self
-            .pending_non_reference_finalizations
+            .pending_picture_completions
             .pop_front()
-            .expect("the pending finalization was inspected above");
+            .expect("the pending picture completion was inspected above");
         let completion = completion?;
         if let Some(reusable_workspace) = completion.reusable_workspace {
             self.reusable_workspaces.push(reusable_workspace);
@@ -1268,8 +1332,8 @@ impl H264Decoder {
         Ok(true)
     }
 
-    fn discard_pending_non_reference_finalizations(&mut self) {
-        while let Some(pending) = self.pending_non_reference_finalizations.pop_front() {
+    fn discard_pending_picture_completions(&mut self) {
+        while let Some(pending) = self.pending_picture_completions.pop_front() {
             if let Ok(Ok(completion)) = pending.receiver.recv()
                 && let Some(reusable_workspace) = completion.reusable_workspace
             {
@@ -1287,7 +1351,7 @@ impl H264Decoder {
                 no_output_of_prior_pictures: true,
                 ..
             } => {
-                self.discard_pending_non_reference_finalizations();
+                self.discard_pending_picture_completions();
                 self.reorder.clear();
             }
             ReferencePictureMarking::Idr { .. } => self.drain_reorder()?,
@@ -1319,7 +1383,7 @@ impl H264Decoder {
     }
 
     fn drain_reorder(&mut self) -> Result<()> {
-        self.finish_pending_non_reference_finalizations(true)?;
+        self.finish_pending_picture_completions(true)?;
         let frames = self.reorder.drain();
         for frame in frames.into_iter().flatten() {
             self.queue_output_frame(frame)?;
@@ -1328,7 +1392,7 @@ impl H264Decoder {
     }
 
     fn reset_all_state(&mut self) {
-        self.discard_pending_non_reference_finalizations();
+        self.discard_pending_picture_completions();
         self.parser.reset();
         self.current_picture = None;
         self.current_skipped_picture = None;
@@ -1344,7 +1408,7 @@ impl H264Decoder {
     }
 
     fn flush_timeline(&mut self) {
-        self.discard_pending_non_reference_finalizations();
+        self.discard_pending_picture_completions();
         self.parser.reset_picture_history();
         self.current_picture = None;
         self.current_skipped_picture = None;
@@ -1401,7 +1465,7 @@ impl H264Decoder {
             && slice_type == SliceType::B
             && entropy_coding_mode == EntropyCodingMode::Cabac
             && u64::from(coded_size.width) * u64::from(coded_size.height)
-                >= MIN_ASYNC_FINALIZATION_PIXELS
+                >= MIN_ASYNC_NON_REFERENCE_PIXELS
             && self
                 .reconstruction_executor
                 .as_ref()
@@ -1499,7 +1563,7 @@ impl VideoDecoder for H264Decoder {
                 "H.264 decoder cannot accept input while draining",
             ));
         }
-        self.finish_pending_non_reference_finalizations(false)?;
+        self.finish_pending_picture_completions(false)?;
         if !self.outputs.is_empty() {
             return Ok(DecodeInputStatus::NeedOutput(packet));
         }
@@ -1507,12 +1571,12 @@ impl VideoDecoder for H264Decoder {
             self.flush_timeline();
         }
         self.process_packet(&packet)?;
-        self.finish_pending_non_reference_finalizations(false)?;
+        self.finish_pending_picture_completions(false)?;
         Ok(DecodeInputStatus::Accepted)
     }
 
     fn receive_frame(&mut self) -> Result<DecodeOutput> {
-        self.finish_pending_non_reference_finalizations(false)?;
+        self.finish_pending_picture_completions(false)?;
         if let Some(output) = self.outputs.pop_front() {
             return Ok(output);
         }

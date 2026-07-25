@@ -62,7 +62,7 @@ const LUMA_4X4_COORDINATES: [(usize, usize); 16] = [
 ];
 const LUMA_8X8_COORDINATES: [(usize, usize); 4] = [(0, 0), (1, 0), (0, 1), (1, 1)];
 #[cfg(not(test))]
-const INTER_PIPELINE_MIN_PIXELS: u64 = 8_000_000;
+const INTER_PIPELINE_MIN_PIXELS: u64 = 2_000_000;
 #[cfg(test)]
 const INTER_PIPELINE_MIN_PIXELS: u64 = 1;
 const INTER_BATCH_ROWS: usize = 4;

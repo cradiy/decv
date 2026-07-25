@@ -5,6 +5,7 @@ use rayon::ThreadPool;
 
 use crate::{H264Error, Result};
 
+pub(crate) const FRAME_AUTO_PARALLELISM_MIN_PIXELS: u64 = 70_000;
 pub(crate) const WIDE_AUTO_PARALLELISM_MIN_PIXELS: u64 = 8_000_000;
 
 /// CPU parallelism used by the H.264 reconstruction backend.
@@ -16,9 +17,10 @@ pub enum H264Parallelism {
     /// Select a conservative worker count for the current implementation.
     ///
     /// CABAC parsing within one reference picture remains serial. `Auto` uses
-    /// at most two workers below roughly eight megapixels and at most four
-    /// workers for 4K-class pictures, and may decode independent large
-    /// non-reference B pictures concurrently during ordinary playback.
+    /// at most two workers below roughly 70 kilopixels, three workers for
+    /// intermediate pictures, and four workers for 4K-class pictures. It may
+    /// decode independent non-reference B pictures concurrently during ordinary
+    /// playback.
     #[default]
     Auto,
     /// Use exactly this many reconstruction threads.
@@ -48,6 +50,8 @@ impl ReconstructionExecutor {
         let pixels = u64::from(coded_size.width) * u64::from(coded_size.height);
         let auto_cap = if pixels >= WIDE_AUTO_PARALLELISM_MIN_PIXELS {
             4
+        } else if pixels >= FRAME_AUTO_PARALLELISM_MIN_PIXELS {
+            3
         } else {
             2
         };
@@ -128,13 +132,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_uses_a_larger_cap_only_for_4k_class_pictures() {
+    fn auto_scales_its_cap_with_picture_size() {
         let available = std::thread::available_parallelism()
             .map(NonZeroUsize::get)
             .unwrap_or(1);
+        let small = ReconstructionExecutor::try_new_for_coded_size(
+            H264Parallelism::Auto,
+            Size::new(160, 128),
+        )
+        .unwrap();
         let hd = ReconstructionExecutor::try_new_for_coded_size(
             H264Parallelism::Auto,
-            Size::new(1920, 1088),
+            Size::new(320, 240),
+        )
+        .unwrap();
+        let intermediate = ReconstructionExecutor::try_new_for_coded_size(
+            H264Parallelism::Auto,
+            Size::new(1440, 2560),
         )
         .unwrap();
         let uhd = ReconstructionExecutor::try_new_for_coded_size(
@@ -142,7 +156,9 @@ mod tests {
             Size::new(3840, 2176),
         )
         .unwrap();
-        assert_eq!(hd.worker_count(), available.min(2));
+        assert_eq!(small.worker_count(), available.min(2));
+        assert_eq!(hd.worker_count(), available.min(3));
+        assert_eq!(intermediate.worker_count(), available.min(3));
         assert_eq!(uhd.worker_count(), available.min(4));
     }
 }
