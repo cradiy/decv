@@ -3,6 +3,7 @@
 //! This crate deliberately has no asynchronous-runtime dependency. A decoder
 //! remains synchronous and can run on any caller-owned worker thread.
 
+mod audio;
 mod color;
 mod decoder;
 mod error;
@@ -12,6 +13,10 @@ mod input;
 mod packet;
 mod time;
 
+pub use audio::{
+    AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder, AudioDecoderConfig,
+    AudioFormat, AudioSampleFormat, ChannelLayout, DecodedAudioFrame, EncodedAudioPacket,
+};
 pub use color::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, TransferFunction};
 pub use decoder::{
     BitstreamFormat, DecodeInputStatus, DecodeOutput, VideoCodec, VideoDecoder, VideoDecoderConfig,

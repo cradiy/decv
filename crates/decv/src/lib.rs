@@ -8,8 +8,10 @@
 #![forbid(unsafe_code)]
 
 pub use decv_core::{
-    BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, CpuFrame, CpuPlane,
-    DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket, FrameStorage,
+    AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder, AudioDecoderConfig,
+    AudioFormat, AudioSampleFormat, BitstreamFormat, ChannelLayout, ColorInfo, ColorMatrix,
+    ColorPrimaries, ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput,
+    DecodedAudioFrame, DecodedVideoFrame, EncodedAudioPacket, EncodedVideoPacket, FrameStorage,
     MediaError, MediaInput, MediaTime, PixelFormat, Rect, Size, TransferFunction, VideoCodec,
     VideoDecoder, VideoDecoderConfig, VideoFormat,
 };

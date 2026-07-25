@@ -6,7 +6,9 @@ use std::fmt;
 pub enum MediaError {
     InvalidDecoderConfig(&'static str),
     InvalidVideoFormat(&'static str),
+    InvalidAudioFormat(&'static str),
     InvalidFrameStorage(&'static str),
+    InvalidAudioFrame(&'static str),
     IntegerOverflow,
 }
 
@@ -19,8 +21,14 @@ impl fmt::Display for MediaError {
             Self::InvalidVideoFormat(message) => {
                 write!(formatter, "invalid video format: {message}")
             }
+            Self::InvalidAudioFormat(message) => {
+                write!(formatter, "invalid audio format: {message}")
+            }
             Self::InvalidFrameStorage(message) => {
                 write!(formatter, "invalid frame storage: {message}")
+            }
+            Self::InvalidAudioFrame(message) => {
+                write!(formatter, "invalid audio frame: {message}")
             }
             Self::IntegerOverflow => {
                 formatter.write_str("integer overflow while processing media data")
