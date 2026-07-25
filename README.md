@@ -118,10 +118,14 @@ Decode Annex-B H.264 or MP4, optionally writing visible NV12 bytes:
 cargo run --release -p decv-cli -- input.h264 output.nv12
 cargo run --release -p decv-cli -- input.mp4 output.nv12
 cargo run --release -p decv-cli -- --seek 12.5 input.mp4 output.nv12
+cargo run --release -p decv-cli -- --seek 12.5 --max-frames 1 input.mp4
 ```
 
 Select reconstruction parallelism with `--parallelism serial`, `auto`, or a
-positive worker count.
+positive worker count. `--max-frames` stops as soon as the requested number of
+output frames has been observed, without draining the rest of the input. This
+is useful for measuring first-frame seek latency independently of subsequent
+playback.
 
 For opt-in frame-service latency statistics, build the CLI with its dedicated
 feature:

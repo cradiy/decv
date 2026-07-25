@@ -1797,6 +1797,16 @@ it chooses the closer adjacent sync sample in logarithmic time, avoids preroll,
 and limits the usual preview timestamp error to half of the surrounding
 keyframe interval. Exact output still uses the preceding-keyframe path above.
 
+The CLI now exposes `--max-frames 1` so this first-frame boundary can be
+measured without a custom probe or the cost of decoding the remaining file
+suffix. It stops compressed input immediately after observing the selected
+frame and intentionally does not drain the abandoned timeline. On the same
+1440x2560 long-GOP source, fifteen native release runs at 131.900 seconds had
+a 0.66-second median. The one-frame output was 5,529,600 bytes and matched the
+first frame of the ordinary six-frame seek suffix byte for byte. This is a
+latency diagnostic; unrestricted decode and the real-stream verifiers remain
+the throughput and complete-output checks.
+
 ## Integer Bidirectional Prediction Fusion
 
 Default bidirectional prediction with integer luma and chroma motion formerly

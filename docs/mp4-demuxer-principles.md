@@ -713,6 +713,15 @@ The same accurate-seek path is available manually:
 cargo run -p decv-cli -- --seek 1.37 file.mp4 output.nv12
 ```
 
+For a first-frame-only latency probe, add `--max-frames 1`. The CLI stops
+feeding compressed packets as soon as the selected frame is emitted instead
+of decoding and draining the remaining suffix:
+
+```bash
+cargo run --release -p decv-cli -- \
+    --seek 1.37 --max-frames 1 file.mp4
+```
+
 Useful local checks are:
 
 ```bash

@@ -3,7 +3,7 @@ use std::{
     error::Error,
     fs::{self, File},
     io::{self, Read, Write},
-    num::NonZeroUsize,
+    num::{NonZeroU64, NonZeroUsize},
     path::Path,
 };
 
@@ -27,16 +27,19 @@ type CliDecoder = H264Decoder;
 
 const VIDE: FourCc = FourCc::new(*b"vide");
 #[cfg(not(feature = "frame-timing"))]
-const USAGE: &str = "usage: decv-cli [--seek <seconds>] [--parallelism <serial|auto|threads>] \
+const USAGE: &str = "usage: decv-cli [--seek <seconds>] [--max-frames <count>] \
+                     [--parallelism <serial|auto|threads>] \
                      <input.h264|input.mp4> [output.nv12]";
 #[cfg(feature = "frame-timing")]
-const USAGE: &str = "usage: decv-cli [--seek <seconds>] [--parallelism <serial|auto|threads>] \
-                     [--frame-timing] <input.h264|input.mp4> [output.nv12]";
+const USAGE: &str = "usage: decv-cli [--seek <seconds>] [--max-frames <count>] \
+                     [--parallelism <serial|auto|threads>] [--frame-timing] \
+                     <input.h264|input.mp4> [output.nv12]";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullState {
     NeedInput,
     EndOfStream,
+    FrameLimitReached,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +47,7 @@ struct CliOptions {
     input_path: String,
     output_path: Option<String>,
     seek_target: Option<MediaTime>,
+    maximum_frames: Option<NonZeroU64>,
     parallelism: H264Parallelism,
     #[cfg(feature = "frame-timing")]
     frame_timing: bool,
@@ -57,6 +61,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         input_path: path,
         output_path,
         seek_target,
+        maximum_frames,
         parallelism,
         #[cfg(feature = "frame-timing")]
         frame_timing,
@@ -68,25 +73,39 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut raw_output = output_path.as_deref().map(File::create).transpose()?;
     decoder.set_parallelism(parallelism)?;
     let mut frame_count = 0u64;
-    if is_mp4(Path::new(&path))? {
+    let stopped_at_frame_limit = if is_mp4(Path::new(&path))? {
         decode_mp4(
             &path,
             &mut decoder,
             &mut raw_output,
             &mut frame_count,
             seek_target,
-        )?;
+            maximum_frames,
+        )?
     } else {
         if seek_target.is_some() {
             return Err("--seek requires an MP4 input with a sample index".into());
         }
-        decode_annex_b(&path, &mut decoder, &mut raw_output, &mut frame_count)?;
-    }
-    decoder.drain()?;
-    if receive_available(&mut decoder, &mut raw_output, &mut frame_count, seek_target)?
-        != PullState::EndOfStream
-    {
-        return Err("decoder requested input after drain".into());
+        decode_annex_b(
+            &path,
+            &mut decoder,
+            &mut raw_output,
+            &mut frame_count,
+            maximum_frames,
+        )?
+    };
+    if !stopped_at_frame_limit {
+        decoder.drain()?;
+        match receive_available(
+            &mut decoder,
+            &mut raw_output,
+            &mut frame_count,
+            seek_target,
+            maximum_frames,
+        )? {
+            PullState::EndOfStream | PullState::FrameLimitReached => {}
+            PullState::NeedInput => return Err("decoder requested input after drain".into()),
+        }
     }
 
     if let Some(output_path) = output_path {
@@ -107,6 +126,7 @@ fn parse_arguments(
 ) -> Result<CliOptions, Box<dyn Error>> {
     let mut positional = Vec::new();
     let mut seek_target = None;
+    let mut maximum_frames = None;
     let mut parallelism = H264Parallelism::Auto;
     let mut parallelism_specified = false;
     #[cfg(feature = "frame-timing")]
@@ -125,6 +145,19 @@ fn parse_arguments(
                 return Err("--seek may only be specified once".into());
             }
             seek_target = Some(parse_seconds(&arguments.next().ok_or(USAGE)?)?);
+        } else if argument == "--max-frames" {
+            if maximum_frames.is_some() {
+                return Err("--max-frames may only be specified once".into());
+            }
+            maximum_frames = Some(
+                arguments
+                    .next()
+                    .ok_or(USAGE)?
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(NonZeroU64::new)
+                    .ok_or("--max-frames must be a positive integer")?,
+            );
         } else if argument == "--parallelism" {
             if parallelism_specified {
                 return Err("--parallelism may only be specified once".into());
@@ -145,6 +178,7 @@ fn parse_arguments(
         input_path: positional.remove(0),
         output_path: output,
         seek_target,
+        maximum_frames,
         parallelism,
         #[cfg(feature = "frame-timing")]
         frame_timing,
@@ -198,7 +232,8 @@ fn decode_annex_b(
     decoder: &mut CliDecoder,
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
-) -> Result<(), Box<dyn Error>> {
+    maximum_frames: Option<NonZeroU64>,
+) -> Result<bool, Box<dyn Error>> {
     let data = fs::read(path)?;
     decoder.configure(VideoDecoderConfig::new(
         VideoCodec::H264,
@@ -209,15 +244,18 @@ fn decode_annex_b(
         let mut framed = Vec::with_capacity(4 + unit.bytes().len());
         framed.extend_from_slice(&[0, 0, 0, 1]);
         framed.extend_from_slice(unit.bytes());
-        send_packet(
+        if send_packet(
             decoder,
             EncodedVideoPacket::new(framed),
             raw_output,
             frame_count,
             None,
-        )?;
+            maximum_frames,
+        )? {
+            return Ok(true);
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn decode_mp4(
@@ -226,7 +264,8 @@ fn decode_mp4(
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
     seek_target: Option<MediaTime>,
-) -> Result<(), Box<dyn Error>> {
+    maximum_frames: Option<NonZeroU64>,
+) -> Result<bool, Box<dyn Error>> {
     let demuxer = Mp4Demuxer::open(File::open(path)?)?;
     let track_index = demuxer
         .movie()
@@ -267,9 +306,18 @@ fn decode_mp4(
             packet.discontinuity = true;
         }
         first_packet = false;
-        send_packet(decoder, packet, raw_output, frame_count, seek_target)?;
+        if send_packet(
+            decoder,
+            packet,
+            raw_output,
+            frame_count,
+            seek_target,
+            maximum_frames,
+        )? {
+            return Ok(true);
+        }
     }
-    Ok(())
+    Ok(false)
 }
 
 fn send_packet(
@@ -278,25 +326,41 @@ fn send_packet(
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
     minimum_pts: Option<MediaTime>,
-) -> Result<(), Box<dyn Error>> {
+    maximum_frames: Option<NonZeroU64>,
+) -> Result<bool, Box<dyn Error>> {
     loop {
         match decoder.send_packet(packet)? {
             DecodeInputStatus::Accepted => break,
             DecodeInputStatus::NeedOutput(unconsumed) => {
                 packet = unconsumed;
-                if receive_available(decoder, raw_output, frame_count, minimum_pts)?
-                    == PullState::EndOfStream
-                {
-                    return Err("decoder ended before all input was accepted".into());
+                match receive_available(
+                    decoder,
+                    raw_output,
+                    frame_count,
+                    minimum_pts,
+                    maximum_frames,
+                )? {
+                    PullState::NeedInput => {}
+                    PullState::FrameLimitReached => return Ok(true),
+                    PullState::EndOfStream => {
+                        return Err("decoder ended before all input was accepted".into());
+                    }
                 }
             }
             _ => return Err("decoder returned an unknown input status".into()),
         }
     }
-    if receive_available(decoder, raw_output, frame_count, minimum_pts)? == PullState::EndOfStream {
-        return Err("decoder ended before drain".into());
+    match receive_available(
+        decoder,
+        raw_output,
+        frame_count,
+        minimum_pts,
+        maximum_frames,
+    )? {
+        PullState::NeedInput => Ok(false),
+        PullState::FrameLimitReached => Ok(true),
+        PullState::EndOfStream => Err("decoder ended before drain".into()),
     }
-    Ok(())
 }
 
 fn is_mp4(path: &Path) -> Result<bool, Box<dyn Error>> {
@@ -332,6 +396,7 @@ fn receive_available(
     raw_output: &mut Option<File>,
     frame_count: &mut u64,
     minimum_pts: Option<MediaTime>,
+    maximum_frames: Option<NonZeroU64>,
 ) -> Result<PullState, Box<dyn Error>> {
     loop {
         match decoder.receive_frame()? {
@@ -355,6 +420,9 @@ fn receive_available(
                     .checked_add(1)
                     .ok_or("decoded frame count overflow")?;
                 println!("frame id={} bytes={bytes}", frame.id);
+                if maximum_frames.is_some_and(|maximum| *frame_count >= maximum.get()) {
+                    return Ok(PullState::FrameLimitReached);
+                }
             }
             DecodeOutput::EndOfStream => return Ok(PullState::EndOfStream),
             DecodeOutput::NeedInput => return Ok(PullState::NeedInput),
@@ -495,6 +563,8 @@ mod tests {
             [
                 "--seek",
                 "1.25",
+                "--max-frames",
+                "1",
                 "--parallelism",
                 "2",
                 "input.mp4",
@@ -507,6 +577,7 @@ mod tests {
         assert_eq!(options.input_path, "input.mp4");
         assert_eq!(options.output_path.as_deref(), Some("output.nv12"));
         assert_eq!(options.seek_target, MediaTime::from_parts(125, 100));
+        assert_eq!(options.maximum_frames.unwrap().get(), 1);
         assert!(matches!(
             options.parallelism,
             H264Parallelism::Threads(threads) if threads.get() == 2
@@ -519,6 +590,22 @@ mod tests {
         );
         assert_eq!(parse_parallelism("auto").unwrap(), H264Parallelism::Auto);
         assert!(parse_parallelism("0").is_err());
+        assert!(
+            parse_arguments(
+                ["--max-frames", "0", "input.mp4"]
+                    .map(String::from)
+                    .into_iter(),
+            )
+            .is_err()
+        );
+        assert!(
+            parse_arguments(
+                ["--max-frames", "1", "--max-frames", "2", "input.mp4"]
+                    .map(String::from)
+                    .into_iter(),
+            )
+            .is_err()
+        );
     }
 
     #[cfg(feature = "frame-timing")]
