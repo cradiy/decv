@@ -1,7 +1,8 @@
 # MP4 Demuxer Principles
 
-This document explains the non-fragmented MP4 path implemented by `decv-mp4`.
-It focuses on the relationships that matter when maintaining the code:
+This document explains the ordinary and fragmented MP4 paths implemented by
+`decv-mp4`. It focuses on the relationships that matter when maintaining the
+code:
 
 - how box traversal stays bounded;
 - how several compact sample tables become one packet index;
@@ -326,6 +327,33 @@ absent, every sample is treated as a sync sample, as required by the format.
 
 The demuxer stores a compact list of zero-based sync sample indices for seek
 queries.
+
+### 6.7 Fragmented sample indexes
+
+A fragmented MP4 can carry a valid but empty initialization `stbl`. Its real
+samples arrive later in top-level movie fragments:
+
+```text
+moov/mvex/trex       track-level defaults
+moof/traf/tfhd       fragment track and overridden defaults
+moof/traf/tfdt       first decode time
+moof/traf/trun       sample fields and media-data offset
+mdat                 compressed sample bytes
+```
+
+`decv-mp4` expands each `trun` into the same `Sample` representation used by
+ordinary tables. Duration, size, dependency flags, and sample-description
+index are selected from the per-sample field, `tfhd`, or `trex` in that order.
+Version 0 composition offsets are unsigned; version 1 offsets are signed.
+The first sample's data position is derived from the validated fragment data
+base plus `trun.data_offset`, and subsequent positions advance by their
+declared sizes.
+
+This normalization keeps packet cursors, edit-list mapping, decoder
+configuration, and keyframe search independent of the source index shape. The
+fragment parser rejects missing defaults, invalid description indices,
+out-of-file data ranges, unsupported implicit data bases, and arithmetic
+overflow before exposing samples.
 
 ## 7. `stsd`, `avc1`/`avc3`, and `avcC`
 
@@ -669,6 +697,8 @@ Implemented:
 - `moov`, movie headers, video tracks, and AVC sample descriptions;
 - `stts`, `ctts` version 0/1, `stsc`, `stsz`, `stz2`, `stco`, `co64`, and
   `stss`;
+- `mvex`/`trex` fragment defaults;
+- `moof`/`traf`, `tfhd`, version 0/1 `tfdt`, and version 0/1 `trun`;
 - `edts`/`elst` version 0/1 parsing;
 - common linear edit-list timestamp mapping;
 - `avc1` and `avc3` configuration through `avcC`;
@@ -678,7 +708,8 @@ Implemented:
 
 Not implemented yet:
 
-- fragmented MP4 (`moof`, `traf`, `trun`, and fragment defaults);
+- fragment runs without an explicit base-data-offset or
+  `default-base-is-moof`;
 - encrypted/protected sample entries and CENC metadata;
 - audio sample descriptions and interleaved A/V demuxing;
 - complex/repeated/variable-rate edit lists;

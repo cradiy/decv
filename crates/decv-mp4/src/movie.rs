@@ -5,6 +5,7 @@ use decv_core::{BitstreamFormat, MediaTime, VideoCodec, VideoDecoderConfig};
 use crate::{
     BoxHeader, FourCc, Mp4Error, Mp4File, Result,
     edit::{EDTS, Edit, linear_timeline_offset, parse_edit_container},
+    fragment::{append_fragmented_samples, find_movie_extends},
     reader::{BoundedReader, read_full_box},
     sample_table::{Sample, parse_sample_table},
 };
@@ -66,10 +67,12 @@ impl Movie {
             file,
             movie_header.ok_or(Mp4Error::InvalidData("moov has no mvhd box"))?,
         )?;
-        let tracks = track_boxes
+        let mut tracks = track_boxes
             .into_iter()
             .map(|header| Track::parse(file, header, timescale))
             .collect::<Result<Vec<_>>>()?;
+        let movie_extends = find_movie_extends(file, movie_box)?;
+        append_fragmented_samples(file, movie_extends, &mut tracks)?;
         Ok(Self {
             timescale,
             duration,
@@ -246,6 +249,22 @@ impl Track {
     #[inline]
     pub fn edits(&self) -> &[Edit] {
         &self.edits
+    }
+
+    pub(crate) fn extend_fragment_samples(&mut self, samples: Vec<Sample>) {
+        self.samples.extend(samples);
+    }
+
+    pub(crate) fn rebuild_sync_sample_indices(&mut self) {
+        self.sync_sample_indices = self
+            .samples
+            .iter()
+            .enumerate()
+            .filter_map(|(index, sample)| sample.is_sync().then_some(index))
+            .collect();
+        self.sync_sample_indices_by_presentation = self.sync_sample_indices.clone();
+        self.sync_sample_indices_by_presentation
+            .sort_unstable_by_key(|&index| (self.samples[index].presentation_time(), index));
     }
 
     pub fn decoder_config(&self, description_index: usize) -> Result<VideoDecoderConfig> {
@@ -832,6 +851,93 @@ mod tests {
         let mut file = boxed(*b"ftyp", b"isom\0\0\0\0isom");
         file.extend_from_slice(&boxed(*b"moov", &moov));
         file
+    }
+
+    fn synthetic_fragmented_movie() -> Vec<u8> {
+        let mut file = synthetic_movie();
+
+        let mut trex = Vec::from(7u32.to_be_bytes());
+        trex.extend_from_slice(&1u32.to_be_bytes());
+        trex.extend_from_slice(&3_000u32.to_be_bytes());
+        trex.extend_from_slice(&4u32.to_be_bytes());
+        trex.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        let movie_extends = boxed(*b"mvex", &boxed(*b"trex", &full(0, 0, &trex)));
+
+        let movie_start =
+            usize::try_from(u32::from_be_bytes(file[..4].try_into().unwrap())).unwrap();
+        let movie_size = usize::try_from(u32::from_be_bytes(
+            file[movie_start..movie_start + 4].try_into().unwrap(),
+        ))
+        .unwrap();
+        let movie_end = movie_start + movie_size;
+        file.splice(movie_end..movie_end, movie_extends.iter().copied());
+        let extended_movie_size = u32::try_from(movie_size + movie_extends.len()).unwrap();
+        file[movie_start..movie_start + 4].copy_from_slice(&extended_movie_size.to_be_bytes());
+
+        let mut track_fragment_header = Vec::from(7u32.to_be_bytes());
+        track_fragment_header.extend_from_slice(&3_000u32.to_be_bytes());
+        track_fragment_header.extend_from_slice(&4u32.to_be_bytes());
+        track_fragment_header.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        let track_fragment_header = boxed(*b"tfhd", &full(0, 0x020038, &track_fragment_header));
+        let decode_time = boxed(*b"tfdt", &full(1, 0, &12_000u64.to_be_bytes()));
+
+        let make_fragment = |data_offset: i32| {
+            let mut run = Vec::from(2u32.to_be_bytes());
+            run.extend_from_slice(&data_offset.to_be_bytes());
+            run.extend_from_slice(&0u32.to_be_bytes());
+            run.extend_from_slice(&3u32.to_be_bytes());
+            run.extend_from_slice(&300i32.to_be_bytes());
+            run.extend_from_slice(&4u32.to_be_bytes());
+            run.extend_from_slice(&(-100i32).to_be_bytes());
+            let run = boxed(*b"trun", &full(1, 0x000a05, &run));
+            let mut track_fragment = track_fragment_header.clone();
+            track_fragment.extend_from_slice(&decode_time);
+            track_fragment.extend_from_slice(&run);
+            let mut movie_fragment = boxed(*b"mfhd", &full(0, 0, &1u32.to_be_bytes()));
+            movie_fragment.extend_from_slice(&boxed(*b"traf", &track_fragment));
+            boxed(*b"moof", &movie_fragment)
+        };
+        let provisional = make_fragment(0);
+        let data_offset = i32::try_from(provisional.len() + 8).unwrap();
+        let movie_fragment = make_fragment(data_offset);
+        file.extend_from_slice(&movie_fragment);
+        file.extend_from_slice(&boxed(*b"mdat", &[1, 2, 3, 4, 5, 6, 7]));
+        file
+    }
+
+    #[test]
+    fn appends_fragment_runs_with_signed_composition_offsets() {
+        let bytes = synthetic_fragmented_movie();
+        let input = MemoryInput(bytes);
+        let movie = Movie::parse(Mp4File::open(&input).unwrap()).unwrap();
+        let track = &movie.tracks()[0];
+        assert_eq!(track.samples().len(), 5);
+        assert_eq!(track.sync_sample_indices(), [0, 2, 3]);
+
+        let first = track.samples()[3];
+        assert_eq!(first.decode_time(), 12_000);
+        assert_eq!(first.presentation_time(), 12_300);
+        assert_eq!(first.duration(), 3_000);
+        assert_eq!(first.size(), 3);
+        assert_eq!(first.description_index(), 0);
+        assert!(first.is_sync());
+
+        let second = track.samples()[4];
+        assert_eq!(second.decode_time(), 15_000);
+        assert_eq!(second.presentation_time(), 14_900);
+        assert_eq!(second.duration(), 3_000);
+        assert_eq!(second.size(), 4);
+        assert!(!second.is_sync());
+
+        let first_packet = track.read_packet(&input, 3).unwrap();
+        assert_eq!(first_packet.data.as_ref(), [1, 2, 3]);
+        assert_eq!(first_packet.dts, MediaTime::from_parts(3_000, 90_000));
+        assert_eq!(first_packet.pts, MediaTime::from_parts(3_300, 90_000));
+        assert!(first_packet.keyframe);
+
+        let second_packet = track.read_packet(&input, 4).unwrap();
+        assert_eq!(second_packet.data.as_ref(), [4, 5, 6, 7]);
+        assert!(!second_packet.keyframe);
     }
 
     #[test]

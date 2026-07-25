@@ -12,7 +12,7 @@ const STCO: FourCc = FourCc::new(*b"stco");
 const CO64: FourCc = FourCc::new(*b"co64");
 const STSS: FourCc = FourCc::new(*b"stss");
 
-const MAX_SAMPLE_COUNT: usize = 2_000_000;
+pub(crate) const MAX_SAMPLE_COUNT: usize = 2_000_000;
 const MAX_TABLE_ENTRY_COUNT: usize = 2_000_000;
 
 /// One compressed sample located and timed by an MP4 sample table.
@@ -28,6 +28,27 @@ pub struct Sample {
 }
 
 impl Sample {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) const fn new_fragment(
+        offset: u64,
+        size: u32,
+        decode_time: i64,
+        presentation_time: i64,
+        duration: u32,
+        description_index: usize,
+        sync: bool,
+    ) -> Self {
+        Self {
+            offset,
+            size,
+            decode_time,
+            presentation_time,
+            duration,
+            description_index,
+            sync,
+        }
+    }
+
     #[inline]
     pub const fn offset(self) -> u64 {
         self.offset

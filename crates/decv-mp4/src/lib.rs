@@ -9,6 +9,7 @@ mod demuxer;
 mod edit;
 mod error;
 mod fourcc;
+mod fragment;
 mod movie;
 mod reader;
 mod sample_table;

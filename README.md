@@ -2,7 +2,7 @@
 
 `decv` is an experimental, pure-Rust video decoding and demuxing library. Its
 current software pipeline decodes H.264/AVC from Annex-B streams or ordinary
-sample-table MP4 files into immutable CPU NV12 frames.
+and fragmented MP4 files into immutable CPU NV12 frames.
 
 The workspace provides deterministic media primitives:
 
@@ -64,15 +64,16 @@ Valid H.264 features that are still rejected include:
 Unsupported syntax must return an explicit error. Corrupt or truncated
 untrusted input must not panic or silently produce a known-wrong frame.
 
-`decv-mp4` currently handles ordinary non-fragmented MP4 sample tables,
-including track enumeration, AVC sample descriptions, DTS/PTS/duration,
-binary-searchable sync-sample indexes, simple linear edit lists, packet
-cursors, exact-seek preroll from a preceding keyframe, and low-latency preview
-seeks to a following keyframe. The H.264 decoder additionally exposes
+`decv-mp4` currently handles ordinary sample tables and movie fragments,
+including track enumeration, AVC sample descriptions, `trex`/`tfhd`/`tfdt`/
+`trun` sample indexing, DTS/PTS/duration, binary-searchable sync-sample
+indexes, simple linear edit lists, packet cursors, exact-seek preroll from a
+preceding keyframe, and low-latency preview seeks to a following keyframe. The
+H.264 decoder additionally exposes
 forward-target retargeting and reusable decode-state checkpoints for
 interactive exact seeks, including a bounded checkpoint cache with generic
-container cursor tokens and paired capture/restore operations. Fragmented MP4,
-audio decoding, and encrypted media are not yet implemented.
+container cursor tokens and paired capture/restore operations. Audio decoding
+and encrypted media are not yet implemented.
 
 ## Decoder Contract
 
