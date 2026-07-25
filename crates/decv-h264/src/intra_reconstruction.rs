@@ -248,6 +248,8 @@ pub struct IntraPictureReconstructor {
     width_in_macroblocks: usize,
     picture: Yuv420Picture,
     cavlc: CavlcNeighborState,
+    cabac_p: Option<CabacPMacroblockState>,
+    cabac_b: Option<CabacBMacroblockState>,
     cabac_residual: CabacResidualState,
     modes: IntraModeState,
     motion: PMotionState,
@@ -270,6 +272,8 @@ pub struct IntraPictureReconstructor {
 #[derive(Debug, Clone)]
 pub(crate) struct ReconstructionWorkspace {
     b_motion: BMotionState,
+    cabac_p: Option<CabacPMacroblockState>,
+    cabac_b: Option<CabacBMacroblockState>,
     cabac_residual: CabacResidualState,
     modes: IntraModeState,
     motion: PMotionState,
@@ -280,6 +284,8 @@ impl ReconstructionWorkspace {
     fn new(width_in_macroblocks: usize, height_in_macroblocks: usize) -> Result<Self> {
         Ok(Self {
             b_motion: BMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
+            cabac_p: None,
+            cabac_b: None,
             cabac_residual: CabacResidualState::new(width_in_macroblocks, height_in_macroblocks)?,
             modes: IntraModeState::new(width_in_macroblocks, height_in_macroblocks)?,
             motion: PMotionState::new(width_in_macroblocks, height_in_macroblocks)?,
@@ -304,6 +310,22 @@ impl ReconstructionWorkspace {
             first_slice_id,
             generation_exhausted,
         )?;
+        if let Some(cabac_p) = self.cabac_p.as_mut() {
+            cabac_p.reset_for_picture(
+                width_in_macroblocks,
+                height_in_macroblocks,
+                first_slice_id,
+                generation_exhausted,
+            )?;
+        }
+        if let Some(cabac_b) = self.cabac_b.as_mut() {
+            cabac_b.reset_for_picture(
+                width_in_macroblocks,
+                height_in_macroblocks,
+                first_slice_id,
+                generation_exhausted,
+            )?;
+        }
         self.cabac_residual.reset_for_picture(
             width_in_macroblocks,
             height_in_macroblocks,
@@ -424,6 +446,8 @@ impl IntraPictureReconstructor {
             width_in_macroblocks,
             picture,
             cavlc,
+            cabac_p: workspace.cabac_p,
+            cabac_b: workspace.cabac_b,
             cabac_residual: workspace.cabac_residual,
             modes: workspace.modes,
             motion: workspace.motion,
@@ -1152,6 +1176,35 @@ impl IntraPictureReconstructor {
         references_l0: ReconstructionReferenceList<'_>,
         prediction_weights: Option<&PredictionWeightTable>,
     ) -> Result<usize> {
+        let height_in_macroblocks = self.completed.len() / self.width_in_macroblocks;
+        let mut macroblocks = match self.cabac_p.take() {
+            Some(macroblocks) => macroblocks,
+            None => CabacPMacroblockState::new(self.width_in_macroblocks, height_in_macroblocks)?,
+        };
+        let result = self.decode_cabac_p_slice_data_with_state(
+            rbsp,
+            config,
+            cabac_init_idc,
+            num_ref_idx_l0_active,
+            references_l0,
+            prediction_weights,
+            &mut macroblocks,
+        );
+        self.cabac_p = Some(macroblocks);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_cabac_p_slice_data_with_state(
+        &mut self,
+        rbsp: &[u8],
+        config: IntraSliceConfig,
+        cabac_init_idc: Option<u8>,
+        num_ref_idx_l0_active: u8,
+        references_l0: ReconstructionReferenceList<'_>,
+        prediction_weights: Option<&PredictionWeightTable>,
+        macroblocks: &mut CabacPMacroblockState,
+    ) -> Result<usize> {
         self.next_slice_id = self
             .next_slice_id
             .checked_add(1)
@@ -1164,9 +1217,6 @@ impl IntraPictureReconstructor {
             cabac_init_idc,
             config.slice_qp_y,
         )?;
-        let height_in_macroblocks = self.completed.len() / self.width_in_macroblocks;
-        let mut macroblocks =
-            CabacPMacroblockState::new(self.width_in_macroblocks, height_in_macroblocks)?;
         let mut quantizers = MacroblockQuantizerState::new(
             config.slice_qp_y,
             config.chroma_cb_offset,
@@ -1573,10 +1623,41 @@ impl IntraPictureReconstructor {
         rbsp: &[u8],
         config: IntraSliceConfig,
         cabac_init_idc: Option<u8>,
+        context: CabacBMacroblockContext,
+        references_l0: ReconstructionReferenceList<'_>,
+        references_l1: ReconstructionReferenceList<'_>,
+        modes: BReconstructionModes<'_>,
+    ) -> Result<usize> {
+        let height_in_macroblocks = self.completed.len() / self.width_in_macroblocks;
+        let mut macroblocks = match self.cabac_b.take() {
+            Some(macroblocks) => macroblocks,
+            None => CabacBMacroblockState::new(self.width_in_macroblocks, height_in_macroblocks)?,
+        };
+        let result = self.decode_cabac_b_slice_data_with_state(
+            rbsp,
+            config,
+            cabac_init_idc,
+            context,
+            references_l0,
+            references_l1,
+            modes,
+            &mut macroblocks,
+        );
+        self.cabac_b = Some(macroblocks);
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn decode_cabac_b_slice_data_with_state(
+        &mut self,
+        rbsp: &[u8],
+        config: IntraSliceConfig,
+        cabac_init_idc: Option<u8>,
         mut context: CabacBMacroblockContext,
         references_l0: ReconstructionReferenceList<'_>,
         references_l1: ReconstructionReferenceList<'_>,
         modes: BReconstructionModes<'_>,
+        macroblocks: &mut CabacBMacroblockState,
     ) -> Result<usize> {
         let reference_ids_l0 = references_l0.reference_ids;
         let reference_ids_l1 = references_l1.reference_ids;
@@ -1596,9 +1677,6 @@ impl IntraPictureReconstructor {
             cabac_init_idc,
             config.slice_qp_y,
         )?;
-        let height_in_macroblocks = self.completed.len() / self.width_in_macroblocks;
-        let mut macroblocks =
-            CabacBMacroblockState::new(self.width_in_macroblocks, height_in_macroblocks)?;
         let mut quantizers = MacroblockQuantizerState::new(
             config.slice_qp_y,
             config.chroma_cb_offset,
@@ -2684,6 +2762,8 @@ impl IntraPictureReconstructor {
             motion,
             ReconstructionWorkspace {
                 b_motion: self.b_motion,
+                cabac_p: self.cabac_p,
+                cabac_b: self.cabac_b,
                 cabac_residual: self.cabac_residual,
                 modes: self.modes,
                 motion: self.motion,
@@ -2709,6 +2789,8 @@ impl IntraPictureReconstructor {
             },
             ReconstructionWorkspace {
                 b_motion: self.b_motion,
+                cabac_p: self.cabac_p,
+                cabac_b: self.cabac_b,
                 cabac_residual: self.cabac_residual,
                 modes: self.modes,
                 motion: self.motion,
@@ -3549,8 +3631,8 @@ mod tests {
         write_b_inter_deblock_info, write_inter_deblock_info,
     };
     use crate::{
-        BMacroblockContext, CabacResidualBlock, CodedBlockPattern, DeblockingFilter,
-        DecodedIntraMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
+        BMacroblockContext, CabacBMacroblockContext, CabacResidualBlock, CodedBlockPattern,
+        DeblockingFilter, DecodedIntraMacroblock, H264Error, IntraLumaPrediction, IntraMacroblock,
         IntraMacroblockHeader, IntraPredictionModeSyntax, IntraResidual, MacroblockQuantizer,
         MotionVector, PcmMacroblock, ResidualBlock, ResolvedBListMotion, ResolvedBMacroblock,
         ResolvedBPartition, ResolvedPMacroblock, ResolvedPPartition, resolve_scaling_lists_4x4,
@@ -3609,6 +3691,46 @@ mod tests {
                 .unwrap(),
             Some(85)
         );
+    }
+
+    #[test]
+    fn cabac_inter_state_returns_to_workspace_after_slice_errors() {
+        let mut reconstructor = reconstructor(Size::new(16, 16));
+        let references = [];
+        assert!(
+            reconstructor
+                .decode_cabac_p_slice_data(
+                    &[],
+                    p_slice_config(),
+                    None,
+                    1,
+                    ReconstructionReferenceList::new(&references),
+                    None,
+                )
+                .is_err()
+        );
+        assert!(reconstructor.cabac_p.is_some());
+
+        assert!(
+            reconstructor
+                .decode_cabac_b_slice_data(
+                    &[],
+                    p_slice_config(),
+                    None,
+                    CabacBMacroblockContext {
+                        num_ref_idx_l0_active: 1,
+                        num_ref_idx_l1_active: 1,
+                        transform_8x8_mode_enabled: false,
+                        direct_8x8_inference: true,
+                        previous_qp_delta_nonzero: false,
+                    },
+                    ReconstructionReferenceList::new(&references),
+                    ReconstructionReferenceList::new(&references),
+                    b_reconstruction_modes(),
+                )
+                .is_err()
+        );
+        assert!(reconstructor.cabac_b.is_some());
     }
 
     #[test]

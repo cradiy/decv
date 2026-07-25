@@ -57,6 +57,7 @@ struct CompletedCabacMacroblock {
 pub struct CabacMacroblockState {
     width_in_macroblocks: usize,
     height_in_macroblocks: usize,
+    first_slice_id: u32,
     completed: Vec<Option<CompletedCabacMacroblock>>,
 }
 
@@ -73,8 +74,35 @@ impl CabacMacroblockState {
         Ok(Self {
             width_in_macroblocks,
             height_in_macroblocks,
+            first_slice_id: 0,
             completed: vec![None; macroblock_count],
         })
+    }
+
+    pub(crate) fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+        first_slice_id: u32,
+        clear_entries: bool,
+    ) -> Result<()> {
+        if width_in_macroblocks == 0 || height_in_macroblocks == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC macroblock-state dimensions must be non-zero",
+            ));
+        }
+        let macroblock_count = width_in_macroblocks
+            .checked_mul(height_in_macroblocks)
+            .ok_or(H264Error::IntegerOverflow)?;
+        self.width_in_macroblocks = width_in_macroblocks;
+        self.height_in_macroblocks = height_in_macroblocks;
+        self.first_slice_id = first_slice_id;
+        if self.completed.len() != macroblock_count {
+            self.completed = vec![None; macroblock_count];
+        } else if clear_entries {
+            self.completed.fill(None);
+        }
+        Ok(())
     }
 
     /// Decodes progressive-frame `mb_skip_flag` for a P/SP or B slice.
@@ -335,7 +363,7 @@ impl CabacMacroblockState {
             .ok_or(H264Error::InvalidSyntax(
                 "CABAC macroblock address exceeds the picture",
             ))?;
-        if slot.is_some() {
+        if slot.is_some_and(|macroblock| macroblock.slice_id >= self.first_slice_id) {
             return Err(H264Error::InvalidSyntax(
                 "CABAC macroblock was already completed",
             ));
@@ -1024,6 +1052,35 @@ mod tests {
                 .is_err()
         );
         assert!(state.skip_flag_context_index(4, 1, SliceType::P).is_err());
+    }
+
+    #[test]
+    fn reuses_macroblock_storage_across_picture_generations() {
+        let mut state = CabacMacroblockState::new(2, 1).unwrap();
+        let storage = state.completed.as_ptr();
+        state
+            .record_macroblock(0, 3, summary(false, false, None, 0, 0))
+            .unwrap();
+
+        state.reset_for_picture(2, 1, 4, false).unwrap();
+        assert_eq!(state.completed.as_ptr(), storage);
+        assert_eq!(state.left_and_top(1, 4).unwrap(), [None, None]);
+        state
+            .record_macroblock(0, 4, summary(true, false, None, 0, 0))
+            .unwrap();
+        assert!(
+            state
+                .record_macroblock(0, 5, summary(false, false, None, 0, 0))
+                .is_err()
+        );
+
+        state.reset_for_picture(2, 1, 6, false).unwrap();
+        state
+            .record_macroblock(0, 6, summary(false, false, None, 0, 0))
+            .unwrap();
+        state.reset_for_picture(2, 1, 1, true).unwrap();
+        assert_eq!(state.completed.as_ptr(), storage);
+        assert!(state.completed.iter().all(Option::is_none));
     }
 
     #[test]

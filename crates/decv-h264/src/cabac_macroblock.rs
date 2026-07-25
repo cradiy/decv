@@ -62,6 +62,23 @@ impl CabacPMacroblockState {
         })
     }
 
+    pub(crate) fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+        first_slice_id: u32,
+        clear_entries: bool,
+    ) -> Result<()> {
+        self.macroblocks.reset_for_picture(
+            width_in_macroblocks,
+            height_in_macroblocks,
+            first_slice_id,
+            clear_entries,
+        )?;
+        self.motion_l0
+            .reset_for_picture(width_in_macroblocks, height_in_macroblocks, clear_entries)
+    }
+
     /// Decodes, assembles, and records one progressive 4:2:0 P macroblock.
     ///
     /// Motion and residual neighbour state are transactional. Arithmetic

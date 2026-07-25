@@ -1931,6 +1931,39 @@ respective SHA-256 hashes
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534` and
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`.
 
+## Generation-Reused CABAC Inter Syntax Grids
+
+CABAC P and B slice decoding formerly constructed fresh macroblock-summary and
+4x4 motion-syntax grids for every picture. The allocator can recycle those
+blocks, but zero-initializing `Option` cells repeatedly still discards useful
+physical pages during long-GOP preroll. The reconstruction workspace now
+retains lazily allocated P and B states. Exact slice IDs make previous-picture
+cells invisible without clearing; a first-slice generation additionally keeps
+duplicate macroblock writes detectable within the current picture. Dimension
+changes reallocate, and generation wrap explicitly clears all retained cells.
+State returns to the workspace on both successful and failed slice decoding.
+
+On the 1440x2560 long-GOP exact-seek workload, seven alternating PGO pairs
+reduced median end-to-end time from 0.71 to 0.68 seconds and median CPU task
+time from about 0.94 to 0.89 seconds. Five-run counters reduced mean task-clock
+by 3.0%, elapsed time by 3.7%, and minor faults from 70,481 to 45,497 (35.4%).
+A deeper 3.3-second preroll improved first-frame median from 1.36 to 1.34
+seconds. Retained state increased peak RSS by about 5 MiB on the shorter seek.
+
+The 48-frame 4K PGO counter sample reduced task-clock by 2.2%, cycles by 1.1%,
+elapsed time by 2.6%, and minor faults by 3.2%; seven alternating wall-time
+pairs were neutral at a 0.97-second median. Keeping both P and B grids raised
+median peak RSS by about 12 MiB on that stream. This is an explicit
+throughput/latency tradeoff: the retained memory is bounded by coded
+dimensions and avoids repeated page churn across arbitrarily long streams.
+The CAVLC control workload remained neutral because it never allocates these
+states.
+
+The native H.264 and MP4 verification corpora remained byte-exact. The
+complete 4K output and exact-seek suffix retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534` and
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

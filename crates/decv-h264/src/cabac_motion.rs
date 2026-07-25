@@ -53,6 +53,31 @@ impl CabacMotionSyntaxState {
         })
     }
 
+    pub(crate) fn reset_for_picture(
+        &mut self,
+        width_in_macroblocks: usize,
+        height_in_macroblocks: usize,
+        clear_entries: bool,
+    ) -> Result<()> {
+        if width_in_macroblocks == 0 || height_in_macroblocks == 0 {
+            return Err(H264Error::InvalidSyntax(
+                "CABAC motion-state dimensions must be non-zero",
+            ));
+        }
+        let cell_count = width_in_macroblocks
+            .checked_mul(height_in_macroblocks)
+            .and_then(|count| count.checked_mul(16))
+            .ok_or(H264Error::IntegerOverflow)?;
+        self.width_in_macroblocks = width_in_macroblocks;
+        self.height_in_macroblocks = height_in_macroblocks;
+        if self.cells.len() != cell_count {
+            self.cells = vec![None; cell_count];
+        } else if clear_entries {
+            self.cells.fill(None);
+        }
+        Ok(())
+    }
+
     /// Decodes and records `ref_idx_lX`. A single active reference is inferred
     /// as zero and consumes no bin.
     pub fn decode_reference_index(
@@ -595,6 +620,43 @@ mod tests {
             state.reference_context_increment(1, 8, second, false),
             Ok(0)
         );
+    }
+
+    #[test]
+    fn reuses_motion_storage_and_ignores_previous_picture_cells() {
+        let mut state = CabacMotionSyntaxState::new(2, 1).unwrap();
+        let storage = state.cells.as_ptr();
+        let whole = CabacMotionPartition {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 16,
+        };
+        state
+            .fill_partition(
+                0,
+                whole,
+                MotionSyntaxCell {
+                    slice_id: 3,
+                    reference_index: 2,
+                    direct: false,
+                    mvd_absolute: [0; 2],
+                },
+            )
+            .unwrap();
+        assert_eq!(state.reference_context_increment(1, 3, whole, false), Ok(1));
+
+        state.reset_for_picture(2, 1, false).unwrap();
+        assert_eq!(state.cells.as_ptr(), storage);
+        assert_eq!(state.reference_context_increment(1, 4, whole, false), Ok(0));
+        state.record_skip_macroblock(0, 4).unwrap();
+        assert_eq!(state.reference_context_increment(1, 4, whole, false), Ok(0));
+
+        state.reset_for_picture(2, 1, true).unwrap();
+        assert_eq!(state.cells.as_ptr(), storage);
+        assert!(state.cells.iter().all(Option::is_none));
+        state.reset_for_picture(1, 1, false).unwrap();
+        assert_eq!(state.cells.len(), 16);
     }
 
     #[test]
