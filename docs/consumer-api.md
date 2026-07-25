@@ -169,6 +169,37 @@ order:
 3. If neither applies, seek the container to the preceding keyframe and call
    `flush_for_seek`.
 
+The `decv` facade provides `H264Mp4SeekController` to apply that ordering
+without duplicating the cursor/decoder coordination in each application:
+
+```rust,ignore
+let mut seeks = H264Mp4SeekController::new(
+    video_track_index,
+    4,
+    128 * 1024 * 1024,
+);
+
+let outcome = seeks.begin_exact_seek(
+    &mut decoder,
+    &mut cursor,
+    target,
+    can_continue_current_input,
+)?;
+
+let mut packet = cursor.next_packet()?.unwrap();
+packet.discontinuity = outcome.requires_discontinuity();
+decoder.send_packet(packet)?;
+
+// Capture sparsely after complete samples, according to the application's
+// latency and memory budget.
+seeks.capture_checkpoint(&mut decoder, &cursor)?;
+```
+
+For pointer-move previews, `begin_nearest_preview` flushes the active exact
+timeline and selects the closest independently decodable sample. Its first
+packet must be marked discontinuous. Once the pointer settles, call
+`begin_exact_seek` for the requested timestamp.
+
 Decoder mutation remains single-threaded and synchronous. A request scheduler
 should stop feeding stale work between compressed packets and tag
 consumer-owned results with its own request generation, because a frame

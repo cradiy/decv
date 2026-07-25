@@ -5,9 +5,9 @@ use decv::{
     AudioDecoderConfig, BitstreamFormat, ChannelLayout, ColorInfo, ColorMatrix, ColorPrimaries,
     ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput, DecodedVideoFrame,
     EncodedAudioPacket, EncodedVideoPacket, FourCc, FrameStorage, H264Decoder, H264Error,
-    H264Parallelism, H264SeekCheckpointCache, MediaTime, Mp4Demuxer, PcmCodec, PixelFormat, Rect,
-    Size, SoftwareAudioDecoder, TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig,
-    VideoFormat,
+    H264Mp4SeekController, H264Mp4SeekOutcome, H264Parallelism, H264SeekCheckpointCache, MediaTime,
+    Mp4Demuxer, PcmCodec, PixelFormat, Rect, Size, SoftwareAudioDecoder, TransferFunction,
+    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
 
 fn accepts_consumer_decoder<D>(decoder: &mut D)
@@ -373,6 +373,83 @@ fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
         [Some(earlier_target), Some(final_target)]
     );
     assert!(frames.iter().all(|frame| frame.validate().is_ok()));
+}
+
+#[test]
+fn facade_controller_selects_keyframe_checkpoint_and_forward_retarget() {
+    let mp4 = decode_hex(include_str!("fixtures/three-frame-high-b.mp4.hex"));
+    let demuxer = Mp4Demuxer::open(mp4).unwrap();
+    let track_index = demuxer
+        .movie()
+        .tracks()
+        .iter()
+        .position(|track| track.handler() == FourCc::new(*b"vide"))
+        .unwrap();
+    let mut cursor = demuxer.packet_cursor(track_index).unwrap();
+    let mut decoder = H264Decoder::new();
+    decoder
+        .configure(cursor.decoder_config().unwrap().unwrap())
+        .unwrap();
+    let mut seeks = H264Mp4SeekController::new(track_index, 4, 128 * 1024 * 1024);
+
+    let final_target = MediaTime::from_parts(1024, 15_360).unwrap();
+    let cold = seeks
+        .begin_exact_seek(&mut decoder, &mut cursor, final_target, false)
+        .unwrap();
+    assert_eq!(cold, H264Mp4SeekOutcome::Keyframe { sample_index: 0 });
+    assert!(cold.requires_discontinuity());
+
+    let mut anchor = cursor.next_packet().unwrap().unwrap();
+    anchor.discontinuity = cold.requires_discontinuity();
+    assert!(matches!(
+        decoder.send_packet(anchor).unwrap(),
+        DecodeInputStatus::Accepted
+    ));
+    assert!(seeks.capture_checkpoint(&mut decoder, &cursor).unwrap());
+    assert_eq!(seeks.checkpoint_count(), 1);
+
+    let earlier_target = MediaTime::from_parts(512, 15_360).unwrap();
+    let restored = seeks
+        .begin_exact_seek(&mut decoder, &mut cursor, earlier_target, false)
+        .unwrap();
+    assert_eq!(restored, H264Mp4SeekOutcome::Checkpoint { sample_index: 1 });
+    assert!(!restored.requires_discontinuity());
+    assert_eq!(cursor.next_sample_index(), 1);
+
+    let retargeted = seeks
+        .begin_exact_seek(&mut decoder, &mut cursor, final_target, true)
+        .unwrap();
+    assert_eq!(retargeted, H264Mp4SeekOutcome::ForwardRetarget);
+    assert!(!retargeted.requires_discontinuity());
+    assert_eq!(cursor.next_sample_index(), 1);
+}
+
+#[test]
+fn facade_controller_uses_a_discontinuous_keyframe_for_preview() {
+    let mp4 = decode_hex(include_str!("fixtures/three-frame-high-b.mp4.hex"));
+    let demuxer = Mp4Demuxer::open(mp4).unwrap();
+    let track_index = demuxer
+        .movie()
+        .tracks()
+        .iter()
+        .position(|track| track.handler() == FourCc::new(*b"vide"))
+        .unwrap();
+    let mut cursor = demuxer.packet_cursor(track_index).unwrap();
+    let mut decoder = H264Decoder::new();
+    decoder
+        .configure(cursor.decoder_config().unwrap().unwrap())
+        .unwrap();
+    let mut seeks = H264Mp4SeekController::new(track_index, 2, 64 * 1024 * 1024);
+
+    let target = MediaTime::from_parts(512, 15_360).unwrap();
+    assert_eq!(
+        seeks
+            .begin_nearest_preview(&mut decoder, &mut cursor, target)
+            .unwrap(),
+        0
+    );
+    assert_eq!(cursor.next_sample_index(), 0);
+    assert_eq!(seeks.active_exact_target(), None);
 }
 
 #[test]

@@ -7,6 +7,8 @@
 
 #![forbid(unsafe_code)]
 
+mod seek;
+
 pub use decv_audio::{AacDecoder, AacError, AudioError, SoftwareAudioDecoder};
 pub use decv_core::{
     AdpcmCodec, AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder,
@@ -24,3 +26,4 @@ pub use decv_mp4::{
     AacSampleEntry, AudioPacketCursor, FourCc, Movie, Mp4Demuxer, Mp4Error, PacketCursor, Sample,
     SampleDescription, Track, TrackKind,
 };
+pub use seek::{H264Mp4SeekController, H264Mp4SeekError, H264Mp4SeekOutcome};
