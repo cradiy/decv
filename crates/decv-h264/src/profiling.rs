@@ -32,7 +32,12 @@ const SPATIAL_DIRECT_UNIFORM_PREDICTION: usize = 23;
 const SPATIAL_DIRECT_COL_ZERO_CLEAR: usize = 24;
 const SPATIAL_DIRECT_COL_ZERO_SET: usize = 25;
 const SPATIAL_DIRECT_COL_ZERO_MIXED: usize = 26;
-const COUNTER_COUNT: usize = 27;
+const SPATIAL_DIRECT_BOTH_ZERO: usize = 27;
+const SPATIAL_DIRECT_LIST0_ZERO: usize = 28;
+const SPATIAL_DIRECT_LIST1_ZERO: usize = 29;
+const SPATIAL_DIRECT_BOTH_REFERENCE_ZERO: usize = 30;
+const SPATIAL_DIRECT_ZERO_NEIGHBOUR_TRIPLET: usize = 31;
+const COUNTER_COUNT: usize = 32;
 
 static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
 
@@ -107,7 +112,7 @@ impl fmt::Display for InterPredictionProfile {
             self.counter(CHROMA_CLIPPED_PIXELS),
             percent(self.counter(CHROMA_CLIPPED_PIXELS), chroma_pixels)
         )?;
-        write!(
+        writeln!(
             formatter,
             "spatial Direct: macroblocks={} prediction-uniform={} \
              col-zero-clear={} col-zero-set={} col-zero-mixed={}",
@@ -116,6 +121,16 @@ impl fmt::Display for InterPredictionProfile {
             self.counter(SPATIAL_DIRECT_COL_ZERO_CLEAR),
             self.counter(SPATIAL_DIRECT_COL_ZERO_SET),
             self.counter(SPATIAL_DIRECT_COL_ZERO_MIXED)
+        )?;
+        write!(
+            formatter,
+            "  uniform predictions: both-zero={} list0-zero={} list1-zero={} \
+             both-reference-zero={} zero-neighbour-triplet={}",
+            self.counter(SPATIAL_DIRECT_BOTH_ZERO),
+            self.counter(SPATIAL_DIRECT_LIST0_ZERO),
+            self.counter(SPATIAL_DIRECT_LIST1_ZERO),
+            self.counter(SPATIAL_DIRECT_BOTH_REFERENCE_ZERO),
+            self.counter(SPATIAL_DIRECT_ZERO_NEIGHBOUR_TRIPLET)
         )
     }
 }
@@ -179,9 +194,23 @@ pub(crate) fn record_inter_prediction(
     }
 }
 
-pub(crate) fn record_spatial_direct_uniform_prediction() {
+pub(crate) fn record_spatial_direct_uniform_prediction(
+    list0_zero: bool,
+    list1_zero: bool,
+    both_reference_zero: bool,
+) {
     increment(SPATIAL_DIRECT_MACROBLOCKS, 1);
     increment(SPATIAL_DIRECT_UNIFORM_PREDICTION, 1);
+    increment(SPATIAL_DIRECT_LIST0_ZERO, u64::from(list0_zero));
+    increment(SPATIAL_DIRECT_LIST1_ZERO, u64::from(list1_zero));
+    increment(
+        SPATIAL_DIRECT_BOTH_ZERO,
+        u64::from(list0_zero && list1_zero),
+    );
+    increment(
+        SPATIAL_DIRECT_BOTH_REFERENCE_ZERO,
+        u64::from(both_reference_zero),
+    );
 }
 
 pub(crate) fn record_spatial_direct_col_zero_grid(cell_count: usize, mask: u16) {
@@ -195,6 +224,10 @@ pub(crate) fn record_spatial_direct_col_zero_grid(cell_count: usize, mask: u16) 
         },
         1,
     );
+}
+
+pub(crate) fn record_spatial_direct_zero_neighbour_triplet() {
+    increment(SPATIAL_DIRECT_ZERO_NEIGHBOUR_TRIPLET, 1);
 }
 
 fn increment(index: usize, value: u64) {
@@ -225,5 +258,6 @@ mod tests {
         assert!(formatted.contains("0 calls"));
         assert!(formatted.contains("(0.0%)"));
         assert!(formatted.contains("spatial Direct: macroblocks=0"));
+        assert!(formatted.contains("zero-neighbour-triplet=0"));
     }
 }

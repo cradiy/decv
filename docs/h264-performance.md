@@ -2261,6 +2261,39 @@ does not change cold-seek codec work by itself; it makes the measured
 checkpoint restore path directly usable without every consumer independently
 implementing ordering, strict-bound selection, and memory eviction.
 
+## Zero-Neighbour Spatial Direct Fast Path
+
+Profiling the long-GOP first-frame seek found 604,613 Spatial Direct
+macroblocks before the selected output. For 572,764 of them (94.7%), the
+effective A, B, and C motion neighbours all carried bidirectional reference
+index zero with zero motion vectors. The normative spatial median therefore
+also resolves to the same bidirectional zero motion, and its co-located-zero
+rule cannot change the result.
+
+The resolver now recognizes that narrow case before expanding each neighbour
+into separate List 0 and List 1 predictor forms. It still validates both
+active reference lists and the co-located motion-field boundary before
+committing the macroblock. Missing neighbours, C-to-D fallback distinctions,
+single-list motion, non-zero vectors, non-zero reference indices, and mixed
+co-located grids retain the complete derivation path.
+
+Across fifteen fixed-CPU PGO first-frame runs, median exact-seek latency moved
+from 0.52 to 0.51 seconds. Fifteen-run hardware-counter means reduced
+task-clock from 530.12 to 515.02 ms (2.8%), cycles from 2.418 to 2.380 billion
+(1.6%), instructions from 5.455 to 5.217 billion (4.4%), and branches from
+668.8 to 662.1 million (1.0%).
+
+On the ordinary 48-frame 4K workload, eleven-run PGO means reduced task-clock
+by 1.2%, cycles by 0.7%, instructions by 1.1%, and branches by 0.3%. The CAVLC
+control retained the same nine-run wall-time median; its instructions and
+branches fell about 0.1%, while mean cycles increased about 0.9%. That small
+measured tradeoff is retained for the primary High Profile CABAC target. The
+complete 4K output, six-frame exact-seek suffix, and CAVLC control retained
+SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
+and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

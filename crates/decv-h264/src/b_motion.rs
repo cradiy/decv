@@ -292,6 +292,33 @@ impl BMotionState {
             macroblock_y,
             slice_id,
         );
+        if zero_bidirectional_neighbour_triplet(neighbour_cells) {
+            let zero = Some(ResolvedBListMotion {
+                reference_index: 0,
+                motion_vector: MotionVector::default(),
+            });
+            validate_direct_reference(Some(0), context.num_ref_idx_l0_active, "List 0")?;
+            validate_direct_reference(Some(0), context.num_ref_idx_l1_active, "List 1")?;
+            let last_colocated_x = macroblock_x * 4 + 3;
+            let last_colocated_y = macroblock_y * 4 + 3;
+            if last_colocated_x >= context.colocated_motion.width_in_4x4_blocks()
+                || last_colocated_y >= context.colocated_motion.height_in_4x4_blocks()
+            {
+                return Err(H264Error::InvalidSyntax(
+                    "spatial Direct co-located block lies outside the reference motion field",
+                ));
+            }
+            #[cfg(feature = "internal-profiling")]
+            crate::profiling::record_spatial_direct_zero_neighbour_triplet();
+            #[cfg(feature = "internal-profiling")]
+            crate::profiling::record_spatial_direct_uniform_prediction(true, true, true);
+            return Ok(self.commit_uniform_direct_macroblock(
+                macroblock_address,
+                slice_id,
+                zero,
+                zero,
+            ));
+        }
         let (neighbours_l0, neighbours_l1) = neighbour_motion_lists(neighbour_cells);
         let mut reference_l0 = spatial_direct_reference_index_from(neighbours_l0);
         let mut reference_l1 = spatial_direct_reference_index_from(neighbours_l1);
@@ -354,7 +381,16 @@ impl BMotionState {
                 motion_vector,
             });
             #[cfg(feature = "internal-profiling")]
-            crate::profiling::record_spatial_direct_uniform_prediction();
+            crate::profiling::record_spatial_direct_uniform_prediction(
+                list0.is_some_and(|motion| {
+                    motion.reference_index == 0 && motion.motion_vector == MotionVector::default()
+                }),
+                list1.is_some_and(|motion| {
+                    motion.reference_index == 0 && motion.motion_vector == MotionVector::default()
+                }),
+                list0.is_some_and(|motion| motion.reference_index == 0)
+                    && list1.is_some_and(|motion| motion.reference_index == 0),
+            );
             return Ok(self.commit_uniform_direct_macroblock(
                 macroblock_address,
                 slice_id,
@@ -1052,6 +1088,16 @@ fn neighbour_motion_pair(cell: Option<MotionCell>) -> (NeighbourMotion, Neighbou
     (list0, list1)
 }
 
+fn zero_bidirectional_neighbour_triplet([a, b, c, d]: [Option<MotionCell>; 4]) -> bool {
+    let zero = ResolvedBListMotion {
+        reference_index: 0,
+        motion_vector: MotionVector::default(),
+    };
+    [a, b, c.or(d)]
+        .into_iter()
+        .all(|cell| cell.is_some_and(|cell| cell.list0 == Some(zero) && cell.list1 == Some(zero)))
+}
+
 fn spatial_direct_reference_index_from([a, b, mut c, d]: [NeighbourMotion; 4]) -> Option<u8> {
     if !c.available {
         c = d;
@@ -1558,6 +1604,53 @@ mod tests {
             num_ref_idx_l0_active: 2,
             num_ref_idx_l1_active: 2,
         }
+    }
+
+    #[test]
+    fn zero_bidirectional_neighbour_triplet_preserves_c_fallback_rules() {
+        let zero = ResolvedBListMotion {
+            reference_index: 0,
+            motion_vector: MotionVector::default(),
+        };
+        let cell = |list0, list1| {
+            Some(MotionCell {
+                slice_id: 1,
+                list0,
+                list1,
+            })
+        };
+
+        let bidirectional_zero = cell(Some(zero), Some(zero));
+        assert!(!zero_bidirectional_neighbour_triplet([None; 4]));
+        assert!(zero_bidirectional_neighbour_triplet([
+            bidirectional_zero,
+            bidirectional_zero,
+            bidirectional_zero,
+            None,
+        ]));
+        assert!(zero_bidirectional_neighbour_triplet([
+            bidirectional_zero,
+            bidirectional_zero,
+            None,
+            bidirectional_zero,
+        ]));
+
+        let nonzero = ResolvedBListMotion {
+            reference_index: 0,
+            motion_vector: MotionVector { x: 1, y: 0 },
+        };
+        assert!(!zero_bidirectional_neighbour_triplet([
+            bidirectional_zero,
+            bidirectional_zero,
+            cell(None, None),
+            bidirectional_zero,
+        ]));
+        assert!(!zero_bidirectional_neighbour_triplet([
+            None,
+            bidirectional_zero,
+            bidirectional_zero,
+            cell(Some(nonzero), Some(nonzero)),
+        ]));
     }
 
     #[test]
