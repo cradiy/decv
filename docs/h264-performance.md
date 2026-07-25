@@ -2260,6 +2260,9 @@ oldest resume points first, preserving the most recent decoded window. This
 does not change cold-seek codec work by itself; it makes the measured
 checkpoint restore path directly usable without every consumer independently
 implementing ordering, strict-bound selection, and memory eviction.
+Paired `capture` and `restore_latest_before` operations now perform checkpoint
+creation and decoder restoration through the cache itself, returning the exact
+matching caller-owned input token after a successful restore.
 
 ## Zero-Neighbour Spatial Direct Fast Path
 

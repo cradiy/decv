@@ -273,18 +273,12 @@ fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
         decoder.send_packet(anchor).unwrap(),
         DecodeInputStatus::Accepted
     ));
-    let checkpoint = decoder.create_seek_checkpoint().unwrap();
-    assert_eq!(checkpoint.retained_reference_count(), 1);
-    assert!(checkpoint.estimated_retained_reference_bytes() > 0);
     let resume_sample = cursor.next_sample_index();
-    let mut checkpoints = H264SeekCheckpointCache::new(
-        4,
-        checkpoint
-            .estimated_retained_reference_bytes()
-            .checked_mul(4)
-            .unwrap(),
-    );
-    assert!(checkpoints.insert(checkpoint, resume_sample));
+    let mut checkpoints = H264SeekCheckpointCache::new(4, 128 * 1024 * 1024);
+    assert!(checkpoints.capture(&mut decoder, resume_sample).unwrap());
+    let cached = checkpoints.latest_before(final_target).unwrap();
+    assert_eq!(cached.checkpoint().retained_reference_count(), 1);
+    assert!(cached.estimated_retained_reference_bytes() > 0);
     let remaining_packets = std::iter::from_fn(|| cursor.next_packet().transpose())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
@@ -298,11 +292,11 @@ fn facade_restores_an_mp4_seek_checkpoint_at_an_earlier_target() {
     assert_eq!(frames[0].pts, Some(final_target));
 
     let earlier_target = MediaTime::from_parts(512, 15_360).unwrap();
-    let cached = checkpoints.latest_before(earlier_target).unwrap();
-    decoder
-        .restore_seek_checkpoint(cached.checkpoint(), earlier_target)
+    let resume_sample = *checkpoints
+        .restore_latest_before(&mut decoder, earlier_target)
+        .unwrap()
         .unwrap();
-    cursor.seek_to_sample(*cached.input_position()).unwrap();
+    cursor.seek_to_sample(resume_sample).unwrap();
     let replay_packets = std::iter::from_fn(|| cursor.next_packet().transpose())
         .collect::<Result<Vec<_>, _>>()
         .unwrap();

@@ -194,6 +194,17 @@ impl<T> H264SeekCheckpointCache<T> {
         }
     }
 
+    /// Captures the decoder at the current complete access-unit boundary and
+    /// pairs it with the exact next compressed-input position.
+    ///
+    /// Returns whether the new checkpoint remains cached after enforcing the
+    /// configured limits. Checkpoint creation errors leave the cache
+    /// unchanged.
+    pub fn capture(&mut self, decoder: &mut H264Decoder, input_position: T) -> Result<bool> {
+        let checkpoint = decoder.create_seek_checkpoint()?;
+        Ok(self.insert(checkpoint, input_position))
+    }
+
     /// Inserts or replaces the checkpoint at its resume time.
     ///
     /// Returns whether the inserted entry remains cached after enforcing both
@@ -254,6 +265,25 @@ impl<T> H264SeekCheckpointCache<T> {
         insertion_index
             .checked_sub(1)
             .and_then(|index| self.entries.get(index))
+    }
+
+    /// Restores the latest valid predecessor and returns its matching
+    /// compressed-input position.
+    ///
+    /// `None` means that the cache has no checkpoint strictly before
+    /// `target`; in that case the decoder is not modified. On success, resume
+    /// feeding from the returned position without marking the next packet as
+    /// discontinuous.
+    pub fn restore_latest_before(
+        &self,
+        decoder: &mut H264Decoder,
+        target: MediaTime,
+    ) -> Result<Option<&T>> {
+        let Some(entry) = self.latest_before(target) else {
+            return Ok(None);
+        };
+        decoder.restore_seek_checkpoint(entry.checkpoint(), target)?;
+        Ok(Some(entry.input_position()))
     }
 
     pub fn clear(&mut self) {
@@ -2428,6 +2458,19 @@ mod tests {
         let checkpoint_zero = decoder.create_seek_checkpoint().unwrap();
         let estimated_bytes = checkpoint_zero.estimated_retained_reference_bytes();
         assert!(estimated_bytes > 0);
+        let mut captured = H264SeekCheckpointCache::new(1, estimated_bytes);
+        assert!(captured.capture(&mut decoder, 7usize).unwrap());
+        assert_eq!(
+            captured
+                .latest_before(MediaTime::from_parts(1, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &7
+        );
+        let mut unconfigured = H264Decoder::new();
+        assert!(captured.capture(&mut unconfigured, 8usize).is_err());
+        assert_eq!(captured.len(), 1);
+
         let mut checkpoint_two = checkpoint_zero.clone();
         checkpoint_two.resume_time = MediaTime::from_parts(2, 1).unwrap();
         let mut checkpoint_four = checkpoint_zero.clone();
@@ -2460,6 +2503,21 @@ mod tests {
                 .input_position(),
             &20
         );
+        let restore_target = MediaTime::from_parts(3, 1).unwrap();
+        assert_eq!(
+            cache
+                .restore_latest_before(&mut decoder, restore_target)
+                .unwrap(),
+            Some(&20)
+        );
+        assert_eq!(decoder.output_start_time, Some(restore_target));
+        assert!(
+            cache
+                .restore_latest_before(&mut decoder, zero)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(decoder.output_start_time, Some(restore_target));
 
         assert!(cache.insert(checkpoint_four.clone(), 40usize));
         assert_eq!(cache.len(), 2);

@@ -71,8 +71,8 @@ cursors, exact-seek preroll from a preceding keyframe, and low-latency preview
 seeks to a following keyframe. The H.264 decoder additionally exposes
 forward-target retargeting and reusable decode-state checkpoints for
 interactive exact seeks, including a bounded checkpoint cache with generic
-container cursor tokens. Fragmented MP4, audio decoding, and encrypted media
-are not yet implemented.
+container cursor tokens and paired capture/restore operations. Fragmented MP4,
+audio decoding, and encrypted media are not yet implemented.
 
 ## Decoder Contract
 

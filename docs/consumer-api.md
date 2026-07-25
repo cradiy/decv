@@ -125,26 +125,27 @@ let mut checkpoints = H264SeekCheckpointCache::new(
     128 * 1024 * 1024,
 );
 let resume_sample = cursor.next_sample_index();
-let checkpoint = decoder.create_seek_checkpoint()?;
-checkpoints.insert(checkpoint, resume_sample);
+checkpoints.capture(&mut decoder, resume_sample)?;
 
 // Later, the cache enforces the strict resume-time bound:
-if let Some(cached) = checkpoints.latest_before(target) {
-    cursor.seek_to_sample(*cached.input_position())?;
-    decoder.restore_seek_checkpoint(cached.checkpoint(), target)?;
+if let Some(resume_sample) =
+    checkpoints.restore_latest_before(&mut decoder, target)?
+{
+    cursor.seek_to_sample(*resume_sample)?;
 }
 ```
 
-Call `create_seek_checkpoint` only after feeding a complete access unit. It
-finishes that unit before snapshotting parser history, the DPB, and display
-reordering. The decoder derives `checkpoint.resume_time()` as the maximum PTS
-of every completed access unit, rather than trusting decode order to match
-presentation order. Every completed picture must therefore carry a PTS, and
-the restored target must be later than that bound. Reference pictures and
-motion fields are stored behind `Arc`, so checkpoint cloning does not copy full
-pixel planes. Checkpoints can still retain old reference pictures, so
-consumers should use a bounded, sparsely sampled cache rather than keeping one
-for every frame. `retained_reference_count()` and
+Call `capture` (or the lower-level `create_seek_checkpoint`) only after feeding
+a complete access unit. Checkpoint creation finishes that unit before
+snapshotting parser history, the DPB, and display reordering. The decoder
+derives `checkpoint.resume_time()` as the maximum PTS of every completed access
+unit, rather than trusting decode order to match presentation order. Every
+completed picture must therefore carry a PTS, and the restored target must be
+later than that bound. Reference pictures and motion fields are stored behind
+`Arc`, so checkpoint cloning does not copy full pixel planes. Checkpoints can
+still retain old reference pictures, so consumers should use a bounded,
+sparsely sampled cache rather than keeping one for every frame.
+`retained_reference_count()` and
 `estimated_retained_reference_bytes()` expose a conservative per-checkpoint
 cache cost. Summing the byte estimate can overcount allocations shared by
 multiple checkpoints, making it suitable for a simple upper-budget eviction
@@ -152,7 +153,10 @@ policy. `H264SeekCheckpointCache<T>` implements that policy with independent
 entry and byte limits. It stores a caller-defined input-position token, keeps
 entries ordered by resume time, selects the strict predecessor required by
 restore, replaces duplicate resume points, and evicts the oldest checkpoints
-first to retain the most recent decoded window.
+first to retain the most recent decoded window. Its `capture` and
+`restore_latest_before` operations keep decoder snapshots paired with the
+matching input token so callers do not independently select one entry and
+restore another.
 
 For one active decoder, choose the least destructive valid transition in this
 order:
