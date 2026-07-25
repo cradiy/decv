@@ -1,9 +1,10 @@
 use std::{num::NonZeroU32, sync::Arc};
 
-use decv_core::{BitstreamFormat, MediaTime, VideoCodec, VideoDecoderConfig};
+use decv_core::{AudioDecoderConfig, BitstreamFormat, MediaTime, VideoCodec, VideoDecoderConfig};
 
 use crate::{
-    BoxHeader, FourCc, Mp4Error, Mp4File, Result,
+    AacSampleEntry, BoxHeader, FourCc, Mp4Error, Mp4File, Result,
+    audio::{MP4A, parse_aac_sample_entry},
     edit::{EDTS, Edit, linear_timeline_offset, parse_edit_container},
     fragment::{append_fragmented_samples, find_movie_extends},
     reader::{BoundedReader, read_full_box},
@@ -21,6 +22,12 @@ const MINF: FourCc = FourCc::new(*b"minf");
 const STBL: FourCc = FourCc::new(*b"stbl");
 const STSD: FourCc = FourCc::new(*b"stsd");
 const VIDE: FourCc = FourCc::new(*b"vide");
+const SOUN: FourCc = FourCc::new(*b"soun");
+const SUBT: FourCc = FourCc::new(*b"subt");
+const SBTL: FourCc = FourCc::new(*b"sbtl");
+const TEXT: FourCc = FourCc::new(*b"text");
+const CLCP: FourCc = FourCc::new(*b"clcp");
+const META: FourCc = FourCc::new(*b"meta");
 const AVC1: FourCc = FourCc::new(*b"avc1");
 const AVC3: FourCc = FourCc::new(*b"avc3");
 const AVCC: FourCc = FourCc::new(*b"avcC");
@@ -113,6 +120,16 @@ pub struct Track {
     edits: Vec<Edit>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TrackKind {
+    Video,
+    Audio,
+    Subtitle,
+    Metadata,
+    Unknown,
+}
+
 impl Track {
     fn parse(file: Mp4File<'_>, track_box: BoxHeader, movie_timescale: NonZeroU32) -> Result<Self> {
         let mut track_header = None;
@@ -158,9 +175,16 @@ impl Track {
             handler_box.ok_or(Mp4Error::InvalidData("mdia has no hdlr box"))?,
         )?;
         let (sample_descriptions, samples) = if handler == VIDE {
-            parse_video_sample_table(
+            parse_media_sample_table(
                 file,
                 media_information.ok_or(Mp4Error::InvalidData("video track has no minf box"))?,
+                parse_video_sample_entry,
+            )?
+        } else if handler == SOUN {
+            parse_media_sample_table(
+                file,
+                media_information.ok_or(Mp4Error::InvalidData("audio track has no minf box"))?,
+                parse_audio_sample_entry,
             )?
         } else {
             (Vec::new(), Vec::new())
@@ -194,6 +218,27 @@ impl Track {
     #[inline]
     pub const fn id(&self) -> u32 {
         self.id
+    }
+
+    #[inline]
+    pub const fn track_id(&self) -> u32 {
+        self.id
+    }
+
+    #[inline]
+    pub const fn kind(&self) -> TrackKind {
+        match self.handler {
+            VIDE => TrackKind::Video,
+            SOUN => TrackKind::Audio,
+            SUBT | SBTL | TEXT | CLCP => TrackKind::Subtitle,
+            META => TrackKind::Metadata,
+            _ => TrackKind::Unknown,
+        }
+    }
+
+    #[inline]
+    pub const fn language(&self) -> Option<&str> {
+        None
     }
 
     #[inline]
@@ -277,10 +322,46 @@ impl Track {
                 })?;
         match description {
             SampleDescription::Avc(entry) => entry.decoder_config(),
+            SampleDescription::Aac(_) => Err(Mp4Error::UnsupportedFeature(
+                "audio sample description has no video decoder",
+            )),
             SampleDescription::Unsupported { .. } => Err(Mp4Error::UnsupportedFeature(
                 "sample description has no supported video decoder",
             )),
         }
+    }
+
+    pub fn audio_decoder_config(&self, description_index: usize) -> Result<AudioDecoderConfig> {
+        let description =
+            self.sample_descriptions
+                .get(description_index)
+                .ok_or(Mp4Error::IndexOutOfRange {
+                    kind: "sample-description",
+                    index: description_index,
+                })?;
+        match description {
+            SampleDescription::Aac(entry) => entry.decoder_config(),
+            SampleDescription::Avc(_) => Err(Mp4Error::UnsupportedFeature(
+                "video sample description has no audio decoder",
+            )),
+            SampleDescription::Unsupported { .. } => Err(Mp4Error::UnsupportedFeature(
+                "sample description has no supported audio decoder",
+            )),
+        }
+    }
+
+    pub fn audio_decoder_config_for_sample(
+        &self,
+        sample_index: usize,
+    ) -> Result<AudioDecoderConfig> {
+        let sample = self
+            .samples
+            .get(sample_index)
+            .ok_or(Mp4Error::IndexOutOfRange {
+                kind: "sample",
+                index: sample_index,
+            })?;
+        self.audio_decoder_config(sample.description_index())
     }
 
     pub fn decoder_config_for_sample(&self, sample_index: usize) -> Result<VideoDecoderConfig> {
@@ -404,6 +485,57 @@ impl Track {
         }))
     }
 
+    /// Finds the complete audio sample with the greatest presentation time not
+    /// after `target`.
+    pub fn audio_sample_at_or_before(&self, target: MediaTime) -> Result<Option<usize>> {
+        if self.kind() != TrackKind::Audio {
+            return Err(Mp4Error::UnsupportedFeature(
+                "audio sample seek requires an audio track",
+            ));
+        }
+        let offset = self.presentation_time_offset()?.value;
+        if let Some(first) = self.samples.first() {
+            first
+                .presentation_time()
+                .checked_add(offset)
+                .ok_or(Mp4Error::IntegerOverflow)?;
+        }
+        if let Some(last) = self.samples.last() {
+            last.presentation_time()
+                .checked_add(offset)
+                .ok_or(Mp4Error::IntegerOverflow)?;
+        }
+        if self
+            .samples
+            .windows(2)
+            .all(|pair| pair[0].presentation_time() <= pair[1].presentation_time())
+        {
+            let position = self.samples.partition_point(|sample| {
+                adjusted_presentation_time_is_not_after(
+                    sample.presentation_time(),
+                    offset,
+                    self.media_timescale,
+                    target,
+                )
+            });
+            return Ok(position.checked_sub(1));
+        }
+        Ok(self
+            .samples
+            .iter()
+            .enumerate()
+            .filter(|(_, sample)| {
+                adjusted_presentation_time_is_not_after(
+                    sample.presentation_time(),
+                    offset,
+                    self.media_timescale,
+                    target,
+                )
+            })
+            .max_by_key(|(_, sample)| sample.presentation_time())
+            .map(|(index, _)| index))
+    }
+
     fn validate_sync_presentation_range(&self, offset: i64) -> Result<()> {
         let Some((&first, &last)) = self
             .sync_sample_indices_by_presentation
@@ -462,8 +594,10 @@ fn adjusted_presentation_distance(
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SampleDescription {
     Avc(AvcSampleEntry),
+    Aac(AacSampleEntry),
     Unsupported { format: FourCc },
 }
 
@@ -471,6 +605,7 @@ impl SampleDescription {
     pub const fn format(&self) -> FourCc {
         match self {
             Self::Avc(entry) => entry.format,
+            Self::Aac(entry) => entry.format(),
             Self::Unsupported { format } => *format,
         }
     }
@@ -606,9 +741,10 @@ fn parse_handler(file: Mp4File<'_>, header: BoxHeader) -> Result<FourCc> {
     reader.read_fourcc()
 }
 
-fn parse_video_sample_table(
+fn parse_media_sample_table(
     file: Mp4File<'_>,
     media_information: BoxHeader,
+    parse_entry: fn(Mp4File<'_>, BoxHeader) -> Result<SampleDescription>,
 ) -> Result<(Vec<SampleDescription>, Vec<Sample>)> {
     let mut sample_table = None;
     for child in file.children(media_information)? {
@@ -617,7 +753,7 @@ fn parse_video_sample_table(
             set_once(&mut sample_table, child, "duplicate stbl box")?;
         }
     }
-    let sample_table = sample_table.ok_or(Mp4Error::InvalidData("video minf has no stbl box"))?;
+    let sample_table = sample_table.ok_or(Mp4Error::InvalidData("media minf has no stbl box"))?;
     let mut description_box = None;
     for child in file.children(sample_table)? {
         let child = child?;
@@ -626,8 +762,8 @@ fn parse_video_sample_table(
         }
     }
     let description_box =
-        description_box.ok_or(Mp4Error::InvalidData("video stbl has no stsd box"))?;
-    let descriptions = parse_sample_description_box(file, description_box)?;
+        description_box.ok_or(Mp4Error::InvalidData("media stbl has no stsd box"))?;
+    let descriptions = parse_sample_description_box(file, description_box, parse_entry)?;
     let samples = parse_sample_table(file, sample_table, descriptions.len())?;
     Ok((descriptions, samples))
 }
@@ -635,6 +771,7 @@ fn parse_video_sample_table(
 fn parse_sample_description_box(
     file: Mp4File<'_>,
     description_box: BoxHeader,
+    parse_entry: fn(Mp4File<'_>, BoxHeader) -> Result<SampleDescription>,
 ) -> Result<Vec<SampleDescription>> {
     let range = description_box.payload_range()?;
     let mut reader = BoundedReader::new(file.input(), range.start, range.end)?;
@@ -655,12 +792,24 @@ fn parse_sample_description_box(
         let entry = entries.next().ok_or(Mp4Error::InvalidData(
             "stsd has fewer entries than declared",
         ))??;
-        descriptions.push(parse_video_sample_entry(file, entry)?);
+        descriptions.push(parse_entry(file, entry)?);
     }
     if entries.next().is_some() {
         return Err(Mp4Error::InvalidData("stsd has more entries than declared"));
     }
     Ok(descriptions)
+}
+
+fn parse_audio_sample_entry(file: Mp4File<'_>, entry: BoxHeader) -> Result<SampleDescription> {
+    let format = entry.kind();
+    if format != MP4A {
+        return Ok(SampleDescription::Unsupported { format });
+    }
+    match parse_aac_sample_entry(file, entry) {
+        Ok(entry) => Ok(SampleDescription::Aac(entry)),
+        Err(Mp4Error::UnsupportedFeature(_)) => Ok(SampleDescription::Unsupported { format }),
+        Err(error) => Err(error),
+    }
 }
 
 fn parse_video_sample_entry(file: Mp4File<'_>, entry: BoxHeader) -> Result<SampleDescription> {
@@ -905,6 +1054,102 @@ mod tests {
         file
     }
 
+    fn synthetic_audio_movie() -> Vec<u8> {
+        let mut mvhd = vec![0; 8];
+        mvhd.extend_from_slice(&1_000u32.to_be_bytes());
+        mvhd.extend_from_slice(&70u32.to_be_bytes());
+        mvhd.extend_from_slice(&[0; 80]);
+
+        let mut tkhd = vec![0; 8];
+        tkhd.extend_from_slice(&2u32.to_be_bytes());
+        tkhd.extend_from_slice(&0u32.to_be_bytes());
+        tkhd.extend_from_slice(&70u32.to_be_bytes());
+        tkhd.extend_from_slice(&[0; 60]);
+
+        let mut mdhd = vec![0; 8];
+        mdhd.extend_from_slice(&44_100u32.to_be_bytes());
+        mdhd.extend_from_slice(&3_072u32.to_be_bytes());
+        mdhd.extend_from_slice(&[0; 4]);
+
+        let mut hdlr = vec![0; 4];
+        hdlr.extend_from_slice(b"soun");
+        hdlr.extend_from_slice(&[0; 12]);
+        hdlr.extend_from_slice(b"Audio\0");
+
+        let audio_specific_config = [0x12, 0x10, 0x56, 0xe5, 0x00];
+        let mut decoder_config = vec![0x40, 0x15, 0, 0, 0];
+        decoder_config.extend_from_slice(&0u32.to_be_bytes());
+        decoder_config.extend_from_slice(&0u32.to_be_bytes());
+        decoder_config.extend_from_slice(&[0x05, 5]);
+        decoder_config.extend_from_slice(&audio_specific_config);
+        let mut es_descriptor = vec![0, 2, 0, 0x04];
+        es_descriptor.push(u8::try_from(decoder_config.len()).unwrap());
+        es_descriptor.extend_from_slice(&decoder_config);
+        es_descriptor.extend_from_slice(&[0x06, 1, 2]);
+        let mut descriptors = vec![0x03, u8::try_from(es_descriptor.len()).unwrap()];
+        descriptors.extend_from_slice(&es_descriptor);
+        let esds = boxed(*b"esds", &full(0, 0, &descriptors));
+
+        let mut mp4a = vec![0; 6];
+        mp4a.extend_from_slice(&1u16.to_be_bytes());
+        mp4a.extend_from_slice(&0u16.to_be_bytes());
+        mp4a.extend_from_slice(&0u16.to_be_bytes());
+        mp4a.extend_from_slice(&0u32.to_be_bytes());
+        mp4a.extend_from_slice(&2u16.to_be_bytes());
+        mp4a.extend_from_slice(&16u16.to_be_bytes());
+        mp4a.extend_from_slice(&0u16.to_be_bytes());
+        mp4a.extend_from_slice(&0u16.to_be_bytes());
+        mp4a.extend_from_slice(&(44_100u32 << 16).to_be_bytes());
+        mp4a.extend_from_slice(&esds);
+        let mp4a = boxed(*b"mp4a", &mp4a);
+
+        let mut stsd = full(0, 0, &1u32.to_be_bytes());
+        stsd.extend_from_slice(&mp4a);
+        let stts = boxed(
+            *b"stts",
+            &full(0, 0, &[1u32, 3, 1_024].map(u32::to_be_bytes).concat()),
+        );
+        let stsc = boxed(
+            *b"stsc",
+            &full(0, 0, &[1u32, 1, 3, 1].map(u32::to_be_bytes).concat()),
+        );
+        let stsz = boxed(
+            *b"stsz",
+            &full(0, 0, &[1u32, 3].map(u32::to_be_bytes).concat()),
+        );
+        let stco = boxed(
+            *b"stco",
+            &full(0, 0, &[1u32, 0].map(u32::to_be_bytes).concat()),
+        );
+        let mut stbl_payload = boxed(*b"stsd", &stsd);
+        stbl_payload.extend_from_slice(&stts);
+        stbl_payload.extend_from_slice(&stsc);
+        stbl_payload.extend_from_slice(&stsz);
+        stbl_payload.extend_from_slice(&stco);
+        let stbl = boxed(*b"stbl", &stbl_payload);
+        let minf = boxed(*b"minf", &stbl);
+
+        let mut mdia = boxed(*b"mdhd", &full(0, 0, &mdhd));
+        mdia.extend_from_slice(&boxed(*b"hdlr", &full(0, 0, &hdlr)));
+        mdia.extend_from_slice(&minf);
+
+        let mut elst = Vec::from(1u32.to_be_bytes());
+        elst.extend_from_slice(&70u32.to_be_bytes());
+        elst.extend_from_slice(&1_024i32.to_be_bytes());
+        elst.extend_from_slice(&1i16.to_be_bytes());
+        elst.extend_from_slice(&0i16.to_be_bytes());
+        let edts = boxed(*b"edts", &boxed(*b"elst", &full(0, 0, &elst)));
+
+        let mut trak = boxed(*b"tkhd", &full(0, 3, &tkhd));
+        trak.extend_from_slice(&edts);
+        trak.extend_from_slice(&boxed(*b"mdia", &mdia));
+        let mut moov = boxed(*b"mvhd", &full(0, 0, &mvhd));
+        moov.extend_from_slice(&boxed(*b"trak", &trak));
+        let mut file = boxed(*b"ftyp", b"isom\0\0\0\0isom");
+        file.extend_from_slice(&boxed(*b"moov", &moov));
+        file
+    }
+
     #[test]
     fn appends_fragment_runs_with_signed_composition_offsets() {
         let bytes = synthetic_fragmented_movie();
@@ -1070,6 +1315,74 @@ mod tests {
     }
 
     #[test]
+    fn parses_aac_track_and_keeps_audio_cursors_independent() {
+        let demuxer = crate::Mp4Demuxer::open(MemoryInput(synthetic_audio_movie())).unwrap();
+        let track = &demuxer.movie().tracks()[0];
+        assert_eq!(track.id(), 2);
+        assert_eq!(track.track_id(), 2);
+        assert_eq!(track.kind(), TrackKind::Audio);
+        assert_eq!(track.language(), None);
+        assert_eq!(track.media_timescale().get(), 44_100);
+        assert_eq!(track.samples().len(), 3);
+        let SampleDescription::Aac(entry) = &track.sample_descriptions()[0] else {
+            panic!("expected AAC sample entry");
+        };
+        assert_eq!(entry.format(), MP4A);
+        assert_eq!(entry.data_reference_index(), 1);
+        assert_eq!(entry.channel_count(), 2);
+        assert_eq!(entry.sample_size(), 16);
+        assert_eq!(entry.sample_rate(), 44_100);
+        assert_eq!(
+            entry.audio_specific_config().as_ref(),
+            [0x12, 0x10, 0x56, 0xe5, 0x00]
+        );
+
+        let config = track.audio_decoder_config_for_sample(0).unwrap();
+        assert_eq!(config.codec, decv_core::AudioCodec::Aac);
+        assert_eq!(config.sample_rate, 44_100);
+        assert_eq!(config.channel_layout, decv_core::ChannelLayout::Stereo);
+
+        let mut first = demuxer.audio_packet_cursor(0).unwrap();
+        let mut second = demuxer.audio_packet_cursor(0).unwrap();
+        assert!(matches!(
+            demuxer.packet_cursor(0),
+            Err(Mp4Error::UnsupportedFeature(
+                "video packet cursor requires a video track"
+            ))
+        ));
+        let packet = first.next_packet().unwrap().unwrap();
+        assert_eq!(packet.data.as_ref(), [0]);
+        assert_eq!(packet.pts, MediaTime::from_parts(-1_024, 44_100));
+        assert_eq!(packet.dts, MediaTime::from_parts(-1_024, 44_100));
+        assert_eq!(packet.duration, MediaTime::from_parts(1_024, 44_100));
+        assert_eq!(first.next_sample_index(), 1);
+        assert_eq!(second.next_sample_index(), 0);
+
+        assert_eq!(
+            second
+                .seek_to_time(MediaTime::from_parts(0, 44_100).unwrap())
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(second.next_sample_index(), 1);
+        assert!(second.next_packet().unwrap().is_some());
+        second.rewind();
+        assert_eq!(second.next_sample_index(), 0);
+        assert_eq!(
+            second.decoder_config().unwrap().unwrap().sample_rate,
+            44_100
+        );
+
+        let video = crate::Mp4Demuxer::open(MemoryInput(synthetic_movie())).unwrap();
+        assert!(matches!(
+            video.audio_packet_cursor(0),
+            Err(Mp4Error::UnsupportedFeature(
+                "audio packet cursor requires an audio track"
+            ))
+        ));
+    }
+
+    #[test]
     fn rejects_missing_movie_and_zero_timescale() {
         let input = MemoryInput(boxed(*b"ftyp", b"isom"));
         assert!(matches!(
@@ -1187,25 +1500,30 @@ mod tests {
 
         for (track_index, track) in demuxer.movie().tracks().iter().enumerate() {
             for sample_index in 0..track.samples().len() {
-                let _ = track.decoder_config_for_sample(sample_index);
-                let _ = demuxer.read_packet(track_index, sample_index);
+                if track.kind() == TrackKind::Audio {
+                    let _ = track.audio_decoder_config_for_sample(sample_index);
+                    let _ = demuxer.read_audio_packet(track_index, sample_index);
+                } else {
+                    let _ = track.decoder_config_for_sample(sample_index);
+                    let _ = demuxer.read_packet(track_index, sample_index);
+                }
             }
         }
     }
 
     #[test]
     fn truncated_or_single_byte_corrupted_movies_do_not_panic() {
-        let valid = synthetic_movie();
+        for valid in [synthetic_movie(), synthetic_audio_movie()] {
+            for end in 0..=valid.len() {
+                exercise_demuxer(valid[..end].to_vec());
+            }
 
-        for end in 0..=valid.len() {
-            exercise_demuxer(valid[..end].to_vec());
-        }
-
-        for index in 0..valid.len() {
-            for mask in [0x01, 0x80, 0xff] {
-                let mut corrupted = valid.clone();
-                corrupted[index] ^= mask;
-                exercise_demuxer(corrupted);
+            for index in 0..valid.len() {
+                for mask in [0x01, 0x80, 0xff] {
+                    let mut corrupted = valid.clone();
+                    corrupted[index] ^= mask;
+                    exercise_demuxer(corrupted);
+                }
             }
         }
     }

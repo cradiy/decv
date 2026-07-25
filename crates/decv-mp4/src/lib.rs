@@ -4,6 +4,7 @@
 //! sample-table readers build on these offsets without loading the whole file
 //! or depending on a particular storage/network implementation.
 
+mod audio;
 mod boxes;
 mod demuxer;
 mod edit;
@@ -14,10 +15,11 @@ mod movie;
 mod reader;
 mod sample_table;
 
+pub use audio::AacSampleEntry;
 pub use boxes::{BoxHeader, BoxIter, Mp4File};
-pub use demuxer::{Mp4Demuxer, PacketCursor};
+pub use demuxer::{AudioPacketCursor, Mp4Demuxer, PacketCursor};
 pub use edit::Edit;
 pub use error::{Mp4Error, Result};
 pub use fourcc::FourCc;
-pub use movie::{AvcSampleEntry, Movie, SampleDescription, Track};
+pub use movie::{AvcSampleEntry, Movie, SampleDescription, Track, TrackKind};
 pub use sample_table::Sample;

@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
-use decv_core::{EncodedVideoPacket, MediaInput, MediaTime, VideoDecoderConfig};
+use decv_core::{
+    AudioDecoderConfig, EncodedAudioPacket, EncodedVideoPacket, MediaInput, MediaTime,
+    VideoDecoderConfig,
+};
 
-use crate::{Movie, Mp4Error, Mp4File, Result, Track};
+use crate::{Movie, Mp4Error, Mp4File, Result, Track, TrackKind};
 
 const MAX_PACKET_SIZE: usize = 256 * 1024 * 1024;
 
@@ -46,17 +49,66 @@ where
                 kind: "track",
                 index: track_index,
             })?;
+        if track.kind() != TrackKind::Video {
+            return Err(Mp4Error::UnsupportedFeature(
+                "video packet read requires a video track",
+            ));
+        }
         track.read_packet(&self.input, sample_index)
     }
 
     pub fn packet_cursor(&self, track_index: usize) -> Result<PacketCursor<'_, I>> {
-        if track_index >= self.movie.tracks().len() {
-            return Err(Mp4Error::IndexOutOfRange {
+        let track = self
+            .movie
+            .tracks()
+            .get(track_index)
+            .ok_or(Mp4Error::IndexOutOfRange {
                 kind: "track",
                 index: track_index,
-            });
+            })?;
+        if track.kind() != TrackKind::Video {
+            return Err(Mp4Error::UnsupportedFeature(
+                "video packet cursor requires a video track",
+            ));
         }
         Ok(PacketCursor {
+            demuxer: self,
+            track_index,
+            next_sample_index: 0,
+        })
+    }
+
+    pub fn read_audio_packet(
+        &self,
+        track_index: usize,
+        sample_index: usize,
+    ) -> Result<EncodedAudioPacket> {
+        let track = self
+            .movie
+            .tracks()
+            .get(track_index)
+            .ok_or(Mp4Error::IndexOutOfRange {
+                kind: "track",
+                index: track_index,
+            })?;
+        track.read_audio_packet(&self.input, sample_index)
+    }
+
+    pub fn audio_packet_cursor(&self, track_index: usize) -> Result<AudioPacketCursor<'_, I>> {
+        let track = self
+            .movie
+            .tracks()
+            .get(track_index)
+            .ok_or(Mp4Error::IndexOutOfRange {
+                kind: "track",
+                index: track_index,
+            })?;
+        if track.kind() != TrackKind::Audio {
+            return Err(Mp4Error::UnsupportedFeature(
+                "audio packet cursor requires an audio track",
+            ));
+        }
+        Ok(AudioPacketCursor {
             demuxer: self,
             track_index,
             next_sample_index: 0,
@@ -178,6 +230,72 @@ where
     }
 }
 
+/// A lightweight sequential view over one audio track.
+#[derive(Debug)]
+pub struct AudioPacketCursor<'demuxer, I> {
+    demuxer: &'demuxer Mp4Demuxer<I>,
+    track_index: usize,
+    next_sample_index: usize,
+}
+
+impl<I> AudioPacketCursor<'_, I>
+where
+    I: MediaInput,
+{
+    #[inline]
+    pub const fn track_index(&self) -> usize {
+        self.track_index
+    }
+
+    #[inline]
+    pub const fn next_sample_index(&self) -> usize {
+        self.next_sample_index
+    }
+
+    #[inline]
+    pub fn track(&self) -> &Track {
+        &self.demuxer.movie().tracks()[self.track_index]
+    }
+
+    pub fn decoder_config(&self) -> Result<Option<AudioDecoderConfig>> {
+        let Some(sample) = self.track().samples().get(self.next_sample_index) else {
+            return Ok(None);
+        };
+        self.track()
+            .audio_decoder_config(sample.description_index())
+            .map(Some)
+    }
+
+    pub fn next_packet(&mut self) -> Result<Option<EncodedAudioPacket>> {
+        if self.next_sample_index == self.track().samples().len() {
+            return Ok(None);
+        }
+        let sample_index = self.next_sample_index;
+        let packet = self
+            .demuxer
+            .read_audio_packet(self.track_index, sample_index)?;
+        self.next_sample_index = self
+            .next_sample_index
+            .checked_add(1)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        Ok(Some(packet))
+    }
+
+    /// Repositions to the closest complete audio sample at or before `target`.
+    pub fn seek_to_time(&mut self, target: MediaTime) -> Result<Option<usize>> {
+        let sample_index = self.track().audio_sample_at_or_before(target)?;
+        if let Some(sample_index) = sample_index {
+            self.next_sample_index = sample_index;
+        }
+        Ok(sample_index)
+    }
+
+    #[inline]
+    pub const fn rewind(&mut self) {
+        self.next_sample_index = 0;
+    }
+}
+
 impl Track {
     /// Reads one compressed sample and maps its raw media timestamps through
     /// the track's supported edit-list timeline.
@@ -186,6 +304,11 @@ impl Track {
         input: &dyn MediaInput,
         sample_index: usize,
     ) -> Result<EncodedVideoPacket> {
+        if self.kind() != TrackKind::Video {
+            return Err(Mp4Error::UnsupportedFeature(
+                "video packet read requires a video track",
+            ));
+        }
         let sample = self
             .samples()
             .get(sample_index)
@@ -221,6 +344,64 @@ impl Track {
         packet.keyframe = sample.is_sync();
         Ok(packet)
     }
+
+    /// Reads one raw compressed audio access unit and maps its timestamps
+    /// through the track's supported edit-list timeline.
+    pub fn read_audio_packet(
+        &self,
+        input: &dyn MediaInput,
+        sample_index: usize,
+    ) -> Result<EncodedAudioPacket> {
+        if self.kind() != TrackKind::Audio {
+            return Err(Mp4Error::UnsupportedFeature(
+                "audio packet read requires an audio track",
+            ));
+        }
+        let sample = self
+            .samples()
+            .get(sample_index)
+            .ok_or(Mp4Error::IndexOutOfRange {
+                kind: "sample",
+                index: sample_index,
+            })?;
+        let data = read_sample_data(input, sample.offset(), sample.size())?;
+        let (pts, dts, duration) = self.packet_times(sample)?;
+        let mut packet = EncodedAudioPacket::new(data);
+        packet.pts = Some(pts);
+        packet.dts = Some(dts);
+        packet.duration = Some(duration);
+        Ok(packet)
+    }
+
+    fn packet_times(&self, sample: &crate::Sample) -> Result<(MediaTime, MediaTime, MediaTime)> {
+        let offset = self.presentation_time_offset()?.value;
+        let pts = sample
+            .presentation_time()
+            .checked_add(offset)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        let dts = sample
+            .decode_time()
+            .checked_add(offset)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        let timescale = self.media_timescale();
+        Ok((
+            MediaTime::new(pts, timescale),
+            MediaTime::new(dts, timescale),
+            MediaTime::new(i64::from(sample.duration()), timescale),
+        ))
+    }
+}
+
+fn read_sample_data(input: &dyn MediaInput, offset: u64, size: u32) -> Result<Arc<[u8]>> {
+    let size = usize::try_from(size).map_err(|_| Mp4Error::IntegerOverflow)?;
+    if size > MAX_PACKET_SIZE {
+        return Err(Mp4Error::InvalidData(
+            "MP4 sample exceeds the packet allocation limit",
+        ));
+    }
+    let mut data = vec![0; size];
+    read_exact_at(input, offset, &mut data)?;
+    Ok(Arc::from(data))
 }
 
 fn read_exact_at(input: &dyn MediaInput, offset: u64, mut buffer: &mut [u8]) -> Result<()> {

@@ -355,7 +355,7 @@ fragment parser rejects missing defaults, invalid description indices,
 out-of-file data ranges, unsupported implicit data bases, and arithmetic
 overflow before exposing samples.
 
-## 7. `stsd`, `avc1`/`avc3`, and `avcC`
+## 7. Codec sample descriptions
 
 `stsd` contains sample descriptions. `stsc` tells each chunk which description
 its samples use.
@@ -391,6 +391,18 @@ length-prefixed, not marked by `00 00 01` start codes.
 
 `decv-mp4` validates enough of the `avcC` header to derive framing. The H.264
 decoder performs the codec-specific validation and parses the parameter sets.
+
+For audio tracks, `soun` selects the audio entry parser. An `mp4a` entry
+declares its channel count, integer sample rate, and sample size. Its `esds`
+descriptor hierarchy supplies the MPEG-4 Audio object type and the
+`DecoderSpecificInfo` payload used as AAC `AudioSpecificConfig`.
+
+The current parser accepts AAC-LC mono or stereo and cross-checks the
+AudioSpecificConfig sample rate and channel configuration against `mp4a`.
+Unsupported AAC object types remain indexed as unsupported descriptions, so
+an unselected audio track cannot prevent another usable track from opening.
+AAC packets contain the raw MP4 access unit; the demuxer does not synthesize an
+ADTS header.
 
 ## 8. Edit lists map media time onto presentation time
 
@@ -694,7 +706,8 @@ Implemented:
 
 - known-length random-access inputs;
 - bounded ordinary, extended-size, size-zero, and UUID box traversal;
-- `moov`, movie headers, video tracks, and AVC sample descriptions;
+- `moov`, movie headers, and media tracks;
+- video, audio, subtitle, metadata, and unknown track classification;
 - `stts`, `ctts` version 0/1, `stsc`, `stsz`, `stz2`, `stco`, `co64`, and
   `stss`;
 - `mvex`/`trex` fragment defaults;
@@ -702,8 +715,10 @@ Implemented:
 - `edts`/`elst` version 0/1 parsing;
 - common linear edit-list timestamp mapping;
 - `avc1` and `avc3` configuration through `avcC`;
+- `soun`, `mp4a`, `esds`, and AAC-LC mono/stereo AudioSpecificConfig;
 - indexed packet reads with PTS, DTS, duration, and keyframe status;
-- sequential packet cursors and previous-keyframe seek;
+- independent audio/video packet cursors, audio sample-time seek, and
+  previous-keyframe video seek;
 - end-to-end MP4 AVC decoding through `decv-cli`.
 
 Not implemented yet:
@@ -711,7 +726,8 @@ Not implemented yet:
 - fragment runs without an explicit base-data-offset or
   `default-base-is-moof`;
 - encrypted/protected sample entries and CENC metadata;
-- audio sample descriptions and interleaved A/V demuxing;
+- a single globally interleaved audio/video packet cursor;
+- AAC PCM decoding;
 - complex/repeated/variable-rate edit lists;
 - mid-stream sample-description switching in the CLI;
 - subtitle and metadata packet APIs;

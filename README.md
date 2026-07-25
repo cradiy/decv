@@ -1,12 +1,13 @@
 # decv
 
-`decv` is an experimental, pure-Rust video decoding and demuxing library. Its
+`decv` is an experimental, pure-Rust media decoding and demuxing library. Its
 current software pipeline decodes H.264/AVC from Annex-B streams or ordinary
-and fragmented MP4 files into immutable CPU NV12 frames.
+and fragmented MP4 files into immutable CPU NV12 frames. MP4 AAC-LC tracks can
+already be indexed and read as raw access units; PCM decoding is in progress.
 
 The workspace provides deterministic media primitives:
 
-- codec-independent packet, timestamp, format, color, and frame types;
+- codec-independent audio/video packet, timestamp, format, and frame types;
 - synchronous `Send` decoder objects with no async-runtime dependency;
 - random-access input implemented for files and memory and extensible to other
   storage sources;
@@ -20,10 +21,10 @@ the `0.1.0` crates as a complete H.264 conformance implementation.
 
 | Crate | Responsibility |
 | --- | --- |
-| `decv` | Narrow consumer facade for decoding, immutable frames, H.264 configuration, and MP4 packet access |
-| `decv-core` | Codec-independent time, packet, frame, color, input, and synchronous decoder contracts |
+| `decv` | Narrow consumer facade for decoding, immutable frames, codec configuration, and MP4 packet access |
+| `decv-core` | Codec-independent time, audio/video packet, frame, input, and synchronous decoder contracts |
 | `decv-h264` | Pure-Rust H.264 parsing, reconstruction, deblocking, DPB management, and NV12 output |
-| `decv-mp4` | Synchronous random-access MP4 parsing, track/sample indexing, packet timestamps, and keyframe seek |
+| `decv-mp4` | Synchronous random-access MP4 parsing, audio/video sample indexing, packet timestamps, and seek |
 | `bit-readers` | Allocation-free MSB-first bit reading and Exp-Golomb primitives |
 | `decv-cli` | Annex-B/MP4 decoding, seek, verification, and benchmark command |
 
@@ -66,14 +67,14 @@ untrusted input must not panic or silently produce a known-wrong frame.
 
 `decv-mp4` currently handles ordinary sample tables and movie fragments,
 including track enumeration, AVC sample descriptions, `trex`/`tfhd`/`tfdt`/
-`trun` sample indexing, DTS/PTS/duration, binary-searchable sync-sample
-indexes, simple linear edit lists, packet cursors, exact-seek preroll from a
-preceding keyframe, and low-latency preview seeks to a following keyframe. The
-H.264 decoder additionally exposes
+`trun` sample indexing, AVC and AAC-LC sample descriptions, DTS/PTS/duration,
+simple linear edit lists, independent audio/video packet cursors, audio sample
+seek, exact video seek from a preceding keyframe, and low-latency preview seek
+to a following keyframe. The H.264 decoder additionally exposes
 forward-target retargeting and reusable decode-state checkpoints for
 interactive exact seeks, including a bounded checkpoint cache with generic
-container cursor tokens and paired capture/restore operations. Audio decoding
-and encrypted media are not yet implemented.
+container cursor tokens and paired capture/restore operations. AAC-to-PCM
+decoding and encrypted media are not yet implemented.
 
 ## Decoder Contract
 

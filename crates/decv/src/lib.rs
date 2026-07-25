@@ -19,4 +19,7 @@ pub use decv_h264::{
     H264Decoder, H264Error, H264Parallelism, H264SeekCheckpoint, H264SeekCheckpointCache,
     H264SeekCheckpointEntry,
 };
-pub use decv_mp4::{FourCc, Movie, Mp4Demuxer, Mp4Error, PacketCursor, Sample, Track};
+pub use decv_mp4::{
+    AacSampleEntry, AudioPacketCursor, FourCc, Movie, Mp4Demuxer, Mp4Error, PacketCursor, Sample,
+    SampleDescription, Track, TrackKind,
+};

@@ -1,6 +1,6 @@
 use std::{env, error::Error, fs::File};
 
-use decv_mp4::{Mp4Demuxer, SampleDescription};
+use decv_mp4::{Mp4Demuxer, SampleDescription, TrackKind};
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args().skip(1);
@@ -57,22 +57,36 @@ fn main() -> Result<(), Box<dyn Error>> {
                     entry.height(),
                     entry.codec_configuration().len()
                 ),
+                SampleDescription::Aac(entry) => println!(
+                    "  {} {} Hz {} channels AudioSpecificConfig={} bytes",
+                    entry.format(),
+                    entry.sample_rate(),
+                    entry.channel_count(),
+                    entry.audio_specific_config().len()
+                ),
                 SampleDescription::Unsupported { format } => {
                     println!("  unsupported {format}")
                 }
+                _ => println!("  unknown sample description"),
             }
         }
         if dump_samples {
             for (index, sample) in track.samples().iter().enumerate() {
-                let packet = demuxer.read_packet(track_index, index)?;
+                let (dts, pts) = if track.kind() == TrackKind::Audio {
+                    let packet = demuxer.read_audio_packet(track_index, index)?;
+                    (packet.dts, packet.pts)
+                } else {
+                    let packet = demuxer.read_packet(track_index, index)?;
+                    (packet.dts, packet.pts)
+                };
                 println!(
                     "  sample={index} offset={} size={} raw_dts={} raw_pts={} dts={} pts={} duration={} description={} sync={}",
                     sample.offset(),
                     sample.size(),
                     sample.decode_time(),
                     sample.presentation_time(),
-                    packet.dts.map(|time| time.value).unwrap_or_default(),
-                    packet.pts.map(|time| time.value).unwrap_or_default(),
+                    dts.map(|time| time.value).unwrap_or_default(),
+                    pts.map(|time| time.value).unwrap_or_default(),
                     sample.duration(),
                     sample.description_index(),
                     sample.is_sync()
