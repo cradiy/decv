@@ -1296,14 +1296,24 @@ impl IntraPictureReconstructor {
                     }
                     CabacPMacroblock::Decoded(decoded) => match decoded.as_ref() {
                         DecodedPSliceMacroblock::Inter { header, residual } => {
-                            let reconstructed = reconstruct_inter_residual(
-                                header,
-                                residual,
-                                quantizer,
-                                &self.scaling_lists,
-                                &self.scaling_lists_8x8,
-                                self.scan_mode,
-                            )?;
+                            // A zero coded-block pattern normatively carries no
+                            // residual samples. `None` has that exact meaning
+                            // to the staged reconstruction path, and avoids
+                            // allocating an all-zero transformed residual.
+                            let reconstructed = header
+                                .coded_block_pattern
+                                .has_residual()
+                                .then(|| {
+                                    reconstruct_inter_residual(
+                                        header,
+                                        residual,
+                                        quantizer,
+                                        &self.scaling_lists,
+                                        &self.scaling_lists_8x8,
+                                        self.scan_mode,
+                                    )
+                                })
+                                .transpose()?;
                             let motion = self.motion.resolve_inter_macroblock(
                                 macroblock_address,
                                 slice_id,
@@ -1336,7 +1346,7 @@ impl IntraPictureReconstructor {
                                 macroblock_x,
                                 macroblock_y,
                                 motion,
-                                residual: Some(reconstructed),
+                                residual: reconstructed,
                             });
                             Ok(())
                         }
@@ -1759,14 +1769,23 @@ impl IntraPictureReconstructor {
                             }
                             CabacBMacroblock::Decoded(decoded) => match decoded.as_ref() {
                                 DecodedBSliceMacroblock::Inter { header, residual } => {
-                                    let reconstructed = reconstruct_b_inter_residual(
-                                        header,
-                                        residual,
-                                        quantizer,
-                                        &self.scaling_lists,
-                                        &self.scaling_lists_8x8,
-                                        self.scan_mode,
-                                    )?;
+                                    // See the P-slice path above. This remains a
+                                    // decoded motion macroblock, but it does not
+                                    // need an allocated all-zero residual.
+                                    let reconstructed = header
+                                        .coded_block_pattern
+                                        .has_residual()
+                                        .then(|| {
+                                            reconstruct_b_inter_residual(
+                                                header,
+                                                residual,
+                                                quantizer,
+                                                &self.scaling_lists,
+                                                &self.scaling_lists_8x8,
+                                                self.scan_mode,
+                                            )
+                                        })
+                                        .transpose()?;
                                     let motion = if is_fully_direct_b_macroblock(header) {
                                         modes.direct.resolve(
                                             &mut self.b_motion,
@@ -1821,7 +1840,7 @@ impl IntraPictureReconstructor {
                                         macroblock_x,
                                         macroblock_y,
                                         motion,
-                                        residual: Some(reconstructed),
+                                        residual: reconstructed,
                                     });
                                     Ok(())
                                 }

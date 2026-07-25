@@ -2144,6 +2144,30 @@ post-seek suffix, and CAVLC control stream retained SHA-256
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
 and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
 
+## Zero-CBP CABAC Residual Elision
+
+A CABAC inter macroblock with a zero coded-block pattern still carries motion
+syntax, but it normatively has no residual coefficients. The batched P/B
+reconstruction path already represents skipped macroblocks with an absent
+reconstructed residual. Decoded zero-CBP inter macroblocks now use the same
+pixel-assembly representation while retaining their decoded motion and
+deblocking metadata. This avoids allocating and initializing an all-zero
+transformed-residual object for each such macroblock.
+
+Across nine fixed-CPU PGO exact-seek counter pairs, retired instructions fell
+from 4.821 billion to 4.782 billion (0.8%) and branches from 592.3 million to
+586.1 million (1.1%). Twelve alternating first-frame pairs were wall-time
+neutral at the available 10 ms reporting resolution. On the 48-frame 4K
+workload, five PGO counter pairs reduced instructions by 1.3% and branches by
+1.2%; seven alternating wall-time pairs retained a 0.92-second median.
+
+The full workspace suite, strict all-target Clippy, and generated real-stream
+verifier passed. The complete 4K output, six-frame exact-seek suffix, and CAVLC
+control stream retained SHA-256
+`d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534`,
+`b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
+and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
