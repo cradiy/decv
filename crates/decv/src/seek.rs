@@ -232,17 +232,29 @@ impl H264Mp4SeekController {
                 H264Mp4SeekOutcome::ForwardRetarget
             }
             ExactSeekSource::Checkpoint => {
-                let entry = self
-                    .checkpoints
-                    .latest_before(target)
-                    .expect("checkpoint source requires a matching cache entry");
                 let previous_sample_index = cursor.next_sample_index();
-                cursor.seek_to_sample(*entry.input_position())?;
-                if let Err(error) = decoder.restore_seek_checkpoint(entry.checkpoint(), target) {
+                let checkpoint_sample_index = checkpoint_sample_index
+                    .expect("checkpoint source requires a matching cache entry");
+                cursor.seek_to_sample(checkpoint_sample_index)?;
+                let restored_sample_index = match self
+                    .checkpoints
+                    .restore_latest_before(decoder, target)
+                {
+                    Ok(Some(sample_index)) => *sample_index,
+                    Ok(None) => unreachable!("checkpoint source requires a matching cache entry"),
+                    Err(error) => {
+                        let _ = cursor.seek_to_sample(previous_sample_index);
+                        return Err(error.into());
+                    }
+                };
+                if restored_sample_index != checkpoint_sample_index {
                     // The stored position came from this cursor, so rollback
                     // should only fail if the caller changed the sample table.
                     let _ = cursor.seek_to_sample(previous_sample_index);
-                    return Err(error.into());
+                    return Err(H264Error::InvalidSyntax(
+                        "H.264 seek checkpoint cache changed during restore",
+                    )
+                    .into());
                 }
                 H264Mp4SeekOutcome::Checkpoint {
                     sample_index: cursor.next_sample_index(),

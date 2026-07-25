@@ -144,6 +144,7 @@ impl H264SeekCheckpoint {
 pub struct H264SeekCheckpointEntry<T> {
     checkpoint: H264SeekCheckpoint,
     input_position: T,
+    last_used: u64,
 }
 
 impl<T> H264SeekCheckpointEntry<T> {
@@ -170,9 +171,9 @@ impl<T> H264SeekCheckpointEntry<T> {
 
 /// A bounded cache of decoder checkpoints for repeated exact seeks.
 ///
-/// Entries are ordered by resume time. When either limit is exceeded, the
-/// oldest resume points are evicted first, retaining the most recent decoded
-/// window. The byte accounting deliberately sums each checkpoint's
+/// Entries are ordered by resume time for predecessor lookup. When either
+/// limit is exceeded, the least recently inserted or restored checkpoint is
+/// evicted. The byte accounting deliberately sums each checkpoint's
 /// conservative estimate even when checkpoints share `Arc` allocations.
 #[derive(Debug, Clone)]
 pub struct H264SeekCheckpointCache<T> {
@@ -180,6 +181,7 @@ pub struct H264SeekCheckpointCache<T> {
     maximum_entries: usize,
     maximum_estimated_reference_bytes: usize,
     estimated_retained_reference_bytes: usize,
+    next_recency: u64,
 }
 
 impl<T> H264SeekCheckpointCache<T> {
@@ -191,6 +193,7 @@ impl<T> H264SeekCheckpointCache<T> {
             maximum_entries,
             maximum_estimated_reference_bytes,
             estimated_retained_reference_bytes: 0,
+            next_recency: 0,
         }
     }
 
@@ -232,6 +235,7 @@ impl<T> H264SeekCheckpointCache<T> {
                 .estimated_retained_reference_bytes
                 .saturating_sub(replaced.estimated_retained_reference_bytes());
         }
+        let last_used = self.take_recency();
         self.estimated_retained_reference_bytes = self
             .estimated_retained_reference_bytes
             .saturating_add(estimated_bytes);
@@ -240,13 +244,21 @@ impl<T> H264SeekCheckpointCache<T> {
             H264SeekCheckpointEntry {
                 checkpoint,
                 input_position,
+                last_used,
             },
         );
 
         while self.entries.len() > self.maximum_entries
             || self.estimated_retained_reference_bytes > self.maximum_estimated_reference_bytes
         {
-            let evicted = self.entries.remove(0);
+            let least_recent_index = self
+                .entries
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .expect("an over-budget checkpoint cache is not empty");
+            let evicted = self.entries.remove(least_recent_index);
             self.estimated_retained_reference_bytes = self
                 .estimated_retained_reference_bytes
                 .saturating_sub(evicted.estimated_retained_reference_bytes());
@@ -275,20 +287,26 @@ impl<T> H264SeekCheckpointCache<T> {
     /// feeding from the returned position without marking the next packet as
     /// discontinuous.
     pub fn restore_latest_before(
-        &self,
+        &mut self,
         decoder: &mut H264Decoder,
         target: MediaTime,
     ) -> Result<Option<&T>> {
-        let Some(entry) = self.latest_before(target) else {
+        let insertion_index = self
+            .entries
+            .partition_point(|entry| entry.resume_time() < target);
+        let Some(entry_index) = insertion_index.checked_sub(1) else {
             return Ok(None);
         };
-        decoder.restore_seek_checkpoint(entry.checkpoint(), target)?;
-        Ok(Some(entry.input_position()))
+        decoder.restore_seek_checkpoint(self.entries[entry_index].checkpoint(), target)?;
+        let last_used = self.take_recency();
+        self.entries[entry_index].last_used = last_used;
+        Ok(Some(self.entries[entry_index].input_position()))
     }
 
     pub fn clear(&mut self) {
         self.entries.clear();
         self.estimated_retained_reference_bytes = 0;
+        self.next_recency = 0;
     }
 
     pub const fn len(&self) -> usize {
@@ -309,6 +327,12 @@ impl<T> H264SeekCheckpointCache<T> {
 
     pub const fn estimated_retained_reference_bytes(&self) -> usize {
         self.estimated_retained_reference_bytes
+    }
+
+    fn take_recency(&mut self) -> u64 {
+        let recency = self.next_recency;
+        self.next_recency = self.next_recency.saturating_add(1);
+        recency
     }
 }
 
@@ -2526,9 +2550,16 @@ mod tests {
                 .latest_before(MediaTime::from_parts(2, 1).unwrap())
                 .is_none()
         );
-        assert!(!cache.insert(checkpoint_zero.clone(), 11usize));
+        assert!(cache.insert(checkpoint_zero.clone(), 11usize));
         assert_eq!(cache.len(), 2);
-        assert!(cache.insert(checkpoint_four, 41usize));
+        assert_eq!(
+            cache
+                .latest_before(MediaTime::from_parts(2, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &11
+        );
+        assert!(cache.insert(checkpoint_four.clone(), 41usize));
         assert_eq!(cache.len(), 2);
         assert_eq!(
             cache
@@ -2536,6 +2567,31 @@ mod tests {
                 .unwrap()
                 .input_position(),
             &41
+        );
+
+        let mut lru = H264SeekCheckpointCache::new(2, byte_budget);
+        assert!(lru.insert(checkpoint_zero.clone(), 10usize));
+        assert!(lru.insert(checkpoint_two.clone(), 20usize));
+        assert_eq!(
+            lru.restore_latest_before(
+                &mut decoder,
+                MediaTime::from_parts(1, 1).unwrap()
+            )
+            .unwrap(),
+            Some(&10)
+        );
+        assert!(lru.insert(checkpoint_four.clone(), 40usize));
+        assert_eq!(
+            lru.latest_before(MediaTime::from_parts(3, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &10
+        );
+        assert_eq!(
+            lru.latest_before(MediaTime::from_parts(5, 1).unwrap())
+                .unwrap()
+                .input_position(),
+            &40
         );
 
         let mut undersized = H264SeekCheckpointCache::new(1, estimated_bytes - 1);

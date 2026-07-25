@@ -152,8 +152,8 @@ multiple checkpoints, making it suitable for a simple upper-budget eviction
 policy. `H264SeekCheckpointCache<T>` implements that policy with independent
 entry and byte limits. It stores a caller-defined input-position token, keeps
 entries ordered by resume time, selects the strict predecessor required by
-restore, replaces duplicate resume points, and evicts the oldest checkpoints
-first to retain the most recent decoded window. Its `capture` and
+restore, replaces duplicate resume points, and evicts the least recently
+inserted or restored checkpoints. Its `capture` and
 `restore_latest_before` operations keep decoder snapshots paired with the
 matching input token so callers do not independently select one entry and
 restore another.

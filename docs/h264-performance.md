@@ -2256,7 +2256,8 @@ library component. It pairs each checkpoint with a generic compressed-input
 position, applies independent entry-count and conservative reference-byte
 limits, replaces duplicate resume points, and returns the latest checkpoint
 strictly before a requested target. When a limit is exceeded it evicts the
-oldest resume points first, preserving the most recent decoded window. This
+least recently inserted or restored entry, preserving seek locality when the
+active playback window moves backward as well as forward. This
 does not change cold-seek codec work by itself; it makes the measured
 checkpoint restore path directly usable without every consumer independently
 implementing ordering, strict-bound selection, and memory eviction.
