@@ -363,18 +363,17 @@ impl BMotionState {
             ));
         }
 
-        let mut col_zero_mask = 0u16;
-        for (index, &(_, _, cell_x, cell_y)) in direct_grid.iter().enumerate() {
-            let colocated = context
-                .colocated_motion
-                .cell(macroblock_x * 4 + cell_x, macroblock_y * 4 + cell_y)
-                .ok_or(H264Error::InvalidSyntax(
-                    "spatial Direct co-located block lies outside the reference motion field",
-                ))?;
-            if colocated_zero_flag(colocated, context.colocated_long_term) {
-                col_zero_mask |= 1 << index;
-            }
-        }
+        let col_zero_mask = context
+            .colocated_motion
+            .spatial_direct_col_zero_mask(
+                macroblock_x,
+                macroblock_y,
+                context.direct_8x8_inference,
+                context.colocated_long_term,
+            )
+            .ok_or(H264Error::InvalidSyntax(
+                "spatial Direct co-located block lies outside the reference motion field",
+            ))?;
         #[cfg(feature = "internal-profiling")]
         crate::profiling::record_spatial_direct_col_zero_grid(direct_grid.len(), col_zero_mask);
 
@@ -1208,15 +1207,7 @@ fn validate_direct_reference(
 }
 
 fn colocated_zero_flag(cell: crate::MotionFieldCell, colocated_long_term: bool) -> bool {
-    if cell.intra || colocated_long_term {
-        return false;
-    }
-    let Some(motion) = cell.list0.or(cell.list1) else {
-        return false;
-    };
-    motion.reference_index == 0
-        && motion.vector.x.unsigned_abs() <= 1
-        && motion.vector.y.unsigned_abs() <= 1
+    cell.colocated_zero_flag(colocated_long_term)
 }
 
 fn partition_plans(header: &BInterMacroblockHeader) -> Result<Vec<PartitionPlan>> {

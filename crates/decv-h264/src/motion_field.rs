@@ -30,6 +30,19 @@ impl MotionFieldCell {
         list0: None,
         list1: None,
     };
+
+    #[inline]
+    pub(crate) fn colocated_zero_flag(self, colocated_long_term: bool) -> bool {
+        if self.intra || colocated_long_term {
+            return false;
+        }
+        let Some(motion) = self.list0.or(self.list1) else {
+            return false;
+        };
+        motion.reference_index == 0
+            && motion.vector.x.unsigned_abs() <= 1
+            && motion.vector.y.unsigned_abs() <= 1
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +79,50 @@ impl ReferenceMotionField {
         self.cells
             .capacity()
             .saturating_mul(size_of::<MotionFieldCell>())
+    }
+
+    pub(crate) fn spatial_direct_col_zero_mask(
+        &self,
+        macroblock_x: usize,
+        macroblock_y: usize,
+        direct_8x8_inference: bool,
+        colocated_long_term: bool,
+    ) -> Option<u16> {
+        let base_x = macroblock_x.checked_mul(4)?;
+        let base_y = macroblock_y.checked_mul(4)?;
+        if base_x.checked_add(4)? > self.width_in_4x4_blocks
+            || base_y.checked_add(4)? > self.height_in_4x4_blocks
+        {
+            return None;
+        }
+        if colocated_long_term {
+            return Some(0);
+        }
+
+        let stride = self.width_in_4x4_blocks;
+        let base = base_y * stride + base_x;
+        if direct_8x8_inference {
+            let indices = [base, base + 2, base + 2 * stride, base + 2 * stride + 2];
+            return Some(
+                indices
+                    .into_iter()
+                    .enumerate()
+                    .fold(0, |mask, (index, cell)| {
+                        mask | (u16::from(self.cells[cell].colocated_zero_flag(false)) << index)
+                    }),
+            );
+        }
+
+        let mut mask = 0;
+        for y in 0..4 {
+            for x in 0..4 {
+                let index = y * 4 + x;
+                if self.cells[base + y * stride + x].colocated_zero_flag(false) {
+                    mask |= 1 << index;
+                }
+            }
+        }
+        Some(mask)
     }
 
     pub fn cell(&self, x: usize, y: usize) -> Option<MotionFieldCell> {
@@ -566,11 +623,52 @@ fn partition_mask(x: u8, y: u8, width: u8, height: u8) -> Result<u16> {
 mod tests {
     use decv_core::Size;
 
-    use super::MotionFieldBuilder;
+    use super::{MotionFieldBuilder, MotionFieldCell, ReferenceMotionField, StoredListMotion};
     use crate::{
         MotionVector, ReferenceId, ResolvedBListMotion, ResolvedBMacroblock, ResolvedBPartition,
         ResolvedPMacroblock, ResolvedPPartition,
     };
+
+    #[test]
+    fn derives_spatial_direct_col_zero_masks_with_one_bounds_check() {
+        let zero = MotionFieldCell {
+            intra: false,
+            list0: Some(StoredListMotion {
+                reference_index: 0,
+                reference_id: None,
+                vector: MotionVector { x: 1, y: -1 },
+            }),
+            list1: None,
+        };
+        let mut field = ReferenceMotionField {
+            width_in_4x4_blocks: 4,
+            height_in_4x4_blocks: 4,
+            cells: vec![zero; 16],
+        };
+        assert_eq!(
+            field.spatial_direct_col_zero_mask(0, 0, true, false),
+            Some(0b1111)
+        );
+        assert_eq!(
+            field.spatial_direct_col_zero_mask(0, 0, false, false),
+            Some(u16::MAX)
+        );
+
+        field.cells[2].list0.as_mut().unwrap().vector.x = 2;
+        assert_eq!(
+            field.spatial_direct_col_zero_mask(0, 0, true, false),
+            Some(0b1101)
+        );
+        assert_eq!(
+            field.spatial_direct_col_zero_mask(0, 0, false, false),
+            Some(!(1 << 2))
+        );
+        assert_eq!(
+            field.spatial_direct_col_zero_mask(0, 0, true, true),
+            Some(0)
+        );
+        assert_eq!(field.spatial_direct_col_zero_mask(1, 0, true, false), None);
+    }
 
     #[test]
     fn snapshots_intra_p_and_bidirectional_cells_in_raster_order() {
