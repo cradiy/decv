@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
 };
 
-use decv_aac::AacDecoder;
+use decv_audio::SoftwareAudioDecoder;
 use decv_core::{
     AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder, DecodedAudioFrame, EncodedAudioPacket,
 };
@@ -32,7 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let config = cursor
         .decoder_config()?
         .ok_or("audio track has no decoder configuration")?;
-    let mut decoder = AacDecoder::new();
+    let mut decoder = SoftwareAudioDecoder::new();
     decoder.configure(config)?;
     let mut output = output_path.map(File::create).transpose()?;
     let mut frames = 0u64;
@@ -72,7 +72,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn send_packet(
-    decoder: &mut AacDecoder,
+    decoder: &mut SoftwareAudioDecoder,
     mut packet: EncodedAudioPacket,
     output: &mut Option<File>,
     frames: &mut u64,
@@ -102,7 +102,7 @@ enum ReceiveState {
 }
 
 fn receive_one(
-    decoder: &mut AacDecoder,
+    decoder: &mut SoftwareAudioDecoder,
     output: &mut Option<File>,
     frames: &mut u64,
     sample_frames: &mut u64,

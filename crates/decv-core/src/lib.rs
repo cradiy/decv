@@ -14,8 +14,9 @@ mod packet;
 mod time;
 
 pub use audio::{
-    AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder, AudioDecoderConfig,
-    AudioFormat, AudioSampleFormat, ChannelLayout, DecodedAudioFrame, EncodedAudioPacket,
+    AdpcmCodec, AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder,
+    AudioDecoderConfig, AudioFormat, AudioSampleFormat, ChannelLayout, DecodedAudioFrame,
+    EncodedAudioPacket, PcmCodec,
 };
 pub use color::{ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, TransferFunction};
 pub use decoder::{

@@ -7,14 +7,14 @@
 
 #![forbid(unsafe_code)]
 
-pub use decv_aac::{AacDecoder, AacError};
+pub use decv_audio::{AacDecoder, AacError, AudioError, SoftwareAudioDecoder};
 pub use decv_core::{
-    AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder, AudioDecoderConfig,
-    AudioFormat, AudioSampleFormat, BitstreamFormat, ChannelLayout, ColorInfo, ColorMatrix,
-    ColorPrimaries, ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput,
+    AdpcmCodec, AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder,
+    AudioDecoderConfig, AudioFormat, AudioSampleFormat, BitstreamFormat, ChannelLayout, ColorInfo,
+    ColorMatrix, ColorPrimaries, ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput,
     DecodedAudioFrame, DecodedVideoFrame, EncodedAudioPacket, EncodedVideoPacket, FrameStorage,
-    MediaError, MediaInput, MediaTime, PixelFormat, Rect, Size, TransferFunction, VideoCodec,
-    VideoDecoder, VideoDecoderConfig, VideoFormat,
+    MediaError, MediaInput, MediaTime, PcmCodec, PixelFormat, Rect, Size, TransferFunction,
+    VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
 pub use decv_h264::{
     H264Decoder, H264Error, H264Parallelism, H264SeekCheckpoint, H264SeekCheckpointCache,

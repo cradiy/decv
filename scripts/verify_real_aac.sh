@@ -32,7 +32,7 @@ ffmpeg -hide_banner -loglevel error -ignore_editlist 1 \
     -i "$input" -map 0:a:0 -acodec pcm_f32le -f f32le -y "$reference"
 
 cargo build --quiet --manifest-path "$repo_dir/Cargo.toml" \
-    -p decv-aac --example decode_mp4 --release
+    -p decv-audio --example decode_mp4 --release
 "$repo_dir/target/release/examples/decode_mp4" \
     "$input" "$actual" >/dev/null
 

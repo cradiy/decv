@@ -3,7 +3,7 @@ resolver = "2"
 members = [
   "crates/bit-readers",
   "crates/decv",
-  "crates/decv-aac",
+  "crates/decv-audio",
   "crates/decv-cli",
   "crates/decv-core",
   "crates/decv-h264",

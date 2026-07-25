@@ -5,8 +5,9 @@ use decv::{
     AudioDecoderConfig, BitstreamFormat, ChannelLayout, ColorInfo, ColorMatrix, ColorPrimaries,
     ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput, DecodedVideoFrame,
     EncodedAudioPacket, EncodedVideoPacket, FourCc, FrameStorage, H264Decoder, H264Error,
-    H264Parallelism, H264SeekCheckpointCache, MediaTime, Mp4Demuxer, PixelFormat, Rect, Size,
-    TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
+    H264Parallelism, H264SeekCheckpointCache, MediaTime, Mp4Demuxer, PcmCodec, PixelFormat, Rect,
+    Size, SoftwareAudioDecoder, TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig,
+    VideoFormat,
 };
 
 fn accepts_consumer_decoder<D>(decoder: &mut D)
@@ -80,6 +81,34 @@ fn facade_decodes_a_real_aac_lc_access_unit() {
     assert_eq!(frame.channels(), 2);
     assert_eq!(frame.sample_frames(), 1_024);
     assert_eq!(frame.samples.len(), 2_048);
+}
+
+#[test]
+fn facade_exposes_the_multi_codec_audio_decoder() {
+    let config = AudioDecoderConfig::new(
+        AudioCodec::Pcm(PcmCodec::Signed16Le),
+        48_000,
+        ChannelLayout::Mono,
+    )
+    .with_bits_per_sample(16);
+    let mut decoder = SoftwareAudioDecoder::new();
+    decoder.configure(config).unwrap();
+
+    let mut packet = EncodedAudioPacket::new([0x00, 0x80, 0xff, 0x7f]);
+    packet.duration = MediaTime::from_parts(2, 48_000);
+    assert!(matches!(
+        decoder.send_packet(packet).unwrap(),
+        AudioDecodeInputStatus::Accepted
+    ));
+    assert!(matches!(
+        decoder.receive_frame().unwrap(),
+        AudioDecodeOutput::FormatChanged(_)
+    ));
+    let AudioDecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
+        panic!("expected decoded PCM frame");
+    };
+    assert_eq!(frame.sample_frames(), 2);
+    assert_eq!(frame.samples.as_ref(), [-1.0, 0.999_969_5]);
 }
 
 #[test]

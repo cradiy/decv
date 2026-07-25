@@ -1,5 +1,5 @@
 [package]
-name = "decv-aac"
+name = "decv-audio"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -7,8 +7,7 @@ authors.workspace = true
 
 [dependencies]
 decv-core = { path = "../decv-core" }
-symphonia-codec-aac = "0.6.0"
-symphonia-core = "0.6.0"
+symphonia = { version = "0.6.0", default-features = false, features = ["all-codecs"] }
 
 [dev-dependencies]
 decv-mp4 = { path = "../decv-mp4" }

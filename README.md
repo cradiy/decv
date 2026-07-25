@@ -23,7 +23,7 @@ the `0.1.0` crates as a complete H.264 conformance implementation.
 | Crate | Responsibility |
 | --- | --- |
 | `decv` | Narrow consumer facade for decoding, immutable frames, codec configuration, and MP4 packet access |
-| `decv-aac` | Pure-Rust AAC-LC mono/stereo decoding and interleaved `f32` PCM output |
+| `decv-audio` | Pure-Rust audio decoding and interleaved `f32` PCM output |
 | `decv-core` | Codec-independent time, audio/video packet, frame, input, and synchronous decoder contracts |
 | `decv-h264` | Pure-Rust H.264 parsing, reconstruction, deblocking, DPB management, and NV12 output |
 | `decv-mp4` | Synchronous random-access MP4 parsing, audio/video sample indexing, packet timestamps, and seek |
@@ -80,12 +80,17 @@ decoding is supported; encrypted media are not implemented.
 
 ## Current Audio Support
 
-MP4 files containing mono or stereo AAC-LC audio can be decoded to interleaved
-`f32` PCM at the original sample rate. Audio timestamps and seeking are
-supported independently from video.
+The software audio decoder supports AAC-LC, Microsoft/IMA ADPCM, ALAC, FLAC,
+MP1, MP2, MP3, interleaved integer/float PCM, A-law, mu-law, and Vorbis. Every
+format is returned as owned interleaved `f32` PCM at its original sample rate.
 
-HE-AAC/SBR, xHE-AAC, multichannel AAC, gapless metadata, and encrypted audio
-are not currently supported.
+The built-in MP4 path currently connects AAC-LC tracks, including independent
+audio timestamps and seeking. Other codecs can be fed through the public audio
+decoder by a container layer that supplies complete codec configuration and
+packet boundaries.
+
+HE-AAC/SBR, xHE-AAC, gapless metadata, and encrypted audio are not currently
+supported.
 
 ## Decoder Contract
 
@@ -137,7 +142,7 @@ cargo run --release -p decv-cli -- --seek 12.5 --max-frames 1 input.mp4
 Decode the first MP4 AAC track into interleaved little-endian `f32` PCM:
 
 ```bash
-cargo run --release -p decv-aac --example decode_mp4 -- \
+cargo run --release -p decv-audio --example decode_mp4 -- \
   input.mp4 output.f32le
 ```
 
@@ -210,4 +215,4 @@ independent native binaries are measured on the same inputs.
 - [H.264 performance record](docs/h264-performance.md)
 - [H.264 reconstruction parallelism](docs/h264-parallel-decoding-plan.md)
 - [MP4 demuxer principles](docs/mp4-demuxer-principles.md)
-- [AAC decoder principles](docs/aac-decoder-principles.md)
+- [Audio decoder principles](docs/audio-decoder-principles.md)
