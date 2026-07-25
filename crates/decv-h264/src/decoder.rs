@@ -17,7 +17,7 @@ use decv_core::{
 
 use crate::avcc::{LengthPrefixedNalReader, parse_avcc};
 use crate::intra_reconstruction::{ReconstructionReferenceList, ReconstructionWorkspace};
-use crate::parallelism::ReconstructionExecutor;
+use crate::parallelism::{ReconstructionExecutor, WIDE_AUTO_PARALLELISM_MIN_PIXELS};
 use crate::reorder::PictureReorderBuffer;
 use crate::{
     AnnexBNalUnit, AnnexBReader, DecodedPictureBuffer, DirectReference, EntropyCodingMode,
@@ -240,13 +240,19 @@ impl H264Decoder {
                             )?);
                         self.auto_executor_size = Some(coded_size);
                     }
-                    let reconstructor =
-                        IntraPictureReconstructor::from_parameter_sets_with_executor_and_workspace(
-                            &parsed.parameter_sets,
+                    let reconstruction_executor =
+                        if self.should_use_serial_seek_preroll(coded_size, packet.pts) {
+                            ReconstructionExecutor::serial()
+                        } else {
                             self.reconstruction_executor
                                 .as_ref()
                                 .expect("configure initializes the reconstruction executor")
-                                .clone(),
+                                .clone()
+                        };
+                    let reconstructor =
+                        IntraPictureReconstructor::from_parameter_sets_with_executor_and_workspace(
+                            &parsed.parameter_sets,
+                            reconstruction_executor,
                             self.reusable_workspace.take(),
                             nal_header.nal_ref_idc != 0,
                         )?;
@@ -736,6 +742,17 @@ impl H264Decoder {
         pts: Option<MediaTime>,
     ) -> bool {
         nal_header.nal_ref_idc == 0
+            && self
+                .output_start_time
+                .zip(pts)
+                .is_some_and(|(start, pts)| pts < start)
+    }
+
+    #[inline]
+    fn should_use_serial_seek_preroll(&self, coded_size: Size, pts: Option<MediaTime>) -> bool {
+        self.parallelism == H264Parallelism::Auto
+            && u64::from(coded_size.width) * u64::from(coded_size.height)
+                < WIDE_AUTO_PARALLELISM_MIN_PIXELS
             && self
                 .output_start_time
                 .zip(pts)
@@ -1799,6 +1816,30 @@ mod tests {
             decoder.receive_frame().unwrap(),
             DecodeOutput::Frame(frame)
                 if frame.id == 3 && frame.pts == MediaTime::from_parts(0, 1)
+        ));
+    }
+
+    #[test]
+    fn auto_uses_serial_reconstruction_only_for_sub_4k_seek_preroll() {
+        let mut decoder = H264Decoder::new();
+        let target = MediaTime::from_parts(3, 1).unwrap();
+        decoder.output_start_time = Some(target);
+
+        assert!(decoder.should_use_serial_seek_preroll(
+            Size::new(1440, 2560),
+            MediaTime::from_parts(2, 1),
+        ));
+        assert!(!decoder.should_use_serial_seek_preroll(Size::new(1440, 2560), Some(target),));
+        assert!(!decoder.should_use_serial_seek_preroll(
+            Size::new(3840, 2160),
+            MediaTime::from_parts(2, 1),
+        ));
+        assert!(!decoder.should_use_serial_seek_preroll(Size::new(1440, 2560), None));
+
+        decoder.parallelism = H264Parallelism::Threads(NonZeroUsize::new(4).unwrap());
+        assert!(!decoder.should_use_serial_seek_preroll(
+            Size::new(1440, 2560),
+            MediaTime::from_parts(2, 1),
         ));
     }
 

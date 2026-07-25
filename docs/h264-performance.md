@@ -1964,6 +1964,41 @@ complete 4K output and exact-seek suffix retained SHA-256
 `d261aeed6ed16abe634b89afe40017bed59ff9eb8aa1353279300d7ff9689534` and
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`.
 
+## Serial Sub-4K Exact-Seek Preroll
+
+Rayon reconstruction batches are valuable for sustained high-resolution
+decode, but they were a net loss during sub-4K exact-seek preroll. Output
+suppression removes non-reference pictures before the target, leaving short
+reference-picture batches separated by serial CABAC, motion, commit, and
+deblock work. On the 1440x2560 long-GOP source, increasing reconstruction
+workers from one to two, four, six, or eight raised CPU time without reducing
+first-frame latency. Serial execution was faster and avoided worker wakeups,
+cross-thread staging, and synchronization.
+
+`Auto` now selects serial reconstruction for pictures below eight megapixels
+whose PTS precedes the active exact-seek target. The selected picture and
+ordinary playback immediately use the normal size-derived executor again.
+4K-class preroll keeps its wider executor because its macroblock batches do
+amortize parallel scheduling, and an explicit `Threads(n)` policy is never
+overridden. A boundary probe favored serial at 3840x2048 (0.66 versus 0.69
+seconds for two threads), while 3840x2160 favored four threads (0.62 versus
+0.66 seconds for serial), supporting the existing eight-megapixel split.
+
+Nine alternating PGO pairs on the 1440x2560 source reduced median end-to-end
+seek time from 0.67 to 0.64 seconds and median CPU task time from about 0.91 to
+0.65 seconds. Seven-run counters reduced mean task-clock from 965 to 665 ms
+(31.1%), cycles from 3.269 to 2.988 billion (8.6%), instructions from 6.910 to
+6.765 billion (2.1%), branch misses from 6.78 to 5.20 million (23.3%), and
+elapsed time from 0.730 to 0.650 seconds (11.0%). For a deeper 3.3-second
+preroll, first-frame median fell from 1.31 to 1.12 seconds (14.5%) while CPU
+time fell from about 1.87 to 1.14 seconds (39%).
+
+A separate 1920x1080, 60 fps MP4 seek reduced median wall time from 0.24 to
+0.22 seconds and CPU task time from about 0.29 to 0.22 seconds. Ordinary 4K
+decode remained neutral because it does not enter the seek-specific serial
+path. The complete native and PGO H.264/MP4 verification corpora remained
+byte-exact.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded

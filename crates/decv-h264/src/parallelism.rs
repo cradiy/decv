@@ -5,6 +5,8 @@ use rayon::ThreadPool;
 
 use crate::{H264Error, Result};
 
+pub(crate) const WIDE_AUTO_PARALLELISM_MIN_PIXELS: u64 = 8_000_000;
+
 /// CPU parallelism used by the H.264 reconstruction backend.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -41,7 +43,11 @@ impl ReconstructionExecutor {
         coded_size: Size,
     ) -> Result<Self> {
         let pixels = u64::from(coded_size.width) * u64::from(coded_size.height);
-        let auto_cap = if pixels >= 8_000_000 { 4 } else { 2 };
+        let auto_cap = if pixels >= WIDE_AUTO_PARALLELISM_MIN_PIXELS {
+            4
+        } else {
+            2
+        };
         Self::try_new_with_auto_cap(parallelism, auto_cap)
     }
 
