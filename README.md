@@ -2,8 +2,9 @@
 
 `decv` is an experimental, pure-Rust media decoding and demuxing library. Its
 current software pipeline decodes H.264/AVC from Annex-B streams or ordinary
-and fragmented MP4 files into immutable CPU NV12 frames. MP4 AAC-LC tracks can
-already be indexed and read as raw access units; PCM decoding is in progress.
+and fragmented MP4 files into immutable CPU NV12 frames. MP4 AAC-LC mono and
+stereo tracks decode into owned interleaved `f32` PCM at their original sample
+rate.
 
 The workspace provides deterministic media primitives:
 
@@ -22,6 +23,7 @@ the `0.1.0` crates as a complete H.264 conformance implementation.
 | Crate | Responsibility |
 | --- | --- |
 | `decv` | Narrow consumer facade for decoding, immutable frames, codec configuration, and MP4 packet access |
+| `decv-aac` | Pure-Rust AAC-LC mono/stereo decoding and interleaved `f32` PCM output |
 | `decv-core` | Codec-independent time, audio/video packet, frame, input, and synchronous decoder contracts |
 | `decv-h264` | Pure-Rust H.264 parsing, reconstruction, deblocking, DPB management, and NV12 output |
 | `decv-mp4` | Synchronous random-access MP4 parsing, audio/video sample indexing, packet timestamps, and seek |
@@ -73,8 +75,17 @@ seek, exact video seek from a preceding keyframe, and low-latency preview seek
 to a following keyframe. The H.264 decoder additionally exposes
 forward-target retargeting and reusable decode-state checkpoints for
 interactive exact seeks, including a bounded checkpoint cache with generic
-container cursor tokens and paired capture/restore operations. AAC-to-PCM
-decoding and encrypted media are not yet implemented.
+container cursor tokens and paired capture/restore operations. AAC-LC audio
+decoding is supported; encrypted media are not implemented.
+
+## Current Audio Support
+
+MP4 files containing mono or stereo AAC-LC audio can be decoded to interleaved
+`f32` PCM at the original sample rate. Audio timestamps and seeking are
+supported independently from video.
+
+HE-AAC/SBR, xHE-AAC, multichannel AAC, gapless metadata, and encrypted audio
+are not currently supported.
 
 ## Decoder Contract
 
@@ -121,6 +132,13 @@ cargo run --release -p decv-cli -- input.h264 output.nv12
 cargo run --release -p decv-cli -- input.mp4 output.nv12
 cargo run --release -p decv-cli -- --seek 12.5 input.mp4 output.nv12
 cargo run --release -p decv-cli -- --seek 12.5 --max-frames 1 input.mp4
+```
+
+Decode the first MP4 AAC track into interleaved little-endian `f32` PCM:
+
+```bash
+cargo run --release -p decv-aac --example decode_mp4 -- \
+  input.mp4 output.f32le
 ```
 
 Select reconstruction parallelism with `--parallelism serial`, `auto`, or a
@@ -192,3 +210,4 @@ independent native binaries are measured on the same inputs.
 - [H.264 performance record](docs/h264-performance.md)
 - [H.264 reconstruction parallelism](docs/h264-parallel-decoding-plan.md)
 - [MP4 demuxer principles](docs/mp4-demuxer-principles.md)
+- [AAC decoder principles](docs/aac-decoder-principles.md)

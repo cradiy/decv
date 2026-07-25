@@ -7,6 +7,7 @@
 
 #![forbid(unsafe_code)]
 
+pub use decv_aac::{AacDecoder, AacError};
 pub use decv_core::{
     AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder, AudioDecoderConfig,
     AudioFormat, AudioSampleFormat, BitstreamFormat, ChannelLayout, ColorInfo, ColorMatrix,

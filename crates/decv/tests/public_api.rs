@@ -1,11 +1,12 @@
 use std::{num::NonZeroUsize, sync::Arc};
 
 use decv::{
-    BitstreamFormat, ColorInfo, ColorMatrix, ColorPrimaries, ColorRange, CpuFrame, CpuPlane,
-    DecodeInputStatus, DecodeOutput, DecodedVideoFrame, EncodedVideoPacket, FourCc, FrameStorage,
-    H264Decoder, H264Error, H264Parallelism, H264SeekCheckpointCache, MediaTime, Mp4Demuxer,
-    PixelFormat, Rect, Size, TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig,
-    VideoFormat,
+    AacDecoder, AudioCodec, AudioDecodeInputStatus, AudioDecodeOutput, AudioDecoder,
+    AudioDecoderConfig, BitstreamFormat, ChannelLayout, ColorInfo, ColorMatrix, ColorPrimaries,
+    ColorRange, CpuFrame, CpuPlane, DecodeInputStatus, DecodeOutput, DecodedVideoFrame,
+    EncodedAudioPacket, EncodedVideoPacket, FourCc, FrameStorage, H264Decoder, H264Error,
+    H264Parallelism, H264SeekCheckpointCache, MediaTime, Mp4Demuxer, PixelFormat, Rect, Size,
+    TransferFunction, VideoCodec, VideoDecoder, VideoDecoderConfig, VideoFormat,
 };
 
 fn accepts_consumer_decoder<D>(decoder: &mut D)
@@ -45,6 +46,40 @@ fn facade_exposes_the_complete_decoder_contract() {
 fn facade_exposes_random_access_mp4_input() {
     let error = Mp4Demuxer::open(Vec::<u8>::new()).unwrap_err();
     assert!(!error.to_string().is_empty());
+}
+
+#[test]
+fn facade_decodes_a_real_aac_lc_access_unit() {
+    let access_unit = [
+        0xde, 0x02, 0x00, 0x4c, 0x61, 0x76, 0x63, 0x35, 0x39, 0x2e, 0x33, 0x37, 0x2e, 0x31, 0x30,
+        0x30, 0x00, 0x42, 0x20, 0x08, 0xc1, 0x18, 0x38,
+    ];
+    let pts = MediaTime::from_parts(-1_024, 44_100);
+    let mut packet = EncodedAudioPacket::new(access_unit);
+    packet.pts = pts;
+    packet.duration = MediaTime::from_parts(1_024, 44_100);
+
+    let config = AudioDecoderConfig::new(AudioCodec::Aac, 44_100, ChannelLayout::Stereo)
+        .with_codec_data([0x12, 0x10, 0x56, 0xe5, 0x00]);
+    let mut decoder = AacDecoder::new();
+    decoder.configure(config).unwrap();
+    assert!(matches!(
+        decoder.send_packet(packet).unwrap(),
+        AudioDecodeInputStatus::Accepted
+    ));
+    assert!(matches!(
+        decoder.receive_frame().unwrap(),
+        AudioDecodeOutput::FormatChanged(_)
+    ));
+    let AudioDecodeOutput::Frame(frame) = decoder.receive_frame().unwrap() else {
+        panic!("expected decoded AAC frame");
+    };
+    frame.validate().unwrap();
+    assert_eq!(frame.pts, pts);
+    assert_eq!(frame.duration, MediaTime::from_parts(1_024, 44_100));
+    assert_eq!(frame.channels(), 2);
+    assert_eq!(frame.sample_frames(), 1_024);
+    assert_eq!(frame.samples.len(), 2_048);
 }
 
 #[test]

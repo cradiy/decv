@@ -1,13 +1,19 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/bit-readers",
-    "crates/decv",
-    "crates/decv-cli",
-    "crates/decv-core",
-    "crates/decv-h264",
-    "crates/decv-mp4",
+  "crates/bit-readers",
+  "crates/decv",
+  "crates/decv-aac",
+  "crates/decv-cli",
+  "crates/decv-core",
+  "crates/decv-h264",
+  "crates/decv-mp4",
 ]
+[workspace.package]
+publish = false
+edition = "2024"
+version = "0.1.0"
+authors = ["cradiy.rs@gmail.com"]
 
 [profile.release]
 codegen-units = 1

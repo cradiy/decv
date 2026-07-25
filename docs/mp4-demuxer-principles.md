@@ -727,7 +727,6 @@ Not implemented yet:
   `default-base-is-moof`;
 - encrypted/protected sample entries and CENC metadata;
 - a single globally interleaved audio/video packet cursor;
-- AAC PCM decoding;
 - complex/repeated/variable-rate edit lists;
 - mid-stream sample-description switching in the CLI;
 - subtitle and metadata packet APIs;
