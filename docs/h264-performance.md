@@ -2168,6 +2168,38 @@ control stream retained SHA-256
 `b27258d86f27c0f8d0c0cb8f1fa16b561205b68708e1e83f704dd81292103a51`,
 and `bef5e6d0aa58063816e19503fcab84c65ee9817c8cec0053cf44d9e87e0034ce`.
 
+## Forward Exact-Seek Retargeting
+
+Repeated exact seek requests inside one GOP formerly required a container
+rewind, decoder timeline flush, and reconstruction from the same preceding
+keyframe for every target. `H264Decoder::retarget_seek_forward` now advances
+an active output target while retaining parser history, the decoded picture
+buffer, the current picture, asynchronous finalization, and presentation
+reordering. Output already delayed or queued below the new target is removed,
+and the final queue boundary rechecks the current target so work started before
+the retarget cannot leak a stale frame.
+
+The operation is intentionally forward-only. Pre-target non-reference pictures
+may have skipped pixel reconstruction, so moving backward cannot recover them
+from current decoder state. A backward target or new timeline still requires a
+container seek followed by `flush_for_seek`.
+
+A nine-pair native release test used the 1440x2560, 60 fps long-GOP source with
+4.167-second keyframe spacing. It first selected 130.500 seconds, then requested
+131.900 seconds in the same final GOP. The control path rewound to the
+preceding keyframe and performed a second independent exact seek; the retarget
+path kept its current packet cursor and decoder state.
+
+| Measurement | Independent second seek | Forward retarget | Change |
+| --- | ---: | ---: | ---: |
+| Second-target first-frame median | 682.03 ms | 319.85 ms | -53.1% |
+| Two-target total median | 1057.41 ms | 703.95 ms | -33.4% |
+
+Runs alternated order, and every pair produced the same final-frame CRC. A
+public-facade regression also exercises length-prefixed MP4 input with I/P/B
+presentation reordering: it decodes the first target, retargets without
+rewinding the packet cursor, and emits only the final selected frame.
+
 ## Interpretation
 
 The wall-time gap is not explained by thread count alone. Single-threaded
