@@ -407,6 +407,11 @@ fn facade_controller_selects_keyframe_checkpoint_and_forward_retarget() {
     ));
     assert!(seeks.capture_checkpoint(&mut decoder, &cursor).unwrap());
     assert_eq!(seeks.checkpoint_count(), 1);
+    assert!(!seeks.capture_checkpoint(&mut decoder, &cursor).unwrap());
+    assert_eq!(
+        seeks.minimum_checkpoint_sample_distance(),
+        H264Mp4SeekController::DEFAULT_MINIMUM_CHECKPOINT_SAMPLE_DISTANCE
+    );
 
     let earlier_target = MediaTime::from_parts(512, 15_360).unwrap();
     let restored = seeks

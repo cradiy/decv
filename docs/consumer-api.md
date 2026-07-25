@@ -158,16 +158,14 @@ first to retain the most recent decoded window. Its `capture` and
 matching input token so callers do not independently select one entry and
 restore another.
 
-For one active decoder, choose the least destructive valid transition in this
-order:
+For one active decoder, compare the valid resume positions and choose the one
+closest to the target in compressed-sample order:
 
-1. If the new target is later and the current packet cursor can continue,
-   call `retarget_seek_forward`.
-2. Otherwise, restore the latest cached checkpoint whose `resume_time()` is
-   strictly before the target and reposition the cursor with
-   `seek_to_sample`.
-3. If neither applies, seek the container to the preceding keyframe and call
-   `flush_for_seek`.
+1. Retarget forward only when the live cursor is at least as far into the
+   stream as the best restart point.
+2. Restore a checkpoint only when its next sample is later than the preceding
+   keyframe.
+3. Otherwise, restart from the preceding keyframe and call `flush_for_seek`.
 
 The `decv` facade provides `H264Mp4SeekController` to apply that ordering
 without duplicating the cursor/decoder coordination in each application:
@@ -190,10 +188,15 @@ let mut packet = cursor.next_packet()?.unwrap();
 packet.discontinuity = outcome.requires_discontinuity();
 decoder.send_packet(packet)?;
 
-// Capture sparsely after complete samples, according to the application's
-// latency and memory budget.
+// Capture sparsely after complete samples. The controller defaults to at
+// least 30 compressed samples between retained checkpoints.
 seeks.capture_checkpoint(&mut decoder, &cursor)?;
 ```
+
+Checkpoint creation finishes the current access unit and waits for pending
+decoder finalization. Do not capture after every packet unless that throughput
+cost is intentional. The default sample spacing can be changed with
+`with_minimum_checkpoint_sample_distance`.
 
 For pointer-move previews, `begin_nearest_preview` flushes the active exact
 timeline and selects the closest independently decodable sample. Its first
