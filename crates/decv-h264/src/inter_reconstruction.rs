@@ -364,6 +364,28 @@ pub(crate) fn reconstruct_b_macroblock_pixels_from_lists_into_with_scratch(
                 "B reference picture coded size does not match",
             ));
         }
+        if predict_implicit_integer_macroblock_into(
+            reference_l0,
+            reference_l1,
+            macroblock_x,
+            macroblock_y,
+            list0,
+            list1,
+            weight_mode,
+            predicted_luma,
+            predicted_cb,
+            predicted_cr,
+        )? {
+            if let Some(residual) = residual {
+                add_inter_residual_to_prediction(
+                    predicted_luma,
+                    predicted_cb,
+                    predicted_cr,
+                    residual,
+                );
+            }
+            return Ok(());
+        }
         let (luma_l0, cb_l0, cr_l0) = (
             &mut prediction_l0.luma,
             &mut prediction_l0.cb,
@@ -648,6 +670,157 @@ fn write_implicit_biprediction_into(
             8,
             chroma_width,
             chroma_height,
+            weight_l0,
+            weight_l1,
+        );
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_implicit_integer_macroblock_into(
+    reference_l0: &Yuv420Picture,
+    reference_l1: &Yuv420Picture,
+    macroblock_x: usize,
+    macroblock_y: usize,
+    list0: ResolvedBListMotion,
+    list1: ResolvedBListMotion,
+    weight_mode: BPredictionWeightMode<'_>,
+    predicted_luma: &mut [[u8; 16]; 16],
+    predicted_cb: &mut [[u8; 8]; 8],
+    predicted_cr: &mut [[u8; 8]; 8],
+) -> Result<bool> {
+    let motion_l0_x = i32::from(list0.motion_vector.x);
+    let motion_l0_y = i32::from(list0.motion_vector.y);
+    let motion_l1_x = i32::from(list1.motion_vector.x);
+    let motion_l1_y = i32::from(list1.motion_vector.y);
+    if motion_l0_x.rem_euclid(8) != 0
+        || motion_l0_y.rem_euclid(8) != 0
+        || motion_l1_x.rem_euclid(8) != 0
+        || motion_l1_y.rem_euclid(8) != 0
+    {
+        return Ok(false);
+    }
+    let BPredictionWeightMode::Implicit {
+        current_picture_order_count,
+        list0: metadata_l0,
+        list1: metadata_l1,
+    } = weight_mode
+    else {
+        return Ok(false);
+    };
+
+    let (picture_width, picture_height) = reference_l0.dimensions();
+    debug_assert_eq!(reference_l1.dimensions(), (picture_width, picture_height));
+    let current_luma_x = macroblock_x
+        .checked_mul(16)
+        .ok_or(H264Error::IntegerOverflow)?;
+    let current_luma_y = macroblock_y
+        .checked_mul(16)
+        .ok_or(H264Error::IntegerOverflow)?;
+    let Some((luma_l0_x, luma_l0_y)) = integer_reference_origin(
+        current_luma_x,
+        current_luma_y,
+        list0.motion_vector,
+        4,
+        16,
+        16,
+        picture_width,
+        picture_height,
+    ) else {
+        return Ok(false);
+    };
+    let Some((luma_l1_x, luma_l1_y)) = integer_reference_origin(
+        current_luma_x,
+        current_luma_y,
+        list1.motion_vector,
+        4,
+        16,
+        16,
+        picture_width,
+        picture_height,
+    ) else {
+        return Ok(false);
+    };
+
+    let chroma_width = picture_width / 2;
+    let chroma_height = picture_height / 2;
+    let current_chroma_x = current_luma_x / 2;
+    let current_chroma_y = current_luma_y / 2;
+    let Some((chroma_l0_x, chroma_l0_y)) = integer_reference_origin(
+        current_chroma_x,
+        current_chroma_y,
+        list0.motion_vector,
+        8,
+        8,
+        8,
+        chroma_width,
+        chroma_height,
+    ) else {
+        return Ok(false);
+    };
+    let Some((chroma_l1_x, chroma_l1_y)) = integer_reference_origin(
+        current_chroma_x,
+        current_chroma_y,
+        list1.motion_vector,
+        8,
+        8,
+        8,
+        chroma_width,
+        chroma_height,
+    ) else {
+        return Ok(false);
+    };
+
+    let metadata_l0 = implicit_weight_reference(metadata_l0, list0.reference_index, "List 0")?;
+    let metadata_l1 = implicit_weight_reference(metadata_l1, list1.reference_index, "List 1")?;
+    let (weight_l0, weight_l1) =
+        derive_implicit_bipred_weights(current_picture_order_count, metadata_l0, metadata_l1);
+    let (luma_l0, cb_l0, cr_l0) = reference_l0.planes();
+    let (luma_l1, cb_l1, cr_l1) = reference_l1.planes();
+    let (luma_stride_l0, chroma_stride_l0) = reference_l0.plane_strides();
+    let (luma_stride_l1, chroma_stride_l1) = reference_l1.plane_strides();
+    let luma_source_l0 = luma_l0_y * luma_stride_l0 + luma_l0_x;
+    let luma_source_l1 = luma_l1_y * luma_stride_l1 + luma_l1_x;
+    let chroma_source_l0 = chroma_l0_y * chroma_stride_l0 + chroma_l0_x;
+    let chroma_source_l1 = chroma_l1_y * chroma_stride_l1 + chroma_l1_x;
+
+    // SAFETY: Both complete integer reference rectangles were validated
+    // above, and the fixed staging planes cannot alias immutable references.
+    unsafe {
+        implicit_bipred_rectangle(
+            predicted_luma.as_mut_ptr().cast(),
+            16,
+            luma_l0.as_ptr().add(luma_source_l0),
+            luma_stride_l0,
+            luma_l1.as_ptr().add(luma_source_l1),
+            luma_stride_l1,
+            16,
+            16,
+            weight_l0,
+            weight_l1,
+        );
+        implicit_bipred_rectangle(
+            predicted_cb.as_mut_ptr().cast(),
+            8,
+            cb_l0.as_ptr().add(chroma_source_l0),
+            chroma_stride_l0,
+            cb_l1.as_ptr().add(chroma_source_l1),
+            chroma_stride_l1,
+            8,
+            8,
+            weight_l0,
+            weight_l1,
+        );
+        implicit_bipred_rectangle(
+            predicted_cr.as_mut_ptr().cast(),
+            8,
+            cr_l0.as_ptr().add(chroma_source_l0),
+            chroma_stride_l0,
+            cr_l1.as_ptr().add(chroma_source_l1),
+            chroma_stride_l1,
+            8,
+            8,
             weight_l0,
             weight_l1,
         );
@@ -2754,7 +2927,7 @@ mod tests {
     }
 
     #[test]
-    fn implicit_biprediction_weights_scratch_rectangles_into_staging() {
+    fn implicit_integer_biprediction_writes_weighted_rectangles_into_staging() {
         let size = Size {
             width: 32,
             height: 16,

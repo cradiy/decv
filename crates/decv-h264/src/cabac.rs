@@ -345,11 +345,21 @@ impl<'data> CabacDecoder<'data> {
         });
         range -= lps_range;
 
+        #[cfg(feature = "internal-profiling")]
+        let lps;
         let (bin, next_state) = if offset < range {
+            #[cfg(feature = "internal-profiling")]
+            {
+                lps = false;
+            }
             // SAFETY: A packed CABAC context is always in 0..128.
             let next_state = unsafe { *TRANS_STATE_MPS.get_unchecked(usize::from(packed_state)) };
             (packed_state & 1, next_state)
         } else {
+            #[cfg(feature = "internal-profiling")]
+            {
+                lps = true;
+            }
             offset -= range;
             range = lps_range;
             // SAFETY: A packed CABAC context is always in 0..128.
@@ -357,6 +367,8 @@ impl<'data> CabacDecoder<'data> {
             ((packed_state & 1) ^ 1, next_state)
         };
 
+        #[cfg(feature = "internal-profiling")]
+        crate::profiling::record_cabac_decision(lps, range < 256);
         // BitReader reads are failure-atomic, so this can operate directly on
         // the decoder reader without snapshotting and copying its 40 bytes.
         renormalize(&mut self.reader, &mut range, &mut offset)?;

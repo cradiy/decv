@@ -58,8 +58,8 @@ pub(crate) struct MacroblockDeblockInfo {
     pub cb_qp: u8,
     pub cr_qp: u8,
     pub transform_8x8: bool,
-    /// All internal edges are known to have boundary strength zero.
-    pub internal_edges_zero: bool,
+    /// Luma residual is zero and every 4x4 cell has identical list motion.
+    pub uniform_zero_residual: bool,
     /// Non-zero luma coefficients at raster-ordered 4x4 granularity.
     pub luma_nonzero: u16,
     /// List-0 reference identity and motion at raster-ordered 4x4 granularity.
@@ -271,15 +271,24 @@ pub(crate) fn filter_420_picture(
         });
         let mut vertical_strengths = [[0u8; 4]; 4];
         let mut horizontal_strengths = [[0u8; 4]; 4];
+        let uniform_zero_residual = current.uniform_zero_residual;
         if filter_left {
             let previous = left.expect("filter_left requires a neighbor");
-            for block_row in 0..4 {
-                vertical_strengths[0][block_row] =
-                    boundary_strength(previous, block_row * 4 + 3, current, block_row * 4, true);
+            if uniform_zero_residual && previous.uniform_zero_residual {
+                vertical_strengths[0].fill(boundary_strength(previous, 3, current, 0, true));
+            } else {
+                for block_row in 0..4 {
+                    vertical_strengths[0][block_row] = boundary_strength(
+                        previous,
+                        block_row * 4 + 3,
+                        current,
+                        block_row * 4,
+                        true,
+                    );
+                }
             }
         }
-        let internal_edges_zero = current.internal_edges_zero;
-        if !internal_edges_zero {
+        if !uniform_zero_residual {
             for block_column in 1..4 {
                 if block_column == 2 || !current.transform_8x8 {
                     for block_row in 0..4 {
@@ -301,9 +310,13 @@ pub(crate) fn filter_420_picture(
         }
         if filter_top {
             let previous = top.expect("filter_top requires a neighbor");
-            for block_column in 0..4 {
-                horizontal_strengths[0][block_column] =
-                    boundary_strength(previous, 12 + block_column, current, block_column, true);
+            if uniform_zero_residual && previous.uniform_zero_residual {
+                horizontal_strengths[0].fill(boundary_strength(previous, 12, current, 0, true));
+            } else {
+                for block_column in 0..4 {
+                    horizontal_strengths[0][block_column] =
+                        boundary_strength(previous, 12 + block_column, current, block_column, true);
+                }
             }
         }
 
@@ -317,17 +330,17 @@ pub(crate) fn filter_420_picture(
         let filter_top = filter_top && horizontal_strengths[0] != [0; 4];
         let internal_thresholds = [
             if filter_internal_luma {
-                edge_thresholds(current, current, 0)?
+                edge_thresholds(current, current, 0)
             } else {
                 None
             },
             if filter_internal_chroma {
-                edge_thresholds(current, current, 1)?
+                edge_thresholds(current, current, 1)
             } else {
                 None
             },
             if filter_internal_chroma {
-                edge_thresholds(current, current, 2)?
+                edge_thresholds(current, current, 2)
             } else {
                 None
             },
@@ -335,9 +348,9 @@ pub(crate) fn filter_420_picture(
         let left_thresholds = if filter_left {
             let previous = left.expect("filter_left requires a neighbor");
             [
-                edge_thresholds(previous, current, 0)?,
-                edge_thresholds(previous, current, 1)?,
-                edge_thresholds(previous, current, 2)?,
+                edge_thresholds(previous, current, 0),
+                edge_thresholds(previous, current, 1),
+                edge_thresholds(previous, current, 2),
             ]
         } else {
             [None; 3]
@@ -345,9 +358,9 @@ pub(crate) fn filter_420_picture(
         let top_thresholds = if filter_top {
             let previous = top.expect("filter_top requires a neighbor");
             [
-                edge_thresholds(previous, current, 0)?,
-                edge_thresholds(previous, current, 1)?,
-                edge_thresholds(previous, current, 2)?,
+                edge_thresholds(previous, current, 0),
+                edge_thresholds(previous, current, 1),
+                edge_thresholds(previous, current, 2),
             ]
         } else {
             [None; 3]
@@ -548,7 +561,7 @@ fn edge_thresholds(
     previous: &MacroblockDeblockInfo,
     current: &MacroblockDeblockInfo,
     component: u8,
-) -> Result<Option<EdgeThresholds>> {
+) -> Option<EdgeThresholds> {
     let qp = |macroblock: &MacroblockDeblockInfo| match component {
         0 => macroblock.luma_qp,
         1 => macroblock.cb_qp,
@@ -558,14 +571,16 @@ fn edge_thresholds(
     let qp_q = qp(current);
     let alpha_offset_div2 = current.filter.alpha_c0_offset_div2;
     let beta_offset_div2 = current.filter.beta_offset_div2;
-    validate_threshold_inputs(qp_p, qp_q, alpha_offset_div2, beta_offset_div2)?;
-    Ok(prepare_edge_thresholds_unchecked(
+    debug_assert!(
+        validate_threshold_inputs(qp_p, qp_q, alpha_offset_div2, beta_offset_div2).is_ok()
+    );
+    prepare_edge_thresholds_unchecked(
         qp_p,
         qp_q,
         alpha_offset_div2,
         beta_offset_div2,
         component != 0,
-    ))
+    )
 }
 
 #[inline(always)]
@@ -759,6 +774,21 @@ fn filter_horizontal_luma_edge(
     boundary_strengths: [u8; 4],
     thresholds: Option<EdgeThresholds>,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if boundary_strengths[0] != 0
+        && boundary_strengths[1..]
+            .iter()
+            .all(|strength| *strength == boundary_strengths[0])
+        && let Some(parameters) = prepare_edge_strength(boundary_strengths[0], thresholds)
+    {
+        // SAFETY: Picture traversal guarantees sixteen horizontally adjacent
+        // luma samples and four complete rows on either side. All lanes use
+        // the same already-prepared boundary strength.
+        unsafe {
+            filter_horizontal_uniform_luma_edge_sse2(plane, stride, x, y, parameters);
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     for (segment, boundary_strength) in boundary_strengths.into_iter().enumerate() {
         let Some(parameters) = prepare_edge_strength(boundary_strength, thresholds) else {
@@ -1088,6 +1118,170 @@ unsafe fn filter_chroma_lanes_sse2(
 #[cfg(target_arch = "x86_64")]
 #[inline]
 #[target_feature(enable = "sse2")]
+unsafe fn filter_weak_luma_lanes_sse2(
+    p0: std::arch::x86_64::__m128i,
+    p1: std::arch::x86_64::__m128i,
+    p2: std::arch::x86_64::__m128i,
+    q0: std::arch::x86_64::__m128i,
+    q1: std::arch::x86_64::__m128i,
+    q2: std::arch::x86_64::__m128i,
+    parameters: PreparedEdgeParameters,
+) -> (
+    [std::arch::x86_64::__m128i; 2],
+    [std::arch::x86_64::__m128i; 2],
+) {
+    use std::arch::x86_64::{
+        _mm_add_epi16, _mm_and_si128, _mm_andnot_si128, _mm_cmplt_epi16, _mm_max_epi16,
+        _mm_min_epi16, _mm_or_si128, _mm_set1_epi16, _mm_setzero_si128, _mm_slli_epi16,
+        _mm_srai_epi16, _mm_sub_epi16,
+    };
+
+    macro_rules! absolute {
+        ($value:expr, $zero:expr) => {{
+            let value = $value;
+            _mm_max_epi16(value, _mm_sub_epi16($zero, value))
+        }};
+    }
+    macro_rules! select {
+        ($mask:expr, $selected:expr, $fallback:expr) => {
+            _mm_or_si128(
+                _mm_and_si128($mask, $selected),
+                _mm_andnot_si128($mask, $fallback),
+            )
+        };
+    }
+
+    debug_assert!(parameters.boundary_strength < 4);
+    debug_assert!(!parameters.chroma_style);
+    let zero = _mm_setzero_si128();
+    let alpha = _mm_set1_epi16(parameters.alpha);
+    let beta = _mm_set1_epi16(parameters.beta);
+    let valid = _mm_and_si128(
+        _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p0, q0), zero), alpha),
+        _mm_and_si128(
+            _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p1, p0), zero), beta),
+            _mm_cmplt_epi16(absolute!(_mm_sub_epi16(q1, q0), zero), beta),
+        ),
+    );
+    let ap = _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p2, p0), zero), beta);
+    let aq = _mm_cmplt_epi16(absolute!(_mm_sub_epi16(q2, q0), zero), beta);
+    let one = _mm_set1_epi16(1);
+    let tc0 = _mm_set1_epi16(parameters.tc0);
+    let tc = _mm_add_epi16(
+        tc0,
+        _mm_add_epi16(_mm_and_si128(ap, one), _mm_and_si128(aq, one)),
+    );
+    let negative_tc = _mm_sub_epi16(zero, tc);
+    let delta = _mm_srai_epi16::<3>(_mm_add_epi16(
+        _mm_add_epi16(
+            _mm_slli_epi16::<2>(_mm_sub_epi16(q0, p0)),
+            _mm_sub_epi16(p1, q1),
+        ),
+        _mm_set1_epi16(4),
+    ));
+    let delta = _mm_min_epi16(_mm_max_epi16(delta, negative_tc), tc);
+    let average = _mm_srai_epi16::<1>(_mm_add_epi16(_mm_add_epi16(p0, q0), one));
+    let negative_tc0 = _mm_sub_epi16(zero, tc0);
+    let p1_delta = _mm_srai_epi16::<1>(_mm_sub_epi16(
+        _mm_add_epi16(p2, average),
+        _mm_slli_epi16::<1>(p1),
+    ));
+    let p1_delta = _mm_min_epi16(_mm_max_epi16(p1_delta, negative_tc0), tc0);
+    let q1_delta = _mm_srai_epi16::<1>(_mm_sub_epi16(
+        _mm_add_epi16(q2, average),
+        _mm_slli_epi16::<1>(q1),
+    ));
+    let q1_delta = _mm_min_epi16(_mm_max_epi16(q1_delta, negative_tc0), tc0);
+
+    (
+        [
+            select!(valid, _mm_add_epi16(p0, delta), p0),
+            select!(valid, select!(ap, _mm_add_epi16(p1, p1_delta), p1), p1),
+        ],
+        [
+            select!(valid, _mm_sub_epi16(q0, delta), q0),
+            select!(valid, select!(aq, _mm_add_epi16(q1, q1_delta), q1), q1),
+        ],
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse2")]
+unsafe fn filter_horizontal_uniform_luma_edge_sse2(
+    plane: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
+    parameters: PreparedEdgeParameters,
+) {
+    use std::arch::x86_64::{
+        __m128i, _mm_cvtsi64_si128, _mm_cvtsi128_si64, _mm_packus_epi16, _mm_setzero_si128,
+        _mm_unpacklo_epi8,
+    };
+
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn load_eight(ptr: *const u8, zero: __m128i) -> __m128i {
+        // SAFETY: The caller proves that the eight-byte row is in-bounds.
+        let packed = unsafe { ptr.cast::<u64>().read_unaligned() };
+        _mm_unpacklo_epi8(_mm_cvtsi64_si128(packed as i64), zero)
+    }
+    #[inline]
+    #[target_feature(enable = "sse2")]
+    unsafe fn store_eight(ptr: *mut u8, values: __m128i, zero: __m128i) {
+        let packed = _mm_cvtsi128_si64(_mm_packus_epi16(values, zero)) as u64;
+        // SAFETY: The caller proves that the eight-byte row is in-bounds.
+        unsafe {
+            ptr.cast::<u64>().write_unaligned(packed);
+        }
+    }
+
+    let zero = _mm_setzero_si128();
+    for half in 0..2 {
+        let base = plane.as_mut_ptr().wrapping_add(y * stride + x + half * 8);
+        // SAFETY: Picture traversal supplies four complete rows on either
+        // side of all sixteen luma samples.
+        let p0 = unsafe { load_eight(base.wrapping_sub(stride), zero) };
+        let p1 = unsafe { load_eight(base.wrapping_sub(2 * stride), zero) };
+        let p2 = unsafe { load_eight(base.wrapping_sub(3 * stride), zero) };
+        let q0 = unsafe { load_eight(base, zero) };
+        let q1 = unsafe { load_eight(base.wrapping_add(stride), zero) };
+        let q2 = unsafe { load_eight(base.wrapping_add(2 * stride), zero) };
+
+        if parameters.boundary_strength < 4 {
+            // SAFETY: Every lane contains one validated weak luma sample set.
+            let (p, q) = unsafe { filter_weak_luma_lanes_sse2(p0, p1, p2, q0, q1, q2, parameters) };
+            // SAFETY: The same validated rows used for the loads are writable.
+            unsafe {
+                store_eight(base.wrapping_sub(stride), p[0], zero);
+                store_eight(base.wrapping_sub(2 * stride), p[1], zero);
+                store_eight(base, q[0], zero);
+                store_eight(base.wrapping_add(stride), q[1], zero);
+            }
+        } else {
+            // SAFETY: The strong filter additionally requires p3 and q3.
+            let p3 = unsafe { load_eight(base.wrapping_sub(4 * stride), zero) };
+            let q3 = unsafe { load_eight(base.wrapping_add(3 * stride), zero) };
+            // SAFETY: Every lane contains one validated strong luma sample set.
+            let (p, q) = unsafe {
+                filter_strong_luma_lanes_sse2(p0, p1, p2, p3, q0, q1, q2, q3, parameters)
+            };
+            // SAFETY: The same validated rows used for the loads are writable.
+            unsafe {
+                store_eight(base.wrapping_sub(stride), p[0], zero);
+                store_eight(base.wrapping_sub(2 * stride), p[1], zero);
+                store_eight(base.wrapping_sub(3 * stride), p[2], zero);
+                store_eight(base, q[0], zero);
+                store_eight(base.wrapping_add(stride), q[1], zero);
+                store_eight(base.wrapping_add(2 * stride), q[2], zero);
+            }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+#[target_feature(enable = "sse2")]
 #[allow(clippy::too_many_arguments)]
 unsafe fn filter_strong_luma_lanes_sse2(
     p0: std::arch::x86_64::__m128i,
@@ -1288,10 +1482,8 @@ unsafe fn filter_horizontal_weak_luma_sse2(
     parameters: PreparedEdgeParameters,
 ) {
     use std::arch::x86_64::{
-        __m128i, _mm_add_epi16, _mm_and_si128, _mm_andnot_si128, _mm_cmplt_epi16,
-        _mm_cvtsi32_si128, _mm_cvtsi128_si32, _mm_max_epi16, _mm_min_epi16, _mm_or_si128,
-        _mm_packus_epi16, _mm_set1_epi16, _mm_setzero_si128, _mm_slli_epi16, _mm_srai_epi16,
-        _mm_sub_epi16, _mm_unpacklo_epi8,
+        __m128i, _mm_cvtsi32_si128, _mm_cvtsi128_si32, _mm_packus_epi16, _mm_setzero_si128,
+        _mm_unpacklo_epi8,
     };
 
     #[inline]
@@ -1312,21 +1504,6 @@ unsafe fn filter_horizontal_weak_luma_sse2(
         }
     }
 
-    macro_rules! absolute {
-        ($value:expr, $zero:expr) => {{
-            let value = $value;
-            _mm_max_epi16(value, _mm_sub_epi16($zero, value))
-        }};
-    }
-    macro_rules! select {
-        ($mask:expr, $selected:expr, $fallback:expr) => {
-            _mm_or_si128(
-                _mm_and_si128($mask, $selected),
-                _mm_andnot_si128($mask, $fallback),
-            )
-        };
-    }
-
     let zero = _mm_setzero_si128();
     let base = plane.as_mut_ptr().wrapping_add(y * stride + x);
     // SAFETY: Picture traversal supplies three complete rows on either side.
@@ -1342,57 +1519,15 @@ unsafe fn filter_horizontal_weak_luma_sse2(
     // SAFETY: See above.
     let q2 = unsafe { load_four(base.wrapping_add(2 * stride), zero) };
 
-    let alpha = _mm_set1_epi16(parameters.alpha);
-    let beta = _mm_set1_epi16(parameters.beta);
-    let valid = _mm_and_si128(
-        _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p0, q0), zero), alpha),
-        _mm_and_si128(
-            _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p1, p0), zero), beta),
-            _mm_cmplt_epi16(absolute!(_mm_sub_epi16(q1, q0), zero), beta),
-        ),
-    );
-    let ap = _mm_cmplt_epi16(absolute!(_mm_sub_epi16(p2, p0), zero), beta);
-    let aq = _mm_cmplt_epi16(absolute!(_mm_sub_epi16(q2, q0), zero), beta);
-    let one = _mm_set1_epi16(1);
-    let tc0 = _mm_set1_epi16(parameters.tc0);
-    let tc = _mm_add_epi16(
-        tc0,
-        _mm_add_epi16(_mm_and_si128(ap, one), _mm_and_si128(aq, one)),
-    );
-    let negative_tc = _mm_sub_epi16(zero, tc);
-    let delta = _mm_srai_epi16::<3>(_mm_add_epi16(
-        _mm_add_epi16(
-            _mm_slli_epi16::<2>(_mm_sub_epi16(q0, p0)),
-            _mm_sub_epi16(p1, q1),
-        ),
-        _mm_set1_epi16(4),
-    ));
-    let delta = _mm_min_epi16(_mm_max_epi16(delta, negative_tc), tc);
-
-    let average = _mm_srai_epi16::<1>(_mm_add_epi16(_mm_add_epi16(p0, q0), one));
-    let negative_tc0 = _mm_sub_epi16(zero, tc0);
-    let p1_delta = _mm_srai_epi16::<1>(_mm_sub_epi16(
-        _mm_add_epi16(p2, average),
-        _mm_slli_epi16::<1>(p1),
-    ));
-    let p1_delta = _mm_min_epi16(_mm_max_epi16(p1_delta, negative_tc0), tc0);
-    let q1_delta = _mm_srai_epi16::<1>(_mm_sub_epi16(
-        _mm_add_epi16(q2, average),
-        _mm_slli_epi16::<1>(q1),
-    ));
-    let q1_delta = _mm_min_epi16(_mm_max_epi16(q1_delta, negative_tc0), tc0);
-
-    let filtered_p0 = select!(valid, _mm_add_epi16(p0, delta), p0);
-    let filtered_q0 = select!(valid, _mm_sub_epi16(q0, delta), q0);
-    let filtered_p1 = select!(valid, select!(ap, _mm_add_epi16(p1, p1_delta), p1), p1);
-    let filtered_q1 = select!(valid, select!(aq, _mm_add_epi16(q1, q1_delta), q1), q1);
+    // SAFETY: Every lane contains one validated weak luma sample set.
+    let (p, q) = unsafe { filter_weak_luma_lanes_sse2(p0, p1, p2, q0, q1, q2, parameters) };
 
     // SAFETY: The same validated row ranges used for the loads are writable.
     unsafe {
-        store_four(base.wrapping_sub(stride), filtered_p0, zero);
-        store_four(base.wrapping_sub(2 * stride), filtered_p1, zero);
-        store_four(base, filtered_q0, zero);
-        store_four(base.wrapping_add(stride), filtered_q1, zero);
+        store_four(base.wrapping_sub(stride), p[0], zero);
+        store_four(base.wrapping_sub(2 * stride), p[1], zero);
+        store_four(base, q[0], zero);
+        store_four(base.wrapping_add(stride), q[1], zero);
     }
 }
 
@@ -1686,7 +1821,7 @@ mod tests {
             cb_qp: 40,
             cr_qp: 40,
             transform_8x8: false,
-            internal_edges_zero: false,
+            uniform_zero_residual: false,
             luma_nonzero: 0,
             motion: [DeblockMotion::default(); 16],
             filter: DeblockingFilter {
@@ -1700,7 +1835,7 @@ mod tests {
     fn inter_macroblock(reference_id: u8, vector: MotionVector) -> MacroblockDeblockInfo {
         MacroblockDeblockInfo {
             is_intra: false,
-            internal_edges_zero: true,
+            uniform_zero_residual: true,
             motion: [DeblockMotion::new(
                 DeblockListMotion {
                     reference_id,
@@ -1856,11 +1991,14 @@ mod tests {
 
     #[test]
     fn luma_edge_batches_match_segmented_filtering() {
-        const STRENGTHS: [[u8; 4]; 6] = [
+        const STRENGTHS: [[u8; 4]; 9] = [
             [0, 0, 0, 0],
             [1, 2, 3, 4],
             [4, 3, 2, 1],
             [1, 1, 2, 2],
+            [1, 1, 1, 1],
+            [2, 2, 2, 2],
+            [3, 3, 3, 3],
             [4, 4, 4, 4],
             [0, 3, 0, 4],
         ];

@@ -37,14 +37,26 @@ const SPATIAL_DIRECT_LIST0_ZERO: usize = 28;
 const SPATIAL_DIRECT_LIST1_ZERO: usize = 29;
 const SPATIAL_DIRECT_BOTH_REFERENCE_ZERO: usize = 30;
 const SPATIAL_DIRECT_ZERO_NEIGHBOUR_TRIPLET: usize = 31;
-const COUNTER_COUNT: usize = 32;
+const CABAC_DECISIONS: usize = 32;
+const CABAC_MPS_NO_RENORMALIZATION: usize = 33;
+const CABAC_MPS_RENORMALIZATION: usize = 34;
+const CABAC_LPS: usize = 35;
+const COUNTER_COUNT: usize = 36;
 
 static COUNTERS: [AtomicU64; COUNTER_COUNT] = [const { AtomicU64::new(0) }; COUNTER_COUNT];
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[doc(hidden)]
 pub struct InterPredictionProfile {
     counters: [u64; COUNTER_COUNT],
+}
+
+impl Default for InterPredictionProfile {
+    fn default() -> Self {
+        Self {
+            counters: [0; COUNTER_COUNT],
+        }
+    }
 }
 
 impl InterPredictionProfile {
@@ -122,7 +134,7 @@ impl fmt::Display for InterPredictionProfile {
             self.counter(SPATIAL_DIRECT_COL_ZERO_SET),
             self.counter(SPATIAL_DIRECT_COL_ZERO_MIXED)
         )?;
-        write!(
+        writeln!(
             formatter,
             "  uniform predictions: both-zero={} list0-zero={} list1-zero={} \
              both-reference-zero={} zero-neighbour-triplet={}",
@@ -131,6 +143,19 @@ impl fmt::Display for InterPredictionProfile {
             self.counter(SPATIAL_DIRECT_LIST1_ZERO),
             self.counter(SPATIAL_DIRECT_BOTH_REFERENCE_ZERO),
             self.counter(SPATIAL_DIRECT_ZERO_NEIGHBOUR_TRIPLET)
+        )?;
+        let cabac_decisions = self.counter(CABAC_DECISIONS);
+        write!(
+            formatter,
+            "CABAC decisions: total={} MPS-no-renorm={} ({:.1}%) \
+             MPS-renorm={} ({:.1}%) LPS={} ({:.1}%)",
+            cabac_decisions,
+            self.counter(CABAC_MPS_NO_RENORMALIZATION),
+            percent(self.counter(CABAC_MPS_NO_RENORMALIZATION), cabac_decisions),
+            self.counter(CABAC_MPS_RENORMALIZATION),
+            percent(self.counter(CABAC_MPS_RENORMALIZATION), cabac_decisions),
+            self.counter(CABAC_LPS),
+            percent(self.counter(CABAC_LPS), cabac_decisions),
         )
     }
 }
@@ -230,6 +255,18 @@ pub(crate) fn record_spatial_direct_zero_neighbour_triplet() {
     increment(SPATIAL_DIRECT_ZERO_NEIGHBOUR_TRIPLET, 1);
 }
 
+pub(crate) fn record_cabac_decision(lps: bool, renormalized: bool) {
+    increment(CABAC_DECISIONS, 1);
+    increment(
+        match (lps, renormalized) {
+            (false, false) => CABAC_MPS_NO_RENORMALIZATION,
+            (false, true) => CABAC_MPS_RENORMALIZATION,
+            (true, _) => CABAC_LPS,
+        },
+        1,
+    );
+}
+
 fn increment(index: usize, value: u64) {
     COUNTERS[index].fetch_add(value, Ordering::Relaxed);
 }
@@ -259,5 +296,6 @@ mod tests {
         assert!(formatted.contains("(0.0%)"));
         assert!(formatted.contains("spatial Direct: macroblocks=0"));
         assert!(formatted.contains("zero-neighbour-triplet=0"));
+        assert!(formatted.contains("CABAC decisions: total=0"));
     }
 }
