@@ -142,6 +142,10 @@ impl MediaInput for HttpRangeInput {
         MediaInput::len(&self.input)
     }
 
+    fn prefetch(&self, offset: u64, length: usize) -> io::Result<()> {
+        self.input.prefetch(offset, length)
+    }
+
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         self.input.read_at(offset, buffer)
     }

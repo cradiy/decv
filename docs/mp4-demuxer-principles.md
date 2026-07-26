@@ -116,6 +116,11 @@ whole file. The project instead uses:
 ```rust
 pub trait MediaInput: Send + Sync {
     fn len(&self) -> std::io::Result<Option<u64>>;
+    fn prefetch(
+        &self,
+        offset: u64,
+        length: usize,
+    ) -> std::io::Result<()>;
     fn read_at(
         &self,
         offset: u64,
@@ -129,6 +134,7 @@ The consequences are useful:
 - a local file can use positional reads;
 - memory inputs need no cursor;
 - HTTP or WebDAV implementations can use range requests;
+- packet cursors can issue transport-independent prefetch hints;
 - multiple packet cursors can read one immutable input independently;
 - one extraction cursor does not disturb another cursor.
 

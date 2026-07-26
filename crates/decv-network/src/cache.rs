@@ -155,21 +155,33 @@ where
         Ok(())
     }
 
-    /// Synchronously warms every block intersecting the requested range.
+    /// Synchronously warms the leading cache-sized window of a range.
     ///
     /// Applications should normally call this on a worker thread. The range is
-    /// clipped to the known media length.
+    /// clipped to the known media length and to the number of blocks the cache
+    /// can retain, so later fetched blocks cannot immediately evict the start
+    /// of the requested window.
     pub fn prefetch(&self, offset: u64, length: usize) -> io::Result<()> {
+        let block_size =
+            u64::try_from(self.config.block_size.get()).map_err(|_| integer_overflow())?;
         let requested = clipped_length(self.length, offset, length)?;
         if requested == 0 {
             return Ok(());
         }
-        let block_size =
-            u64::try_from(self.config.block_size.get()).map_err(|_| integer_overflow())?;
+        let first = offset / block_size;
+        let maximum_blocks =
+            u64::try_from(self.config.maximum_blocks.get()).map_err(|_| integer_overflow())?;
+        let cache_end = first
+            .checked_add(maximum_blocks)
+            .ok_or_else(integer_overflow)?
+            .checked_mul(block_size)
+            .ok_or_else(integer_overflow)?
+            .min(self.length);
+        let cache_window = usize::try_from(cache_end - offset).map_err(|_| integer_overflow())?;
+        let requested = requested.min(cache_window);
         let end = offset
             .checked_add(u64::try_from(requested).map_err(|_| integer_overflow())?)
             .ok_or_else(integer_overflow)?;
-        let first = offset / block_size;
         let last = (end - 1) / block_size;
         let mut block_index = first;
         loop {
@@ -371,6 +383,10 @@ where
 {
     fn len(&self) -> io::Result<Option<u64>> {
         Ok(Some(self.length))
+    }
+
+    fn prefetch(&self, offset: u64, length: usize) -> io::Result<()> {
+        CachedRangeInput::prefetch(self, offset, length)
     }
 
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
@@ -631,6 +647,27 @@ mod tests {
         assert_eq!(stats.range_requests, 1);
         assert_eq!(stats.fetched_bytes, 16);
         assert_eq!(stats.cache_misses, 4);
+    }
+
+    #[test]
+    fn prefetch_does_not_evict_the_start_of_an_oversized_window() {
+        let input =
+            CachedRangeInput::new(MemoryFetcher::new(*b"abcdefghijklmnop"), config(4, 2)).unwrap();
+
+        MediaInput::prefetch(&input, 1, 15).unwrap();
+        let after_prefetch = input.stats().snapshot();
+        assert_eq!(after_prefetch.range_requests, 1);
+        assert_eq!(after_prefetch.fetched_bytes, 8);
+
+        let mut first = [0; 1];
+        input.read_at(1, &mut first).unwrap();
+        assert_eq!(first, *b"b");
+        assert_eq!(input.stats().snapshot().range_requests, 1);
+
+        let mut outside = [0; 1];
+        input.read_at(8, &mut outside).unwrap();
+        assert_eq!(outside, *b"i");
+        assert_eq!(input.stats().snapshot().range_requests, 2);
     }
 
     #[test]

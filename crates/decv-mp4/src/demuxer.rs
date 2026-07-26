@@ -36,6 +36,35 @@ where
         &self.movie
     }
 
+    /// Synchronously prefetches a continuous source range containing samples
+    /// from one track.
+    ///
+    /// This index-based form can be scheduled on a separate I/O worker without
+    /// sharing a mutable packet cursor. `maximum_span_bytes` includes gaps
+    /// occupied by interleaved tracks. The first sample is included even when
+    /// it alone exceeds the budget. Returns the number of samples covered.
+    pub fn prefetch_track_bytes(
+        &self,
+        track_index: usize,
+        first_sample_index: usize,
+        maximum_span_bytes: usize,
+    ) -> Result<usize> {
+        let track = self
+            .movie
+            .tracks()
+            .get(track_index)
+            .ok_or(Mp4Error::IndexOutOfRange {
+                kind: "track",
+                index: track_index,
+            })?;
+        prefetch_samples(
+            self.input(),
+            track.samples(),
+            first_sample_index,
+            maximum_span_bytes,
+        )
+    }
+
     pub fn read_packet(
         &self,
         track_index: usize,
@@ -161,6 +190,22 @@ where
         Ok(Some(packet))
     }
 
+    /// Synchronously prefetches a continuous source range containing upcoming
+    /// compressed packets.
+    ///
+    /// `maximum_span_bytes` bounds the complete source range, including gaps
+    /// occupied by interleaved tracks. The first packet is included even when
+    /// it alone exceeds the budget. Returns the number of upcoming packets
+    /// covered by the hint. Network-backed inputs should call this from a
+    /// playback worker.
+    pub fn prefetch_next_bytes(&self, maximum_span_bytes: usize) -> Result<usize> {
+        self.demuxer.prefetch_track_bytes(
+            self.track_index,
+            self.next_sample_index,
+            maximum_span_bytes,
+        )
+    }
+
     pub fn decoder_config(&self) -> Result<Option<VideoDecoderConfig>> {
         let Some(sample) = self.track().samples().get(self.next_sample_index) else {
             return Ok(None);
@@ -281,6 +326,18 @@ where
         Ok(Some(packet))
     }
 
+    /// Synchronously prefetches a continuous source range containing upcoming
+    /// compressed audio packets.
+    ///
+    /// See [`PacketCursor::prefetch_next_bytes`] for budget semantics.
+    pub fn prefetch_next_bytes(&self, maximum_span_bytes: usize) -> Result<usize> {
+        self.demuxer.prefetch_track_bytes(
+            self.track_index,
+            self.next_sample_index,
+            maximum_span_bytes,
+        )
+    }
+
     /// Repositions to the closest complete audio sample at or before `target`.
     pub fn seek_to_time(&mut self, target: MediaTime) -> Result<Option<usize>> {
         let sample_index = self.track().audio_sample_at_or_before(target)?;
@@ -294,6 +351,55 @@ where
     pub const fn rewind(&mut self) {
         self.next_sample_index = 0;
     }
+}
+
+fn prefetch_samples(
+    input: &dyn MediaInput,
+    samples: &[crate::Sample],
+    first_sample_index: usize,
+    maximum_span_bytes: usize,
+) -> Result<usize> {
+    if maximum_span_bytes == 0 {
+        return Ok(0);
+    }
+    let Some(upcoming) = samples.get(first_sample_index..) else {
+        return Err(Mp4Error::IndexOutOfRange {
+            kind: "sample cursor",
+            index: first_sample_index,
+        });
+    };
+    let Some(first) = upcoming.first() else {
+        return Ok(0);
+    };
+
+    let maximum_span = u64::try_from(maximum_span_bytes).map_err(|_| Mp4Error::IntegerOverflow)?;
+    let mut range_start = first.offset();
+    let mut range_end = first
+        .offset()
+        .checked_add(u64::from(first.size()))
+        .ok_or(Mp4Error::IntegerOverflow)?;
+    let mut packet_count = 1usize;
+
+    for sample in &upcoming[1..] {
+        let sample_end = sample
+            .offset()
+            .checked_add(u64::from(sample.size()))
+            .ok_or(Mp4Error::IntegerOverflow)?;
+        let candidate_start = range_start.min(sample.offset());
+        let candidate_end = range_end.max(sample_end);
+        if candidate_end - candidate_start > maximum_span {
+            break;
+        }
+        range_start = candidate_start;
+        range_end = candidate_end;
+        packet_count = packet_count
+            .checked_add(1)
+            .ok_or(Mp4Error::IntegerOverflow)?;
+    }
+
+    let length = usize::try_from(range_end - range_start).map_err(|_| Mp4Error::IntegerOverflow)?;
+    input.prefetch(range_start, length)?;
+    Ok(packet_count)
 }
 
 impl Track {
@@ -422,4 +528,89 @@ fn read_exact_at(input: &dyn MediaInput, offset: u64, mut buffer: &mut [u8]) -> 
         buffer = &mut buffer[read..];
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io,
+        sync::{Arc, Mutex},
+    };
+
+    use decv_core::MediaInput;
+
+    use crate::{Mp4Demuxer, TrackKind};
+
+    #[derive(Debug)]
+    struct TrackingInput {
+        bytes: Arc<[u8]>,
+        prefetches: Mutex<Vec<(u64, usize)>>,
+    }
+
+    impl MediaInput for TrackingInput {
+        fn len(&self) -> io::Result<Option<u64>> {
+            Ok(Some(u64::try_from(self.bytes.as_ref().len()).unwrap()))
+        }
+
+        fn prefetch(&self, offset: u64, length: usize) -> io::Result<()> {
+            self.prefetches.lock().unwrap().push((offset, length));
+            Ok(())
+        }
+
+        fn read_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
+            self.bytes.as_ref().read_at(offset, buffer)
+        }
+    }
+
+    #[test]
+    fn packet_cursor_prefetches_upcoming_sample_span() {
+        let input = TrackingInput {
+            bytes: Arc::from(decode_hex(include_str!(
+                "../../decv/tests/fixtures/three-frame-high-b.mp4.hex"
+            ))),
+            prefetches: Mutex::new(Vec::new()),
+        };
+        let demuxer = Mp4Demuxer::open(input).unwrap();
+        let track_index = demuxer
+            .movie()
+            .tracks()
+            .iter()
+            .position(|track| track.kind() == TrackKind::Video)
+            .unwrap();
+        let first_sample = demuxer.movie().tracks()[track_index].samples()[0];
+
+        let cursor = demuxer.packet_cursor(track_index).unwrap();
+        let packet_count = cursor.prefetch_next_bytes(1024).unwrap();
+        assert!(packet_count >= 1);
+
+        let prefetches = demuxer.input().prefetches.lock().unwrap();
+        assert_eq!(prefetches.len(), 1);
+        let (offset, length) = prefetches[0];
+        assert!(offset <= first_sample.offset());
+        assert!(
+            offset + u64::try_from(length).unwrap()
+                >= first_sample.offset() + u64::from(first_sample.size())
+        );
+    }
+
+    fn decode_hex(text: &str) -> Vec<u8> {
+        let digits = text
+            .bytes()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .collect::<Vec<_>>();
+        assert!(digits.len().is_multiple_of(2));
+        digits
+            .chunks_exact(2)
+            .map(|pair| hex_digit(pair[0]) << 4 | hex_digit(pair[1]))
+            .collect()
+    }
+
+    fn hex_digit(byte: u8) -> u8 {
+        match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => panic!("fixture contains a non-hex byte"),
+        }
+    }
 }

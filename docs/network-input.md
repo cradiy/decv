@@ -69,6 +69,36 @@ let input = HttpRangeInput::builder(download_url)
 let demuxer = Mp4Demuxer::open(input)?;
 ```
 
+Once a track is selected, the packet cursor can translate a source-byte
+budget into a prefetch hint without exposing HTTP details:
+
+```rust,ignore
+let mut cursor = demuxer.packet_cursor(video_track_index)?;
+
+// Refill on the playback worker before consuming each packet window.
+'playback: loop {
+    let covered_packets = cursor.prefetch_next_bytes(2 * 1024 * 1024)?;
+    if covered_packets == 0 {
+        break;
+    }
+    for _ in 0..covered_packets {
+        let Some(packet) = cursor.next_packet()? else {
+            break 'playback;
+        };
+        decoder.send_packet(packet)?;
+    }
+}
+```
+
+The byte budget includes gaps between samples, such as interleaved audio
+chunks. The method returns the number of upcoming packets contained in the
+prefetched source range. Local files and memory inputs accept the same hint
+but may ignore it. To overlap network I/O with decoding, schedule
+`demuxer.prefetch_track_bytes(track_index, sample_index, budget)` on a separate
+I/O worker; unlike the cursor helper, it needs no shared mutable cursor.
+Playback code should attach its seek generation to that work and ignore
+obsolete completion after a newer seek.
+
 `HttpRangeInput` is synchronous because `MediaInput` and the current demuxer
 are synchronous. Opening, demuxing, seeking, packet reads, and explicit
 `prefetch` calls should run on a playback worker rather than a UI or async
@@ -85,11 +115,12 @@ Concurrent reads of the same missing block share one request, while different
 blocks can be fetched concurrently. Ready blocks use least-recently-used
 eviction.
 
-`prefetch(offset, length)` warms blocks synchronously and combines adjacent
-misses instead of paying one network round trip per block. One request is
-bounded by the configured maximum block count. Prefetch is a mechanism, not a
-playback policy: the upper layer decides whether to prefetch around the current
-packet cursor, a seek target, or the next expected media segment.
+`prefetch(offset, length)` warms the leading cache-sized portion of the range
+synchronously and combines adjacent misses instead of paying one network round
+trip per block. Clipping the window to cache capacity prevents its tail from
+immediately evicting the requested start. Prefetch is a mechanism, not a
+playback policy: the upper layer chooses the byte budget and decides when to
+prefetch around the current packet cursor or a seek target.
 `stats_snapshot()` exposes cache hits, misses, request count, fetched bytes,
 and evictions for tuning.
 
