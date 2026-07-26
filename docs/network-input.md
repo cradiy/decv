@@ -79,14 +79,17 @@ connection pool.
 ## Cache behavior
 
 The default cache uses 256 KiB blocks and retains up to 32 ready blocks. A
-read that crosses blocks assembles the requested bytes transparently.
+read that crosses adjacent missing blocks combines them into a bounded range
+request and still stores and evicts the result as individual blocks.
 Concurrent reads of the same missing block share one request, while different
 blocks can be fetched concurrently. Ready blocks use least-recently-used
 eviction.
 
-`prefetch(offset, length)` warms blocks synchronously. It is a mechanism, not
-a playback policy: the upper layer decides whether to prefetch around the
-current packet cursor, a seek target, or the next expected media segment.
+`prefetch(offset, length)` warms blocks synchronously and combines adjacent
+misses instead of paying one network round trip per block. One request is
+bounded by the configured maximum block count. Prefetch is a mechanism, not a
+playback policy: the upper layer decides whether to prefetch around the current
+packet cursor, a seek target, or the next expected media segment.
 `stats_snapshot()` exposes cache hits, misses, request count, fetched bytes,
 and evictions for tuning.
 

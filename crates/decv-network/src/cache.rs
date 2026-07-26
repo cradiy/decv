@@ -110,9 +110,10 @@ impl RangeCacheStats {
 
 /// A bounded block cache that implements [`MediaInput`] over a range source.
 ///
-/// Concurrent reads for the same missing block share one fetch. Reads for
-/// different blocks may proceed concurrently. Ready blocks are retained using
-/// least-recently-used eviction.
+/// Concurrent reads for the same missing block share one fetch. A single read
+/// or prefetch spanning adjacent missing blocks coalesces them into bounded
+/// range requests. Reads for different blocks may proceed concurrently. Ready
+/// blocks are retained using least-recently-used eviction.
 #[derive(Debug)]
 pub struct CachedRangeInput<F> {
     fetcher: F,
@@ -170,39 +171,76 @@ where
             .ok_or_else(integer_overflow)?;
         let first = offset / block_size;
         let last = (end - 1) / block_size;
-        for block_index in first..=last {
-            self.get_block(block_index)?;
+        let mut block_index = first;
+        loop {
+            let access = self.get_block_through(block_index, last)?;
+            if access.fetched_through >= last {
+                break;
+            }
+            block_index = access
+                .fetched_through
+                .checked_add(1)
+                .ok_or_else(integer_overflow)?;
         }
         Ok(())
     }
 
-    fn get_block(&self, block_index: u64) -> io::Result<Arc<[u8]>> {
-        let (entry, fetch) = {
+    fn get_block_through(&self, block_index: u64, requested_last: u64) -> io::Result<BlockAccess> {
+        let reservation = {
             let mut cache = lock(&self.cache)?;
             let recency = cache.take_recency();
             if let Some(record) = cache.blocks.get_mut(&block_index) {
                 record.last_used = recency;
                 self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
-                (record.entry.clone(), false)
+                BlockReservation::Existing(record.entry.clone())
             } else {
-                self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
-                self.evict_for_insert(&mut cache)?;
-                let entry = Arc::new(BlockEntry::loading());
-                cache.blocks.insert(
-                    block_index,
-                    CacheRecord {
-                        entry: entry.clone(),
-                        last_used: recency,
-                    },
-                );
-                (entry, true)
+                let maximum_span = u64::try_from(self.config.maximum_blocks.get())
+                    .map_err(|_| integer_overflow())?;
+                let span_last = block_index
+                    .checked_add(maximum_span - 1)
+                    .ok_or_else(integer_overflow)?
+                    .min(requested_last);
+                let mut blocks = Vec::new();
+                for index in block_index..=span_last {
+                    if cache.blocks.contains_key(&index) {
+                        break;
+                    }
+                    self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    self.evict_for_insert(&mut cache)?;
+                    let entry = Arc::new(BlockEntry::loading());
+                    let last_used = if index == block_index {
+                        recency
+                    } else {
+                        cache.take_recency()
+                    };
+                    cache.blocks.insert(
+                        index,
+                        CacheRecord {
+                            entry: entry.clone(),
+                            last_used,
+                        },
+                    );
+                    blocks.push((index, entry));
+                }
+                BlockReservation::Fetch(blocks)
             }
         };
 
-        if fetch {
-            self.fetch_block(block_index, &entry)
-        } else {
-            entry.wait()
+        match reservation {
+            BlockReservation::Existing(entry) => Ok(BlockAccess {
+                bytes: entry.wait()?,
+                fetched_through: block_index,
+            }),
+            BlockReservation::Fetch(blocks) => {
+                let fetched_through = blocks
+                    .last()
+                    .map(|(index, _)| *index)
+                    .ok_or_else(|| io::Error::other("empty range cache reservation"))?;
+                Ok(BlockAccess {
+                    bytes: self.fetch_blocks(&blocks)?,
+                    fetched_through,
+                })
+            }
         }
     }
 
@@ -220,13 +258,23 @@ where
         Ok(())
     }
 
-    fn fetch_block(&self, block_index: u64, entry: &Arc<BlockEntry>) -> io::Result<Arc<[u8]>> {
+    fn fetch_blocks(&self, blocks: &[(u64, Arc<BlockEntry>)]) -> io::Result<Arc<[u8]>> {
         let block_size =
             u64::try_from(self.config.block_size.get()).map_err(|_| integer_overflow())?;
-        let start = block_index
+        let first_index = blocks
+            .first()
+            .map(|(index, _)| *index)
+            .ok_or_else(|| io::Error::other("empty range cache fetch"))?;
+        let last_index = blocks
+            .last()
+            .map(|(index, _)| *index)
+            .ok_or_else(|| io::Error::other("empty range cache fetch"))?;
+        let start = first_index
             .checked_mul(block_size)
             .ok_or_else(integer_overflow)?;
-        let end = start
+        let end = last_index
+            .checked_mul(block_size)
+            .ok_or_else(integer_overflow)?
             .checked_add(block_size)
             .ok_or_else(integer_overflow)?
             .min(self.length);
@@ -239,46 +287,68 @@ where
                     u64::try_from(bytes.len()).unwrap_or(u64::MAX),
                     Ordering::Relaxed,
                 );
-                let bytes = Arc::<[u8]>::from(bytes);
-                entry.complete(bytes.clone())?;
+                let mut first = None;
+                for (block_index, entry) in blocks {
+                    let block_start = block_index
+                        .checked_mul(block_size)
+                        .ok_or_else(integer_overflow)?;
+                    let block_end = block_start
+                        .checked_add(block_size)
+                        .ok_or_else(integer_overflow)?
+                        .min(self.length);
+                    let relative_start =
+                        usize::try_from(block_start - start).map_err(|_| integer_overflow())?;
+                    let relative_end =
+                        usize::try_from(block_end - start).map_err(|_| integer_overflow())?;
+                    let block_bytes = Arc::<[u8]>::from(&bytes[relative_start..relative_end]);
+                    if first.is_none() {
+                        first = Some(block_bytes.clone());
+                    }
+                    entry.complete(block_bytes)?;
+                }
                 self.trim_after_fetch()?;
-                Ok(bytes)
+                first.ok_or_else(|| io::Error::other("empty range cache fetch"))
             }
             Ok(bytes) => {
                 let error = io::Error::new(
                     io::ErrorKind::UnexpectedEof,
                     format!(
-                        "range source returned {} bytes for expected {expected}-byte block",
+                        "range source returned {} bytes for expected {expected}-byte block span",
                         bytes.len()
                     ),
                 );
-                self.fail_block(block_index, entry, &error)?;
+                self.fail_blocks(blocks, &error)?;
                 Err(error)
             }
             Err(error) => {
-                self.fail_block(block_index, entry, &error)?;
+                self.fail_blocks(blocks, &error)?;
                 Err(error)
             }
         }
     }
 
-    fn fail_block(
-        &self,
-        block_index: u64,
-        entry: &Arc<BlockEntry>,
-        error: &io::Error,
-    ) -> io::Result<()> {
+    fn fail_blocks(&self, blocks: &[(u64, Arc<BlockEntry>)], error: &io::Error) -> io::Result<()> {
         {
             let mut cache = lock(&self.cache)?;
-            if cache
-                .blocks
-                .get(&block_index)
-                .is_some_and(|record| Arc::ptr_eq(&record.entry, entry))
-            {
-                cache.blocks.remove(&block_index);
+            for (block_index, entry) in blocks {
+                if cache
+                    .blocks
+                    .get(block_index)
+                    .is_some_and(|record| Arc::ptr_eq(&record.entry, entry))
+                {
+                    cache.blocks.remove(block_index);
+                }
             }
         }
-        entry.fail(error)
+        let mut first_failure = None;
+        for (_, entry) in blocks {
+            if let Err(failure) = entry.fail(error)
+                && first_failure.is_none()
+            {
+                first_failure = Some(failure);
+            }
+        }
+        first_failure.map_or(Ok(()), Err)
     }
 
     fn trim_after_fetch(&self) -> io::Result<()> {
@@ -311,11 +381,15 @@ where
 
         let block_size =
             u64::try_from(self.config.block_size.get()).map_err(|_| integer_overflow())?;
+        let end = offset
+            .checked_add(u64::try_from(requested).map_err(|_| integer_overflow())?)
+            .ok_or_else(integer_overflow)?;
+        let last_block = (end - 1) / block_size;
         let mut position = offset;
         let mut written = 0usize;
         while written < requested {
             let block_index = position / block_size;
-            let bytes = self.get_block(block_index)?;
+            let bytes = self.get_block_through(block_index, last_block)?.bytes;
             let within_block =
                 usize::try_from(position % block_size).map_err(|_| integer_overflow())?;
             let available = bytes
@@ -338,6 +412,18 @@ where
         }
         Ok(written)
     }
+}
+
+#[derive(Debug)]
+struct BlockAccess {
+    bytes: Arc<[u8]>,
+    fetched_through: u64,
+}
+
+#[derive(Debug)]
+enum BlockReservation {
+    Existing(Arc<BlockEntry>),
+    Fetch(Vec<(u64, Arc<BlockEntry>)>),
 }
 
 #[derive(Debug, Default)]
@@ -525,13 +611,26 @@ mod tests {
         let mut output = [0; 7];
         assert_eq!(input.read_at(2, &mut output).unwrap(), 7);
         assert_eq!(&output, b"cdefghi");
-        assert_eq!(input.stats().snapshot().range_requests, 3);
+        assert_eq!(input.stats().snapshot().range_requests, 2);
 
         let mut cached = [0; 2];
         assert_eq!(input.read_at(5, &mut cached).unwrap(), 2);
         assert_eq!(&cached, b"fg");
-        assert_eq!(input.stats().snapshot().range_requests, 3);
+        assert_eq!(input.stats().snapshot().range_requests, 2);
         assert!(input.stats().snapshot().cache_hits > 0);
+    }
+
+    #[test]
+    fn prefetch_coalesces_adjacent_missing_blocks() {
+        let input =
+            CachedRangeInput::new(MemoryFetcher::new(*b"abcdefghijklmnop"), config(4, 4)).unwrap();
+
+        input.prefetch(1, 14).unwrap();
+
+        let stats = input.stats().snapshot();
+        assert_eq!(stats.range_requests, 1);
+        assert_eq!(stats.fetched_bytes, 16);
+        assert_eq!(stats.cache_misses, 4);
     }
 
     #[test]
