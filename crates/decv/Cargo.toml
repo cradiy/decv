@@ -12,3 +12,4 @@ decv-core = { path = "../decv-core" }
 decv-h264 = { path = "../decv-h264" }
 decv-mp4 = { path = "../decv-mp4" }
 decv-network = { path = "../decv-network", optional = true }
+decv-vp9 = { path = "../decv-vp9" }

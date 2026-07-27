@@ -31,6 +31,8 @@ const META: FourCc = FourCc::new(*b"meta");
 const AVC1: FourCc = FourCc::new(*b"avc1");
 const AVC3: FourCc = FourCc::new(*b"avc3");
 const AVCC: FourCc = FourCc::new(*b"avcC");
+const VP09: FourCc = FourCc::new(*b"vp09");
+const VPCC: FourCc = FourCc::new(*b"vpcC");
 
 const VISUAL_SAMPLE_ENTRY_FIELDS_SIZE: u64 = 78;
 const MAX_CODEC_CONFIGURATION_SIZE: usize = 1024 * 1024;
@@ -322,6 +324,7 @@ impl Track {
                 })?;
         match description {
             SampleDescription::Avc(entry) => entry.decoder_config(),
+            SampleDescription::Vp9(entry) => entry.decoder_config(),
             SampleDescription::Aac(_) => Err(Mp4Error::UnsupportedFeature(
                 "audio sample description has no video decoder",
             )),
@@ -341,9 +344,9 @@ impl Track {
                 })?;
         match description {
             SampleDescription::Aac(entry) => entry.decoder_config(),
-            SampleDescription::Avc(_) => Err(Mp4Error::UnsupportedFeature(
-                "video sample description has no audio decoder",
-            )),
+            SampleDescription::Avc(_) | SampleDescription::Vp9(_) => Err(
+                Mp4Error::UnsupportedFeature("video sample description has no audio decoder"),
+            ),
             SampleDescription::Unsupported { .. } => Err(Mp4Error::UnsupportedFeature(
                 "sample description has no supported audio decoder",
             )),
@@ -597,6 +600,7 @@ fn adjusted_presentation_distance(
 #[non_exhaustive]
 pub enum SampleDescription {
     Avc(AvcSampleEntry),
+    Vp9(Vp9SampleEntry),
     Aac(AacSampleEntry),
     Unsupported { format: FourCc },
 }
@@ -605,6 +609,7 @@ impl SampleDescription {
     pub const fn format(&self) -> FourCc {
         match self {
             Self::Avc(entry) => entry.format,
+            Self::Vp9(entry) => entry.format,
             Self::Aac(entry) => entry.format(),
             Self::Unsupported { format } => *format,
         }
@@ -665,6 +670,118 @@ impl AvcSampleEntry {
             },
         )
         .with_codec_data(Arc::clone(&self.codec_configuration)))
+    }
+}
+
+/// VP Codec Configuration Box (`vpcC`) fields carried by a `vp09` sample
+/// entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VpCodecConfiguration {
+    version: u8,
+    profile: u8,
+    level: u8,
+    bit_depth: u8,
+    chroma_subsampling: u8,
+    full_range: bool,
+    color_primaries: u8,
+    transfer_characteristics: u8,
+    matrix_coefficients: u8,
+    codec_initialization_data: Arc<[u8]>,
+}
+
+impl VpCodecConfiguration {
+    #[inline]
+    pub const fn version(&self) -> u8 {
+        self.version
+    }
+
+    #[inline]
+    pub const fn profile(&self) -> u8 {
+        self.profile
+    }
+
+    #[inline]
+    pub const fn level(&self) -> u8 {
+        self.level
+    }
+
+    #[inline]
+    pub const fn bit_depth(&self) -> u8 {
+        self.bit_depth
+    }
+
+    #[inline]
+    pub const fn chroma_subsampling(&self) -> u8 {
+        self.chroma_subsampling
+    }
+
+    #[inline]
+    pub const fn full_range(&self) -> bool {
+        self.full_range
+    }
+
+    #[inline]
+    pub const fn color_primaries(&self) -> u8 {
+        self.color_primaries
+    }
+
+    #[inline]
+    pub const fn transfer_characteristics(&self) -> u8 {
+        self.transfer_characteristics
+    }
+
+    #[inline]
+    pub const fn matrix_coefficients(&self) -> u8 {
+        self.matrix_coefficients
+    }
+
+    #[inline]
+    pub fn codec_initialization_data(&self) -> &Arc<[u8]> {
+        &self.codec_initialization_data
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Vp9SampleEntry {
+    format: FourCc,
+    data_reference_index: u16,
+    width: u16,
+    height: u16,
+    codec_configuration: VpCodecConfiguration,
+    raw_codec_configuration: Arc<[u8]>,
+}
+
+impl Vp9SampleEntry {
+    #[inline]
+    pub const fn format(&self) -> FourCc {
+        self.format
+    }
+
+    #[inline]
+    pub const fn data_reference_index(&self) -> u16 {
+        self.data_reference_index
+    }
+
+    #[inline]
+    pub const fn width(&self) -> u16 {
+        self.width
+    }
+
+    #[inline]
+    pub const fn height(&self) -> u16 {
+        self.height
+    }
+
+    #[inline]
+    pub const fn codec_configuration(&self) -> &VpCodecConfiguration {
+        &self.codec_configuration
+    }
+
+    pub fn decoder_config(&self) -> Result<VideoDecoderConfig> {
+        Ok(
+            VideoDecoderConfig::new(VideoCodec::Vp9, BitstreamFormat::Frame)
+                .with_codec_data(Arc::clone(&self.raw_codec_configuration)),
+        )
     }
 }
 
@@ -814,7 +931,7 @@ fn parse_audio_sample_entry(file: Mp4File<'_>, entry: BoxHeader) -> Result<Sampl
 
 fn parse_video_sample_entry(file: Mp4File<'_>, entry: BoxHeader) -> Result<SampleDescription> {
     let format = entry.kind();
-    if format != AVC1 && format != AVC3 {
+    if format != AVC1 && format != AVC3 && format != VP09 {
         return Ok(SampleDescription::Unsupported { format });
     }
     if entry.payload_size() < VISUAL_SAMPLE_ENTRY_FIELDS_SIZE {
@@ -829,33 +946,92 @@ fn parse_video_sample_entry(file: Mp4File<'_>, entry: BoxHeader) -> Result<Sampl
     let height = reader.read_u16()?;
     reader.skip(VISUAL_SAMPLE_ENTRY_FIELDS_SIZE - 28)?;
 
-    let mut codec_configuration = None;
+    let configuration_box = if format == VP09 { VPCC } else { AVCC };
+    let mut raw_codec_configuration: Option<Arc<[u8]>> = None;
     for child in file.boxes_in(reader.position()..payload.end)? {
         let child = child?;
-        if child.kind() == AVCC {
-            if codec_configuration.is_some() {
+        if child.kind() == configuration_box {
+            if raw_codec_configuration.is_some() {
                 return Err(Mp4Error::InvalidData(
-                    "AVC sample entry has multiple avcC boxes",
+                    "video sample entry has multiple codec configuration boxes",
                 ));
             }
             let range = child.payload_range()?;
             let mut reader = BoundedReader::new(file.input(), range.start, range.end)?;
-            codec_configuration = Some(
+            raw_codec_configuration = Some(
                 reader
                     .read_vec(reader.remaining()?, MAX_CODEC_CONFIGURATION_SIZE)?
                     .into(),
             );
         }
     }
-    let codec_configuration =
-        codec_configuration.ok_or(Mp4Error::InvalidData("AVC sample entry is missing avcC"))?;
-    Ok(SampleDescription::Avc(AvcSampleEntry {
-        format,
-        data_reference_index,
-        width,
-        height,
-        codec_configuration,
-    }))
+    let raw_codec_configuration = raw_codec_configuration.ok_or(if format == VP09 {
+        Mp4Error::InvalidData("VP9 sample entry is missing vpcC")
+    } else {
+        Mp4Error::InvalidData("AVC sample entry is missing avcC")
+    })?;
+
+    if format == VP09 {
+        let codec_configuration = parse_vp_codec_configuration(raw_codec_configuration.as_ref())?;
+        Ok(SampleDescription::Vp9(Vp9SampleEntry {
+            format,
+            data_reference_index,
+            width,
+            height,
+            codec_configuration,
+            raw_codec_configuration,
+        }))
+    } else {
+        Ok(SampleDescription::Avc(AvcSampleEntry {
+            format,
+            data_reference_index,
+            width,
+            height,
+            codec_configuration: raw_codec_configuration,
+        }))
+    }
+}
+
+fn parse_vp_codec_configuration(data: &[u8]) -> Result<VpCodecConfiguration> {
+    if data.len() < 12 {
+        return Err(Mp4Error::InvalidData(
+            "VP codec configuration record is truncated",
+        ));
+    }
+    let version = data[0];
+    let flags = u32::from(data[1]) << 16 | u32::from(data[2]) << 8 | u32::from(data[3]);
+    if version != 1 {
+        return Err(Mp4Error::UnsupportedFeature(
+            "only vpcC version 1 is supported",
+        ));
+    }
+    if flags != 0 {
+        return Err(Mp4Error::InvalidData("vpcC flags must be zero"));
+    }
+
+    let packed = data[6];
+    let initialization_size = usize::from(u16::from_be_bytes([data[10], data[11]]));
+    let expected_size = 12usize
+        .checked_add(initialization_size)
+        .ok_or(Mp4Error::IntegerOverflow)?;
+    if data.len() != expected_size {
+        return Err(Mp4Error::InvalidData(
+            "vpcC codec initialization size does not match its payload",
+        ));
+    }
+
+    Ok(VpCodecConfiguration {
+        version,
+        profile: data[4],
+        level: data[5],
+        bit_depth: packed >> 4,
+        chroma_subsampling: packed >> 1 & 7,
+        full_range: packed & 1 != 0,
+        color_primaries: data[7],
+        transfer_characteristics: data[8],
+        matrix_coefficients: data[9],
+        codec_initialization_data: Arc::from(&data[12..]),
+    })
 }
 
 fn set_once<T>(slot: &mut Option<T>, value: T, duplicate: &'static str) -> Result<()> {
@@ -1312,6 +1488,48 @@ mod tests {
         assert_eq!(packet.dts, MediaTime::from_parts(-9_000, 90_000));
         assert_eq!(packet.duration, MediaTime::from_parts(3_000, 90_000));
         assert!(packet.keyframe);
+    }
+
+    #[test]
+    fn parses_vp9_sample_entry_and_codec_configuration() {
+        let configuration = [
+            1, 0, 0, 0, // FullBox version and flags.
+            0, 50, 0x82, 1, 1, 1, // Profile 0, level 5.0, 8-bit 4:2:0 BT.709.
+            0, 0, // No codec initialization data.
+        ];
+        let mut payload = vec![0; 6];
+        payload.extend_from_slice(&1u16.to_be_bytes());
+        payload.extend_from_slice(&[0; 16]);
+        payload.extend_from_slice(&3_840u16.to_be_bytes());
+        payload.extend_from_slice(&2_160u16.to_be_bytes());
+        payload.extend_from_slice(&[0; 50]);
+        payload.extend_from_slice(&boxed(*b"vpcC", &configuration));
+        let input = MemoryInput(boxed(*b"vp09", &payload));
+        let file = Mp4File::open(&input).unwrap();
+        let header = file.boxes().next().unwrap().unwrap();
+
+        let SampleDescription::Vp9(entry) = parse_video_sample_entry(file, header).unwrap() else {
+            panic!("expected VP9 sample entry");
+        };
+        assert_eq!(entry.format(), VP09);
+        assert_eq!(entry.data_reference_index(), 1);
+        assert_eq!((entry.width(), entry.height()), (3_840, 2_160));
+        let codec = entry.codec_configuration();
+        assert_eq!(codec.version(), 1);
+        assert_eq!(codec.profile(), 0);
+        assert_eq!(codec.level(), 50);
+        assert_eq!(codec.bit_depth(), 8);
+        assert_eq!(codec.chroma_subsampling(), 1);
+        assert!(!codec.full_range());
+        assert_eq!(codec.color_primaries(), 1);
+        assert_eq!(codec.transfer_characteristics(), 1);
+        assert_eq!(codec.matrix_coefficients(), 1);
+        assert!(codec.codec_initialization_data().as_ref().is_empty());
+
+        let decoder = entry.decoder_config().unwrap();
+        assert_eq!(decoder.codec, VideoCodec::Vp9);
+        assert_eq!(decoder.bitstream_format, BitstreamFormat::Frame);
+        assert_eq!(decoder.codec_data.unwrap().as_ref(), configuration);
     }
 
     #[test]

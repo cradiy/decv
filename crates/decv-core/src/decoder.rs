@@ -6,6 +6,7 @@ use crate::{DecodedVideoFrame, EncodedVideoPacket, VideoFormat};
 #[non_exhaustive]
 pub enum VideoCodec {
     H264,
+    Vp9,
 }
 
 /// Framing of compressed packets supplied to a decoder.
@@ -16,6 +17,9 @@ pub enum BitstreamFormat {
     ByteStream,
     /// NAL-like units prefixed by a one-to-four-byte big-endian length.
     LengthPrefixed { length_size: u8 },
+    /// One codec packet containing one complete frame or a codec-defined
+    /// collection of frames, such as a VP9 superframe.
+    Frame,
 }
 
 /// Codec selection, packet framing, and optional out-of-band configuration.
@@ -128,6 +132,14 @@ mod tests {
             Err(MediaError::InvalidDecoderConfig(
                 "length prefix must contain one to four bytes"
             ))
+        );
+    }
+
+    #[test]
+    fn accepts_complete_frame_packets() {
+        assert_eq!(
+            VideoDecoderConfig::new(VideoCodec::Vp9, BitstreamFormat::Frame).validate(),
+            Ok(())
         );
     }
 }

@@ -21,5 +21,8 @@ pub use demuxer::{AudioPacketCursor, Mp4Demuxer, PacketCursor};
 pub use edit::Edit;
 pub use error::{Mp4Error, Result};
 pub use fourcc::FourCc;
-pub use movie::{AvcSampleEntry, Movie, SampleDescription, Track, TrackKind};
+pub use movie::{
+    AvcSampleEntry, Movie, SampleDescription, Track, TrackKind, Vp9SampleEntry,
+    VpCodecConfiguration,
+};
 pub use sample_table::Sample;

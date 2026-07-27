@@ -233,6 +233,7 @@ dependencies = [
  "decv-h264",
  "decv-mp4",
  "decv-network",
+ "decv-vp9",
 ]
 
 [[package]]
@@ -286,6 +287,15 @@ dependencies = [
  "decv-core",
  "decv-mp4",
  "ureq",
+]
+
+[[package]]
+name = "decv-vp9"
+version = "0.1.0"
+dependencies = [
+ "bit-readers",
+ "decv-core",
+ "decv-mp4",
 ]
 
 [[package]]

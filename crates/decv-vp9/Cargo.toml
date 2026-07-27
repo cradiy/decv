@@ -1,0 +1,11 @@
+[package]
+name = "decv-vp9"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+bit-readers = { path = "../bit-readers" }
+decv-core = { path = "../decv-core" }
+
+[dev-dependencies]
+decv-mp4 = { path = "../decv-mp4" }

@@ -57,6 +57,20 @@ fn main() -> Result<(), Box<dyn Error>> {
                     entry.height(),
                     entry.codec_configuration().len()
                 ),
+                SampleDescription::Vp9(entry) => {
+                    let configuration = entry.codec_configuration();
+                    println!(
+                        "  {} {}x{} profile={} level={} bit-depth={} chroma={} full-range={}",
+                        entry.format(),
+                        entry.width(),
+                        entry.height(),
+                        configuration.profile(),
+                        configuration.level(),
+                        configuration.bit_depth(),
+                        configuration.chroma_subsampling(),
+                        configuration.full_range()
+                    )
+                }
                 SampleDescription::Aac(entry) => println!(
                     "  {} {} Hz {} channels AudioSpecificConfig={} bytes",
                     entry.format(),
