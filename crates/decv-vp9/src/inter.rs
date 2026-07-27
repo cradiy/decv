@@ -46,19 +46,14 @@ impl InterSyntaxSummary {
     }
 }
 
-/// Decodes and reconstructs one 8-bit Profile-0 or Profile-1 inter frame against LAST, GOLDEN,
-/// and ALTREF pictures in that order.
+/// Decodes and reconstructs one inter frame against LAST, GOLDEN, and ALTREF
+/// pictures in that order, preserving the coded sample depth.
 pub fn decode_inter_picture(
     frame: &[u8],
     header: &FrameHeader,
     compressed: &CompressedHeader,
     references: [&IntraPicture; 3],
 ) -> Result<IntraPicture> {
-    if header.profile > 1 {
-        return Err(Vp9Error::UnsupportedFeature(
-            "8-bit pixel reconstruction currently supports VP9 Profiles 0 and 1",
-        ));
-    }
     if header.intra_only {
         return Err(Vp9Error::UnsupportedFeature(
             "inter picture decoder received an intra-only frame",
@@ -71,6 +66,7 @@ pub fn decode_inter_picture(
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
     if references.iter().any(|reference| {
         reference.subsampling() != header.chroma_subsampling()
+            || reference.bit_depth() != header.bit_depth()
             || !valid_reference_size(reference, width, height)
     }) {
         return Err(Vp9Error::UnsupportedFeature(
@@ -79,7 +75,12 @@ pub fn decode_inter_picture(
     }
     let mut context = ProbabilityContext::default();
     context.apply(compressed)?;
-    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
+    let mut picture = IntraPicture::new(
+        width,
+        height,
+        header.chroma_subsampling(),
+        header.bit_depth(),
+    );
     let (_, modes) = parse_inter_syntax(
         frame,
         header,
@@ -113,13 +114,19 @@ pub(crate) fn decode_inter_picture_with_context(
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
     if references.iter().any(|reference| {
         reference.subsampling() != header.chroma_subsampling()
+            || reference.bit_depth() != header.bit_depth()
             || !valid_reference_size(reference, width, height)
     }) {
         return Err(Vp9Error::UnsupportedFeature(
             "VP9 reference layout is incompatible with the current frame",
         ));
     }
-    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
+    let mut picture = IntraPicture::new(
+        width,
+        height,
+        header.chroma_subsampling(),
+        header.bit_depth(),
+    );
     let (_, modes) = parse_inter_syntax(
         frame,
         header,
@@ -451,6 +458,7 @@ fn parse_inter_tiles_parallel(
                         origin_x,
                         end_x - origin_x,
                         header.chroma_subsampling(),
+                        header.bit_depth(),
                     );
                     let mut tile_modes = vec![None; mi_columns * mi_rows];
                     let mut tile_segment_ids = vec![0; mi_columns * mi_rows];

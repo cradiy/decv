@@ -101,16 +101,6 @@ impl Vp9Decoder {
                 format: video_format(&header)?,
             }));
         }
-        if header.profile > 1
-            || header
-                .color
-                .is_some_and(|color| color.bit_depth != BitDepth::Eight)
-        {
-            return Err(Vp9Error::UnsupportedFeature(
-                "reconstruction currently supports 8-bit VP9 Profiles 0 and 1",
-            ));
-        }
-
         self.reset_probability_contexts(&header);
         let context_index = usize::from(header.frame_context_index);
         let previous_context = self.probability_contexts[context_index].clone();
@@ -305,26 +295,33 @@ impl VideoDecoder for Vp9Decoder {
                 self.current_format = Some(decoded.format);
             }
             let picture = decoded.picture;
-            let storage = FrameStorage::Cpu(CpuFrame::new(vec![
-                CpuPlane::new(
-                    picture.shared_plane(0),
-                    0,
-                    picture.stride(0),
-                    picture.height(),
-                ),
-                CpuPlane::new(
-                    picture.shared_plane(1),
-                    0,
-                    picture.stride(1),
-                    picture.plane_height(1),
-                ),
-                CpuPlane::new(
-                    picture.shared_plane(2),
-                    0,
-                    picture.stride(2),
-                    picture.plane_height(2),
-                ),
-            ]));
+            let planes = match picture.bit_depth() {
+                BitDepth::Eight => (0..3)
+                    .map(|plane| {
+                        CpuPlane::new(
+                            picture
+                                .shared_plane_u8(plane)
+                                .expect("8-bit picture must own byte planes"),
+                            0,
+                            picture.stride(plane),
+                            picture.plane_height(plane),
+                        )
+                    })
+                    .collect(),
+                BitDepth::Ten | BitDepth::Twelve => (0..3)
+                    .map(|plane| {
+                        CpuPlane::new(
+                            picture
+                                .shared_plane_u16(plane)
+                                .expect("high-bit-depth picture must own word planes"),
+                            0,
+                            picture.stride(plane),
+                            picture.plane_height(plane),
+                        )
+                    })
+                    .collect(),
+            };
+            let storage = FrameStorage::Cpu(CpuFrame::new(planes));
             let frame =
                 DecodedVideoFrame::new(self.next_frame_id, pts, duration, decoded.format, storage);
             frame.validate()?;

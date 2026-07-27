@@ -1,5 +1,6 @@
 use std::{
     fmt,
+    mem::size_of,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
@@ -107,6 +108,8 @@ impl AsMut<[u8]> for AlignedBytes {
 #[derive(Debug, Clone)]
 pub enum CpuBuffer {
     Bytes(Arc<[u8]>),
+    /// Native-endian 16-bit samples exposed as their byte representation.
+    Words(Arc<[u16]>),
     Aligned(Arc<AlignedBytes>),
 }
 
@@ -115,6 +118,7 @@ impl CpuBuffer {
     pub fn ptr_eq(left: &Self, right: &Self) -> bool {
         match (left, right) {
             (Self::Bytes(left), Self::Bytes(right)) => Arc::ptr_eq(left, right),
+            (Self::Words(left), Self::Words(right)) => Arc::ptr_eq(left, right),
             (Self::Aligned(left), Self::Aligned(right)) => Arc::ptr_eq(left, right),
             _ => false,
         }
@@ -128,6 +132,17 @@ impl Deref for CpuBuffer {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Bytes(bytes) => bytes,
+            Self::Words(words) => {
+                // SAFETY: `u16` has no invalid bit patterns, the resulting byte
+                // slice covers exactly the same allocation, and its lifetime is
+                // bounded by the borrowed `Arc<[u16]>`.
+                unsafe {
+                    std::slice::from_raw_parts(
+                        words.as_ptr().cast::<u8>(),
+                        words.len() * size_of::<u16>(),
+                    )
+                }
+            }
             Self::Aligned(bytes) => bytes,
         }
     }
@@ -151,6 +166,13 @@ impl From<Vec<u8>> for CpuBuffer {
     #[inline]
     fn from(bytes: Vec<u8>) -> Self {
         Self::Bytes(bytes.into())
+    }
+}
+
+impl From<Arc<[u16]>> for CpuBuffer {
+    #[inline]
+    fn from(words: Arc<[u16]>) -> Self {
+        Self::Words(words)
     }
 }
 
@@ -384,6 +406,17 @@ mod tests {
     }
 
     #[test]
+    fn word_buffers_expose_native_endian_bytes_without_copying() {
+        let words: Arc<[u16]> = vec![0x1234, 0xabcd].into();
+        let first = CpuBuffer::from(words.clone());
+        let second = CpuBuffer::from(words);
+        let expected = [0x1234u16.to_ne_bytes(), 0xabcdu16.to_ne_bytes()].concat();
+
+        assert_eq!(first.as_ref(), expected);
+        assert!(CpuBuffer::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn validates_strided_nv12_storage() {
         let allocation: Arc<[u8]> = vec![0; 48].into();
         let frame = DecodedVideoFrame {
@@ -486,9 +519,9 @@ mod tests {
             duration: None,
             format,
             storage: FrameStorage::Cpu(CpuFrame::new(vec![
-                CpuPlane::new(vec![0; 16], 0, 8, 2),
-                CpuPlane::new(vec![0; 8], 0, 4, 2),
-                CpuPlane::new(vec![0; 8], 0, 4, 2),
+                CpuPlane::new(Arc::<[u16]>::from(vec![0; 8]), 0, 8, 2),
+                CpuPlane::new(Arc::<[u16]>::from(vec![0; 4]), 0, 4, 2),
+                CpuPlane::new(Arc::<[u16]>::from(vec![0; 4]), 0, 4, 2),
             ])),
         };
         assert_eq!(frame.validate(), Ok(()));

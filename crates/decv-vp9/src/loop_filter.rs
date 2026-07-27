@@ -1,5 +1,5 @@
 use crate::{
-    FrameHeader, Result, Vp9Error,
+    BitDepth, FrameHeader, Result, Vp9Error,
     block::{BlockSize, TransformSize},
     reconstruct::IntraPicture,
     tile::floor_transform,
@@ -62,6 +62,37 @@ struct Thresholds {
     hev: u8,
 }
 
+trait LoopSample: Copy + Default + Send {
+    fn to_i32(self) -> i32;
+    fn from_i32(value: i32) -> Self;
+
+    #[allow(clippy::too_many_arguments)]
+    fn filter_vertical(
+        pixels: &mut [Self],
+        stride: usize,
+        plane_width: usize,
+        x: usize,
+        y: usize,
+        count: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    );
+
+    #[allow(clippy::too_many_arguments)]
+    fn filter_horizontal(
+        pixels: &mut [Self],
+        stride: usize,
+        plane_height: usize,
+        x: usize,
+        y: usize,
+        count: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    );
+}
+
 pub(crate) fn apply_loop_filter(
     picture: &mut IntraPicture,
     header: &FrameHeader,
@@ -83,10 +114,49 @@ pub(crate) fn apply_loop_filter(
 
     let plane_widths: [usize; 3] = std::array::from_fn(|plane| picture.plane_width(plane));
     let plane_heights: [usize; 3] = std::array::from_fn(|plane| picture.plane_height(plane));
-    let plane_strides: [usize; 3] = std::array::from_fn(|plane| picture.stride(plane));
+    let plane_strides: [usize; 3] = std::array::from_fn(|plane| picture.sample_stride(plane));
     let subsampling_x: [usize; 3] = std::array::from_fn(|plane| picture.subsampling_x(plane));
     let subsampling_y: [usize; 3] = std::array::from_fn(|plane| picture.subsampling_y(plane));
-    let [luma, chroma_u, chroma_v] = picture.planes_mut();
+    let bit_depth = picture.bit_depth();
+    match bit_depth {
+        BitDepth::Eight => apply_all_planes(
+            picture.planes_mut(),
+            plane_widths,
+            plane_heights,
+            plane_strides,
+            subsampling_x,
+            subsampling_y,
+            header,
+            modes,
+            bit_depth,
+        ),
+        BitDepth::Ten | BitDepth::Twelve => apply_all_planes(
+            picture.planes_u16_mut(),
+            plane_widths,
+            plane_heights,
+            plane_strides,
+            subsampling_x,
+            subsampling_y,
+            header,
+            modes,
+            bit_depth,
+        ),
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_all_planes<T: LoopSample>(
+    [luma, chroma_u, chroma_v]: [&mut [T]; 3],
+    plane_widths: [usize; 3],
+    plane_heights: [usize; 3],
+    plane_strides: [usize; 3],
+    subsampling_x: [usize; 3],
+    subsampling_y: [usize; 3],
+    header: &FrameHeader,
+    modes: &FilterModeMap,
+    bit_depth: BitDepth,
+) {
     std::thread::scope(|scope| {
         let u_worker = scope.spawn(|| {
             apply_plane_loop_filter(
@@ -98,6 +168,7 @@ pub(crate) fn apply_loop_filter(
                 subsampling_y[1],
                 header,
                 modes,
+                bit_depth,
             );
         });
         let v_worker = scope.spawn(|| {
@@ -110,6 +181,7 @@ pub(crate) fn apply_loop_filter(
                 subsampling_y[2],
                 header,
                 modes,
+                bit_depth,
             );
         });
         apply_plane_loop_filter(
@@ -121,16 +193,16 @@ pub(crate) fn apply_loop_filter(
             subsampling_y[0],
             header,
             modes,
+            bit_depth,
         );
         u_worker.join().expect("VP9 U-plane loop filter panicked");
         v_worker.join().expect("VP9 V-plane loop filter panicked");
     });
-    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_plane_loop_filter(
-    pixels: &mut [u8],
+fn apply_plane_loop_filter<T: LoopSample>(
+    pixels: &mut [T],
     width: usize,
     height: usize,
     stride: usize,
@@ -138,6 +210,7 @@ fn apply_plane_loop_filter(
     subsampling_y: usize,
     header: &FrameHeader,
     modes: &FilterModeMap,
+    bit_depth: BitDepth,
 ) {
     let configuration = header.loop_filter.as_ref().expect("caller checked");
     let row_step = 1usize << subsampling_y;
@@ -169,15 +242,16 @@ fn apply_plane_loop_filter(
                         && let Some(width_kind) =
                             edge_filter_width(transform, x / 8, width.saturating_sub(x))
                     {
-                        filter_vertical(
+                        T::filter_vertical(
                             pixels, stride, width, x, y, line_count, width_kind, thresholds,
+                            bit_depth,
                         );
                     }
                     if transform == TransformSize::Tx4x4
                         && !(mode.skip && mode.reference != 0)
                         && x + 4 < width
                     {
-                        filter_vertical(
+                        T::filter_vertical(
                             pixels,
                             stride,
                             width,
@@ -186,6 +260,7 @@ fn apply_plane_loop_filter(
                             line_count,
                             FilterWidth::Four,
                             thresholds,
+                            bit_depth,
                         );
                     }
                 }
@@ -210,7 +285,7 @@ fn apply_plane_loop_filter(
                         && let Some(width_kind) =
                             edge_filter_width(transform, y / 8, height.saturating_sub(y))
                     {
-                        filter_horizontal(
+                        T::filter_horizontal(
                             pixels,
                             stride,
                             height,
@@ -219,13 +294,14 @@ fn apply_plane_loop_filter(
                             column_count,
                             width_kind,
                             thresholds,
+                            bit_depth,
                         );
                     }
                     if transform == TransformSize::Tx4x4
                         && !(mode.skip && mode.reference != 0)
                         && y + 4 < height
                     {
-                        filter_horizontal(
+                        T::filter_horizontal(
                             pixels,
                             stride,
                             height,
@@ -234,6 +310,7 @@ fn apply_plane_loop_filter(
                             column_count,
                             FilterWidth::Four,
                             thresholds,
+                            bit_depth,
                         );
                     }
                 }
@@ -361,13 +438,45 @@ fn filter_vertical(
         }
         return;
     }
+    filter_vertical_scalar(
+        pixels,
+        stride,
+        plane_width,
+        x,
+        y,
+        count,
+        width,
+        thresholds,
+        BitDepth::Eight,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_vertical_scalar<T: LoopSample>(
+    pixels: &mut [T],
+    stride: usize,
+    plane_width: usize,
+    x: usize,
+    y: usize,
+    count: usize,
+    width: FilterWidth,
+    thresholds: Thresholds,
+    bit_depth: BitDepth,
+) {
+    let reach = match width {
+        FilterWidth::Sixteen => 8,
+        FilterWidth::Four | FilterWidth::Eight => 4,
+    };
+    if x < reach || x + reach > plane_width {
+        return;
+    }
     for row in 0..count {
         let base = (y + row) * stride + x;
-        let mut samples = [0u8; 16];
+        let mut samples = [T::default(); 16];
         for offset in 0..reach * 2 {
             samples[8 - reach + offset] = pixels[base - reach + offset];
         }
-        filter_samples(&mut samples, width, thresholds);
+        filter_samples(&mut samples, width, thresholds, bit_depth);
         for offset in 0..reach * 2 {
             pixels[base - reach + offset] = samples[8 - reach + offset];
         }
@@ -408,31 +517,175 @@ fn filter_horizontal(
         }
         return;
     }
+    filter_horizontal_scalar(
+        pixels,
+        stride,
+        plane_height,
+        x,
+        y,
+        count,
+        width,
+        thresholds,
+        BitDepth::Eight,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_horizontal_scalar<T: LoopSample>(
+    pixels: &mut [T],
+    stride: usize,
+    plane_height: usize,
+    x: usize,
+    y: usize,
+    count: usize,
+    width: FilterWidth,
+    thresholds: Thresholds,
+    bit_depth: BitDepth,
+) {
+    let reach = match width {
+        FilterWidth::Sixteen => 8,
+        FilterWidth::Four | FilterWidth::Eight => 4,
+    };
+    if y < reach || y + reach > plane_height {
+        return;
+    }
     for column in 0..count {
-        let mut samples = [0u8; 16];
+        let mut samples = [T::default(); 16];
         for offset in 0..reach * 2 {
             samples[8 - reach + offset] = pixels[(y + offset - reach) * stride + x + column];
         }
-        filter_samples(&mut samples, width, thresholds);
+        filter_samples(&mut samples, width, thresholds, bit_depth);
         for offset in 0..reach * 2 {
             pixels[(y + offset - reach) * stride + x + column] = samples[8 - reach + offset];
         }
     }
 }
 
-fn filter_samples(samples: &mut [u8; 16], width: FilterWidth, thresholds: Thresholds) {
-    let mask = filter_mask(thresholds.limit, thresholds.blimit, &samples[4..12]);
+fn filter_samples<T: LoopSample>(
+    samples: &mut [T; 16],
+    width: FilterWidth,
+    thresholds: Thresholds,
+    bit_depth: BitDepth,
+) {
+    let shift = u32::from(bit_depth.bits() - 8);
+    let mask = filter_mask(
+        u32::from(thresholds.limit) << shift,
+        u32::from(thresholds.blimit) << shift,
+        &samples[4..12],
+    );
     if !mask {
         return;
     }
-    let flat = flat_mask(&samples[4..12]);
+    let flat = flat_mask(&samples[4..12], shift);
     match width {
-        FilterWidth::Four => filter_four(samples, thresholds.hev),
+        FilterWidth::Four => filter_four(samples, thresholds.hev, bit_depth),
         FilterWidth::Eight if flat => filter_eight(samples),
-        FilterWidth::Eight => filter_four(samples, thresholds.hev),
-        FilterWidth::Sixteen if flat && flat2_mask(samples) => filter_sixteen(samples),
+        FilterWidth::Eight => filter_four(samples, thresholds.hev, bit_depth),
+        FilterWidth::Sixteen if flat && flat2_mask(samples, shift) => filter_sixteen(samples),
         FilterWidth::Sixteen if flat => filter_eight(samples),
-        FilterWidth::Sixteen => filter_four(samples, thresholds.hev),
+        FilterWidth::Sixteen => filter_four(samples, thresholds.hev, bit_depth),
+    }
+}
+
+impl LoopSample for u8 {
+    #[inline]
+    fn to_i32(self) -> i32 {
+        i32::from(self)
+    }
+
+    #[inline]
+    fn from_i32(value: i32) -> Self {
+        value as Self
+    }
+
+    fn filter_vertical(
+        pixels: &mut [Self],
+        stride: usize,
+        plane_width: usize,
+        x: usize,
+        y: usize,
+        count: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        debug_assert_eq!(bit_depth, BitDepth::Eight);
+        filter_vertical(pixels, stride, plane_width, x, y, count, width, thresholds);
+    }
+
+    fn filter_horizontal(
+        pixels: &mut [Self],
+        stride: usize,
+        plane_height: usize,
+        x: usize,
+        y: usize,
+        count: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        debug_assert_eq!(bit_depth, BitDepth::Eight);
+        filter_horizontal(pixels, stride, plane_height, x, y, count, width, thresholds);
+    }
+}
+
+impl LoopSample for u16 {
+    #[inline]
+    fn to_i32(self) -> i32 {
+        i32::from(self)
+    }
+
+    #[inline]
+    fn from_i32(value: i32) -> Self {
+        value as Self
+    }
+
+    fn filter_vertical(
+        pixels: &mut [Self],
+        stride: usize,
+        plane_width: usize,
+        x: usize,
+        y: usize,
+        count: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        filter_vertical_scalar(
+            pixels,
+            stride,
+            plane_width,
+            x,
+            y,
+            count,
+            width,
+            thresholds,
+            bit_depth,
+        );
+    }
+
+    fn filter_horizontal(
+        pixels: &mut [Self],
+        stride: usize,
+        plane_height: usize,
+        x: usize,
+        y: usize,
+        count: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        filter_horizontal_scalar(
+            pixels,
+            stride,
+            plane_height,
+            x,
+            y,
+            count,
+            width,
+            thresholds,
+            bit_depth,
+        );
     }
 }
 
@@ -615,7 +868,7 @@ mod x86 {
     }
 }
 
-fn filter_mask(limit: u8, blimit: u8, edge: &[u8]) -> bool {
+fn filter_mask<T: LoopSample>(limit: u32, blimit: u32, edge: &[T]) -> bool {
     let p3 = edge[0];
     let p2 = edge[1];
     let p1 = edge[2];
@@ -630,10 +883,10 @@ fn filter_mask(limit: u8, blimit: u8, edge: &[u8]) -> bool {
         && abs_diff(q1, q0) <= limit
         && abs_diff(q2, q1) <= limit
         && abs_diff(q3, q2) <= limit
-        && u16::from(abs_diff(p0, q0)) * 2 + u16::from(abs_diff(p1, q1)) / 2 <= u16::from(blimit)
+        && abs_diff(p0, q0) * 2 + abs_diff(p1, q1) / 2 <= blimit
 }
 
-fn flat_mask(edge: &[u8]) -> bool {
+fn flat_mask<T: LoopSample>(edge: &[T], shift: u32) -> bool {
     let p3 = edge[0];
     let p2 = edge[1];
     let p1 = edge[2];
@@ -642,95 +895,91 @@ fn flat_mask(edge: &[u8]) -> bool {
     let q1 = edge[5];
     let q2 = edge[6];
     let q3 = edge[7];
-    abs_diff(p1, p0) <= 1
-        && abs_diff(q1, q0) <= 1
-        && abs_diff(p2, p0) <= 1
-        && abs_diff(q2, q0) <= 1
-        && abs_diff(p3, p0) <= 1
-        && abs_diff(q3, q0) <= 1
+    let threshold = 1 << shift;
+    abs_diff(p1, p0) <= threshold
+        && abs_diff(q1, q0) <= threshold
+        && abs_diff(p2, p0) <= threshold
+        && abs_diff(q2, q0) <= threshold
+        && abs_diff(p3, p0) <= threshold
+        && abs_diff(q3, q0) <= threshold
 }
 
-fn flat2_mask(samples: &[u8; 16]) -> bool {
+fn flat2_mask<T: LoopSample>(samples: &[T; 16], shift: u32) -> bool {
     let p0 = samples[7];
     let q0 = samples[8];
-    (0..=3).all(|index| abs_diff(samples[index], p0) <= 1)
-        && (12..=15).all(|index| abs_diff(samples[index], q0) <= 1)
+    let threshold = 1 << shift;
+    (0..=3).all(|index| abs_diff(samples[index], p0) <= threshold)
+        && (12..=15).all(|index| abs_diff(samples[index], q0) <= threshold)
 }
 
-fn filter_four(samples: &mut [u8; 16], threshold: u8) {
-    let ps1 = i32::from((samples[6] ^ 0x80) as i8);
-    let ps0 = i32::from((samples[7] ^ 0x80) as i8);
-    let qs0 = i32::from((samples[8] ^ 0x80) as i8);
-    let qs1 = i32::from((samples[9] ^ 0x80) as i8);
+fn filter_four<T: LoopSample>(samples: &mut [T; 16], threshold: u8, bit_depth: BitDepth) {
+    let shift = u32::from(bit_depth.bits() - 8);
+    let ps1 = samples[6].to_i32();
+    let ps0 = samples[7].to_i32();
+    let qs0 = samples[8].to_i32();
+    let qs1 = samples[9].to_i32();
+    let signed_min = -(128i32 << shift);
+    let signed_max = (128i32 << shift) - 1;
+    let signed_clamp = |value: i32| value.clamp(signed_min, signed_max);
+    let pixel_clamp = |value: i32| T::from_i32(value.clamp(0, i32::from(bit_depth.max_sample())));
+    let threshold = u32::from(threshold) << shift;
     let hev = abs_diff(samples[6], samples[7]) > threshold
         || abs_diff(samples[9], samples[8]) > threshold;
-    let outer = if hev { signed_char_clamp(ps1 - qs1) } else { 0 };
-    let filter = signed_char_clamp(outer + 3 * (qs0 - ps0));
-    let filter1 = signed_char_clamp(filter + 4) >> 3;
-    let filter2 = signed_char_clamp(filter + 3) >> 3;
-    samples[8] = signed_to_pixel(signed_char_clamp(qs0 - filter1));
-    samples[7] = signed_to_pixel(signed_char_clamp(ps0 + filter2));
+    let outer = if hev { signed_clamp(ps1 - qs1) } else { 0 };
+    let filter = signed_clamp(outer + 3 * (qs0 - ps0));
+    let filter1 = signed_clamp(filter + 4) >> 3;
+    let filter2 = signed_clamp(filter + 3) >> 3;
+    samples[8] = pixel_clamp(qs0 - filter1);
+    samples[7] = pixel_clamp(ps0 + filter2);
     if !hev {
         let adjustment = (filter1 + 1) >> 1;
-        samples[9] = signed_to_pixel(signed_char_clamp(qs1 - adjustment));
-        samples[6] = signed_to_pixel(signed_char_clamp(ps1 + adjustment));
+        samples[9] = pixel_clamp(qs1 - adjustment);
+        samples[6] = pixel_clamp(ps1 + adjustment);
     }
 }
 
-fn filter_eight(samples: &mut [u8; 16]) {
+fn filter_eight<T: LoopSample>(samples: &mut [T; 16]) {
     let [p3, p2, p1, p0, q0, q1, q2, q3] = samples[4..12].try_into().unwrap();
-    samples[5] = round_shift3(
-        3 * u16::from(p3) + 2 * u16::from(p2) + u16::from(p1) + u16::from(p0) + u16::from(q0),
-    );
+    samples[5] =
+        round_shift3(3 * p3.to_i32() + 2 * p2.to_i32() + p1.to_i32() + p0.to_i32() + q0.to_i32());
     samples[6] = round_shift3(
-        2 * u16::from(p3)
-            + u16::from(p2)
-            + 2 * u16::from(p1)
-            + u16::from(p0)
-            + u16::from(q0)
-            + u16::from(q1),
+        2 * p3.to_i32() + p2.to_i32() + 2 * p1.to_i32() + p0.to_i32() + q0.to_i32() + q1.to_i32(),
     );
     samples[7] = round_shift3(
-        u16::from(p3)
-            + u16::from(p2)
-            + u16::from(p1)
-            + 2 * u16::from(p0)
-            + u16::from(q0)
-            + u16::from(q1)
-            + u16::from(q2),
+        p3.to_i32()
+            + p2.to_i32()
+            + p1.to_i32()
+            + 2 * p0.to_i32()
+            + q0.to_i32()
+            + q1.to_i32()
+            + q2.to_i32(),
     );
     samples[8] = round_shift3(
-        u16::from(p2)
-            + u16::from(p1)
-            + u16::from(p0)
-            + 2 * u16::from(q0)
-            + u16::from(q1)
-            + u16::from(q2)
-            + u16::from(q3),
+        p2.to_i32()
+            + p1.to_i32()
+            + p0.to_i32()
+            + 2 * q0.to_i32()
+            + q1.to_i32()
+            + q2.to_i32()
+            + q3.to_i32(),
     );
     samples[9] = round_shift3(
-        u16::from(p1)
-            + u16::from(p0)
-            + u16::from(q0)
-            + 2 * u16::from(q1)
-            + u16::from(q2)
-            + 2 * u16::from(q3),
+        p1.to_i32() + p0.to_i32() + q0.to_i32() + 2 * q1.to_i32() + q2.to_i32() + 2 * q3.to_i32(),
     );
-    samples[10] = round_shift3(
-        u16::from(p0) + u16::from(q0) + u16::from(q1) + 2 * u16::from(q2) + 3 * u16::from(q3),
-    );
+    samples[10] =
+        round_shift3(p0.to_i32() + q0.to_i32() + q1.to_i32() + 2 * q2.to_i32() + 3 * q3.to_i32());
 }
 
-fn filter_sixteen(samples: &mut [u8; 16]) {
+fn filter_sixteen<T: LoopSample>(samples: &mut [T; 16]) {
     let source = *samples;
     let p = &source[..8];
     let q = &source[8..];
-    let sum = |terms: &[(u16, u8)]| -> u8 {
+    let sum = |terms: &[(i32, T)]| -> T {
         let total = terms
             .iter()
-            .map(|&(weight, value)| weight * u16::from(value))
-            .sum::<u16>();
-        ((total + 8) >> 4) as u8
+            .map(|&(weight, value)| weight * value.to_i32())
+            .sum::<i32>();
+        T::from_i32((total + 8) >> 4)
     };
     samples[1] = sum(&[
         (7, p[0]),
@@ -931,32 +1180,23 @@ fn filter_sixteen(samples: &mut [u8; 16]) {
 }
 
 #[inline]
-fn abs_diff(first: u8, second: u8) -> u8 {
-    first.abs_diff(second)
+fn abs_diff<T: LoopSample>(first: T, second: T) -> u32 {
+    first.to_i32().abs_diff(second.to_i32())
 }
 
 #[inline]
-fn signed_char_clamp(value: i32) -> i32 {
-    value.clamp(-128, 127)
-}
-
-#[inline]
-fn signed_to_pixel(value: i32) -> u8 {
-    (value as i8 as u8) ^ 0x80
-}
-
-#[inline]
-fn round_shift3(value: u16) -> u8 {
-    ((value + 4) >> 3) as u8
+fn round_shift3<T: LoopSample>(value: i32) -> T {
+    T::from_i32((value + 4) >> 3)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{FilterWidth, Thresholds, filter_samples, filter_vertical, thresholds};
+    use crate::BitDepth;
 
     #[test]
     fn flat_eight_tap_edge_is_smoothed_symmetrically() {
-        let mut samples = [0; 16];
+        let mut samples = [0u8; 16];
         samples[..8].fill(100);
         samples[8..].fill(104);
         filter_samples(
@@ -967,8 +1207,27 @@ mod tests {
                 blimit: 20,
                 hev: 0,
             },
+            BitDepth::Eight,
         );
         assert_eq!(&samples[5..11], &[101, 101, 102, 103, 103, 104]);
+    }
+
+    #[test]
+    fn high_bit_depth_filter_scales_normative_thresholds() {
+        let mut samples = [0u16; 16];
+        samples[..8].fill(400);
+        samples[8..].fill(416);
+        filter_samples(
+            &mut samples,
+            FilterWidth::Eight,
+            Thresholds {
+                limit: 4,
+                blimit: 20,
+                hev: 0,
+            },
+            BitDepth::Ten,
+        );
+        assert_eq!(&samples[5..11], &[402, 404, 406, 410, 412, 414]);
     }
 
     #[test]

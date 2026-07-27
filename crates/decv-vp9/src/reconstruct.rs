@@ -1,39 +1,100 @@
 use std::sync::Arc;
 
 use crate::{
-    ChromaSubsampling,
+    BitDepth, ChromaSubsampling,
     block::{IntraMode, TransformSize, TransformType},
     inverse_transform::{inverse_adst, inverse_dct},
 };
 
-/// Reconstructed 8-bit planar YUV picture.
+#[derive(Debug, Clone)]
+enum PicturePlanes {
+    Eight([Arc<[u8]>; 3]),
+    High([Arc<[u16]>; 3]),
+}
+
+trait Sample: Copy + Default {
+    fn from_u32(value: u32) -> Self;
+    fn to_u32(self) -> u32;
+}
+
+impl Sample for u8 {
+    #[inline]
+    fn from_u32(value: u32) -> Self {
+        value as Self
+    }
+
+    #[inline]
+    fn to_u32(self) -> u32 {
+        u32::from(self)
+    }
+}
+
+impl Sample for u16 {
+    #[inline]
+    fn from_u32(value: u32) -> Self {
+        value as Self
+    }
+
+    #[inline]
+    fn to_u32(self) -> u32 {
+        u32::from(self)
+    }
+}
+
+fn copy_strip_plane<T: Copy>(
+    source: &[T],
+    target: &mut [T],
+    source_stride: usize,
+    target_stride: usize,
+    origin_x: usize,
+    width: usize,
+    height: usize,
+) {
+    for row in 0..height {
+        let source_start = row * source_stride;
+        let target_start = row * target_stride + origin_x;
+        target[target_start..target_start + width]
+            .copy_from_slice(&source[source_start..source_start + width]);
+    }
+}
+
+/// Reconstructed planar YUV picture in its native VP9 sample depth.
 #[derive(Debug, Clone)]
 pub struct IntraPicture {
     width: usize,
     height: usize,
     origin_x: usize,
     storage_width: usize,
+    bit_depth: BitDepth,
     subsampling: ChromaSubsampling,
+    /// Plane strides in samples, not bytes.
     strides: [usize; 3],
-    planes: [Arc<[u8]>; 3],
+    planes: PicturePlanes,
 }
 
 impl IntraPicture {
-    pub(crate) fn new(width: usize, height: usize, subsampling: ChromaSubsampling) -> Self {
+    pub(crate) fn new(
+        width: usize,
+        height: usize,
+        subsampling: ChromaSubsampling,
+        bit_depth: BitDepth,
+    ) -> Self {
         let chroma_width = width.div_ceil(1 << subsampling.x_shift());
         let chroma_height = height.div_ceil(1 << subsampling.y_shift());
+        let plane_lengths = [
+            width * height,
+            chroma_width * chroma_height,
+            chroma_width * chroma_height,
+        ];
         Self {
             width,
             height,
             origin_x: 0,
             storage_width: width,
+            bit_depth,
             subsampling,
             strides: [width, chroma_width, chroma_width],
-            planes: [
-                vec![0; width * height].into(),
-                vec![0; chroma_width * chroma_height].into(),
-                vec![0; chroma_width * chroma_height].into(),
-            ],
+            planes: Self::allocate_planes(bit_depth, plane_lengths),
         }
     }
 
@@ -43,29 +104,42 @@ impl IntraPicture {
         origin_x: usize,
         storage_width: usize,
         subsampling: ChromaSubsampling,
+        bit_depth: BitDepth,
     ) -> Self {
         debug_assert!(origin_x <= width && storage_width <= width - origin_x);
         debug_assert!(origin_x.is_multiple_of(1 << subsampling.x_shift()));
         let chroma_width = storage_width.div_ceil(1 << subsampling.x_shift());
         let chroma_height = height.div_ceil(1 << subsampling.y_shift());
+        let plane_lengths = [
+            storage_width * height,
+            chroma_width * chroma_height,
+            chroma_width * chroma_height,
+        ];
         Self {
             width,
             height,
             origin_x,
             storage_width,
+            bit_depth,
             subsampling,
             strides: [storage_width, chroma_width, chroma_width],
-            planes: [
-                vec![0; storage_width * height].into(),
-                vec![0; chroma_width * chroma_height].into(),
-                vec![0; chroma_width * chroma_height].into(),
-            ],
+            planes: Self::allocate_planes(bit_depth, plane_lengths),
+        }
+    }
+
+    fn allocate_planes(bit_depth: BitDepth, lengths: [usize; 3]) -> PicturePlanes {
+        match bit_depth {
+            BitDepth::Eight => PicturePlanes::Eight(lengths.map(|length| vec![0; length].into())),
+            BitDepth::Ten | BitDepth::Twelve => {
+                PicturePlanes::High(lengths.map(|length| vec![0; length].into()))
+            }
         }
     }
 
     pub(crate) fn copy_strip_from(&mut self, strip: &Self) {
         debug_assert_eq!(self.width, strip.width);
         debug_assert_eq!(self.height, strip.height);
+        debug_assert_eq!(self.bit_depth, strip.bit_depth);
         debug_assert_eq!(self.subsampling, strip.subsampling);
         debug_assert_eq!(self.origin_x, 0);
         for plane in 0..3 {
@@ -76,13 +150,30 @@ impl IntraPicture {
             let height = self.height.div_ceil(1 << subsampling_y);
             let source_stride = strip.strides[plane];
             let target_stride = self.strides[plane];
-            let source = &strip.planes[plane];
-            let target = Arc::make_mut(&mut self.planes[plane]);
-            for row in 0..height {
-                let source_start = row * source_stride;
-                let target_start = row * target_stride + origin_x;
-                target[target_start..target_start + width]
-                    .copy_from_slice(&source[source_start..source_start + width]);
+            match (&strip.planes, &mut self.planes) {
+                (PicturePlanes::Eight(source), PicturePlanes::Eight(target)) => {
+                    copy_strip_plane(
+                        &source[plane],
+                        Arc::make_mut(&mut target[plane]),
+                        source_stride,
+                        target_stride,
+                        origin_x,
+                        width,
+                        height,
+                    );
+                }
+                (PicturePlanes::High(source), PicturePlanes::High(target)) => {
+                    copy_strip_plane(
+                        &source[plane],
+                        Arc::make_mut(&mut target[plane]),
+                        source_stride,
+                        target_stride,
+                        origin_x,
+                        width,
+                        height,
+                    );
+                }
+                _ => unreachable!("picture strips must have matching sample depths"),
             }
         }
     }
@@ -95,6 +186,11 @@ impl IntraPicture {
     #[inline]
     pub fn height(&self) -> usize {
         self.height
+    }
+
+    #[inline]
+    pub fn bit_depth(&self) -> BitDepth {
+        self.bit_depth
     }
 
     #[inline]
@@ -124,22 +220,85 @@ impl IntraPicture {
 
     #[inline]
     pub fn stride(&self, plane: usize) -> usize {
+        self.strides[plane] * self.bytes_per_sample()
+    }
+
+    #[inline]
+    pub(crate) fn sample_stride(&self, plane: usize) -> usize {
         self.strides[plane]
     }
 
+    /// Returns an 8-bit plane.
+    ///
+    /// This compatibility accessor is only valid for Profile 0/1 pictures.
+    /// Use [`Self::plane_u16`] for Profile 2/3 pictures.
     #[inline]
     pub fn plane(&self, plane: usize) -> &[u8] {
-        &self.planes[plane]
+        match &self.planes {
+            PicturePlanes::Eight(planes) => &planes[plane],
+            PicturePlanes::High(_) => panic!("16-bit picture accessed through plane()"),
+        }
     }
 
     #[inline]
-    pub(crate) fn shared_plane(&self, plane: usize) -> Arc<[u8]> {
-        Arc::clone(&self.planes[plane])
+    pub fn plane_u16(&self, plane: usize) -> Option<&[u16]> {
+        match &self.planes {
+            PicturePlanes::Eight(_) => None,
+            PicturePlanes::High(planes) => Some(&planes[plane]),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn shared_plane_u8(&self, plane: usize) -> Option<Arc<[u8]>> {
+        match &self.planes {
+            PicturePlanes::Eight(planes) => Some(Arc::clone(&planes[plane])),
+            PicturePlanes::High(_) => None,
+        }
+    }
+
+    #[inline]
+    pub(crate) fn shared_plane_u16(&self, plane: usize) -> Option<Arc<[u16]>> {
+        match &self.planes {
+            PicturePlanes::Eight(_) => None,
+            PicturePlanes::High(planes) => Some(Arc::clone(&planes[plane])),
+        }
     }
 
     pub(crate) fn planes_mut(&mut self) -> [&mut [u8]; 3] {
-        let [y, u, v] = &mut self.planes;
+        let PicturePlanes::Eight(planes) = &mut self.planes else {
+            panic!("16-bit picture accessed through planes_mut()");
+        };
+        let [y, u, v] = planes;
         [Arc::make_mut(y), Arc::make_mut(u), Arc::make_mut(v)]
+    }
+
+    #[inline]
+    fn plane_u8(&self, plane: usize) -> &[u8] {
+        self.plane(plane)
+    }
+
+    #[inline]
+    fn plane_u8_mut(&mut self, plane: usize) -> &mut [u8] {
+        let PicturePlanes::Eight(planes) = &mut self.planes else {
+            panic!("16-bit picture reached the 8-bit reconstruction path");
+        };
+        Arc::make_mut(&mut planes[plane])
+    }
+
+    pub(crate) fn planes_u16_mut(&mut self) -> [&mut [u16]; 3] {
+        let PicturePlanes::High(planes) = &mut self.planes else {
+            panic!("8-bit picture accessed through planes_u16_mut()");
+        };
+        let [y, u, v] = planes;
+        [Arc::make_mut(y), Arc::make_mut(u), Arc::make_mut(v)]
+    }
+
+    #[inline]
+    const fn bytes_per_sample(&self) -> usize {
+        match self.bit_depth {
+            BitDepth::Eight => 1,
+            BitDepth::Ten | BitDepth::Twelve => 2,
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -167,59 +326,37 @@ impl IntraPicture {
         let have_top = y > tile_top;
         let have_left = x > tile_left;
         debug_assert!(size <= 32);
-        let mut above = [127u8; 64];
-        let mut left = [129u8; 32];
         let stride = self.strides[plane];
-        let pixels = &self.planes[plane];
-
-        if have_top {
-            let available = width.saturating_sub(x).min(size * 2);
-            for index in 0..available {
-                above[index] = pixels[(y - 1) * stride + x + index];
-            }
-            let extension = available.saturating_sub(1);
-            for index in available..size * 2 {
-                above[index] = above[extension];
-            }
-            if !right_available || size != 4 {
-                let edge = above[size.saturating_sub(1)];
-                above[size..].fill(edge);
-            }
-        }
-        if have_left {
-            let available = height.saturating_sub(y).min(size);
-            for index in 0..available {
-                left[index] = pixels[(y + index) * stride + x - 1];
-            }
-            let extension = available.saturating_sub(1);
-            for index in available..size {
-                left[index] = left[extension];
-            }
-        }
-        let top_left = match (have_top, have_left) {
-            (true, true) => pixels[(y - 1) * stride + x - 1],
-            (true, false) => 129,
-            (false, _) => 127,
-        };
-
-        let mut prediction = [0u8; 32 * 32];
-        intra_predict(
-            &mut prediction[..size * size],
-            size,
-            mode,
-            &above[..size * 2],
-            &left[..size],
-            top_left,
-            have_top,
-            have_left,
-        );
-        let pixels = Arc::make_mut(&mut self.planes[plane]);
-        let visible_width = size.min(width.saturating_sub(x));
-        let visible_height = size.min(height.saturating_sub(y));
-        for row in 0..visible_height {
-            let target = (y + row) * stride + x;
-            pixels[target..target + visible_width]
-                .copy_from_slice(&prediction[row * size..row * size + visible_width]);
+        let bit_depth = self.bit_depth;
+        match &mut self.planes {
+            PicturePlanes::Eight(planes) => predict_plane(
+                &mut planes[plane],
+                stride,
+                width,
+                height,
+                x,
+                y,
+                size,
+                mode,
+                have_top,
+                have_left,
+                right_available,
+                bit_depth,
+            ),
+            PicturePlanes::High(planes) => predict_plane(
+                &mut planes[plane],
+                stride,
+                width,
+                height,
+                x,
+                y,
+                size,
+                mode,
+                have_top,
+                have_left,
+                right_available,
+                bit_depth,
+            ),
         }
     }
 
@@ -234,7 +371,6 @@ impl IntraPicture {
         lossless: bool,
         coefficients: &[i32],
     ) {
-        let size = 4usize << transform_size as usize;
         let subsampling_x = self.subsampling_x(plane);
         let width = self.storage_width.div_ceil(1 << subsampling_x);
         let height = self.plane_height(plane);
@@ -242,123 +378,35 @@ impl IntraPicture {
         let x = x
             .checked_sub(plane_origin_x)
             .expect("residual belongs to this picture strip");
-        if lossless {
-            debug_assert_eq!(transform_size, TransformSize::Tx4x4);
-            debug_assert_eq!(transform_type, TransformType::DctDct);
-            self.add_lossless_residual(plane, x, y, width, height, coefficients);
-            return;
-        }
-        if transform_type == TransformType::DctDct
-            && coefficients[1..]
-                .iter()
-                .all(|&coefficient| coefficient == 0)
-        {
-            if coefficients[0] == 0 {
-                return;
-            }
-            const DCT_DC_BASIS: i64 = 11_585;
-            let first = (i64::from(coefficients[0]) * DCT_DC_BASIS + (1 << 13)) >> 14;
-            let second = (first * DCT_DC_BASIS + (1 << 13)) >> 14;
-            let final_shift = match transform_size {
-                TransformSize::Tx4x4 => 4,
-                TransformSize::Tx8x8 => 5,
-                TransformSize::Tx16x16 | TransformSize::Tx32x32 => 6,
-            };
-            let residual = round_power_of_two(second as i32, final_shift);
-            let visible_width = size.min(width.saturating_sub(x));
-            let visible_height = size.min(height.saturating_sub(y));
-            let stride = self.strides[plane];
-            let pixels = Arc::make_mut(&mut self.planes[plane]);
-            for row in 0..visible_height {
-                let start = (y + row) * stride + x;
-                for pixel in &mut pixels[start..start + visible_width] {
-                    *pixel = (i32::from(*pixel) + residual).clamp(0, 255) as u8;
-                }
-            }
-            return;
-        }
-        let mut intermediate = [0i32; 32 * 32];
-        let mut input = [0i32; 32];
-        let mut output = [0i32; 32];
-        let (rows, columns) = transform_axes(transform_type);
-
-        for row in 0..size {
-            input[..size].copy_from_slice(&coefficients[row * size..(row + 1) * size]);
-            inverse_1d_sparse(&input, &mut output, size, rows);
-            intermediate[row * size..(row + 1) * size].copy_from_slice(&output[..size]);
-        }
-
-        let final_shift = match transform_size {
-            TransformSize::Tx4x4 => 4,
-            TransformSize::Tx8x8 => 5,
-            TransformSize::Tx16x16 | TransformSize::Tx32x32 => 6,
-        };
         let stride = self.strides[plane];
-        let pixels = Arc::make_mut(&mut self.planes[plane]);
-        for column in 0..size.min(width.saturating_sub(x)) {
-            for row in 0..size {
-                input[row] = intermediate[row * size + column];
-            }
-            inverse_1d_sparse(&input, &mut output, size, columns);
-            for (row, &value) in output
-                .iter()
-                .enumerate()
-                .take(size.min(height.saturating_sub(y)))
-            {
-                let residual = round_power_of_two(value, final_shift);
-                let index = (y + row) * stride + x + column;
-                pixels[index] = (i32::from(pixels[index]) + residual).clamp(0, 255) as u8;
-            }
-        }
-    }
-
-    fn add_lossless_residual(
-        &mut self,
-        plane: usize,
-        x: usize,
-        y: usize,
-        width: usize,
-        height: usize,
-        coefficients: &[i32],
-    ) {
-        debug_assert!(coefficients.len() >= 16);
-        let mut intermediate = [0i32; 16];
-        for row in 0..4 {
-            let input = &coefficients[row * 4..row * 4 + 4];
-            let mut a = input[0] >> 2;
-            let mut c = input[1] >> 2;
-            let mut d = input[2] >> 2;
-            let mut b = input[3] >> 2;
-            a += c;
-            d -= b;
-            let e = (a - d) >> 1;
-            b = e - b;
-            c = e - c;
-            a -= b;
-            d += c;
-            intermediate[row * 4..row * 4 + 4].copy_from_slice(&[a, b, c, d]);
-        }
-
-        let visible_width = 4.min(width.saturating_sub(x));
-        let visible_height = 4.min(height.saturating_sub(y));
-        let stride = self.strides[plane];
-        let pixels = Arc::make_mut(&mut self.planes[plane]);
-        for column in 0..visible_width {
-            let mut a = intermediate[column];
-            let mut c = intermediate[4 + column];
-            let mut d = intermediate[8 + column];
-            let mut b = intermediate[12 + column];
-            a += c;
-            d -= b;
-            let e = (a - d) >> 1;
-            b = e - b;
-            c = e - c;
-            a -= b;
-            d += c;
-            for (row, residual) in [a, b, c, d].into_iter().enumerate().take(visible_height) {
-                let index = (y + row) * stride + x + column;
-                pixels[index] = (i32::from(pixels[index]) + residual).clamp(0, 255) as u8;
-            }
+        let max_sample = self.bit_depth.max_sample();
+        match &mut self.planes {
+            PicturePlanes::Eight(planes) => add_residual_to_plane(
+                &mut planes[plane],
+                stride,
+                x,
+                y,
+                width,
+                height,
+                transform_size,
+                transform_type,
+                lossless,
+                coefficients,
+                max_sample,
+            ),
+            PicturePlanes::High(planes) => add_residual_to_plane(
+                &mut planes[plane],
+                stride,
+                x,
+                y,
+                width,
+                height,
+                transform_size,
+                transform_type,
+                lossless,
+                coefficients,
+                max_sample,
+            ),
         }
     }
 
@@ -377,6 +425,7 @@ impl IntraPicture {
         average: bool,
     ) {
         debug_assert_eq!(self.subsampling, reference.subsampling);
+        debug_assert_eq!(self.bit_depth, reference.bit_depth);
         let subsampling_x = self.subsampling_x(plane);
         let reference_plane_width = reference.plane_width(plane);
         let reference_plane_height = reference.plane_height(plane);
@@ -392,6 +441,47 @@ impl IntraPicture {
             .min(target_width.saturating_sub(target_x));
         let output_height = height.min(plane_height.saturating_sub(y));
         if output_width == 0 || output_height == 0 {
+            return;
+        }
+        if !matches!(self.bit_depth, BitDepth::Eight) {
+            let PicturePlanes::High(reference_planes) = &reference.planes else {
+                unreachable!("high-bit-depth picture requires matching references");
+            };
+            let source = &reference_planes[plane];
+            let source_stride = reference.strides[plane];
+            let source_width = reference.plane_width(plane);
+            let source_height = reference.plane_height(plane);
+            let reference_width = reference.width;
+            let reference_height = reference.height;
+            let current_width = self.width;
+            let current_height = self.height;
+            let max_sample = self.bit_depth.max_sample();
+            let target_stride = self.strides[plane];
+            let PicturePlanes::High(target_planes) = &mut self.planes else {
+                unreachable!("high-bit-depth picture requires word storage");
+            };
+            predict_inter_scalar(
+                source,
+                source_stride,
+                source_width,
+                source_height,
+                reference_width,
+                reference_height,
+                Arc::make_mut(&mut target_planes[plane]),
+                target_stride,
+                current_width,
+                current_height,
+                x,
+                y,
+                target_x,
+                output_width,
+                output_height,
+                motion_row_q4,
+                motion_column_q4,
+                kernel,
+                average,
+                max_sample,
+            );
             return;
         }
         if reference.width != self.width || reference.height != self.height {
@@ -418,7 +508,7 @@ impl IntraPicture {
         let filter_x = &kernel[phase_x * 8..phase_x * 8 + 8];
         let filter_y = &kernel[phase_y * 8..phase_y * 8 + 8];
         let source_stride = reference.strides[plane];
-        let source = &reference.planes[plane];
+        let source = reference.plane_u8(plane);
         let sample = |source_x: i32, source_y: i32| -> u8 {
             let source_x =
                 source_x.clamp(0, reference_plane_width.saturating_sub(1) as i32) as usize;
@@ -429,7 +519,7 @@ impl IntraPicture {
         let origin_x = x as i32 + integer_x;
         let origin_y = y as i32 + integer_y;
         let target_stride = self.strides[plane];
-        let target = Arc::make_mut(&mut self.planes[plane]);
+        let target = self.plane_u8_mut(plane);
 
         match (phase_x == 0, phase_y == 0) {
             (true, true) => {
@@ -633,7 +723,7 @@ impl IntraPicture {
         let source_width = reference.plane_width(plane);
         let source_height = reference.plane_height(plane);
         let source_stride = reference.strides[plane];
-        let source = &reference.planes[plane];
+        let source = reference.plane_u8(plane);
         let sample = |source_x: i64, source_y: i64| -> u8 {
             let source_x = source_x.clamp(0, source_width.saturating_sub(1) as i64) as usize;
             let source_y = source_y.clamp(0, source_height.saturating_sub(1) as i64) as usize;
@@ -641,7 +731,7 @@ impl IntraPicture {
         };
 
         let target_stride = self.strides[plane];
-        let target = Arc::make_mut(&mut self.planes[plane]);
+        let target = self.plane_u8_mut(plane);
         for row in 0..output_height {
             let source_y_q4 = start_y_q4 + row as i64 * y_step_q4;
             let integer_y = source_y_q4 >> 4;
@@ -666,6 +756,105 @@ impl IntraPicture {
                 let index = (y + row) * target_stride + target_x + column;
                 write_prediction(&mut target[index], prediction, average);
             }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_inter_scalar<T: Sample>(
+    source: &[T],
+    source_stride: usize,
+    source_width: usize,
+    source_height: usize,
+    reference_width: usize,
+    reference_height: usize,
+    target: &mut [T],
+    target_stride: usize,
+    current_width: usize,
+    current_height: usize,
+    x: usize,
+    y: usize,
+    target_x: usize,
+    output_width: usize,
+    output_height: usize,
+    motion_row_q4: i32,
+    motion_column_q4: i32,
+    kernel: &[i16; 128],
+    average: bool,
+    max_sample: u16,
+) {
+    const REF_SCALE_SHIFT: u32 = 14;
+    let scaled = reference_width != current_width || reference_height != current_height;
+    let x_scale = if scaled {
+        ((reference_width as i64) << REF_SCALE_SHIFT) / current_width as i64
+    } else {
+        1 << REF_SCALE_SHIFT
+    };
+    let y_scale = if scaled {
+        ((reference_height as i64) << REF_SCALE_SHIFT) / current_height as i64
+    } else {
+        1 << REF_SCALE_SHIFT
+    };
+    let scale = |value: i64, factor: i64| (value * factor) >> REF_SCALE_SHIFT;
+    let start_x_q4 = scale(x as i64 * 16, x_scale) + scale(i64::from(motion_column_q4), x_scale);
+    let start_y_q4 = scale(y as i64 * 16, y_scale) + scale(i64::from(motion_row_q4), y_scale);
+    let x_step_q4 = scale(16, x_scale);
+    let y_step_q4 = scale(16, y_scale);
+    let sample = |source_x: i64, source_y: i64| -> T {
+        let source_x = source_x.clamp(0, source_width.saturating_sub(1) as i64) as usize;
+        let source_y = source_y.clamp(0, source_height.saturating_sub(1) as i64) as usize;
+        source[source_y * source_stride + source_x]
+    };
+    let clip = |value: i32| T::from_u32(value.clamp(0, i32::from(max_sample)) as u32);
+
+    for row in 0..output_height {
+        let source_y_q4 = start_y_q4 + row as i64 * y_step_q4;
+        let integer_y = source_y_q4 >> 4;
+        let phase_y = (source_y_q4 & 15) as usize;
+        let filter_y = &kernel[phase_y * 8..phase_y * 8 + 8];
+        for column in 0..output_width {
+            let source_x_q4 = start_x_q4 + column as i64 * x_step_q4;
+            let integer_x = source_x_q4 >> 4;
+            let phase_x = (source_x_q4 & 15) as usize;
+            let filter_x = &kernel[phase_x * 8..phase_x * 8 + 8];
+            let prediction = match (phase_x == 0, phase_y == 0) {
+                (true, true) => sample(integer_x, integer_y),
+                (false, true) => {
+                    let mut sum = 0i32;
+                    for (tap, &coefficient) in filter_x.iter().enumerate() {
+                        sum += i32::from(coefficient)
+                            * sample(integer_x + tap as i64 - 3, integer_y).to_u32() as i32;
+                    }
+                    clip((sum + 64) >> 7)
+                }
+                (true, false) => {
+                    let mut sum = 0i32;
+                    for (tap, &coefficient) in filter_y.iter().enumerate() {
+                        sum += i32::from(coefficient)
+                            * sample(integer_x, integer_y + tap as i64 - 3).to_u32() as i32;
+                    }
+                    clip((sum + 64) >> 7)
+                }
+                (false, false) => {
+                    let mut vertical_sum = 0i32;
+                    for (vertical_tap, &vertical_coefficient) in filter_y.iter().enumerate() {
+                        let source_y = integer_y + vertical_tap as i64 - 3;
+                        let mut horizontal_sum = 0i32;
+                        for (horizontal_tap, &horizontal_coefficient) in filter_x.iter().enumerate()
+                        {
+                            horizontal_sum += i32::from(horizontal_coefficient)
+                                * sample(integer_x + horizontal_tap as i64 - 3, source_y).to_u32()
+                                    as i32;
+                        }
+                        let horizontal =
+                            ((horizontal_sum + 64) >> 7).clamp(0, i32::from(max_sample));
+                        vertical_sum += i32::from(vertical_coefficient) * horizontal;
+                    }
+                    clip((vertical_sum + 64) >> 7)
+                }
+            };
+            let index = (y + row) * target_stride + target_x + column;
+            write_prediction(&mut target[index], prediction, average);
         }
     }
 }
@@ -951,12 +1140,235 @@ fn round_power_of_two(value: i32, shift: u32) -> i32 {
     (value + (1 << (shift - 1))) >> shift
 }
 
-fn avg2(first: u8, second: u8) -> u8 {
-    ((u16::from(first) + u16::from(second) + 1) >> 1) as u8
+#[inline]
+fn add_clipped<T: Sample>(sample: T, residual: i32, max_sample: u16) -> T {
+    let value = sample.to_u32() as i32 + residual;
+    T::from_u32(value.clamp(0, i32::from(max_sample)) as u32)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_residual_to_plane<T: Sample>(
+    plane: &mut Arc<[T]>,
+    stride: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    transform_size: TransformSize,
+    transform_type: TransformType,
+    lossless: bool,
+    coefficients: &[i32],
+    max_sample: u16,
+) {
+    let size = 4usize << transform_size as usize;
+    if lossless {
+        debug_assert_eq!(transform_size, TransformSize::Tx4x4);
+        debug_assert_eq!(transform_type, TransformType::DctDct);
+        add_lossless_residual_to_plane(
+            plane,
+            stride,
+            x,
+            y,
+            width,
+            height,
+            coefficients,
+            max_sample,
+        );
+        return;
+    }
+    if transform_type == TransformType::DctDct
+        && coefficients[1..]
+            .iter()
+            .all(|&coefficient| coefficient == 0)
+    {
+        if coefficients[0] == 0 {
+            return;
+        }
+        const DCT_DC_BASIS: i64 = 11_585;
+        let first = (i64::from(coefficients[0]) * DCT_DC_BASIS + (1 << 13)) >> 14;
+        let second = (first * DCT_DC_BASIS + (1 << 13)) >> 14;
+        let final_shift = match transform_size {
+            TransformSize::Tx4x4 => 4,
+            TransformSize::Tx8x8 => 5,
+            TransformSize::Tx16x16 | TransformSize::Tx32x32 => 6,
+        };
+        let residual = round_power_of_two(second as i32, final_shift);
+        let visible_width = size.min(width.saturating_sub(x));
+        let visible_height = size.min(height.saturating_sub(y));
+        let pixels = Arc::make_mut(plane);
+        for row in 0..visible_height {
+            let start = (y + row) * stride + x;
+            for pixel in &mut pixels[start..start + visible_width] {
+                *pixel = add_clipped(*pixel, residual, max_sample);
+            }
+        }
+        return;
+    }
+
+    let mut intermediate = [0i32; 32 * 32];
+    let mut input = [0i32; 32];
+    let mut output = [0i32; 32];
+    let (rows, columns) = transform_axes(transform_type);
+    for row in 0..size {
+        input[..size].copy_from_slice(&coefficients[row * size..(row + 1) * size]);
+        inverse_1d_sparse(&input, &mut output, size, rows);
+        intermediate[row * size..(row + 1) * size].copy_from_slice(&output[..size]);
+    }
+
+    let final_shift = match transform_size {
+        TransformSize::Tx4x4 => 4,
+        TransformSize::Tx8x8 => 5,
+        TransformSize::Tx16x16 | TransformSize::Tx32x32 => 6,
+    };
+    let pixels = Arc::make_mut(plane);
+    for column in 0..size.min(width.saturating_sub(x)) {
+        for row in 0..size {
+            input[row] = intermediate[row * size + column];
+        }
+        inverse_1d_sparse(&input, &mut output, size, columns);
+        for (row, &value) in output
+            .iter()
+            .enumerate()
+            .take(size.min(height.saturating_sub(y)))
+        {
+            let residual = round_power_of_two(value, final_shift);
+            let index = (y + row) * stride + x + column;
+            pixels[index] = add_clipped(pixels[index], residual, max_sample);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_lossless_residual_to_plane<T: Sample>(
+    plane: &mut Arc<[T]>,
+    stride: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+    coefficients: &[i32],
+    max_sample: u16,
+) {
+    debug_assert!(coefficients.len() >= 16);
+    let mut intermediate = [0i32; 16];
+    for row in 0..4 {
+        let input = &coefficients[row * 4..row * 4 + 4];
+        let mut a = input[0] >> 2;
+        let mut c = input[1] >> 2;
+        let mut d = input[2] >> 2;
+        let mut b = input[3] >> 2;
+        a += c;
+        d -= b;
+        let e = (a - d) >> 1;
+        b = e - b;
+        c = e - c;
+        a -= b;
+        d += c;
+        intermediate[row * 4..row * 4 + 4].copy_from_slice(&[a, b, c, d]);
+    }
+
+    let visible_width = 4.min(width.saturating_sub(x));
+    let visible_height = 4.min(height.saturating_sub(y));
+    let pixels = Arc::make_mut(plane);
+    for column in 0..visible_width {
+        let mut a = intermediate[column];
+        let mut c = intermediate[4 + column];
+        let mut d = intermediate[8 + column];
+        let mut b = intermediate[12 + column];
+        a += c;
+        d -= b;
+        let e = (a - d) >> 1;
+        b = e - b;
+        c = e - c;
+        a -= b;
+        d += c;
+        for (row, residual) in [a, b, c, d].into_iter().enumerate().take(visible_height) {
+            let index = (y + row) * stride + x + column;
+            pixels[index] = add_clipped(pixels[index], residual, max_sample);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn predict_plane<T: Sample>(
+    plane: &mut Arc<[T]>,
+    stride: usize,
+    width: usize,
+    height: usize,
+    x: usize,
+    y: usize,
+    size: usize,
+    mode: IntraMode,
+    have_top: bool,
+    have_left: bool,
+    right_available: bool,
+    bit_depth: BitDepth,
+) {
+    let shift = u32::from(bit_depth.bits() - 8);
+    let unavailable_above = T::from_u32(127 << shift);
+    let unavailable_left = T::from_u32(129 << shift);
+    let mut above = [unavailable_above; 64];
+    let mut left = [unavailable_left; 32];
+    let pixels = plane.as_ref();
+
+    if have_top {
+        let available = width.saturating_sub(x).min(size * 2);
+        for index in 0..available {
+            above[index] = pixels[(y - 1) * stride + x + index];
+        }
+        let extension = available.saturating_sub(1);
+        for index in available..size * 2 {
+            above[index] = above[extension];
+        }
+        if !right_available || size != 4 {
+            let edge = above[size.saturating_sub(1)];
+            above[size..].fill(edge);
+        }
+    }
+    if have_left {
+        let available = height.saturating_sub(y).min(size);
+        for index in 0..available {
+            left[index] = pixels[(y + index) * stride + x - 1];
+        }
+        let extension = available.saturating_sub(1);
+        for index in available..size {
+            left[index] = left[extension];
+        }
+    }
+    let top_left = match (have_top, have_left) {
+        (true, true) => pixels[(y - 1) * stride + x - 1],
+        (true, false) => unavailable_left,
+        (false, _) => unavailable_above,
+    };
+
+    let mut prediction = [T::default(); 32 * 32];
+    intra_predict(
+        &mut prediction[..size * size],
+        size,
+        mode,
+        &above[..size * 2],
+        &left[..size],
+        top_left,
+        have_top,
+        have_left,
+        bit_depth.max_sample(),
+    );
+    let pixels = Arc::make_mut(plane);
+    let visible_width = size.min(width.saturating_sub(x));
+    let visible_height = size.min(height.saturating_sub(y));
+    for row in 0..visible_height {
+        let target = (y + row) * stride + x;
+        pixels[target..target + visible_width]
+            .copy_from_slice(&prediction[row * size..row * size + visible_width]);
+    }
+}
+
+fn avg2<T: Sample>(first: T, second: T) -> T {
+    T::from_u32((first.to_u32() + second.to_u32() + 1) >> 1)
 }
 
 #[inline(always)]
-fn write_prediction(target: &mut u8, prediction: u8, average: bool) {
+fn write_prediction<T: Sample>(target: &mut T, prediction: T, average: bool) {
     if average {
         *target = avg2(*target, prediction);
     } else {
@@ -964,7 +1376,7 @@ fn write_prediction(target: &mut u8, prediction: u8, average: bool) {
     }
 }
 
-fn write_prediction_row(target: &mut [u8], prediction: &[u8], average: bool) {
+fn write_prediction_row<T: Sample>(target: &mut [T], prediction: &[T], average: bool) {
     debug_assert_eq!(target.len(), prediction.len());
     if average {
         for (target, &prediction) in target.iter_mut().zip(prediction) {
@@ -975,40 +1387,50 @@ fn write_prediction_row(target: &mut [u8], prediction: &[u8], average: bool) {
     }
 }
 
-fn avg3(first: u8, middle: u8, last: u8) -> u8 {
-    ((u16::from(first) + 2 * u16::from(middle) + u16::from(last) + 2) >> 2) as u8
+fn avg3<T: Sample>(first: T, middle: T, last: T) -> T {
+    T::from_u32((first.to_u32() + 2 * middle.to_u32() + last.to_u32() + 2) >> 2)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn intra_predict(
-    target: &mut [u8],
+fn intra_predict<T: Sample>(
+    target: &mut [T],
     size: usize,
     mode: IntraMode,
-    above: &[u8],
-    left: &[u8],
-    top_left: u8,
+    above: &[T],
+    left: &[T],
+    top_left: T,
     have_top: bool,
     have_left: bool,
+    max_sample: u16,
 ) {
     let pixel = |x: usize, y: usize| y * size + x;
     match mode {
         IntraMode::Dc => {
             let value = match (have_top, have_left) {
-                (false, false) => 128,
+                (false, false) => (u32::from(max_sample) + 1) >> 1,
                 (true, false) => {
-                    (above[..size].iter().map(|&x| usize::from(x)).sum::<usize>() + size / 2) / size
+                    (above[..size]
+                        .iter()
+                        .map(|&sample| sample.to_u32())
+                        .sum::<u32>()
+                        + size as u32 / 2)
+                        / size as u32
                 }
                 (false, true) => {
-                    (left.iter().map(|&x| usize::from(x)).sum::<usize>() + size / 2) / size
+                    (left.iter().map(|&sample| sample.to_u32()).sum::<u32>() + size as u32 / 2)
+                        / size as u32
                 }
                 (true, true) => {
-                    (above[..size].iter().map(|&x| usize::from(x)).sum::<usize>()
-                        + left.iter().map(|&x| usize::from(x)).sum::<usize>()
-                        + size)
-                        / (size * 2)
+                    (above[..size]
+                        .iter()
+                        .map(|&sample| sample.to_u32())
+                        .sum::<u32>()
+                        + left.iter().map(|&sample| sample.to_u32()).sum::<u32>()
+                        + size as u32)
+                        / (size * 2) as u32
                 }
-            } as u8;
-            target.fill(value);
+            };
+            target.fill(T::from_u32(value));
         }
         IntraMode::Vertical => {
             for row in target.chunks_exact_mut(size) {
@@ -1023,9 +1445,10 @@ fn intra_predict(
         IntraMode::TrueMotion => {
             for row in 0..size {
                 for column in 0..size {
-                    target[pixel(column, row)] = (i16::from(left[row]) + i16::from(above[column])
-                        - i16::from(top_left))
-                    .clamp(0, 255) as u8;
+                    let prediction = left[row].to_u32() as i32 + above[column].to_u32() as i32
+                        - top_left.to_u32() as i32;
+                    target[pixel(column, row)] =
+                        T::from_u32(prediction.clamp(0, i32::from(max_sample)) as u32);
                 }
             }
         }
@@ -1108,7 +1531,7 @@ fn intra_predict(
             }
         }
         IntraMode::D135 => {
-            let mut border = vec![0u8; size * 2 - 1];
+            let mut border = vec![T::default(); size * 2 - 1];
             for index in 0..size - 2 {
                 border[index] = avg3(
                     left[size - 3 - index],
@@ -1207,13 +1630,13 @@ fn intra_predict(
 mod tests {
     use super::{IntraMode, IntraPicture, intra_predict};
     use crate::{
-        ChromaSubsampling,
+        BitDepth, ChromaSubsampling,
         block::{TransformSize, TransformType},
     };
 
     #[test]
     fn vertical_prediction_repeats_top_row() {
-        let mut target = [0; 16];
+        let mut target = [0u8; 16];
         intra_predict(
             &mut target,
             4,
@@ -1223,6 +1646,7 @@ mod tests {
             8,
             true,
             true,
+            255,
         );
         assert_eq!(target, [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
     }
@@ -1236,7 +1660,7 @@ mod tests {
             (ChromaSubsampling::Cs420, 4, 3, 12),
         ];
         for (subsampling, chroma_width, chroma_height, chroma_len) in layouts {
-            let picture = IntraPicture::new(7, 5, subsampling);
+            let picture = IntraPicture::new(7, 5, subsampling, BitDepth::Eight);
             assert_eq!(picture.stride(1), chroma_width);
             assert_eq!(picture.plane_height(1), chroma_height);
             assert_eq!(picture.plane(1).len(), chroma_len);
@@ -1245,8 +1669,66 @@ mod tests {
     }
 
     #[test]
+    fn high_bit_depth_layout_uses_word_planes_and_byte_strides() {
+        let picture = IntraPicture::new(7, 5, ChromaSubsampling::Cs420, BitDepth::Ten);
+
+        assert_eq!(picture.bit_depth(), BitDepth::Ten);
+        assert_eq!(picture.stride(0), 14);
+        assert_eq!(picture.stride(1), 8);
+        assert_eq!(picture.plane_u16(0).unwrap().len(), 35);
+        assert_eq!(picture.plane_u16(1).unwrap().len(), 12);
+        assert!(
+            picture
+                .plane_u16(0)
+                .unwrap()
+                .iter()
+                .all(|&sample| sample == 0)
+        );
+    }
+
+    #[test]
+    fn high_bit_depth_tile_strips_merge_in_sample_coordinates() {
+        let mut picture = IntraPicture::new(8, 2, ChromaSubsampling::Cs420, BitDepth::Twelve);
+        let mut strip =
+            IntraPicture::new_strip(8, 2, 2, 2, ChromaSubsampling::Cs420, BitDepth::Twelve);
+        let [y, u, v] = strip.planes_u16_mut();
+        y.fill(100);
+        u.fill(200);
+        v.fill(300);
+
+        picture.copy_strip_from(&strip);
+
+        assert_eq!(
+            picture.plane_u16(0).unwrap(),
+            &[0, 0, 100, 100, 0, 0, 0, 0, 0, 0, 100, 100, 0, 0, 0, 0]
+        );
+        assert_eq!(picture.plane_u16(1).unwrap(), &[0, 200, 0, 0]);
+        assert_eq!(picture.plane_u16(2).unwrap(), &[0, 300, 0, 0]);
+    }
+
+    #[test]
+    fn high_bit_depth_intra_prediction_and_lossless_residual_use_full_range() {
+        let mut picture = IntraPicture::new(4, 4, ChromaSubsampling::Cs444, BitDepth::Ten);
+        picture.predict(0, 0, 0, 4, IntraMode::Dc, 0, 0, false);
+        assert_eq!(picture.plane_u16(0).unwrap(), &[512; 16]);
+
+        let mut coefficients = [0; 16];
+        coefficients[0] = 16;
+        picture.add_residual(
+            0,
+            0,
+            0,
+            TransformSize::Tx4x4,
+            TransformType::DctDct,
+            true,
+            &coefficients,
+        );
+        assert_eq!(picture.plane_u16(0).unwrap(), &[513; 16]);
+    }
+
+    #[test]
     fn lossless_walsh_hadamard_reconstructs_dc_block() {
-        let mut picture = IntraPicture::new(4, 4, ChromaSubsampling::Cs444);
+        let mut picture = IntraPicture::new(4, 4, ChromaSubsampling::Cs444, BitDepth::Eight);
         let mut coefficients = [0; 16];
         coefficients[0] = 16;
         picture.add_residual(
@@ -1263,10 +1745,10 @@ mod tests {
 
     #[test]
     fn scaled_inter_prediction_maps_reference_coordinates() {
-        let mut reference = IntraPicture::new(4, 4, ChromaSubsampling::Cs420);
+        let mut reference = IntraPicture::new(4, 4, ChromaSubsampling::Cs420, BitDepth::Eight);
         reference.planes_mut()[0]
             .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
-        let mut target = IntraPicture::new(8, 8, ChromaSubsampling::Cs420);
+        let mut target = IntraPicture::new(8, 8, ChromaSubsampling::Cs420, BitDepth::Eight);
         let mut nearest_kernel = [0i16; 128];
         for phase in 0..16 {
             nearest_kernel[phase * 8 + 3] = 128;
@@ -1278,6 +1760,31 @@ mod tests {
                 1, 1, 2, 2, 3, 3, 4, 4, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 5, 5, 6, 6,
                 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14,
                 14, 15, 15, 16, 16, 13, 13, 14, 14, 15, 15, 16, 16,
+            ]
+        );
+    }
+
+    #[test]
+    fn high_bit_depth_scaled_inter_prediction_preserves_word_samples() {
+        let mut reference = IntraPicture::new(4, 4, ChromaSubsampling::Cs420, BitDepth::Ten);
+        reference.planes_u16_mut()[0]
+            .copy_from_slice(&[4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56, 60, 64]);
+        let mut target = IntraPicture::new(8, 8, ChromaSubsampling::Cs420, BitDepth::Ten);
+        let mut nearest_kernel = [0i16; 128];
+        for phase in 0..16 {
+            nearest_kernel[phase * 8 + 3] = 128;
+        }
+
+        target.predict_inter(&reference, 0, 0, 0, 8, 8, 0, 0, &nearest_kernel, false);
+
+        assert_eq!(
+            &target.plane_u16(0).unwrap()[..16],
+            &[4, 4, 8, 8, 12, 12, 16, 16, 4, 4, 8, 8, 12, 12, 16, 16]
+        );
+        assert_eq!(
+            &target.plane_u16(0).unwrap()[48..],
+            &[
+                52, 52, 56, 56, 60, 60, 64, 64, 52, 52, 56, 56, 60, 60, 64, 64
             ]
         );
     }
@@ -1355,6 +1862,7 @@ mod tests {
                     93,
                     true,
                     true,
+                    255,
                 );
                 let hash = target
                     .into_iter()

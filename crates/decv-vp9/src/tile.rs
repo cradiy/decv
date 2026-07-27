@@ -107,17 +107,12 @@ impl IntraSyntaxSummary {
     }
 }
 
-/// Decodes and reconstructs one intra-only 8-bit Profile-0 or Profile-1 frame.
+/// Decodes and reconstructs one intra-only VP9 frame at its native bit depth.
 pub fn decode_intra_picture(
     frame: &[u8],
     header: &FrameHeader,
     compressed: &CompressedHeader,
 ) -> Result<IntraPicture> {
-    if header.profile > 1 {
-        return Err(Vp9Error::UnsupportedFeature(
-            "8-bit pixel reconstruction currently supports VP9 Profiles 0 and 1",
-        ));
-    }
     let size = header
         .size
         .ok_or(Vp9Error::InvalidData("frame has no dimensions"))?;
@@ -125,7 +120,12 @@ pub fn decode_intra_picture(
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
     let mut context = ProbabilityContext::default();
     context.apply(compressed)?;
-    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
+    let mut picture = IntraPicture::new(
+        width,
+        height,
+        header.chroma_subsampling(),
+        header.bit_depth(),
+    );
     let (_, modes) = parse_intra_syntax(
         frame,
         header,
@@ -150,7 +150,12 @@ pub(crate) fn decode_intra_picture_with_context(
         .ok_or(Vp9Error::InvalidData("frame has no dimensions"))?;
     let width = usize::try_from(size.width).map_err(|_| Vp9Error::IntegerOverflow)?;
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
-    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
+    let mut picture = IntraPicture::new(
+        width,
+        height,
+        header.chroma_subsampling(),
+        header.bit_depth(),
+    );
     let (_, modes) = parse_intra_syntax(
         frame,
         header,
@@ -163,7 +168,7 @@ pub(crate) fn decode_intra_picture_with_context(
     Ok((picture, modes.segment_ids()))
 }
 
-/// Parses every mode and coefficient token of an intra-only 8-bit VP9 frame.
+/// Parses every mode and coefficient token of an intra-only VP9 frame.
 ///
 /// This is the syntax half of reconstruction. Keeping it separately
 /// verifiable prevents predictor or inverse-transform bugs from being
@@ -298,6 +303,7 @@ fn parse_intra_tiles_parallel(
                         origin_x,
                         end_x - origin_x,
                         header.chroma_subsampling(),
+                        header.bit_depth(),
                     );
                     let mut tile_modes = vec![None; mi_columns * mi_rows];
                     let mut tile_counts = FrameCounts::default();
