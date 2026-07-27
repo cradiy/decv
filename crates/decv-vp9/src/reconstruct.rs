@@ -1,30 +1,33 @@
 use std::sync::Arc;
 
 use crate::{
+    ChromaSubsampling,
     block::{IntraMode, TransformSize, TransformType},
     inverse_transform::{inverse_adst, inverse_dct},
 };
 
-/// Reconstructed 8-bit 4:2:0 picture.
+/// Reconstructed 8-bit planar YUV picture.
 #[derive(Debug, Clone)]
 pub struct IntraPicture {
     width: usize,
     height: usize,
     origin_x: usize,
     storage_width: usize,
+    subsampling: ChromaSubsampling,
     strides: [usize; 3],
     planes: [Arc<[u8]>; 3],
 }
 
 impl IntraPicture {
-    pub(crate) fn new(width: usize, height: usize) -> Self {
-        let chroma_width = width.div_ceil(2);
-        let chroma_height = height.div_ceil(2);
+    pub(crate) fn new(width: usize, height: usize, subsampling: ChromaSubsampling) -> Self {
+        let chroma_width = width.div_ceil(1 << subsampling.x_shift());
+        let chroma_height = height.div_ceil(1 << subsampling.y_shift());
         Self {
             width,
             height,
             origin_x: 0,
             storage_width: width,
+            subsampling,
             strides: [width, chroma_width, chroma_width],
             planes: [
                 vec![0; width * height].into(),
@@ -39,16 +42,18 @@ impl IntraPicture {
         height: usize,
         origin_x: usize,
         storage_width: usize,
+        subsampling: ChromaSubsampling,
     ) -> Self {
         debug_assert!(origin_x <= width && storage_width <= width - origin_x);
-        debug_assert!(origin_x.is_multiple_of(2));
-        let chroma_width = storage_width.div_ceil(2);
-        let chroma_height = height.div_ceil(2);
+        debug_assert!(origin_x.is_multiple_of(1 << subsampling.x_shift()));
+        let chroma_width = storage_width.div_ceil(1 << subsampling.x_shift());
+        let chroma_height = height.div_ceil(1 << subsampling.y_shift());
         Self {
             width,
             height,
             origin_x,
             storage_width,
+            subsampling,
             strides: [storage_width, chroma_width, chroma_width],
             planes: [
                 vec![0; storage_width * height].into(),
@@ -61,12 +66,14 @@ impl IntraPicture {
     pub(crate) fn copy_strip_from(&mut self, strip: &Self) {
         debug_assert_eq!(self.width, strip.width);
         debug_assert_eq!(self.height, strip.height);
+        debug_assert_eq!(self.subsampling, strip.subsampling);
         debug_assert_eq!(self.origin_x, 0);
         for plane in 0..3 {
-            let subsampling = usize::from(plane != 0);
-            let origin_x = strip.origin_x >> subsampling;
-            let width = strip.storage_width.div_ceil(1 << subsampling);
-            let height = self.height.div_ceil(1 << subsampling);
+            let subsampling_x = self.subsampling_x(plane);
+            let subsampling_y = self.subsampling_y(plane);
+            let origin_x = strip.origin_x >> subsampling_x;
+            let width = strip.storage_width.div_ceil(1 << subsampling_x);
+            let height = self.height.div_ceil(1 << subsampling_y);
             let source_stride = strip.strides[plane];
             let target_stride = self.strides[plane];
             let source = &strip.planes[plane];
@@ -88,6 +95,31 @@ impl IntraPicture {
     #[inline]
     pub fn height(&self) -> usize {
         self.height
+    }
+
+    #[inline]
+    pub fn subsampling(&self) -> ChromaSubsampling {
+        self.subsampling
+    }
+
+    #[inline]
+    pub(crate) fn subsampling_x(&self, plane: usize) -> usize {
+        usize::from(plane != 0) * self.subsampling.x_shift()
+    }
+
+    #[inline]
+    pub(crate) fn subsampling_y(&self, plane: usize) -> usize {
+        usize::from(plane != 0) * self.subsampling.y_shift()
+    }
+
+    #[inline]
+    pub(crate) fn plane_width(&self, plane: usize) -> usize {
+        self.width.div_ceil(1 << self.subsampling_x(plane))
+    }
+
+    #[inline]
+    pub(crate) fn plane_height(&self, plane: usize) -> usize {
+        self.height.div_ceil(1 << self.subsampling_y(plane))
     }
 
     #[inline]
@@ -122,18 +154,10 @@ impl IntraPicture {
         tile_top: usize,
         right_available: bool,
     ) {
-        let width = if plane == 0 {
-            self.storage_width
-        } else {
-            self.storage_width.div_ceil(2)
-        };
-        let height = if plane == 0 {
-            self.height
-        } else {
-            self.height.div_ceil(2)
-        };
-        let subsampling = usize::from(plane != 0);
-        let plane_origin_x = self.origin_x >> subsampling;
+        let subsampling_x = self.subsampling_x(plane);
+        let width = self.storage_width.div_ceil(1 << subsampling_x);
+        let height = self.plane_height(plane);
+        let plane_origin_x = self.origin_x >> subsampling_x;
         let x = x
             .checked_sub(plane_origin_x)
             .expect("prediction belongs to this picture strip");
@@ -199,6 +223,7 @@ impl IntraPicture {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn add_residual(
         &mut self,
         plane: usize,
@@ -206,23 +231,23 @@ impl IntraPicture {
         y: usize,
         transform_size: TransformSize,
         transform_type: TransformType,
+        lossless: bool,
         coefficients: &[i32],
     ) {
         let size = 4usize << transform_size as usize;
-        let width = if plane == 0 {
-            self.storage_width
-        } else {
-            self.storage_width.div_ceil(2)
-        };
-        let height = if plane == 0 {
-            self.height
-        } else {
-            self.height.div_ceil(2)
-        };
-        let plane_origin_x = self.origin_x >> usize::from(plane != 0);
+        let subsampling_x = self.subsampling_x(plane);
+        let width = self.storage_width.div_ceil(1 << subsampling_x);
+        let height = self.plane_height(plane);
+        let plane_origin_x = self.origin_x >> subsampling_x;
         let x = x
             .checked_sub(plane_origin_x)
             .expect("residual belongs to this picture strip");
+        if lossless {
+            debug_assert_eq!(transform_size, TransformSize::Tx4x4);
+            debug_assert_eq!(transform_type, TransformType::DctDct);
+            self.add_lossless_residual(plane, x, y, width, height, coefficients);
+            return;
+        }
         if transform_type == TransformType::DctDct
             && coefficients[1..]
                 .iter()
@@ -287,6 +312,56 @@ impl IntraPicture {
         }
     }
 
+    fn add_lossless_residual(
+        &mut self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        coefficients: &[i32],
+    ) {
+        debug_assert!(coefficients.len() >= 16);
+        let mut intermediate = [0i32; 16];
+        for row in 0..4 {
+            let input = &coefficients[row * 4..row * 4 + 4];
+            let mut a = input[0] >> 2;
+            let mut c = input[1] >> 2;
+            let mut d = input[2] >> 2;
+            let mut b = input[3] >> 2;
+            a += c;
+            d -= b;
+            let e = (a - d) >> 1;
+            b = e - b;
+            c = e - c;
+            a -= b;
+            d += c;
+            intermediate[row * 4..row * 4 + 4].copy_from_slice(&[a, b, c, d]);
+        }
+
+        let visible_width = 4.min(width.saturating_sub(x));
+        let visible_height = 4.min(height.saturating_sub(y));
+        let stride = self.strides[plane];
+        let pixels = Arc::make_mut(&mut self.planes[plane]);
+        for column in 0..visible_width {
+            let mut a = intermediate[column];
+            let mut c = intermediate[4 + column];
+            let mut d = intermediate[8 + column];
+            let mut b = intermediate[12 + column];
+            a += c;
+            d -= b;
+            let e = (a - d) >> 1;
+            b = e - b;
+            c = e - c;
+            a -= b;
+            d += c;
+            for (row, residual) in [a, b, c, d].into_iter().enumerate().take(visible_height) {
+                let index = (y + row) * stride + x + column;
+                pixels[index] = (i32::from(pixels[index]) + residual).clamp(0, 255) as u8;
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn predict_inter(
         &mut self,
@@ -301,35 +376,17 @@ impl IntraPicture {
         kernel: &[i16; 128],
         average: bool,
     ) {
-        let reference_plane_width = if plane == 0 {
-            reference.width
-        } else {
-            reference.width.div_ceil(2)
-        };
-        let reference_plane_height = if plane == 0 {
-            reference.height
-        } else {
-            reference.height.div_ceil(2)
-        };
-        let plane_width = if plane == 0 {
-            self.width
-        } else {
-            self.width.div_ceil(2)
-        };
-        let plane_height = if plane == 0 {
-            self.height
-        } else {
-            self.height.div_ceil(2)
-        };
-        let plane_origin_x = self.origin_x >> usize::from(plane != 0);
+        debug_assert_eq!(self.subsampling, reference.subsampling);
+        let subsampling_x = self.subsampling_x(plane);
+        let reference_plane_width = reference.plane_width(plane);
+        let reference_plane_height = reference.plane_height(plane);
+        let plane_width = self.plane_width(plane);
+        let plane_height = self.plane_height(plane);
+        let plane_origin_x = self.origin_x >> subsampling_x;
         let target_x = x
             .checked_sub(plane_origin_x)
             .expect("inter prediction belongs to this picture strip");
-        let target_width = if plane == 0 {
-            self.storage_width
-        } else {
-            self.storage_width.div_ceil(2)
-        };
+        let target_width = self.storage_width.div_ceil(1 << subsampling_x);
         let output_width = width
             .min(plane_width.saturating_sub(x))
             .min(target_width.saturating_sub(target_x));
@@ -573,16 +630,8 @@ impl IntraPicture {
         let x_step_q4 = scale(16, x_scale);
         let y_step_q4 = scale(16, y_scale);
 
-        let source_width = if plane == 0 {
-            reference.width
-        } else {
-            reference.width.div_ceil(2)
-        };
-        let source_height = if plane == 0 {
-            reference.height
-        } else {
-            reference.height.div_ceil(2)
-        };
+        let source_width = reference.plane_width(plane);
+        let source_height = reference.plane_height(plane);
         let source_stride = reference.strides[plane];
         let source = &reference.planes[plane];
         let sample = |source_x: i64, source_y: i64| -> u8 {
@@ -1157,6 +1206,10 @@ fn intra_predict(
 #[cfg(test)]
 mod tests {
     use super::{IntraMode, IntraPicture, intra_predict};
+    use crate::{
+        ChromaSubsampling,
+        block::{TransformSize, TransformType},
+    };
 
     #[test]
     fn vertical_prediction_repeats_top_row() {
@@ -1175,11 +1228,45 @@ mod tests {
     }
 
     #[test]
+    fn planar_layout_tracks_independent_chroma_subsampling() {
+        let layouts = [
+            (ChromaSubsampling::Cs444, 7, 5, 35),
+            (ChromaSubsampling::Cs422, 4, 5, 20),
+            (ChromaSubsampling::Cs440, 7, 3, 21),
+            (ChromaSubsampling::Cs420, 4, 3, 12),
+        ];
+        for (subsampling, chroma_width, chroma_height, chroma_len) in layouts {
+            let picture = IntraPicture::new(7, 5, subsampling);
+            assert_eq!(picture.stride(1), chroma_width);
+            assert_eq!(picture.plane_height(1), chroma_height);
+            assert_eq!(picture.plane(1).len(), chroma_len);
+            assert_eq!(picture.plane(2).len(), chroma_len);
+        }
+    }
+
+    #[test]
+    fn lossless_walsh_hadamard_reconstructs_dc_block() {
+        let mut picture = IntraPicture::new(4, 4, ChromaSubsampling::Cs444);
+        let mut coefficients = [0; 16];
+        coefficients[0] = 16;
+        picture.add_residual(
+            0,
+            0,
+            0,
+            TransformSize::Tx4x4,
+            TransformType::DctDct,
+            true,
+            &coefficients,
+        );
+        assert_eq!(picture.plane(0), &[1; 16]);
+    }
+
+    #[test]
     fn scaled_inter_prediction_maps_reference_coordinates() {
-        let mut reference = IntraPicture::new(4, 4);
+        let mut reference = IntraPicture::new(4, 4, ChromaSubsampling::Cs420);
         reference.planes_mut()[0]
             .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
-        let mut target = IntraPicture::new(8, 8);
+        let mut target = IntraPicture::new(8, 8, ChromaSubsampling::Cs420);
         let mut nearest_kernel = [0i16; 128];
         for phase in 0..16 {
             nearest_kernel[phase * 8 + 3] = 128;

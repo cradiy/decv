@@ -79,6 +79,22 @@ impl ChromaSubsampling {
             (true, true) => Self::Cs420,
         }
     }
+
+    #[inline]
+    pub const fn x_shift(self) -> usize {
+        match self {
+            Self::Cs422 | Self::Cs420 => 1,
+            Self::Cs444 | Self::Cs440 => 0,
+        }
+    }
+
+    #[inline]
+    pub const fn y_shift(self) -> usize {
+        match self {
+            Self::Cs440 | Self::Cs420 => 1,
+            Self::Cs444 | Self::Cs422 => 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,6 +208,14 @@ pub struct FrameHeader {
     pub tile_rows_log2: u8,
     pub uncompressed_header_size: usize,
     pub compressed_header_size: usize,
+}
+
+impl FrameHeader {
+    #[inline]
+    pub(crate) fn chroma_subsampling(&self) -> ChromaSubsampling {
+        self.color
+            .map_or(ChromaSubsampling::Cs420, |color| color.subsampling)
+    }
 }
 
 impl FrameHeader {

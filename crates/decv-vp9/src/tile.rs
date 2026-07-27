@@ -106,15 +106,15 @@ impl IntraSyntaxSummary {
     }
 }
 
-/// Decodes and reconstructs one intra-only Profile-0 frame.
+/// Decodes and reconstructs one intra-only 8-bit Profile-0 or Profile-1 frame.
 pub fn decode_intra_picture(
     frame: &[u8],
     header: &FrameHeader,
     compressed: &CompressedHeader,
 ) -> Result<IntraPicture> {
-    if header.profile != 0 {
+    if header.profile > 1 {
         return Err(Vp9Error::UnsupportedFeature(
-            "pixel reconstruction currently supports VP9 Profile 0",
+            "8-bit pixel reconstruction currently supports VP9 Profiles 0 and 1",
         ));
     }
     let size = header
@@ -124,7 +124,7 @@ pub fn decode_intra_picture(
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
     let mut context = ProbabilityContext::default();
     context.apply(compressed)?;
-    let mut picture = IntraPicture::new(width, height);
+    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
     let (_, modes) = parse_intra_syntax(
         frame,
         header,
@@ -149,7 +149,7 @@ pub(crate) fn decode_intra_picture_with_context(
         .ok_or(Vp9Error::InvalidData("frame has no dimensions"))?;
     let width = usize::try_from(size.width).map_err(|_| Vp9Error::IntegerOverflow)?;
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
-    let mut picture = IntraPicture::new(width, height);
+    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
     let (_, modes) = parse_intra_syntax(
         frame,
         header,
@@ -162,7 +162,7 @@ pub(crate) fn decode_intra_picture_with_context(
     Ok((picture, modes.segment_ids()))
 }
 
-/// Parses every mode and coefficient token of an intra-only Profile-0 frame.
+/// Parses every mode and coefficient token of an intra-only 8-bit VP9 frame.
 ///
 /// This is the syntax half of reconstruction. Keeping it separately
 /// verifiable prevents predictor or inverse-transform bugs from being
@@ -291,8 +291,13 @@ fn parse_intra_tiles_parallel(
                         tile_offsets(tile_index, mi_columns, header.tile_columns_log2);
                     let origin_x = column_start * 8;
                     let end_x = (column_end * 8).min(width);
-                    let mut tile_picture =
-                        IntraPicture::new_strip(width, height, origin_x, end_x - origin_x);
+                    let mut tile_picture = IntraPicture::new_strip(
+                        width,
+                        height,
+                        origin_x,
+                        end_x - origin_x,
+                        header.chroma_subsampling(),
+                    );
                     let mut tile_modes = vec![None; mi_columns * mi_rows];
                     let mut tile_counts = FrameCounts::default();
                     let mut decoder = IntraTileDecoder::new(
@@ -446,7 +451,7 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
         counts: Option<&'state mut FrameCounts>,
     ) -> Result<Self> {
         let luma_4x4_columns = mi_columns * 2;
-        let chroma_4x4_columns = mi_columns;
+        let chroma_4x4_columns = luma_4x4_columns >> header.chroma_subsampling().x_shift();
         Ok(Self {
             bits: BoolDecoder::new(tile)?,
             header,
@@ -776,30 +781,25 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
         mode: ModeInfo,
     ) -> Result<()> {
         for plane in 0..3 {
-            let subsampling = usize::from(plane != 0);
+            let subsampling_x =
+                usize::from(plane != 0) * self.header.chroma_subsampling().x_shift();
+            let subsampling_y =
+                usize::from(plane != 0) * self.header.chroma_subsampling().y_shift();
             let (block_width, block_height) = if mode.block_size < BlockSize::B8x8 {
-                (2 >> subsampling, 2 >> subsampling)
+                (2 >> subsampling_x, 2 >> subsampling_y)
             } else {
                 (
-                    mode.block_size.width_4x4().div_ceil(1 << subsampling),
-                    mode.block_size.height_4x4().div_ceil(1 << subsampling),
+                    mode.block_size.width_4x4().div_ceil(1 << subsampling_x),
+                    mode.block_size.height_4x4().div_ceil(1 << subsampling_y),
                 )
             };
             let maximum_transform = floor_transform(block_width.min(block_height));
             let transform_size = mode.transform_size.min(maximum_transform);
             let step = transform_size.width_4x4();
-            let origin_x = (mi_column * 2) >> subsampling;
-            let origin_y = (mi_row * 2) >> subsampling;
-            let plane_width_4x4 = if plane == 0 {
-                self.mi_columns * 2
-            } else {
-                self.mi_columns
-            };
-            let plane_height_4x4 = if plane == 0 {
-                self.mi_rows * 2
-            } else {
-                self.mi_rows
-            };
+            let origin_x = (mi_column * 2) >> subsampling_x;
+            let origin_y = (mi_row * 2) >> subsampling_y;
+            let plane_width_4x4 = (self.mi_columns * 2) >> subsampling_x;
+            let plane_height_4x4 = (self.mi_rows * 2) >> subsampling_y;
             let usable_width = block_width.min(plane_width_4x4.saturating_sub(origin_x));
             let usable_height = block_height.min(plane_height_4x4.saturating_sub(origin_y));
 
@@ -828,8 +828,8 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
                                 (origin_y + row) * 4,
                                 step * 4,
                                 prediction_mode,
-                                ((self.column_start * 2) >> subsampling) * 4,
-                                ((self.row_start * 2) >> subsampling) * 4,
+                                ((self.column_start * 2) >> subsampling_x) * 4,
+                                ((self.row_start * 2) >> subsampling_y) * 4,
                                 column + step < block_width,
                             );
                         }
@@ -869,8 +869,8 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
                     if let Some(picture) = &mut self.picture {
                         let x = (origin_x + column) * 4;
                         let y = (origin_y + row) * 4;
-                        let tile_left = ((self.column_start * 2) >> subsampling) * 4;
-                        let tile_top = ((self.row_start * 2) >> subsampling) * 4;
+                        let tile_left = ((self.column_start * 2) >> subsampling_x) * 4;
+                        let tile_top = ((self.row_start * 2) >> subsampling_y) * 4;
                         picture.predict(
                             plane,
                             x,
@@ -888,6 +888,10 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
                                 y,
                                 transform_size,
                                 transform_type,
+                                self.header
+                                    .quantization
+                                    .expect("decoded frame has quantization")
+                                    .lossless(),
                                 &eob.values[..transform_size.coefficient_count()],
                             );
                         }

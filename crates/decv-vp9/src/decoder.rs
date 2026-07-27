@@ -101,13 +101,13 @@ impl Vp9Decoder {
                 format: video_format(&header)?,
             }));
         }
-        if header.profile != 0
-            || header.color.is_some_and(|color| {
-                color.bit_depth != BitDepth::Eight || color.subsampling != ChromaSubsampling::Cs420
-            })
+        if header.profile > 1
+            || header
+                .color
+                .is_some_and(|color| color.bit_depth != BitDepth::Eight)
         {
             return Err(Vp9Error::UnsupportedFeature(
-                "reconstruction currently supports 8-bit VP9 Profile 0 4:2:0",
+                "reconstruction currently supports 8-bit VP9 Profiles 0 and 1",
             ));
         }
 
@@ -305,7 +305,6 @@ impl VideoDecoder for Vp9Decoder {
                 self.current_format = Some(decoded.format);
             }
             let picture = decoded.picture;
-            let chroma_height = picture.height().div_ceil(2);
             let storage = FrameStorage::Cpu(CpuFrame::new(vec![
                 CpuPlane::new(
                     picture.shared_plane(0),
@@ -313,8 +312,18 @@ impl VideoDecoder for Vp9Decoder {
                     picture.stride(0),
                     picture.height(),
                 ),
-                CpuPlane::new(picture.shared_plane(1), 0, picture.stride(1), chroma_height),
-                CpuPlane::new(picture.shared_plane(2), 0, picture.stride(2), chroma_height),
+                CpuPlane::new(
+                    picture.shared_plane(1),
+                    0,
+                    picture.stride(1),
+                    picture.plane_height(1),
+                ),
+                CpuPlane::new(
+                    picture.shared_plane(2),
+                    0,
+                    picture.stride(2),
+                    picture.plane_height(2),
+                ),
             ]));
             let frame =
                 DecodedVideoFrame::new(self.next_frame_id, pts, duration, decoded.format, storage);
@@ -409,11 +418,17 @@ fn video_format(header: &FrameHeader) -> Result<VideoFormat> {
         };
         ColorInfo::new(range, matrix, primaries, transfer)
     });
+    let pixel_format = match header.chroma_subsampling() {
+        ChromaSubsampling::Cs420 => PixelFormat::I420,
+        ChromaSubsampling::Cs422 => PixelFormat::I422,
+        ChromaSubsampling::Cs440 => PixelFormat::I440,
+        ChromaSubsampling::Cs444 => PixelFormat::I444,
+    };
     let format = VideoFormat::new(
         coded,
         Rect::new(0, 0, size.width, size.height),
         Size::new(size.render_width, size.render_height),
-        PixelFormat::I420,
+        pixel_format,
         color,
     );
     format.validate()?;

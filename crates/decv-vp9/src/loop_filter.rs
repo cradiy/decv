@@ -81,46 +81,67 @@ pub(crate) fn apply_loop_filter(
         ));
     }
 
-    let picture_width = picture.width();
-    let picture_height = picture.height();
+    let plane_widths: [usize; 3] = std::array::from_fn(|plane| picture.plane_width(plane));
+    let plane_heights: [usize; 3] = std::array::from_fn(|plane| picture.plane_height(plane));
+    let plane_strides: [usize; 3] = std::array::from_fn(|plane| picture.stride(plane));
+    let subsampling_x: [usize; 3] = std::array::from_fn(|plane| picture.subsampling_x(plane));
+    let subsampling_y: [usize; 3] = std::array::from_fn(|plane| picture.subsampling_y(plane));
     let [luma, chroma_u, chroma_v] = picture.planes_mut();
     std::thread::scope(|scope| {
         let u_worker = scope.spawn(|| {
-            apply_plane_loop_filter(chroma_u, 1, picture_width, picture_height, header, modes);
+            apply_plane_loop_filter(
+                chroma_u,
+                plane_widths[1],
+                plane_heights[1],
+                plane_strides[1],
+                subsampling_x[1],
+                subsampling_y[1],
+                header,
+                modes,
+            );
         });
         let v_worker = scope.spawn(|| {
-            apply_plane_loop_filter(chroma_v, 2, picture_width, picture_height, header, modes);
+            apply_plane_loop_filter(
+                chroma_v,
+                plane_widths[2],
+                plane_heights[2],
+                plane_strides[2],
+                subsampling_x[2],
+                subsampling_y[2],
+                header,
+                modes,
+            );
         });
-        apply_plane_loop_filter(luma, 0, picture_width, picture_height, header, modes);
+        apply_plane_loop_filter(
+            luma,
+            plane_widths[0],
+            plane_heights[0],
+            plane_strides[0],
+            subsampling_x[0],
+            subsampling_y[0],
+            header,
+            modes,
+        );
         u_worker.join().expect("VP9 U-plane loop filter panicked");
         v_worker.join().expect("VP9 V-plane loop filter panicked");
     });
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_plane_loop_filter(
     pixels: &mut [u8],
-    plane: usize,
-    picture_width: usize,
-    picture_height: usize,
+    width: usize,
+    height: usize,
+    stride: usize,
+    subsampling_x: usize,
+    subsampling_y: usize,
     header: &FrameHeader,
     modes: &FilterModeMap,
 ) {
     let configuration = header.loop_filter.as_ref().expect("caller checked");
-    let subsampling = usize::from(plane != 0);
-    let row_step = 1usize << subsampling;
-    let column_step = 1usize << subsampling;
-    let width = if plane == 0 {
-        picture_width
-    } else {
-        picture_width.div_ceil(2)
-    };
-    let height = if plane == 0 {
-        picture_height
-    } else {
-        picture_height.div_ceil(2)
-    };
-    let stride = width;
+    let row_step = 1usize << subsampling_y;
+    let column_step = 1usize << subsampling_x;
 
     for superblock_row in (0..modes.mi_rows).step_by(8) {
         let row_end = (superblock_row + 8).min(modes.mi_rows);
@@ -130,17 +151,17 @@ fn apply_plane_loop_filter(
             // VP9 completes the vertical and then horizontal pass for each
             // 64x64 superblock before moving to the next one.
             for mi_row in (superblock_row..row_end).step_by(row_step) {
-                let y = (mi_row * 8) >> subsampling;
+                let y = (mi_row * 8) >> subsampling_y;
                 let line_count = 8.min(height.saturating_sub(y));
                 for mi_column in (superblock_column..column_end).step_by(column_step) {
-                    let x = (mi_column * 8) >> subsampling;
+                    let x = (mi_column * 8) >> subsampling_x;
                     let mode = modes.get(mi_row, mi_column);
                     let level = filter_level(header, mode);
                     if level == 0 {
                         continue;
                     }
                     let thresholds = thresholds(level, configuration.sharpness);
-                    let transform = plane_transform(mode, subsampling);
+                    let transform = plane_transform(mode, subsampling_x, subsampling_y);
                     let block_edge = is_left_block_edge(mode.block_size, mi_column);
                     let skip_edge = mode.skip && mode.reference != 0 && !block_edge;
                     if x != 0
@@ -171,9 +192,9 @@ fn apply_plane_loop_filter(
             }
 
             for mi_row in (superblock_row..row_end).step_by(row_step) {
-                let y = (mi_row * 8) >> subsampling;
+                let y = (mi_row * 8) >> subsampling_y;
                 for mi_column in (superblock_column..column_end).step_by(column_step) {
-                    let x = (mi_column * 8) >> subsampling;
+                    let x = (mi_column * 8) >> subsampling_x;
                     let column_count = 8.min(width.saturating_sub(x));
                     let mode = modes.get(mi_row, mi_column);
                     let level = filter_level(header, mode);
@@ -181,7 +202,7 @@ fn apply_plane_loop_filter(
                         continue;
                     }
                     let thresholds = thresholds(level, configuration.sharpness);
-                    let transform = plane_transform(mode, subsampling);
+                    let transform = plane_transform(mode, subsampling_x, subsampling_y);
                     let block_edge = is_top_block_edge(mode.block_size, mi_row);
                     let skip_edge = mode.skip && mode.reference != 0 && !block_edge;
                     if y != 0
@@ -221,16 +242,16 @@ fn apply_plane_loop_filter(
     }
 }
 
-fn plane_transform(mode: FilterMode, subsampling: usize) -> TransformSize {
-    if subsampling == 0 {
+fn plane_transform(mode: FilterMode, subsampling_x: usize, subsampling_y: usize) -> TransformSize {
+    if subsampling_x == 0 && subsampling_y == 0 {
         return mode.transform_size;
     }
     let (width, height) = if mode.block_size < BlockSize::B8x8 {
         (1, 1)
     } else {
         (
-            mode.block_size.width_4x4().div_ceil(2),
-            mode.block_size.height_4x4().div_ceil(2),
+            mode.block_size.width_4x4().div_ceil(1 << subsampling_x),
+            mode.block_size.height_4x4().div_ceil(1 << subsampling_y),
         )
     };
     mode.transform_size.min(floor_transform(width.min(height)))

@@ -50,6 +50,9 @@ pub enum PixelFormat {
     Bgra8,
     Rgba8,
     I420,
+    I422,
+    I440,
+    I444,
     P010,
 }
 
@@ -59,13 +62,24 @@ impl PixelFormat {
         match self {
             Self::Nv12 | Self::P010 => 2,
             Self::Bgra8 | Self::Rgba8 => 1,
-            Self::I420 => 3,
+            Self::I420 | Self::I422 | Self::I440 | Self::I444 => 3,
         }
     }
 
     #[inline]
     pub const fn is_chroma_subsampled_420(self) -> bool {
         matches!(self, Self::Nv12 | Self::I420 | Self::P010)
+    }
+
+    #[inline]
+    pub const fn chroma_subsampling(self) -> Option<(u8, u8)> {
+        match self {
+            Self::Nv12 | Self::I420 | Self::P010 => Some((1, 1)),
+            Self::I422 => Some((1, 0)),
+            Self::I440 => Some((0, 1)),
+            Self::I444 => Some((0, 0)),
+            Self::Bgra8 | Self::Rgba8 => None,
+        }
     }
 }
 
@@ -132,13 +146,17 @@ impl VideoFormat {
             ));
         }
 
-        if self.pixel_format.is_chroma_subsampled_420()
-            && (!self.coded_size.width.is_multiple_of(2)
-                || !self.coded_size.height.is_multiple_of(2))
-        {
-            return Err(MediaError::InvalidVideoFormat(
-                "4:2:0 coded dimensions must be even",
-            ));
+        if let Some((subsampling_x, subsampling_y)) = self.pixel_format.chroma_subsampling() {
+            if subsampling_x != 0 && !self.coded_size.width.is_multiple_of(2) {
+                return Err(MediaError::InvalidVideoFormat(
+                    "horizontally subsampled coded width must be even",
+                ));
+            }
+            if subsampling_y != 0 && !self.coded_size.height.is_multiple_of(2) {
+                return Err(MediaError::InvalidVideoFormat(
+                    "vertically subsampled coded height must be even",
+                ));
+            }
         }
 
         Ok(())

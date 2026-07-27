@@ -480,10 +480,15 @@ fn visible_plane_layout(
         (PixelFormat::Nv12, 1) if (x | y | width | height) & 1 == 0 => {
             Some((y / 2, x, width, height / 2))
         }
-        (PixelFormat::I420, 0) => Some((y, x, width, height)),
+        (PixelFormat::I420 | PixelFormat::I422 | PixelFormat::I440 | PixelFormat::I444, 0) => {
+            Some((y, x, width, height))
+        }
         (PixelFormat::I420, 1 | 2) if (x | y | width | height) & 1 == 0 => {
             Some((y / 2, x / 2, width / 2, height / 2))
         }
+        (PixelFormat::I422, 1 | 2) if (x | width) & 1 == 0 => Some((y, x / 2, width / 2, height)),
+        (PixelFormat::I440, 1 | 2) if (y | height) & 1 == 0 => Some((y / 2, x, width, height / 2)),
+        (PixelFormat::I444, 1 | 2) => Some((y, x, width, height)),
         (PixelFormat::P010, 0) => Some((y, x.checked_mul(2)?, width.checked_mul(2)?, height)),
         (PixelFormat::P010, 1) if (x | y | width | height) & 1 == 0 => {
             Some((y / 2, x.checked_mul(2)?, width.checked_mul(2)?, height / 2))
@@ -520,6 +525,18 @@ mod tests {
         assert_eq!(
             visible_plane_layout(PixelFormat::I420, rect, 2),
             Some((1, 2, 32, 16))
+        );
+        assert_eq!(
+            visible_plane_layout(PixelFormat::I422, rect, 1),
+            Some((2, 2, 32, 32))
+        );
+        assert_eq!(
+            visible_plane_layout(PixelFormat::I440, rect, 2),
+            Some((1, 4, 64, 16))
+        );
+        assert_eq!(
+            visible_plane_layout(PixelFormat::I444, rect, 1),
+            Some((2, 4, 64, 32))
         );
         assert_eq!(
             visible_plane_layout(PixelFormat::P010, rect, 1),

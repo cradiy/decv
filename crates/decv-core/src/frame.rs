@@ -278,9 +278,13 @@ fn validate_cpu_frame(frame: &CpuFrame, format: VideoFormat) -> Result<()> {
                 .ok_or(MediaError::IntegerOverflow)?;
             validate_plane(&frame.planes[0], row_bytes, size.height)?;
         }
-        PixelFormat::I420 => {
+        PixelFormat::I420 | PixelFormat::I422 | PixelFormat::I440 | PixelFormat::I444 => {
             validate_plane(&frame.planes[0], size.width, size.height)?;
-            let chroma = Size::new(size.width / 2, size.height / 2);
+            let (subsampling_x, subsampling_y) = format
+                .pixel_format
+                .chroma_subsampling()
+                .expect("planar YUV format has chroma subsampling");
+            let chroma = Size::new(size.width >> subsampling_x, size.height >> subsampling_y);
             validate_plane(&frame.planes[1], chroma.width, chroma.height)?;
             validate_plane(&frame.planes[2], chroma.width, chroma.height)?;
         }
@@ -423,5 +427,26 @@ mod tests {
                 "plane layout exceeds its backing allocation"
             ))
         );
+    }
+
+    #[test]
+    fn validates_planar_444_storage() {
+        let format = VideoFormat {
+            coded_size: Size::new(4, 2),
+            visible_rect: Rect::new(0, 0, 4, 2),
+            display_size: Size::new(4, 2),
+            pixel_format: PixelFormat::I444,
+            color: ColorInfo::default(),
+        };
+        let frame = DecodedVideoFrame {
+            id: 2,
+            pts: None,
+            duration: None,
+            format,
+            storage: FrameStorage::Cpu(CpuFrame::new(
+                (0..3).map(|_| CpuPlane::new(vec![0; 8], 0, 4, 2)).collect(),
+            )),
+        };
+        assert_eq!(frame.validate(), Ok(()));
     }
 }

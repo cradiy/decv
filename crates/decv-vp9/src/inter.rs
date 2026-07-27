@@ -45,7 +45,7 @@ impl InterSyntaxSummary {
     }
 }
 
-/// Decodes and reconstructs one Profile-0 inter frame against LAST, GOLDEN,
+/// Decodes and reconstructs one 8-bit Profile-0 or Profile-1 inter frame against LAST, GOLDEN,
 /// and ALTREF pictures in that order.
 pub fn decode_inter_picture(
     frame: &[u8],
@@ -53,9 +53,9 @@ pub fn decode_inter_picture(
     compressed: &CompressedHeader,
     references: [&IntraPicture; 3],
 ) -> Result<IntraPicture> {
-    if header.profile != 0 {
+    if header.profile > 1 {
         return Err(Vp9Error::UnsupportedFeature(
-            "pixel reconstruction currently supports VP9 Profile 0",
+            "8-bit pixel reconstruction currently supports VP9 Profiles 0 and 1",
         ));
     }
     if header.intra_only {
@@ -68,17 +68,17 @@ pub fn decode_inter_picture(
         .ok_or(Vp9Error::InvalidData("frame has no dimensions"))?;
     let width = usize::try_from(size.width).map_err(|_| Vp9Error::IntegerOverflow)?;
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
-    if references
-        .iter()
-        .any(|reference| !valid_reference_size(reference, width, height))
-    {
+    if references.iter().any(|reference| {
+        reference.subsampling() != header.chroma_subsampling()
+            || !valid_reference_size(reference, width, height)
+    }) {
         return Err(Vp9Error::UnsupportedFeature(
-            "VP9 reference dimensions exceed the normative scaling range",
+            "VP9 reference layout is incompatible with the current frame",
         ));
     }
     let mut context = ProbabilityContext::default();
     context.apply(compressed)?;
-    let mut picture = IntraPicture::new(width, height);
+    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
     let (_, modes) = parse_inter_syntax(
         frame,
         header,
@@ -110,15 +110,15 @@ pub(crate) fn decode_inter_picture_with_context(
         .ok_or(Vp9Error::InvalidData("frame has no dimensions"))?;
     let width = usize::try_from(size.width).map_err(|_| Vp9Error::IntegerOverflow)?;
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
-    if references
-        .iter()
-        .any(|reference| !valid_reference_size(reference, width, height))
-    {
+    if references.iter().any(|reference| {
+        reference.subsampling() != header.chroma_subsampling()
+            || !valid_reference_size(reference, width, height)
+    }) {
         return Err(Vp9Error::UnsupportedFeature(
-            "VP9 reference dimensions exceed the normative scaling range",
+            "VP9 reference layout is incompatible with the current frame",
         ));
     }
-    let mut picture = IntraPicture::new(width, height);
+    let mut picture = IntraPicture::new(width, height, header.chroma_subsampling());
     let (_, modes) = parse_inter_syntax(
         frame,
         header,
@@ -444,8 +444,13 @@ fn parse_inter_tiles_parallel(
                         tile_offsets(tile_index, mi_columns, header.tile_columns_log2);
                     let origin_x = column_start * 8;
                     let end_x = (column_end * 8).min(width);
-                    let mut tile_picture =
-                        IntraPicture::new_strip(width, height, origin_x, end_x - origin_x);
+                    let mut tile_picture = IntraPicture::new_strip(
+                        width,
+                        height,
+                        origin_x,
+                        end_x - origin_x,
+                        header.chroma_subsampling(),
+                    );
                     let mut tile_modes = vec![None; mi_columns * mi_rows];
                     let mut tile_segment_ids = vec![0; mi_columns * mi_rows];
                     let mut tile_counts = FrameCounts::default();
@@ -604,11 +609,15 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
             segment_ids,
             above_partition: vec![0; mi_columns],
             left_partition: [0; 8],
-            above_coefficients: [
-                vec![0; mi_columns * 2],
-                vec![0; mi_columns],
-                vec![0; mi_columns],
-            ],
+            above_coefficients: {
+                let luma_columns = mi_columns * 2;
+                let chroma_columns = luma_columns >> header.chroma_subsampling().x_shift();
+                [
+                    vec![0; luma_columns],
+                    vec![0; chroma_columns],
+                    vec![0; chroma_columns],
+                ]
+            },
             left_coefficients: [[0; 16]; 3],
             summary: InterSyntaxSummary::default(),
             picture,
@@ -790,20 +799,23 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                 }
             }];
             for plane in 0..3 {
-                let subsampling = usize::from(plane != 0);
-                let origin_x = (mi_column * 8) >> subsampling;
-                let origin_y = (mi_row * 8) >> subsampling;
+                let subsampling_x =
+                    usize::from(plane != 0) * self.header.chroma_subsampling().x_shift();
+                let subsampling_y =
+                    usize::from(plane != 0) * self.header.chroma_subsampling().y_shift();
+                let origin_x = (mi_column * 8) >> subsampling_x;
+                let origin_y = (mi_row * 8) >> subsampling_y;
                 if mode.block_size < BlockSize::B8x8 {
-                    let blocks_wide = 2 >> subsampling;
-                    let blocks_high = 2 >> subsampling;
+                    let blocks_wide = 2 >> subsampling_x;
+                    let blocks_high = 2 >> subsampling_y;
                     for block_y in 0..blocks_high {
                         for block_x in 0..blocks_wide {
-                            let block = block_y * 2 + block_x;
                             let motion = split_motion_vector(
                                 &mode.sub_motion_vectors,
                                 reference_index,
-                                plane,
-                                block,
+                                subsampling_x,
+                                subsampling_y,
+                                block_y * blocks_wide + block_x,
                             );
                             picture.predict_inter(
                                 reference,
@@ -812,16 +824,16 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                                 origin_y + block_y * 4,
                                 4,
                                 4,
-                                i32::from(motion.row) << (1 - subsampling),
-                                i32::from(motion.column) << (1 - subsampling),
+                                i32::from(motion.row) << (1 - subsampling_y),
+                                i32::from(motion.column) << (1 - subsampling_x),
                                 kernel,
                                 reference_index != 0,
                             );
                         }
                     }
                 } else {
-                    let width = (mode.block_size.width_4x4() * 4) >> subsampling;
-                    let height = (mode.block_size.height_4x4() * 4) >> subsampling;
+                    let width = (mode.block_size.width_4x4() * 4) >> subsampling_x;
+                    let height = (mode.block_size.height_4x4() * 4) >> subsampling_y;
                     let motion = mode.motion_vectors[reference_index];
                     picture.predict_inter(
                         reference,
@@ -830,8 +842,8 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                         origin_y,
                         width,
                         height,
-                        i32::from(motion.row) << (1 - subsampling),
-                        i32::from(motion.column) << (1 - subsampling),
+                        i32::from(motion.row) << (1 - subsampling_y),
+                        i32::from(motion.column) << (1 - subsampling_x),
                         kernel,
                         reference_index != 0,
                     );
@@ -1569,30 +1581,25 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
         mode: ModeInfo,
     ) -> Result<()> {
         for plane in 0..3 {
-            let subsampling = usize::from(plane != 0);
+            let subsampling_x =
+                usize::from(plane != 0) * self.header.chroma_subsampling().x_shift();
+            let subsampling_y =
+                usize::from(plane != 0) * self.header.chroma_subsampling().y_shift();
             let (block_width, block_height) = if mode.block_size < BlockSize::B8x8 {
-                (2 >> subsampling, 2 >> subsampling)
+                (2 >> subsampling_x, 2 >> subsampling_y)
             } else {
                 (
-                    mode.block_size.width_4x4().div_ceil(1 << subsampling),
-                    mode.block_size.height_4x4().div_ceil(1 << subsampling),
+                    mode.block_size.width_4x4().div_ceil(1 << subsampling_x),
+                    mode.block_size.height_4x4().div_ceil(1 << subsampling_y),
                 )
             };
             let maximum = floor_transform(block_width.min(block_height));
             let transform_size = mode.transform_size.min(maximum);
             let step = transform_size.width_4x4();
-            let origin_x = (mi_column * 2) >> subsampling;
-            let origin_y = (mi_row * 2) >> subsampling;
-            let plane_width = if plane == 0 {
-                self.mi_columns * 2
-            } else {
-                self.mi_columns
-            };
-            let plane_height = if plane == 0 {
-                self.mi_rows * 2
-            } else {
-                self.mi_rows
-            };
+            let origin_x = (mi_column * 2) >> subsampling_x;
+            let origin_y = (mi_row * 2) >> subsampling_y;
+            let plane_width = (self.mi_columns * 2) >> subsampling_x;
+            let plane_height = (self.mi_rows * 2) >> subsampling_y;
             let usable_width = block_width.min(plane_width.saturating_sub(origin_x));
             let usable_height = block_height.min(plane_height.saturating_sub(origin_y));
             if mode.skip {
@@ -1638,6 +1645,11 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                     let transform_type = if transform_size == TransformSize::Tx32x32
                         || mode.is_inter
                         || plane != 0
+                        || self
+                            .header
+                            .quantization
+                            .expect("decoded frame has quantization")
+                            .lossless()
                     {
                         TransformType::DctDct
                     } else {
@@ -1690,6 +1702,10 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                                 y * 4,
                                 transform_size,
                                 transform_type,
+                                self.header
+                                    .quantization
+                                    .expect("decoded frame has quantization")
+                                    .lossless(),
                                 &coefficients.values[..transform_size.coefficient_count()],
                             );
                         }
@@ -1722,15 +1738,16 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
         } else {
             mode.uv_mode
         };
-        let subsampling = usize::from(plane != 0);
+        let subsampling_x = usize::from(plane != 0) * self.header.chroma_subsampling().x_shift();
+        let subsampling_y = usize::from(plane != 0) * self.header.chroma_subsampling().y_shift();
         picture.predict(
             plane,
             (origin_x + column) * 4,
             (origin_y + row) * 4,
             step * 4,
             prediction_mode,
-            ((self.column_start * 2) >> subsampling) * 4,
-            ((self.row_start * 2) >> subsampling) * 4,
+            ((self.column_start * 2) >> subsampling_x) * 4,
+            ((self.row_start * 2) >> subsampling_y) * 4,
             column + step < block_width,
         );
     }
@@ -2042,23 +2059,29 @@ fn interpolation_kernel(interpolation: Interpolation) -> &'static [i16; 128] {
 fn split_motion_vector(
     vectors: &[[MotionVector; 2]; 4],
     reference: usize,
-    plane: usize,
+    subsampling_x: usize,
+    subsampling_y: usize,
     block: usize,
 ) -> MotionVector {
-    if plane == 0 {
-        return vectors[block][reference];
-    }
-    let sum_row: i32 = vectors
+    let indices: &[usize] = match (subsampling_x, subsampling_y) {
+        (0, 0) => &[block],
+        (0, 1) => &[block, block + 2],
+        (1, 0) => &[block, block + 1],
+        (1, 1) => &[0, 1, 2, 3],
+        _ => unreachable!("VP9 chroma subsampling shifts are at most one"),
+    };
+    let sum_row = indices
         .iter()
-        .map(|vectors| i32::from(vectors[reference].row))
+        .map(|&index| i32::from(vectors[index][reference].row))
         .sum();
-    let sum_column: i32 = vectors
+    let sum_column = indices
         .iter()
-        .map(|vectors| i32::from(vectors[reference].column))
+        .map(|&index| i32::from(vectors[index][reference].column))
         .sum();
+    let count = indices.len() as i32;
     MotionVector {
-        row: round_motion_average(sum_row, 4),
-        column: round_motion_average(sum_column, 4),
+        row: round_motion_average(sum_row, count),
+        column: round_motion_average(sum_column, count),
     }
 }
 
