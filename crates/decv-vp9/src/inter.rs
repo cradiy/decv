@@ -1541,10 +1541,13 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
         mi_column: usize,
         block_size: BlockSize,
     ) -> [MotionVector; 2] {
-        let top = -(mi_row as i32 * 64) - 128;
-        let left = -(mi_column as i32 * 64) - 128;
-        let bottom = (self.mi_rows - mi_row - block_size.height_mi()) as i32 * 64 + 128;
-        let right = (self.mi_columns - mi_column - block_size.width_mi()) as i32 * 64 + 128;
+        let (top, left, bottom, right) = motion_vector_clamp_bounds(
+            self.mi_rows,
+            self.mi_columns,
+            mi_row,
+            mi_column,
+            block_size,
+        );
         for vector in &mut candidates {
             vector.row = i32::from(vector.row).clamp(top, bottom) as i16;
             vector.column = i32::from(vector.column).clamp(left, right) as i16;
@@ -2104,6 +2107,25 @@ fn round_motion_average(value: i32, divisor: i32) -> i16 {
     }) / divisor) as i16
 }
 
+fn motion_vector_clamp_bounds(
+    mi_rows: usize,
+    mi_columns: usize,
+    mi_row: usize,
+    mi_column: usize,
+    block_size: BlockSize,
+) -> (i32, i32, i32, i32) {
+    let mi_row = mi_row as i32;
+    let mi_column = mi_column as i32;
+    let top = -(mi_row * 64) - 128;
+    let left = -(mi_column * 64) - 128;
+    // A boundary block may extend into the padded part of its final
+    // superblock. The remaining distance is therefore intentionally signed:
+    // 180px has 23 mi rows, so an 8-mi block at row 16 leaves -1 mi.
+    let bottom = (mi_rows as i32 - mi_row - block_size.height_mi() as i32) * 64 + 128;
+    let right = (mi_columns as i32 - mi_column - block_size.width_mi() as i32) * 64 + 128;
+    (top, left, bottom, right)
+}
+
 fn mode_context_offsets(size: BlockSize) -> [(isize, isize); 2] {
     match size {
         BlockSize::B8x16 | BlockSize::B16x32 | BlockSize::B32x64 => [(0, -1), (-1, 0)],
@@ -2502,4 +2524,22 @@ fn read_motion_component(
     let magnitude = class_base + (integer << 3) + (fraction << 1) + precision + 1;
     let magnitude = i16::try_from(magnitude).map_err(|_| Vp9Error::IntegerOverflow)?;
     Ok(if negative { -magnitude } else { magnitude })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::motion_vector_clamp_bounds;
+    use crate::block::BlockSize;
+
+    #[test]
+    fn motion_vector_bounds_allow_partial_boundary_superblocks() {
+        assert_eq!(
+            motion_vector_clamp_bounds(23, 40, 16, 32, BlockSize::B64x64),
+            (-1152, -2176, 64, 128),
+        );
+        assert_eq!(
+            motion_vector_clamp_bounds(24, 39, 16, 32, BlockSize::B64x64),
+            (-1152, -2176, 128, 64),
+        );
+    }
 }
