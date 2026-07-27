@@ -899,7 +899,7 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
                                     .quantization
                                     .expect("decoded frame has quantization")
                                     .lossless(),
-                                &eob.values[..transform_size.coefficient_count()],
+                                eob.values(),
                             );
                         }
                     }
@@ -908,7 +908,7 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
                     self.summary.coefficients += eob.eob;
                     self.summary.coefficient_sum_abs =
                         self.summary.coefficient_sum_abs.saturating_add(
-                            eob.values[..transform_size.coefficient_count()]
+                            eob.values()
                                 .iter()
                                 .map(|value| u64::from(value.unsigned_abs()))
                                 .sum(),
@@ -1090,8 +1090,83 @@ pub(crate) fn scan_order(size: TransformSize, transform: TransformType) -> Coeff
 
 #[derive(Debug)]
 pub(crate) struct CoefficientBlock {
-    pub(crate) values: [i32; 32 * 32],
+    values: CoefficientValues,
     pub(crate) eob: usize,
+}
+
+impl CoefficientBlock {
+    pub(crate) fn values(&self) -> &[i32] {
+        self.values.as_slice()
+    }
+}
+
+#[derive(Debug)]
+// Tx16 deliberately stays inline: it avoids a heap allocation for a common
+// transform while still reducing the previous fixed 4 KiB coefficient block.
+#[allow(clippy::large_enum_variant)]
+enum CoefficientValues {
+    Tx4([i32; 4 * 4]),
+    Tx8([i32; 8 * 8]),
+    Tx16([i32; 16 * 16]),
+    Tx32(Box<[i32; 32 * 32]>),
+}
+
+impl CoefficientValues {
+    fn new(transform_size: TransformSize) -> Self {
+        match transform_size {
+            TransformSize::Tx4x4 => Self::Tx4([0; 4 * 4]),
+            TransformSize::Tx8x8 => Self::Tx8([0; 8 * 8]),
+            TransformSize::Tx16x16 => Self::Tx16([0; 16 * 16]),
+            // Keep the uncommon largest transform off the tile decoder's
+            // stack while preserving exact-size initialization.
+            TransformSize::Tx32x32 => Self::Tx32(Box::new([0; 32 * 32])),
+        }
+    }
+
+    fn as_slice(&self) -> &[i32] {
+        match self {
+            Self::Tx4(values) => values,
+            Self::Tx8(values) => values,
+            Self::Tx16(values) => values,
+            Self::Tx32(values) => values.as_slice(),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [i32] {
+        match self {
+            Self::Tx4(values) => values,
+            Self::Tx8(values) => values,
+            Self::Tx16(values) => values,
+            Self::Tx32(values) => values.as_mut_slice(),
+        }
+    }
+}
+
+enum TokenCache {
+    Tx4([u8; 4 * 4]),
+    Tx8([u8; 8 * 8]),
+    Tx16([u8; 16 * 16]),
+    Tx32(Box<[u8; 32 * 32]>),
+}
+
+impl TokenCache {
+    fn new(transform_size: TransformSize) -> Self {
+        match transform_size {
+            TransformSize::Tx4x4 => Self::Tx4([0; 4 * 4]),
+            TransformSize::Tx8x8 => Self::Tx8([0; 8 * 8]),
+            TransformSize::Tx16x16 => Self::Tx16([0; 16 * 16]),
+            TransformSize::Tx32x32 => Self::Tx32(Box::new([0; 32 * 32])),
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Tx4(values) => values,
+            Self::Tx8(values) => values,
+            Self::Tx16(values) => values,
+            Self::Tx32(values) => values.as_mut_slice(),
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1108,87 +1183,64 @@ pub(crate) fn decode_coefficient_tokens(
     mut counts: Option<&mut CoefficientCounts>,
 ) -> Result<CoefficientBlock> {
     let maximum = transform_size.coefficient_count();
-    let mut token_cache = [0u8; 32 * 32];
-    let mut values = [0i32; 32 * 32];
+    let transform_index = transform_size as usize;
+    let family = plane_type * 2 + reference_type;
+    let quant_shift = u32::from(transform_size == TransformSize::Tx32x32);
+    let mut token_cache_storage = TokenCache::new(transform_size);
+    let token_cache = token_cache_storage.as_mut_slice();
+    let mut value_storage = CoefficientValues::new(transform_size);
+    let values = value_storage.as_mut_slice();
     let mut coefficient = 0usize;
     while coefficient < maximum {
         let mut band = coefficient_band(transform_size, coefficient);
-        let mut model = coefficient_model(probabilities, plane_type, reference_type, band, context);
+        let mut model_start = coefficient_model_start(family, band, context);
+        let mut model = &probabilities[model_start..model_start + 3];
         if let Some(counts) = &mut counts {
             counts
-                .model_mut(
-                    transform_size as usize,
-                    plane_type,
-                    reference_type,
-                    band,
-                    context,
-                )
+                .model_index_mut(transform_index, model_start / 3)
                 .record_eob_branch();
         }
         if !bits.read_bool(model[0])? {
             if let Some(counts) = &mut counts {
                 counts
-                    .model_mut(
-                        transform_size as usize,
-                        plane_type,
-                        reference_type,
-                        band,
-                        context,
-                    )
+                    .model_index_mut(transform_index, model_start / 3)
                     .record_token(3);
             }
             return Ok(CoefficientBlock {
-                values,
+                values: value_storage,
                 eob: coefficient,
             });
         }
         while !bits.read_bool(model[1])? {
             if let Some(counts) = &mut counts {
                 counts
-                    .model_mut(
-                        transform_size as usize,
-                        plane_type,
-                        reference_type,
-                        band,
-                        context,
-                    )
+                    .model_index_mut(transform_index, model_start / 3)
                     .record_token(0);
             }
             token_cache[usize::from(scan.scan[coefficient])] = 0;
             coefficient += 1;
             if coefficient == maximum {
                 return Ok(CoefficientBlock {
-                    values,
+                    values: value_storage,
                     eob: coefficient,
                 });
             }
-            context = coefficient_context(&token_cache, scan.neighbors, coefficient);
+            context = coefficient_context(token_cache, scan.neighbors, coefficient);
             band = coefficient_band(transform_size, coefficient);
-            model = coefficient_model(probabilities, plane_type, reference_type, band, context);
+            model_start = coefficient_model_start(family, band, context);
+            model = &probabilities[model_start..model_start + 3];
         }
         let (energy, magnitude) = if !bits.read_bool(model[2])? {
             if let Some(counts) = &mut counts {
                 counts
-                    .model_mut(
-                        transform_size as usize,
-                        plane_type,
-                        reference_type,
-                        band,
-                        context,
-                    )
+                    .model_index_mut(transform_index, model_start / 3)
                     .record_token(1);
             }
             (1, 1)
         } else {
             if let Some(counts) = &mut counts {
                 counts
-                    .model_mut(
-                        transform_size as usize,
-                        plane_type,
-                        reference_type,
-                        band,
-                        context,
-                    )
+                    .model_index_mut(transform_index, model_start / 3)
                     .record_token(2);
             }
             decode_large_coefficient(bits, model[2], bit_depth)?
@@ -1196,44 +1248,43 @@ pub(crate) fn decode_coefficient_tokens(
         let raster = usize::from(scan.scan[coefficient]);
         token_cache[raster] = energy;
         let quant = dequant[usize::from(coefficient != 0)];
-        let shift = u32::from(transform_size == TransformSize::Tx32x32);
-        let value = (magnitude * quant) >> shift;
+        let value = (magnitude * quant) >> quant_shift;
         values[raster] = if bits.read_bit()? { -value } else { value };
         coefficient += 1;
         if coefficient < maximum {
-            context = coefficient_context(&token_cache, scan.neighbors, coefficient);
+            context = coefficient_context(token_cache, scan.neighbors, coefficient);
         }
     }
     Ok(CoefficientBlock {
-        values,
+        values: value_storage,
         eob: coefficient,
     })
 }
 
-fn coefficient_model(
-    probabilities: &[u8; 396],
-    plane_type: usize,
-    reference_type: usize,
-    band: usize,
-    context: usize,
-) -> &[u8] {
-    let family = plane_type * 2 + reference_type;
+#[inline(always)]
+fn coefficient_model_start(family: usize, band: usize, context: usize) -> usize {
     let band_offset = if band == 0 { 0 } else { 9 + (band - 1) * 18 };
-    let start = family * 99 + band_offset + context * 3;
-    &probabilities[start..start + 3]
+    family * 99 + band_offset + context * 3
 }
 
+static COEFFICIENT_BANDS_4X4: [u8; 16] = [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+static COEFFICIENT_BANDS_LARGE: [u8; 22] = [
+    0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5,
+];
+
+#[inline(always)]
 fn coefficient_band(size: TransformSize, coefficient: usize) -> usize {
     if size == TransformSize::Tx4x4 {
-        [0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 5, 5, 5][coefficient]
+        usize::from(COEFFICIENT_BANDS_4X4[coefficient])
     } else {
-        const FIRST: [usize; 22] = [
-            0, 1, 1, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5,
-        ];
-        FIRST.get(coefficient).copied().unwrap_or(5)
+        COEFFICIENT_BANDS_LARGE
+            .get(coefficient)
+            .copied()
+            .map_or(5, usize::from)
     }
 }
 
+#[inline(always)]
 fn coefficient_context(token_cache: &[u8], neighbors: &[u16], coefficient: usize) -> usize {
     let first = usize::from(neighbors[coefficient * 2]);
     let second = usize::from(neighbors[coefficient * 2 + 1]);

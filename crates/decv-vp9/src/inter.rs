@@ -1719,7 +1719,7 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                                     .quantization
                                     .expect("decoded frame has quantization")
                                     .lossless(),
-                                &coefficients.values[..transform_size.coefficient_count()],
+                                coefficients.values(),
                             );
                         }
                     }

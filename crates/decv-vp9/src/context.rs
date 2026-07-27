@@ -60,15 +60,11 @@ impl Default for CoefficientCounts {
 }
 
 impl CoefficientCounts {
-    pub(crate) fn model_mut(
+    pub(crate) fn model_index_mut(
         &mut self,
         transform_size: usize,
-        plane_type: usize,
-        reference_type: usize,
-        band: usize,
-        context: usize,
+        model: usize,
     ) -> &mut CoefficientModelCounts {
-        let model = coefficient_model_index(plane_type, reference_type, band, context);
         &mut self.models[transform_size][model]
     }
 

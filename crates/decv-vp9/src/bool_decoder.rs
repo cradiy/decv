@@ -58,9 +58,14 @@ impl<'a> BoolDecoder<'a> {
         self.range <<= shift;
         self.value = self.value.wrapping_shl(u32::from(shift)) & 0xffff;
         self.pending_shift += shift;
-        while self.pending_shift >= 8 {
+        // `pending_shift` is below eight on entry and normalization shifts by
+        // at most seven bits, so a read can consume at most one new byte.
+        if self.pending_shift >= 8 {
             self.pending_shift -= 8;
-            let byte = if let Some(&byte) = self.data.get(self.cursor) {
+            let byte = if self.cursor < self.data.len() {
+                // SAFETY: the explicit bound check above proves the cursor is
+                // in range and avoids repeating it in the arithmetic hot path.
+                let byte = unsafe { *self.data.get_unchecked(self.cursor) };
                 self.cursor += 1;
                 byte
             } else {
@@ -72,6 +77,7 @@ impl<'a> BoolDecoder<'a> {
             };
             self.value |= u32::from(byte) << self.pending_shift;
         }
+        debug_assert!(self.pending_shift < 8);
         Ok(bit)
     }
 
