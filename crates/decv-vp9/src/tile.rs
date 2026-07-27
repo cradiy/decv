@@ -143,7 +143,7 @@ pub(crate) fn decode_intra_picture_with_context(
     compressed: &CompressedHeader,
     context: &ProbabilityContext,
     counts: &mut FrameCounts,
-) -> Result<IntraPicture> {
+) -> Result<(IntraPicture, Vec<u8>)> {
     let size = header
         .size
         .ok_or(Vp9Error::InvalidData("frame has no dimensions"))?;
@@ -159,7 +159,7 @@ pub(crate) fn decode_intra_picture_with_context(
         Some(counts),
     )?;
     apply_loop_filter(&mut picture, header, &modes)?;
-    Ok(picture)
+    Ok((picture, modes.segment_ids()))
 }
 
 /// Parses every mode and coefficient token of an intra-only Profile-0 frame.
@@ -668,14 +668,7 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
         if !segmentation.enabled || !segmentation.update_map {
             return Ok(0);
         }
-        let probabilities = segmentation.tree_probabilities;
-        let first = usize::from(self.bits.read_bool(probabilities[0])?);
-        let second_node = 1 + first;
-        let second = usize::from(self.bits.read_bool(probabilities[second_node])?);
-        let pair = first * 2 + second;
-        let leaf_node = 3 + pair;
-        let last = usize::from(self.bits.read_bool(probabilities[leaf_node])?);
-        Ok((pair * 2 + last) as u8)
+        read_segment_tree(&mut self.bits, &segmentation.tree_probabilities)
     }
 
     fn read_transform_size(
@@ -999,6 +992,16 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
             i32::from(tables::AC_QUANT_8[quant_index(qindex, ac_delta)]),
         ]
     }
+}
+
+pub(crate) fn read_segment_tree(bits: &mut BoolDecoder<'_>, probabilities: &[u8; 7]) -> Result<u8> {
+    let first = usize::from(bits.read_bool(probabilities[0])?);
+    let second_node = 1 + first;
+    let second = usize::from(bits.read_bool(probabilities[second_node])?);
+    let pair = first * 2 + second;
+    let leaf_node = 3 + pair;
+    let last = usize::from(bits.read_bool(probabilities[leaf_node])?);
+    Ok((pair * 2 + last) as u8)
 }
 
 impl ModeInfo {

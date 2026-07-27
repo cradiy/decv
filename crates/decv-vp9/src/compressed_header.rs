@@ -81,10 +81,28 @@ impl CompressedHeader {
         let mut updates = Vec::new();
 
         if transform_mode == TransformMode::Select {
-            read_updates(
+            // The bitstream orders transform probabilities from the smallest
+            // maximum transform to the largest, while ProbabilityContext
+            // stores the normative p32x32, p16x16, p8x8 struct layout.
+            read_updates_at(
                 &mut decoder,
                 ProbabilityUpdateKind::Transform,
-                2 + 4 + 6,
+                10,
+                2,
+                &mut updates,
+            )?;
+            read_updates_at(
+                &mut decoder,
+                ProbabilityUpdateKind::Transform,
+                6,
+                4,
+                &mut updates,
+            )?;
+            read_updates_at(
+                &mut decoder,
+                ProbabilityUpdateKind::Transform,
+                0,
+                6,
                 &mut updates,
             )?;
         }
@@ -252,22 +270,21 @@ fn read_motion_vector_updates(
     allow_high_precision: bool,
     updates: &mut Vec<ProbabilityUpdate>,
 ) -> Result<()> {
-    let mut index = 0;
-    read_mv_update_group(decoder, 3, &mut index, updates)?;
-    for _component in 0..2 {
-        read_mv_update_group(decoder, 1, &mut index, updates)?; // sign
-        read_mv_update_group(decoder, 10, &mut index, updates)?; // classes
-        read_mv_update_group(decoder, 1, &mut index, updates)?; // class zero
-        read_mv_update_group(decoder, 10, &mut index, updates)?; // integer bits
+    read_mv_update_group(decoder, 0, 3, updates)?;
+    for component in 0..2 {
+        let component_start = 3 + component * 33;
+        // sign, classes, class-zero, and integer bits.
+        read_mv_update_group(decoder, component_start, 22, updates)?;
     }
-    for _component in 0..2 {
-        read_mv_update_group(decoder, 2 * 3, &mut index, updates)?; // class-zero fractions
-        read_mv_update_group(decoder, 3, &mut index, updates)?; // fractions
+    for component in 0..2 {
+        let component_start = 3 + component * 33;
+        // Two class-zero fractional trees followed by the general tree.
+        read_mv_update_group(decoder, component_start + 22, 9, updates)?;
     }
     if allow_high_precision {
-        for _component in 0..2 {
-            read_mv_update_group(decoder, 1, &mut index, updates)?;
-            read_mv_update_group(decoder, 1, &mut index, updates)?;
+        for component in 0..2 {
+            let component_start = 3 + component * 33;
+            read_mv_update_group(decoder, component_start + 31, 2, updates)?;
         }
     }
     Ok(())
@@ -275,21 +292,20 @@ fn read_motion_vector_updates(
 
 fn read_mv_update_group(
     decoder: &mut BoolDecoder<'_>,
+    start_index: usize,
     count: usize,
-    index: &mut usize,
     updates: &mut Vec<ProbabilityUpdate>,
 ) -> Result<()> {
-    for _ in 0..count {
+    for index in start_index..start_index + count {
         if decoder.read_bool(DIFF_UPDATE_PROBABILITY)? {
             let replacement = (decoder.read_literal(7)? as u8) << 1 | 1;
             updates.push(ProbabilityUpdate {
                 kind: ProbabilityUpdateKind::MotionVector,
-                index: *index,
+                index,
                 coded_value: replacement,
                 replacement: Some(replacement),
             });
         }
-        *index += 1;
     }
     Ok(())
 }

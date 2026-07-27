@@ -94,8 +94,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 hidden_frames += 1;
             }
             if coded_frames <= 4 {
+                let segmentation = header.segmentation.as_ref();
                 println!(
-                    "frame={} sample={} type={:?} show={} existing={:?} size={:?} header={}/{} tiles={}x{} base_q={} loop={} segmentation={} refresh={:#04x} refs={:?} hp_mv={} ctx={}/reset{} refresh_ctx={} parallel={}",
+                    "frame={} sample={} type={:?} show={} existing={:?} size={:?} header={}/{} tiles={}x{} base_q={} loop={} segmentation={}/{}/{} refresh={:#04x} refs={:?} hp_mv={} ctx={}/reset{} refresh_ctx={} parallel={}",
                     coded_frames - 1,
                     sample_index,
                     header.frame_type,
@@ -110,10 +111,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .quantization
                         .map_or(0, |quantization| quantization.base_q_idx),
                     header.loop_filter.as_ref().map_or(0, |filter| filter.level),
-                    header
-                        .segmentation
-                        .as_ref()
-                        .is_some_and(|segmentation| segmentation.enabled),
+                    segmentation.is_some_and(|segmentation| segmentation.enabled),
+                    segmentation.is_some_and(|segmentation| segmentation.update_map),
+                    segmentation.is_some_and(|segmentation| segmentation.temporal_update),
                     header.refresh_frame_flags,
                     header.reference_indices,
                     header.allow_high_precision_motion_vectors,

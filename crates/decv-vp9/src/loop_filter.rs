@@ -42,6 +42,10 @@ impl FilterModeMap {
     fn get(&self, row: usize, column: usize) -> FilterMode {
         self.modes[row * self.mi_columns + column]
     }
+
+    pub(crate) fn segment_ids(&self) -> Vec<u8> {
+        self.modes.iter().map(|mode| mode.segment_id).collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]

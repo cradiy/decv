@@ -301,15 +301,25 @@ impl IntraPicture {
         kernel: &[i16; 128],
         average: bool,
     ) {
-        let plane_width = if plane == 0 {
+        let reference_plane_width = if plane == 0 {
             reference.width
         } else {
             reference.width.div_ceil(2)
         };
-        let plane_height = if plane == 0 {
+        let reference_plane_height = if plane == 0 {
             reference.height
         } else {
             reference.height.div_ceil(2)
+        };
+        let plane_width = if plane == 0 {
+            self.width
+        } else {
+            self.width.div_ceil(2)
+        };
+        let plane_height = if plane == 0 {
+            self.height
+        } else {
+            self.height.div_ceil(2)
         };
         let plane_origin_x = self.origin_x >> usize::from(plane != 0);
         let target_x = x
@@ -327,6 +337,22 @@ impl IntraPicture {
         if output_width == 0 || output_height == 0 {
             return;
         }
+        if reference.width != self.width || reference.height != self.height {
+            self.predict_inter_scaled(
+                reference,
+                plane,
+                x,
+                y,
+                target_x,
+                output_width,
+                output_height,
+                motion_row_q4,
+                motion_column_q4,
+                kernel,
+                average,
+            );
+            return;
+        }
 
         let integer_x = motion_column_q4 >> 4;
         let integer_y = motion_row_q4 >> 4;
@@ -337,8 +363,10 @@ impl IntraPicture {
         let source_stride = reference.strides[plane];
         let source = &reference.planes[plane];
         let sample = |source_x: i32, source_y: i32| -> u8 {
-            let source_x = source_x.clamp(0, plane_width.saturating_sub(1) as i32) as usize;
-            let source_y = source_y.clamp(0, plane_height.saturating_sub(1) as i32) as usize;
+            let source_x =
+                source_x.clamp(0, reference_plane_width.saturating_sub(1) as i32) as usize;
+            let source_y =
+                source_y.clamp(0, reference_plane_height.saturating_sub(1) as i32) as usize;
             source[source_y * source_stride + source_x]
         };
         let origin_x = x as i32 + integer_x;
@@ -350,8 +378,8 @@ impl IntraPicture {
             (true, true) => {
                 let source_in_bounds = origin_x >= 0
                     && origin_y >= 0
-                    && origin_x as usize + output_width <= plane_width
-                    && origin_y as usize + output_height <= plane_height;
+                    && origin_x as usize + output_width <= reference_plane_width
+                    && origin_y as usize + output_height <= reference_plane_height;
                 if source_in_bounds {
                     let source_x = origin_x as usize;
                     let source_y = origin_y as usize;
@@ -382,8 +410,8 @@ impl IntraPicture {
             (false, true) => {
                 let source_in_bounds = origin_x >= 3
                     && origin_y >= 0
-                    && origin_x as usize + output_width + 4 <= plane_width
-                    && origin_y as usize + output_height <= plane_height;
+                    && origin_x as usize + output_width + 4 <= reference_plane_width
+                    && origin_y as usize + output_height <= reference_plane_height;
                 if source_in_bounds {
                     let source_x = origin_x as usize - 3;
                     let source_y = origin_y as usize;
@@ -423,8 +451,8 @@ impl IntraPicture {
             (true, false) => {
                 let source_in_bounds = origin_x >= 0
                     && origin_y >= 3
-                    && origin_x as usize + output_width <= plane_width
-                    && origin_y as usize + output_height + 4 <= plane_height;
+                    && origin_x as usize + output_width <= reference_plane_width
+                    && origin_y as usize + output_height + 4 <= reference_plane_height;
                 if source_in_bounds {
                     let source_x = origin_x as usize;
                     let source_y = origin_y as usize - 3;
@@ -470,8 +498,8 @@ impl IntraPicture {
                 let mut temporary = [0u8; MAXIMUM_INTERMEDIATE_SAMPLES];
                 let source_in_bounds = origin_x >= 3
                     && origin_y >= 3
-                    && origin_x as usize + output_width + 4 <= plane_width
-                    && origin_y as usize + output_height + 4 <= plane_height;
+                    && origin_x as usize + output_width + 4 <= reference_plane_width
+                    && origin_y as usize + output_height + 4 <= reference_plane_height;
                 if source_in_bounds {
                     let source_x = origin_x as usize - 3;
                     let source_y = origin_y as usize - 3;
@@ -516,6 +544,78 @@ impl IntraPicture {
                         average,
                     );
                 }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn predict_inter_scaled(
+        &mut self,
+        reference: &Self,
+        plane: usize,
+        x: usize,
+        y: usize,
+        target_x: usize,
+        output_width: usize,
+        output_height: usize,
+        motion_row_q4: i32,
+        motion_column_q4: i32,
+        kernel: &[i16; 128],
+        average: bool,
+    ) {
+        const REF_SCALE_SHIFT: u32 = 14;
+        let x_scale = ((reference.width as i64) << REF_SCALE_SHIFT) / self.width as i64;
+        let y_scale = ((reference.height as i64) << REF_SCALE_SHIFT) / self.height as i64;
+        let scale = |value: i64, factor: i64| (value * factor) >> REF_SCALE_SHIFT;
+        let start_x_q4 =
+            scale(x as i64 * 16, x_scale) + scale(i64::from(motion_column_q4), x_scale);
+        let start_y_q4 = scale(y as i64 * 16, y_scale) + scale(i64::from(motion_row_q4), y_scale);
+        let x_step_q4 = scale(16, x_scale);
+        let y_step_q4 = scale(16, y_scale);
+
+        let source_width = if plane == 0 {
+            reference.width
+        } else {
+            reference.width.div_ceil(2)
+        };
+        let source_height = if plane == 0 {
+            reference.height
+        } else {
+            reference.height.div_ceil(2)
+        };
+        let source_stride = reference.strides[plane];
+        let source = &reference.planes[plane];
+        let sample = |source_x: i64, source_y: i64| -> u8 {
+            let source_x = source_x.clamp(0, source_width.saturating_sub(1) as i64) as usize;
+            let source_y = source_y.clamp(0, source_height.saturating_sub(1) as i64) as usize;
+            source[source_y * source_stride + source_x]
+        };
+
+        let target_stride = self.strides[plane];
+        let target = Arc::make_mut(&mut self.planes[plane]);
+        for row in 0..output_height {
+            let source_y_q4 = start_y_q4 + row as i64 * y_step_q4;
+            let integer_y = source_y_q4 >> 4;
+            let filter_y = &kernel[(source_y_q4 & 15) as usize * 8..][..8];
+            for column in 0..output_width {
+                let source_x_q4 = start_x_q4 + column as i64 * x_step_q4;
+                let integer_x = source_x_q4 >> 4;
+                let filter_x = &kernel[(source_x_q4 & 15) as usize * 8..][..8];
+                let mut vertical_sum = 0i32;
+                for (vertical_tap, &vertical_coefficient) in filter_y.iter().enumerate() {
+                    let source_y = integer_y + vertical_tap as i64 - 3;
+                    let mut horizontal_sum = 0i32;
+                    for (horizontal_tap, &horizontal_coefficient) in filter_x.iter().enumerate() {
+                        let source_x = integer_x + horizontal_tap as i64 - 3;
+                        horizontal_sum += i32::from(horizontal_coefficient)
+                            * i32::from(sample(source_x, source_y));
+                    }
+                    let horizontal = ((horizontal_sum + 64) >> 7).clamp(0, 255);
+                    vertical_sum += i32::from(vertical_coefficient) * horizontal;
+                }
+                let prediction = ((vertical_sum + 64) >> 7).clamp(0, 255) as u8;
+                let index = (y + row) * target_stride + target_x + column;
+                write_prediction(&mut target[index], prediction, average);
             }
         }
     }
@@ -1056,7 +1156,7 @@ fn intra_predict(
 
 #[cfg(test)]
 mod tests {
-    use super::{IntraMode, intra_predict};
+    use super::{IntraMode, IntraPicture, intra_predict};
 
     #[test]
     fn vertical_prediction_repeats_top_row() {
@@ -1072,6 +1172,27 @@ mod tests {
             true,
         );
         assert_eq!(target, [1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn scaled_inter_prediction_maps_reference_coordinates() {
+        let mut reference = IntraPicture::new(4, 4);
+        reference.planes_mut()[0]
+            .copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        let mut target = IntraPicture::new(8, 8);
+        let mut nearest_kernel = [0i16; 128];
+        for phase in 0..16 {
+            nearest_kernel[phase * 8 + 3] = 128;
+        }
+        target.predict_inter(&reference, 0, 0, 0, 8, 8, 0, 0, &nearest_kernel, false);
+        assert_eq!(
+            target.plane(0),
+            &[
+                1, 1, 2, 2, 3, 3, 4, 4, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 5, 5, 6, 6,
+                7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13, 14,
+                14, 15, 15, 16, 16, 13, 13, 14, 14, 15, 15, 16, 16,
+            ]
+        );
     }
 
     #[test]

@@ -8,8 +8,8 @@ use crate::{
     reconstruct::IntraPicture,
     tables,
     tile::{
-        TileLayout, decode_coefficient_tokens, floor_transform, read_intra_mode, scan_order,
-        tile_offsets,
+        TileLayout, decode_coefficient_tokens, floor_transform, read_intra_mode, read_segment_tree,
+        scan_order, tile_offsets,
     },
 };
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -38,8 +38,10 @@ impl InterSyntaxSummary {
         }
         let mut context = ProbabilityContext::default();
         context.apply(compressed)?;
-        parse_inter_syntax(frame, header, compressed, &context, None, None, None, None)
-            .map(|(summary, _)| summary)
+        parse_inter_syntax(
+            frame, header, compressed, &context, None, None, None, None, None,
+        )
+        .map(|(summary, _)| summary)
     }
 }
 
@@ -68,10 +70,10 @@ pub fn decode_inter_picture(
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
     if references
         .iter()
-        .any(|reference| reference.width() != width || reference.height() != height)
+        .any(|reference| !valid_reference_size(reference, width, height))
     {
         return Err(Vp9Error::UnsupportedFeature(
-            "scaled VP9 references are not reconstructed yet",
+            "VP9 reference dimensions exceed the normative scaling range",
         ));
     }
     let mut context = ProbabilityContext::default();
@@ -86,11 +88,13 @@ pub fn decode_inter_picture(
         Some(references),
         None,
         None,
+        None,
     )?;
     apply_loop_filter(&mut picture, header, &modes.loop_filter_map()?)?;
     Ok(picture)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn decode_inter_picture_with_context(
     frame: &[u8],
     header: &FrameHeader,
@@ -99,12 +103,21 @@ pub(crate) fn decode_inter_picture_with_context(
     references: [&IntraPicture; 3],
     counts: &mut FrameCounts,
     previous_modes: Option<&InterModeMap>,
+    previous_segment_ids: Option<&[u8]>,
 ) -> Result<(IntraPicture, InterModeMap)> {
     let size = header
         .size
         .ok_or(Vp9Error::InvalidData("frame has no dimensions"))?;
     let width = usize::try_from(size.width).map_err(|_| Vp9Error::IntegerOverflow)?;
     let height = usize::try_from(size.height).map_err(|_| Vp9Error::IntegerOverflow)?;
+    if references
+        .iter()
+        .any(|reference| !valid_reference_size(reference, width, height))
+    {
+        return Err(Vp9Error::UnsupportedFeature(
+            "VP9 reference dimensions exceed the normative scaling range",
+        ));
+    }
     let mut picture = IntraPicture::new(width, height);
     let (_, modes) = parse_inter_syntax(
         frame,
@@ -115,6 +128,7 @@ pub(crate) fn decode_inter_picture_with_context(
         Some(references),
         Some(counts),
         previous_modes,
+        previous_segment_ids,
     )?;
     apply_loop_filter(&mut picture, header, &modes.loop_filter_map()?)?;
     Ok((picture, modes))
@@ -203,6 +217,8 @@ enum Interpolation {
 #[derive(Debug, Clone, Copy)]
 struct ModeInfo {
     block_size: BlockSize,
+    segment_id: u8,
+    segment_id_predicted: bool,
     skip: bool,
     transform_size: TransformSize,
     is_inter: bool,
@@ -227,18 +243,29 @@ pub(crate) struct InterModeMap {
     mi_columns: usize,
     mi_rows: usize,
     modes: Vec<Option<ModeInfo>>,
+    segment_ids: Vec<u8>,
 }
 
 impl InterModeMap {
-    pub(crate) fn intra(width: u32, height: u32) -> Result<Self> {
+    pub(crate) fn intra(width: u32, height: u32, segment_ids: Vec<u8>) -> Result<Self> {
         let mi_columns =
             usize::try_from(width.div_ceil(8)).map_err(|_| Vp9Error::IntegerOverflow)?;
         let mi_rows = usize::try_from(height.div_ceil(8)).map_err(|_| Vp9Error::IntegerOverflow)?;
+        if segment_ids.len() != mi_columns.saturating_mul(mi_rows) {
+            return Err(Vp9Error::InvalidData(
+                "intra segment map dimensions do not match the frame",
+            ));
+        }
         Ok(Self {
             mi_columns,
             mi_rows,
             modes: vec![None; mi_columns * mi_rows],
+            segment_ids,
         })
+    }
+
+    pub(crate) fn segment_ids(&self) -> &[u8] {
+        &self.segment_ids
     }
 
     fn loop_filter_map(&self) -> Result<FilterModeMap> {
@@ -263,7 +290,7 @@ impl InterModeMap {
                     block_size: mode.block_size,
                     transform_size: mode.transform_size,
                     skip: mode.skip,
-                    segment_id: 0,
+                    segment_id: mode.segment_id,
                     reference,
                     mode_class,
                 })
@@ -283,6 +310,7 @@ fn parse_inter_syntax(
     references: Option<[&IntraPicture; 3]>,
     mut counts: Option<&mut FrameCounts>,
     previous_modes: Option<&InterModeMap>,
+    previous_segment_ids: Option<&[u8]>,
 ) -> Result<(InterSyntaxSummary, InterModeMap)> {
     let size = header
         .size
@@ -298,8 +326,14 @@ fn parse_inter_syntax(
             "previous mode map dimensions do not match the frame",
         ));
     }
+    if previous_segment_ids.is_some_and(|segments| segments.len() != mi_columns * mi_rows) {
+        return Err(Vp9Error::InvalidData(
+            "previous segment map dimensions do not match the frame",
+        ));
+    }
     let layout = TileLayout::parse(frame, header)?;
     let mut modes = vec![None; mi_columns * mi_rows];
+    let mut segment_ids = vec![0; mi_columns * mi_rows];
     let mut summary = InterSyntaxSummary::default();
 
     if layout.rows() == 1
@@ -314,6 +348,7 @@ fn parse_inter_syntax(
             references,
             counts,
             previous_modes,
+            previous_segment_ids,
             &layout,
             picture,
             mi_columns,
@@ -339,10 +374,12 @@ fn parse_inter_syntax(
             column_start,
             column_end,
             &mut modes,
+            &mut segment_ids,
             picture.as_deref_mut(),
             references,
             counts.as_deref_mut(),
             previous_modes.map(|modes| modes.modes.as_slice()),
+            previous_segment_ids,
         )?;
         match decoder.parse() {
             Ok(tile_summary) => summary += tile_summary,
@@ -362,6 +399,7 @@ fn parse_inter_syntax(
             mi_columns,
             mi_rows,
             modes,
+            segment_ids,
         },
     ))
 }
@@ -375,6 +413,7 @@ fn parse_inter_tiles_parallel(
     references: Option<[&IntraPicture; 3]>,
     mut counts: Option<&mut FrameCounts>,
     previous_modes: Option<&InterModeMap>,
+    previous_segment_ids: Option<&[u8]>,
     layout: &TileLayout,
     picture: &mut IntraPicture,
     mi_columns: usize,
@@ -383,6 +422,7 @@ fn parse_inter_tiles_parallel(
     struct TileResult {
         summary: InterSyntaxSummary,
         modes: Vec<Option<ModeInfo>>,
+        segment_ids: Vec<u8>,
         counts: FrameCounts,
         picture: IntraPicture,
         column_start: usize,
@@ -407,6 +447,7 @@ fn parse_inter_tiles_parallel(
                     let mut tile_picture =
                         IntraPicture::new_strip(width, height, origin_x, end_x - origin_x);
                     let mut tile_modes = vec![None; mi_columns * mi_rows];
+                    let mut tile_segment_ids = vec![0; mi_columns * mi_rows];
                     let mut tile_counts = FrameCounts::default();
                     let mut decoder = InterTileDecoder::new(
                         tile,
@@ -420,10 +461,12 @@ fn parse_inter_tiles_parallel(
                         column_start,
                         column_end,
                         &mut tile_modes,
+                        &mut tile_segment_ids,
                         Some(&mut tile_picture),
                         references,
                         collect_counts.then_some(&mut tile_counts),
                         previous_modes.map(|modes| modes.modes.as_slice()),
+                        previous_segment_ids,
                     )?;
                     let summary = match decoder.parse() {
                         Ok(summary) => summary,
@@ -439,6 +482,7 @@ fn parse_inter_tiles_parallel(
                     Ok(TileResult {
                         summary,
                         modes: tile_modes,
+                        segment_ids: tile_segment_ids,
                         counts: tile_counts,
                         picture: tile_picture,
                         column_start,
@@ -460,6 +504,7 @@ fn parse_inter_tiles_parallel(
 
     let mut summary = InterSyntaxSummary::default();
     let mut modes = vec![None; mi_columns * mi_rows];
+    let mut segment_ids = vec![0; mi_columns * mi_rows];
     for tile in tile_results {
         summary += tile.summary;
         if let Some(counts) = &mut counts {
@@ -469,6 +514,7 @@ fn parse_inter_tiles_parallel(
             let start = row * mi_columns + tile.column_start;
             let end = row * mi_columns + tile.column_end;
             modes[start..end].copy_from_slice(&tile.modes[start..end]);
+            segment_ids[start..end].copy_from_slice(&tile.segment_ids[start..end]);
         }
         picture.copy_strip_from(&tile.picture);
     }
@@ -478,6 +524,7 @@ fn parse_inter_tiles_parallel(
             mi_columns,
             mi_rows,
             modes,
+            segment_ids,
         },
     ))
 }
@@ -508,6 +555,7 @@ struct InterTileDecoder<'a, 'state> {
     column_start: usize,
     column_end: usize,
     modes: &'state mut [Option<ModeInfo>],
+    segment_ids: &'state mut [u8],
     above_partition: Vec<u8>,
     left_partition: [u8; 8],
     above_coefficients: [Vec<u8>; 3],
@@ -517,6 +565,7 @@ struct InterTileDecoder<'a, 'state> {
     references: Option<[&'state IntraPicture; 3]>,
     counts: Option<&'state mut FrameCounts>,
     previous_modes: Option<&'state [Option<ModeInfo>]>,
+    previous_segment_ids: Option<&'state [u8]>,
 }
 
 impl<'a, 'state> InterTileDecoder<'a, 'state> {
@@ -533,10 +582,12 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
         column_start: usize,
         column_end: usize,
         modes: &'state mut [Option<ModeInfo>],
+        segment_ids: &'state mut [u8],
         picture: Option<&'state mut IntraPicture>,
         references: Option<[&'state IntraPicture; 3]>,
         counts: Option<&'state mut FrameCounts>,
         previous_modes: Option<&'state [Option<ModeInfo>]>,
+        previous_segment_ids: Option<&'state [u8]>,
     ) -> Result<Self> {
         Ok(Self {
             bits: BoolDecoder::new(tile)?,
@@ -550,6 +601,7 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
             column_start,
             column_end,
             modes,
+            segment_ids,
             above_partition: vec![0; mi_columns],
             left_partition: [0; 8],
             above_coefficients: [
@@ -563,6 +615,7 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
             references,
             counts,
             previous_modes,
+            previous_segment_ids,
         })
     }
 
@@ -796,24 +849,39 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
     ) -> Result<ModeInfo> {
         let above = self.mode_above(mi_row, mi_column);
         let left = self.mode_left(mi_row, mi_column);
+        let (segment_id, segment_id_predicted) =
+            self.read_segment_id(mi_row, mi_column, block_size, above, left)?;
+        let segment_skip = segment_feature(self.header, segment_id, 3).is_some();
         let skip_context = usize::from(above.is_some_and(|mode| mode.skip))
             + usize::from(left.is_some_and(|mode| mode.skip));
-        let skip = self.bits.read_bool(self.context.skip[skip_context])?;
-        if let Some(counts) = &mut self.counts {
-            counts.skip[skip_context][usize::from(skip)] += 1;
-        }
-        let intra_inter_context = intra_inter_context(above, left);
-        let is_inter = self
-            .bits
-            .read_bool(self.context.intra_inter[intra_inter_context])?;
-        if let Some(counts) = &mut self.counts {
-            counts.intra_inter[intra_inter_context][usize::from(is_inter)] += 1;
-        }
+        let skip = if segment_skip {
+            true
+        } else {
+            let skip = self.bits.read_bool(self.context.skip[skip_context])?;
+            if let Some(counts) = &mut self.counts {
+                counts.skip[skip_context][usize::from(skip)] += 1;
+            }
+            skip
+        };
+        let is_inter = if let Some(reference) = segment_feature(self.header, segment_id, 2) {
+            reference != 0
+        } else {
+            let intra_inter_context = intra_inter_context(above, left);
+            let is_inter = self
+                .bits
+                .read_bool(self.context.intra_inter[intra_inter_context])?;
+            if let Some(counts) = &mut self.counts {
+                counts.intra_inter[intra_inter_context][usize::from(is_inter)] += 1;
+            }
+            is_inter
+        };
         let transform_size =
             self.read_transform_size(block_size, !skip || !is_inter, above, left)?;
 
         let mut mode = ModeInfo {
             block_size,
+            segment_id,
+            segment_id_predicted,
             skip,
             transform_size,
             is_inter,
@@ -827,9 +895,15 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
             sub_motion_vectors: [[MotionVector::ZERO; 2]; 4],
         };
         if is_inter {
-            mode.references = self.read_references(above, left)?;
+            mode.references = self.read_references(segment_id, above, left)?;
             let mode_context = self.inter_mode_context(mi_row, mi_column, block_size);
-            if block_size >= BlockSize::B8x8 {
+            if segment_skip {
+                if block_size < BlockSize::B8x8 {
+                    return Err(Vp9Error::InvalidData(
+                        "segment skip feature is invalid for sub-8x8 blocks",
+                    ));
+                }
+            } else if block_size >= BlockSize::B8x8 {
                 mode.inter_mode =
                     read_inter_mode(&mut self.bits, &self.context.inter_mode[mode_context * 3..])?;
                 if let Some(counts) = &mut self.counts {
@@ -875,6 +949,68 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
             }
         }
         Ok(mode)
+    }
+
+    fn read_segment_id(
+        &mut self,
+        mi_row: usize,
+        mi_column: usize,
+        block_size: BlockSize,
+        above: Option<ModeInfo>,
+        left: Option<ModeInfo>,
+    ) -> Result<(u8, bool)> {
+        let row_end = (mi_row + block_size.height_mi()).min(self.mi_rows);
+        let column_end = (mi_column + block_size.width_mi()).min(self.mi_columns);
+        let Some(segmentation) = self
+            .header
+            .segmentation
+            .as_ref()
+            .filter(|segmentation| segmentation.enabled)
+        else {
+            return Ok((0, false));
+        };
+
+        let mi_columns = self.mi_columns;
+        let predicted = self.previous_segment_ids.map_or(0, |segments| {
+            (mi_row..row_end)
+                .flat_map(|row| {
+                    (mi_column..column_end).map(move |column| segments[row * mi_columns + column])
+                })
+                .min()
+                .unwrap_or(0)
+        });
+
+        if !segmentation.update_map {
+            for row in mi_row..row_end {
+                for column in mi_column..column_end {
+                    let index = row * self.mi_columns + column;
+                    self.segment_ids[index] = self
+                        .previous_segment_ids
+                        .map_or(0, |segments| segments[index]);
+                }
+            }
+            return Ok((predicted, false));
+        }
+
+        let segment_id_predicted = if segmentation.temporal_update {
+            let context = usize::from(above.is_some_and(|mode| mode.segment_id_predicted))
+                + usize::from(left.is_some_and(|mode| mode.segment_id_predicted));
+            self.bits
+                .read_bool(segmentation.prediction_probabilities[context])?
+        } else {
+            false
+        };
+        let segment_id = if segment_id_predicted {
+            predicted
+        } else {
+            read_segment_tree(&mut self.bits, &segmentation.tree_probabilities)?
+        };
+        for row in mi_row..row_end {
+            for column in mi_column..column_end {
+                self.segment_ids[row * self.mi_columns + column] = segment_id;
+            }
+        }
+        Ok((segment_id, segment_id_predicted))
     }
 
     fn read_inter_intra_mode(&mut self, group: usize) -> Result<IntraMode> {
@@ -968,9 +1104,25 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
 
     fn read_references(
         &mut self,
+        segment_id: u8,
         above: Option<ModeInfo>,
         left: Option<ModeInfo>,
     ) -> Result<[ReferenceFrame; 2]> {
+        if let Some(reference) = segment_feature(self.header, segment_id, 2) {
+            return Ok([
+                match reference {
+                    1 => ReferenceFrame::Last,
+                    2 => ReferenceFrame::Golden,
+                    3 => ReferenceFrame::Alt,
+                    _ => {
+                        return Err(Vp9Error::InvalidData(
+                            "inter segment forces an invalid reference frame",
+                        ));
+                    }
+                },
+                ReferenceFrame::None,
+            ]);
+        }
         let (fixed, variables) = compound_references(self.header);
         let compound = match self.compressed.reference_mode {
             ReferenceMode::Single => false,
@@ -1444,8 +1596,9 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
             let usable_width = block_width.min(plane_width.saturating_sub(origin_x));
             let usable_height = block_height.min(plane_height.saturating_sub(origin_y));
             if mode.skip {
-                self.above_coefficients[plane][origin_x..origin_x + usable_width].fill(0);
-                for row in origin_y..origin_y + usable_height {
+                let above_end = (origin_x + block_width).min(self.above_coefficients[plane].len());
+                self.above_coefficients[plane][origin_x..above_end].fill(0);
+                for row in origin_y..origin_y + block_height {
                     self.left_coefficients[plane][row & 15] = 0;
                 }
                 if !mode.is_inter {
@@ -1502,7 +1655,7 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                             mode,
                         );
                     }
-                    let dequant = dequant(self.header, plane, 0);
+                    let dequant = dequant(self.header, plane, usize::from(mode.segment_id));
                     let coefficients = decode_coefficient_tokens(
                         &mut self.bits,
                         &self.context.coefficient[transform_size as usize],
@@ -1517,9 +1670,14 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                             .map(|counts| &mut counts.coefficient),
                     )?;
                     let nonzero = u8::from(coefficients.eob != 0);
-                    self.above_coefficients[plane][x..x + step].fill(nonzero);
-                    for index in y..y + step {
-                        self.left_coefficients[plane][index & 15] = nonzero;
+                    let valid_width = step.min(usable_width - column);
+                    let above_end = (x + step).min(self.above_coefficients[plane].len());
+                    self.above_coefficients[plane][x..x + valid_width].fill(nonzero);
+                    self.above_coefficients[plane][x + valid_width..above_end].fill(0);
+                    let valid_height = step.min(usable_height - row);
+                    for offset in 0..step {
+                        self.left_coefficients[plane][(y + offset) & 15] =
+                            if offset < valid_height { nonzero } else { 0 };
                     }
                     self.summary.transform_blocks += 1;
                     self.summary.nonzero_transform_blocks += usize::from(nonzero);
@@ -1607,6 +1765,22 @@ fn reference_bias(header: &FrameHeader, reference: ReferenceFrame) -> bool {
         ReferenceFrame::Alt => header.reference_sign_bias[2],
         _ => false,
     }
+}
+
+fn segment_feature(header: &FrameHeader, segment_id: u8, feature: usize) -> Option<i16> {
+    let segmentation = header
+        .segmentation
+        .as_ref()
+        .filter(|segmentation| segmentation.enabled)?;
+    let feature = segmentation.features[usize::from(segment_id)][feature];
+    feature.enabled.then_some(feature.value)
+}
+
+fn valid_reference_size(reference: &IntraPicture, width: usize, height: usize) -> bool {
+    width.saturating_mul(2) >= reference.width()
+        && height.saturating_mul(2) >= reference.height()
+        && width <= reference.width().saturating_mul(16)
+        && height <= reference.height().saturating_mul(16)
 }
 
 fn reference_mode_context(

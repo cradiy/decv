@@ -128,18 +128,32 @@ impl Vp9Decoder {
             && !self.previous_was_intra_only
             && self.previous_was_shown
             && self.previous_frame_type != Some(FrameType::Key);
+        let previous_segment_ids = (self.previous_size == Some(current_size))
+            .then(|| self.previous_modes.as_ref().map(InterModeMap::segment_ids))
+            .flatten();
 
         let (picture, mode_map) = if header.intra_only {
-            let picture = decode_intra_picture_with_context(
+            let (picture, decoded_segment_ids) = decode_intra_picture_with_context(
                 frame,
                 &header,
                 &compressed,
                 &current_context,
                 &mut counts,
             )?;
+            let segment_ids = if header
+                .segmentation
+                .as_ref()
+                .is_some_and(|segmentation| segmentation.enabled && !segmentation.update_map)
+            {
+                previous_segment_ids
+                    .map(<[u8]>::to_vec)
+                    .unwrap_or_else(|| vec![0; decoded_segment_ids.len()])
+            } else {
+                decoded_segment_ids
+            };
             (
                 picture,
-                InterModeMap::intra(current_size.0, current_size.1)?,
+                InterModeMap::intra(current_size.0, current_size.1, segment_ids)?,
             )
         } else {
             let references = self.resolve_references(&header)?;
@@ -153,6 +167,7 @@ impl Vp9Decoder {
                 use_previous_modes
                     .then_some(self.previous_modes.as_ref())
                     .flatten(),
+                previous_segment_ids,
             )?
         };
         let picture = Arc::new(picture);
