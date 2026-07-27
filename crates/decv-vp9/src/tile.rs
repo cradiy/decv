@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::{
-    CompressedHeader, FrameHeader, Result, TransformMode, Vp9Error,
+    BitDepth, CompressedHeader, FrameHeader, Result, TransformMode, Vp9Error,
     block::{BlockSize, IntraMode, Partition, TransformSize, TransformType},
     bool_decoder::BoolDecoder,
     context::{CoefficientCounts, FrameCounts, ProbabilityContext},
@@ -959,6 +959,7 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
             scan,
             transform_size,
             dequant,
+            self.header.bit_depth(),
             self.counts
                 .as_deref_mut()
                 .map(|counts| &mut counts.coefficient),
@@ -1103,6 +1104,7 @@ pub(crate) fn decode_coefficient_tokens(
     scan: CoefficientScan,
     transform_size: TransformSize,
     dequant: [i32; 2],
+    bit_depth: BitDepth,
     mut counts: Option<&mut CoefficientCounts>,
 ) -> Result<CoefficientBlock> {
     let maximum = transform_size.coefficient_count();
@@ -1189,7 +1191,7 @@ pub(crate) fn decode_coefficient_tokens(
                     )
                     .record_token(2);
             }
-            decode_large_coefficient(bits, model[2])?
+            decode_large_coefficient(bits, model[2], bit_depth)?
         };
         let raster = usize::from(scan.scan[coefficient]);
         token_cache[raster] = energy;
@@ -1241,6 +1243,7 @@ fn coefficient_context(token_cache: &[u8], neighbors: &[u16], coefficient: usize
 fn decode_large_coefficient(
     bits: &mut BoolDecoder<'_>,
     pivot_probability: u8,
+    bit_depth: BitDepth,
 ) -> Result<(u8, i32)> {
     let pivot = usize::from(pivot_probability.saturating_sub(1));
     let probabilities = &tables::PARETO8[pivot * 8..pivot * 8 + 8];
@@ -1259,7 +1262,7 @@ fn decode_large_coefficient(
     } else {
         if bits.read_bool(probabilities[5])? {
             if bits.read_bool(probabilities[7])? {
-                Ok((5, 67 + read_category(bits, &tables::CAT6)?))
+                Ok((5, 67 + read_category(bits, cat6_probabilities(bit_depth))?))
             } else {
                 Ok((5, 35 + read_category(bits, &tables::CAT5)?))
             }
@@ -1268,6 +1271,14 @@ fn decode_large_coefficient(
         } else {
             Ok((5, 11 + read_category(bits, &tables::CAT3)?))
         }
+    }
+}
+
+fn cat6_probabilities(bit_depth: BitDepth) -> &'static [u8] {
+    match bit_depth {
+        BitDepth::Eight => &tables::CAT6,
+        BitDepth::Ten => &tables::CAT6_HIGH_12[2..],
+        BitDepth::Twelve => &tables::CAT6_HIGH_12,
     }
 }
 
@@ -1281,12 +1292,25 @@ fn read_category(bits: &mut BoolDecoder<'_>, probabilities: &[u8]) -> Result<i32
 
 #[cfg(test)]
 mod tests {
-    use super::tile_offsets;
+    use super::{cat6_probabilities, tile_offsets};
+    use crate::BitDepth;
 
     #[test]
     fn aligns_tile_boundaries_to_superblocks() {
         assert_eq!(tile_offsets(0, 480, 3), (0, 56));
         assert_eq!(tile_offsets(1, 480, 3), (56, 120));
         assert_eq!(tile_offsets(7, 480, 3), (416, 480));
+    }
+
+    #[test]
+    fn category_six_probability_width_tracks_sample_depth() {
+        assert_eq!(cat6_probabilities(BitDepth::Eight).len(), 14);
+        assert_eq!(cat6_probabilities(BitDepth::Ten).len(), 16);
+        assert_eq!(cat6_probabilities(BitDepth::Twelve).len(), 18);
+        assert_eq!(cat6_probabilities(BitDepth::Ten)[..2], [255, 255]);
+        assert_eq!(
+            &cat6_probabilities(BitDepth::Twelve)[4..],
+            cat6_probabilities(BitDepth::Eight)
+        );
     }
 }

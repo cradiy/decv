@@ -1305,8 +1305,9 @@ fn predict_plane<T: Sample>(
     bit_depth: BitDepth,
 ) {
     let shift = u32::from(bit_depth.bits() - 8);
-    let unavailable_above = T::from_u32(127 << shift);
-    let unavailable_left = T::from_u32(129 << shift);
+    let prediction_base = 128 << shift;
+    let unavailable_above = T::from_u32(prediction_base - 1);
+    let unavailable_left = T::from_u32(prediction_base + 1);
     let mut above = [unavailable_above; 64];
     let mut left = [unavailable_left; 32];
     let pixels = plane.as_ref();
@@ -1724,6 +1725,17 @@ mod tests {
             &coefficients,
         );
         assert_eq!(picture.plane_u16(0).unwrap(), &[513; 16]);
+    }
+
+    #[test]
+    fn high_bit_depth_directional_prediction_uses_centered_missing_edges() {
+        let mut picture = IntraPicture::new(4, 4, ChromaSubsampling::Cs444, BitDepth::Ten);
+        picture.predict(0, 0, 0, 4, IntraMode::Vertical, 0, 0, false);
+        assert_eq!(picture.plane_u16(0).unwrap(), &[511; 16]);
+
+        let mut picture = IntraPicture::new(4, 4, ChromaSubsampling::Cs444, BitDepth::Twelve);
+        picture.predict(0, 0, 0, 4, IntraMode::Horizontal, 0, 0, false);
+        assert_eq!(picture.plane_u16(0).unwrap(), &[2049; 16]);
     }
 
     #[test]

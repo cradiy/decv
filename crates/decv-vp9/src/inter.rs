@@ -1686,6 +1686,7 @@ impl<'a, 'state> InterTileDecoder<'a, 'state> {
                         scan_order(transform_size, transform_type),
                         transform_size,
                         dequant,
+                        self.header.bit_depth(),
                         self.counts
                             .as_deref_mut()
                             .map(|counts| &mut counts.coefficient),

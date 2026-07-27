@@ -178,19 +178,6 @@ impl VideoFormat {
             ));
         }
 
-        if let Some((subsampling_x, subsampling_y)) = self.pixel_format.chroma_subsampling() {
-            if subsampling_x != 0 && !self.coded_size.width.is_multiple_of(2) {
-                return Err(MediaError::InvalidVideoFormat(
-                    "horizontally subsampled coded width must be even",
-                ));
-            }
-            if subsampling_y != 0 && !self.coded_size.height.is_multiple_of(2) {
-                return Err(MediaError::InvalidVideoFormat(
-                    "vertically subsampled coded height must be even",
-                ));
-            }
-        }
-
         Ok(())
     }
 }

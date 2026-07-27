@@ -44,7 +44,6 @@ pub(crate) fn inverse_adst(input: &[i32; 32], output: &mut [i32; 32], size: usiz
 }
 
 fn idct4(input: &[i32; 32], output: &mut [i32; 32]) {
-    let input = input.map(|value| i32::from(value as i16));
     let mut step = [0i32; 4];
     step[0] = round_shift(i64::from(input[0] + input[2]) * i64::from(cospi(16)));
     step[1] = round_shift(i64::from(input[0] - input[2]) * i64::from(cospi(16)));
@@ -86,7 +85,6 @@ fn iadst4(input: &[i32; 32], output: &mut [i32; 32]) {
 }
 
 fn idct8(input: &[i32; 32], output: &mut [i32; 32]) {
-    let input = input.map(|value| i32::from(value as i16));
     let mut step1 = [0i32; 8];
     let mut step2 = [0i32; 8];
 
@@ -186,7 +184,6 @@ fn iadst8(input: &[i32; 32], output: &mut [i32; 32]) {
 }
 
 fn idct16(input: &[i32; 32], output: &mut [i32; 32]) {
-    let input = input.map(|value| i32::from(value as i16));
     let mut step1 = [0i32; 16];
     let mut step2 = [0i32; 16];
 
@@ -395,7 +392,6 @@ fn iadst16(input: &[i32; 32], output: &mut [i32; 32]) {
 }
 
 fn idct32(input: &[i32; 32], output: &mut [i32; 32]) {
-    let input = input.map(|value| i32::from(value as i16));
     let mut step1 = [0i32; 32];
     let mut step2 = [0i32; 32];
 
@@ -663,6 +659,17 @@ mod tests {
             inverse_adst(&input, &mut output, size);
             assert!(output[..size].iter().all(|&value| value == 0));
         }
+    }
+
+    #[test]
+    fn high_dynamic_range_dct_input_is_not_truncated_to_i16() {
+        let mut input = [0; 32];
+        let mut output = [0; 32];
+        input[0] = 65_536;
+
+        inverse_dct(&input, &mut output, 4);
+
+        assert_eq!(&output[..4], &[46_340; 4]);
     }
 
     #[test]

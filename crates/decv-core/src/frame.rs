@@ -291,7 +291,7 @@ fn validate_cpu_frame(frame: &CpuFrame, format: VideoFormat) -> Result<()> {
     match format.pixel_format {
         PixelFormat::Nv12 => {
             validate_plane(&frame.planes[0], size.width, size.height)?;
-            validate_plane(&frame.planes[1], size.width, size.height / 2)?;
+            validate_plane(&frame.planes[1], size.width, size.height.div_ceil(2))?;
         }
         PixelFormat::Bgra8 | PixelFormat::Rgba8 => {
             let row_bytes = size
@@ -306,7 +306,10 @@ fn validate_cpu_frame(frame: &CpuFrame, format: VideoFormat) -> Result<()> {
                 .pixel_format
                 .chroma_subsampling()
                 .expect("planar YUV format has chroma subsampling");
-            let chroma = Size::new(size.width >> subsampling_x, size.height >> subsampling_y);
+            let chroma = Size::new(
+                size.width.div_ceil(1 << subsampling_x),
+                size.height.div_ceil(1 << subsampling_y),
+            );
             validate_plane(&frame.planes[1], chroma.width, chroma.height)?;
             validate_plane(&frame.planes[2], chroma.width, chroma.height)?;
         }
@@ -320,10 +323,12 @@ fn validate_cpu_frame(frame: &CpuFrame, format: VideoFormat) -> Result<()> {
                 .checked_mul(2)
                 .ok_or(MediaError::IntegerOverflow)?;
             validate_plane(&frame.planes[0], luma_row_bytes, size.height)?;
-            let chroma_width = (size.width >> subsampling_x)
+            let chroma_width = size
+                .width
+                .div_ceil(1 << subsampling_x)
                 .checked_mul(2)
                 .ok_or(MediaError::IntegerOverflow)?;
-            let chroma_height = size.height >> subsampling_y;
+            let chroma_height = size.height.div_ceil(1 << subsampling_y);
             validate_plane(&frame.planes[1], chroma_width, chroma_height)?;
             validate_plane(&frame.planes[2], chroma_width, chroma_height)?;
         }
@@ -333,7 +338,7 @@ fn validate_cpu_frame(frame: &CpuFrame, format: VideoFormat) -> Result<()> {
                 .checked_mul(2)
                 .ok_or(MediaError::IntegerOverflow)?;
             validate_plane(&frame.planes[0], row_bytes, size.height)?;
-            validate_plane(&frame.planes[1], row_bytes, size.height / 2)?;
+            validate_plane(&frame.planes[1], row_bytes, size.height.div_ceil(2))?;
         }
     }
 
@@ -524,6 +529,30 @@ mod tests {
                 CpuPlane::new(Arc::<[u16]>::from(vec![0; 4]), 0, 4, 2),
             ])),
         };
+        assert_eq!(frame.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validates_odd_planar_dimensions_with_rounded_up_chroma() {
+        let format = VideoFormat {
+            coded_size: Size::new(5, 3),
+            visible_rect: Rect::new(0, 0, 5, 3),
+            display_size: Size::new(5, 3),
+            pixel_format: PixelFormat::I420,
+            color: ColorInfo::default(),
+        };
+        let frame = DecodedVideoFrame {
+            id: 4,
+            pts: None,
+            duration: None,
+            format,
+            storage: FrameStorage::Cpu(CpuFrame::new(vec![
+                CpuPlane::new(vec![0; 15], 0, 5, 3),
+                CpuPlane::new(vec![0; 6], 0, 3, 2),
+                CpuPlane::new(vec![0; 6], 0, 3, 2),
+            ])),
+        };
+
         assert_eq!(frame.validate(), Ok(()));
     }
 }
