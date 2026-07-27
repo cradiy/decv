@@ -2,9 +2,9 @@
 
 `decv` is an experimental, pure-Rust media decoding and demuxing library. Its
 current software pipeline decodes H.264/AVC from Annex-B streams or ordinary
-and fragmented MP4 files into immutable CPU NV12 frames. MP4 AAC-LC mono and
-stereo tracks decode into owned interleaved `f32` PCM at their original sample
-rate.
+and fragmented MP4 files into immutable CPU NV12 frames. Audio decoding uses
+the pure-Rust [Symphonia](https://github.com/pdeljanov/Symphonia) 0.6 codec
+backend and returns owned interleaved `f32` PCM at the original sample rate.
 
 The workspace provides deterministic media primitives:
 
@@ -24,7 +24,7 @@ the `0.1.0` crates as a complete H.264 conformance implementation.
 | Crate | Responsibility |
 | --- | --- |
 | `decv` | Narrow consumer facade for decoding, immutable frames, codec configuration, and MP4 packet access |
-| `decv-audio` | Pure-Rust audio decoding and interleaved `f32` PCM output |
+| `decv-audio` | Symphonia-backed pure-Rust audio decoding and interleaved `f32` PCM output |
 | `decv-core` | Codec-independent time, audio/video packet, frame, input, and synchronous decoder contracts |
 | `decv-h264` | Pure-Rust H.264 parsing, reconstruction, deblocking, DPB management, and NV12 output |
 | `decv-mp4` | Synchronous random-access MP4 parsing, audio/video sample indexing, packet timestamps, and seek |
@@ -82,9 +82,11 @@ decoding is supported; encrypted media are not implemented.
 
 ## Current Audio Support
 
-The software audio decoder supports AAC-LC, Microsoft/IMA ADPCM, ALAC, FLAC,
-MP1, MP2, MP3, interleaved integer/float PCM, A-law, mu-law, and Vorbis. Every
-format is returned as owned interleaved `f32` PCM at its original sample rate.
+`decv-audio` uses Symphonia 0.6 for compressed-audio codec decoding; `decv`
+provides the public decoder contract and converts backend output into owned
+interleaved `f32` PCM. The enabled codecs are AAC-LC, Microsoft/IMA ADPCM,
+ALAC, FLAC, MP1, MP2, MP3, interleaved integer/float PCM, A-law, mu-law, and
+Vorbis.
 
 The built-in MP4 path currently connects AAC-LC tracks, including independent
 audio timestamps and seeking. Other codecs can be fed through the public audio
