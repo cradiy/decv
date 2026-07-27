@@ -62,6 +62,13 @@ struct Thresholds {
     hev: u8,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct PreparedFilter {
+    mode: FilterMode,
+    thresholds: Thresholds,
+    transform: TransformSize,
+}
+
 trait LoopSample: Copy + Default + Send {
     fn to_i32(self) -> i32;
     fn from_i32(value: i32) -> Self;
@@ -220,6 +227,7 @@ fn apply_plane_loop_filter<T: LoopSample>(
         let row_end = (superblock_row + 8).min(modes.mi_rows);
         for superblock_column in (0..modes.mi_columns).step_by(8) {
             let column_end = (superblock_column + 8).min(modes.mi_columns);
+            let mut prepared = [None; 64];
 
             // VP9 completes the vertical and then horizontal pass for each
             // 64x64 superblock before moving to the next one.
@@ -235,6 +243,12 @@ fn apply_plane_loop_filter<T: LoopSample>(
                     }
                     let thresholds = thresholds(level, configuration.sharpness);
                     let transform = plane_transform(mode, subsampling_x, subsampling_y);
+                    prepared[(mi_row - superblock_row) * 8 + mi_column - superblock_column] =
+                        Some(PreparedFilter {
+                            mode,
+                            thresholds,
+                            transform,
+                        });
                     let block_edge = is_left_block_edge(mode.block_size, mi_column);
                     let skip_edge = mode.skip && mode.reference != 0 && !block_edge;
                     if x != 0
@@ -271,13 +285,14 @@ fn apply_plane_loop_filter<T: LoopSample>(
                 for mi_column in (superblock_column..column_end).step_by(column_step) {
                     let x = (mi_column * 8) >> subsampling_x;
                     let column_count = 8.min(width.saturating_sub(x));
-                    let mode = modes.get(mi_row, mi_column);
-                    let level = filter_level(header, mode);
-                    if level == 0 {
+                    let Some(prepared) =
+                        prepared[(mi_row - superblock_row) * 8 + mi_column - superblock_column]
+                    else {
                         continue;
-                    }
-                    let thresholds = thresholds(level, configuration.sharpness);
-                    let transform = plane_transform(mode, subsampling_x, subsampling_y);
+                    };
+                    let mode = prepared.mode;
+                    let thresholds = prepared.thresholds;
+                    let transform = prepared.transform;
                     let block_edge = is_top_block_edge(mode.block_size, mi_row);
                     let skip_edge = mode.skip && mode.reference != 0 && !block_edge;
                     if y != 0
@@ -561,6 +576,100 @@ fn filter_horizontal_scalar<T: LoopSample>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn filter_vertical_high(
+    pixels: &mut [u16],
+    stride: usize,
+    plane_width: usize,
+    x: usize,
+    y: usize,
+    count: usize,
+    width: FilterWidth,
+    thresholds: Thresholds,
+    bit_depth: BitDepth,
+) {
+    let reach = match width {
+        FilterWidth::Sixteen => 8,
+        FilterWidth::Four | FilterWidth::Eight => 4,
+    };
+    if x < reach || x + reach > plane_width {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if count == 8 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the reach checks above prove four samples exist on each
+        // side of the edge for all eight rows, and AVX2 was detected.
+        unsafe {
+            x86::filter_vertical_high_avx2(
+                pixels.as_mut_ptr().add(y * stride + x),
+                stride,
+                width,
+                thresholds,
+                bit_depth,
+            );
+        }
+        return;
+    }
+    filter_vertical_scalar(
+        pixels,
+        stride,
+        plane_width,
+        x,
+        y,
+        count,
+        width,
+        thresholds,
+        bit_depth,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn filter_horizontal_high(
+    pixels: &mut [u16],
+    stride: usize,
+    plane_height: usize,
+    x: usize,
+    y: usize,
+    count: usize,
+    width: FilterWidth,
+    thresholds: Thresholds,
+    bit_depth: BitDepth,
+) {
+    let reach = match width {
+        FilterWidth::Sixteen => 8,
+        FilterWidth::Four | FilterWidth::Eight => 4,
+    };
+    if y < reach || y + reach > plane_height {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    if count == 8 && std::arch::is_x86_feature_detected!("avx2") {
+        // SAFETY: the reach checks above prove four rows exist on each side
+        // and count proves every 8-sample row load/store is in bounds.
+        unsafe {
+            x86::filter_horizontal_high_avx2(
+                pixels.as_mut_ptr().add(y * stride + x),
+                stride,
+                width,
+                thresholds,
+                bit_depth,
+            );
+        }
+        return;
+    }
+    filter_horizontal_scalar(
+        pixels,
+        stride,
+        plane_height,
+        x,
+        y,
+        count,
+        width,
+        thresholds,
+        bit_depth,
+    );
+}
+
 fn filter_samples<T: LoopSample>(
     samples: &mut [T; 16],
     width: FilterWidth,
@@ -651,7 +760,7 @@ impl LoopSample for u16 {
         thresholds: Thresholds,
         bit_depth: BitDepth,
     ) {
-        filter_vertical_scalar(
+        filter_vertical_high(
             pixels,
             stride,
             plane_width,
@@ -675,7 +784,7 @@ impl LoopSample for u16 {
         thresholds: Thresholds,
         bit_depth: BitDepth,
     ) {
-        filter_horizontal_scalar(
+        filter_horizontal_high(
             pixels,
             stride,
             plane_height,
@@ -693,7 +802,7 @@ impl LoopSample for u16 {
 mod x86 {
     use std::arch::x86_64::*;
 
-    use super::Thresholds;
+    use super::{BitDepth, FilterWidth, Thresholds};
 
     #[target_feature(enable = "sse2")]
     unsafe fn abs_diff(first: __m128i, second: __m128i) -> __m128i {
@@ -864,6 +973,545 @@ mod x86 {
                 );
             }
             qs1qs0 = _mm_srli_si128::<4>(qs1qs0);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn load_high_row(edge: *mut u16, stride: usize, row: isize) -> __m256i {
+        let samples =
+            unsafe { _mm_loadu_si128(edge.offset(row * stride as isize).cast::<__m128i>()) };
+        _mm256_cvtepu16_epi32(samples)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn pack_high(samples: __m256i) -> __m128i {
+        _mm_packus_epi32(
+            _mm256_castsi256_si128(samples),
+            _mm256_extracti128_si256::<1>(samples),
+        )
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn store_high_row(edge: *mut u16, stride: usize, row: isize, samples: __m256i) {
+        let packed = unsafe { pack_high(samples) };
+        unsafe {
+            _mm_storeu_si128(edge.offset(row * stride as isize).cast::<__m128i>(), packed);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn transpose_8x8_u16(rows: [__m128i; 8]) -> [__m128i; 8] {
+        let pair01_low = _mm_unpacklo_epi16(rows[0], rows[1]);
+        let pair01_high = _mm_unpackhi_epi16(rows[0], rows[1]);
+        let pair23_low = _mm_unpacklo_epi16(rows[2], rows[3]);
+        let pair23_high = _mm_unpackhi_epi16(rows[2], rows[3]);
+        let pair45_low = _mm_unpacklo_epi16(rows[4], rows[5]);
+        let pair45_high = _mm_unpackhi_epi16(rows[4], rows[5]);
+        let pair67_low = _mm_unpacklo_epi16(rows[6], rows[7]);
+        let pair67_high = _mm_unpackhi_epi16(rows[6], rows[7]);
+
+        let group03_0 = _mm_unpacklo_epi32(pair01_low, pair23_low);
+        let group03_1 = _mm_unpackhi_epi32(pair01_low, pair23_low);
+        let group03_2 = _mm_unpacklo_epi32(pair01_high, pair23_high);
+        let group03_3 = _mm_unpackhi_epi32(pair01_high, pair23_high);
+        let group47_0 = _mm_unpacklo_epi32(pair45_low, pair67_low);
+        let group47_1 = _mm_unpackhi_epi32(pair45_low, pair67_low);
+        let group47_2 = _mm_unpacklo_epi32(pair45_high, pair67_high);
+        let group47_3 = _mm_unpackhi_epi32(pair45_high, pair67_high);
+
+        [
+            _mm_unpacklo_epi64(group03_0, group47_0),
+            _mm_unpackhi_epi64(group03_0, group47_0),
+            _mm_unpacklo_epi64(group03_1, group47_1),
+            _mm_unpackhi_epi64(group03_1, group47_1),
+            _mm_unpacklo_epi64(group03_2, group47_2),
+            _mm_unpackhi_epi64(group03_2, group47_2),
+            _mm_unpacklo_epi64(group03_3, group47_3),
+            _mm_unpackhi_epi64(group03_3, group47_3),
+        ]
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn abs_diff_i32(first: __m256i, second: __m256i) -> __m256i {
+        _mm256_abs_epi32(_mm256_sub_epi32(first, second))
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn less_or_equal_i32(value: __m256i, limit: __m256i) -> __m256i {
+        _mm256_xor_si256(_mm256_cmpgt_epi32(value, limit), _mm256_set1_epi32(-1))
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn clamp_i32(value: __m256i, minimum: __m256i, maximum: __m256i) -> __m256i {
+        _mm256_max_epi32(minimum, _mm256_min_epi32(value, maximum))
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn filter4_high(
+        p3: __m256i,
+        p2: __m256i,
+        p1: __m256i,
+        p0: __m256i,
+        q0: __m256i,
+        q1: __m256i,
+        q2: __m256i,
+        q3: __m256i,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) -> (__m256i, __m256i, __m256i, __m256i) {
+        let shift = i32::from(bit_depth.bits() - 8);
+        let limit = _mm256_set1_epi32(i32::from(thresholds.limit) << shift);
+        let blimit = _mm256_set1_epi32(i32::from(thresholds.blimit) << shift);
+        let hev_limit = _mm256_set1_epi32(i32::from(thresholds.hev) << shift);
+
+        let mut mask = unsafe { less_or_equal_i32(abs_diff_i32(p3, p2), limit) };
+        for difference in [
+            unsafe { abs_diff_i32(p2, p1) },
+            unsafe { abs_diff_i32(p1, p0) },
+            unsafe { abs_diff_i32(q1, q0) },
+            unsafe { abs_diff_i32(q2, q1) },
+            unsafe { abs_diff_i32(q3, q2) },
+        ] {
+            mask = _mm256_and_si256(mask, unsafe { less_or_equal_i32(difference, limit) });
+        }
+        let edge_difference = _mm256_add_epi32(
+            _mm256_slli_epi32::<1>(unsafe { abs_diff_i32(p0, q0) }),
+            _mm256_srli_epi32::<1>(unsafe { abs_diff_i32(p1, q1) }),
+        );
+        mask = _mm256_and_si256(mask, unsafe { less_or_equal_i32(edge_difference, blimit) });
+
+        let hev = _mm256_or_si256(
+            _mm256_cmpgt_epi32(unsafe { abs_diff_i32(p1, p0) }, hev_limit),
+            _mm256_cmpgt_epi32(unsafe { abs_diff_i32(q1, q0) }, hev_limit),
+        );
+        let signed_min = _mm256_set1_epi32(-(128 << shift));
+        let signed_max = _mm256_set1_epi32((128 << shift) - 1);
+        let pixel_min = _mm256_setzero_si256();
+        let pixel_max = _mm256_set1_epi32(i32::from(bit_depth.max_sample()));
+
+        let outer = _mm256_and_si256(hev, unsafe {
+            clamp_i32(_mm256_sub_epi32(p1, q1), signed_min, signed_max)
+        });
+        let filter = unsafe {
+            clamp_i32(
+                _mm256_add_epi32(
+                    outer,
+                    _mm256_mullo_epi32(_mm256_sub_epi32(q0, p0), _mm256_set1_epi32(3)),
+                ),
+                signed_min,
+                signed_max,
+            )
+        };
+        let filter1 = _mm256_srai_epi32::<3>(unsafe {
+            clamp_i32(
+                _mm256_add_epi32(filter, _mm256_set1_epi32(4)),
+                signed_min,
+                signed_max,
+            )
+        });
+        let filter2 = _mm256_srai_epi32::<3>(unsafe {
+            clamp_i32(
+                _mm256_add_epi32(filter, _mm256_set1_epi32(3)),
+                signed_min,
+                signed_max,
+            )
+        });
+
+        let filtered_q0 = unsafe { clamp_i32(_mm256_sub_epi32(q0, filter1), pixel_min, pixel_max) };
+        let filtered_p0 = unsafe { clamp_i32(_mm256_add_epi32(p0, filter2), pixel_min, pixel_max) };
+        let q0 = _mm256_blendv_epi8(q0, filtered_q0, mask);
+        let p0 = _mm256_blendv_epi8(p0, filtered_p0, mask);
+
+        let adjustment = _mm256_srai_epi32::<1>(_mm256_add_epi32(filter1, _mm256_set1_epi32(1)));
+        let inner_mask = _mm256_andnot_si256(hev, mask);
+        let filtered_q1 =
+            unsafe { clamp_i32(_mm256_sub_epi32(q1, adjustment), pixel_min, pixel_max) };
+        let filtered_p1 =
+            unsafe { clamp_i32(_mm256_add_epi32(p1, adjustment), pixel_min, pixel_max) };
+        let q1 = _mm256_blendv_epi8(q1, filtered_q1, inner_mask);
+        let p1 = _mm256_blendv_epi8(p1, filtered_p1, inner_mask);
+
+        (p1, p0, q0, q1)
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn sum_i32<const N: usize>(values: [__m256i; N]) -> __m256i {
+        values
+            .into_iter()
+            .fold(_mm256_setzero_si256(), |sum, value| {
+                _mm256_add_epi32(sum, value)
+            })
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn filter8_high(samples: &[__m256i; 16]) -> [__m256i; 6] {
+        let twice = |value| _mm256_slli_epi32::<1>(value);
+        let thrice = |value| _mm256_add_epi32(twice(value), value);
+        let round = |value| _mm256_srai_epi32::<3>(_mm256_add_epi32(value, _mm256_set1_epi32(4)));
+        [
+            round(unsafe {
+                sum_i32([
+                    thrice(samples[4]),
+                    twice(samples[5]),
+                    samples[6],
+                    samples[7],
+                    samples[8],
+                ])
+            }),
+            round(unsafe {
+                sum_i32([
+                    twice(samples[4]),
+                    samples[5],
+                    twice(samples[6]),
+                    samples[7],
+                    samples[8],
+                    samples[9],
+                ])
+            }),
+            round(unsafe {
+                sum_i32([
+                    samples[4],
+                    samples[5],
+                    samples[6],
+                    twice(samples[7]),
+                    samples[8],
+                    samples[9],
+                    samples[10],
+                ])
+            }),
+            round(unsafe {
+                sum_i32([
+                    samples[5],
+                    samples[6],
+                    samples[7],
+                    twice(samples[8]),
+                    samples[9],
+                    samples[10],
+                    samples[11],
+                ])
+            }),
+            round(unsafe {
+                sum_i32([
+                    samples[6],
+                    samples[7],
+                    samples[8],
+                    twice(samples[9]),
+                    samples[10],
+                    twice(samples[11]),
+                ])
+            }),
+            round(unsafe {
+                sum_i32([
+                    samples[7],
+                    samples[8],
+                    samples[9],
+                    twice(samples[10]),
+                    thrice(samples[11]),
+                ])
+            }),
+        ]
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn filter16_high(samples: &[__m256i; 16]) -> [__m256i; 14] {
+        let zero = _mm256_setzero_si256();
+        let mut prefix = [zero; 17];
+        for index in 0..16 {
+            prefix[index + 1] = _mm256_add_epi32(prefix[index], samples[index]);
+        }
+        let mut filtered = [zero; 14];
+        for index in 1..=7 {
+            let endpoint = _mm256_mullo_epi32(samples[0], _mm256_set1_epi32((8 - index) as i32));
+            let before = _mm256_sub_epi32(prefix[index], prefix[1]);
+            let center = _mm256_slli_epi32::<1>(samples[index]);
+            let after = _mm256_sub_epi32(prefix[index + 8], prefix[index + 1]);
+            filtered[index - 1] = _mm256_srai_epi32::<4>(_mm256_add_epi32(
+                unsafe { sum_i32([endpoint, before, center, after]) },
+                _mm256_set1_epi32(8),
+            ));
+        }
+        for index in 8..=14 {
+            let before = _mm256_sub_epi32(prefix[index], prefix[index - 7]);
+            let center = _mm256_slli_epi32::<1>(samples[index]);
+            let after = _mm256_sub_epi32(prefix[15], prefix[index + 1]);
+            let endpoint = _mm256_mullo_epi32(samples[15], _mm256_set1_epi32((index - 7) as i32));
+            filtered[index - 1] = _mm256_srai_epi32::<4>(_mm256_add_epi32(
+                unsafe { sum_i32([before, center, after, endpoint]) },
+                _mm256_set1_epi32(8),
+            ));
+        }
+        filtered
+    }
+
+    #[target_feature(enable = "avx2")]
+    unsafe fn filter_wide_high(
+        samples: &mut [__m256i; 16],
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        debug_assert!(!matches!(width, FilterWidth::Four));
+        let shift = i32::from(bit_depth.bits() - 8);
+        let limit = _mm256_set1_epi32(i32::from(thresholds.limit) << shift);
+        let blimit = _mm256_set1_epi32(i32::from(thresholds.blimit) << shift);
+        let mut mask = unsafe { less_or_equal_i32(abs_diff_i32(samples[4], samples[5]), limit) };
+        for difference in [
+            unsafe { abs_diff_i32(samples[5], samples[6]) },
+            unsafe { abs_diff_i32(samples[6], samples[7]) },
+            unsafe { abs_diff_i32(samples[9], samples[8]) },
+            unsafe { abs_diff_i32(samples[10], samples[9]) },
+            unsafe { abs_diff_i32(samples[11], samples[10]) },
+        ] {
+            mask = _mm256_and_si256(mask, unsafe { less_or_equal_i32(difference, limit) });
+        }
+        let edge_difference = _mm256_add_epi32(
+            _mm256_slli_epi32::<1>(unsafe { abs_diff_i32(samples[7], samples[8]) }),
+            _mm256_srli_epi32::<1>(unsafe { abs_diff_i32(samples[6], samples[9]) }),
+        );
+        mask = _mm256_and_si256(mask, unsafe { less_or_equal_i32(edge_difference, blimit) });
+
+        let flat_limit = _mm256_set1_epi32(1 << shift);
+        let mut flat =
+            unsafe { less_or_equal_i32(abs_diff_i32(samples[6], samples[7]), flat_limit) };
+        for difference in [
+            unsafe { abs_diff_i32(samples[9], samples[8]) },
+            unsafe { abs_diff_i32(samples[5], samples[7]) },
+            unsafe { abs_diff_i32(samples[10], samples[8]) },
+            unsafe { abs_diff_i32(samples[4], samples[7]) },
+            unsafe { abs_diff_i32(samples[11], samples[8]) },
+        ] {
+            flat = _mm256_and_si256(flat, unsafe { less_or_equal_i32(difference, flat_limit) });
+        }
+
+        let (p1, p0, q0, q1) = unsafe {
+            filter4_high(
+                samples[4],
+                samples[5],
+                samples[6],
+                samples[7],
+                samples[8],
+                samples[9],
+                samples[10],
+                samples[11],
+                thresholds,
+                bit_depth,
+            )
+        };
+        let all = _mm256_set1_epi32(-1);
+        let four_mask = _mm256_andnot_si256(flat, all);
+        for (index, filtered) in [(6, p1), (7, p0), (8, q0), (9, q1)] {
+            samples[index] = _mm256_blendv_epi8(samples[index], filtered, four_mask);
+        }
+
+        let mut flat2 = all;
+        if matches!(width, FilterWidth::Sixteen) {
+            for index in 0..=3 {
+                flat2 = _mm256_and_si256(flat2, unsafe {
+                    less_or_equal_i32(abs_diff_i32(samples[index], samples[7]), flat_limit)
+                });
+            }
+            for index in 12..=15 {
+                flat2 = _mm256_and_si256(flat2, unsafe {
+                    less_or_equal_i32(abs_diff_i32(samples[index], samples[8]), flat_limit)
+                });
+            }
+            let wide_mask = _mm256_and_si256(mask, _mm256_and_si256(flat, flat2));
+            let filtered = unsafe { filter16_high(samples) };
+            for (index, filtered) in (1..=14).zip(filtered) {
+                samples[index] = _mm256_blendv_epi8(samples[index], filtered, wide_mask);
+            }
+        }
+
+        let eight_mask = if matches!(width, FilterWidth::Eight) {
+            _mm256_and_si256(mask, flat)
+        } else {
+            _mm256_and_si256(mask, _mm256_andnot_si256(flat2, flat))
+        };
+        let filtered = unsafe { filter8_high(samples) };
+        for (index, filtered) in (5..=10).zip(filtered) {
+            samples[index] = _mm256_blendv_epi8(samples[index], filtered, eight_mask);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn filter_horizontal_high_avx2(
+        edge: *mut u16,
+        stride: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        if matches!(width, FilterWidth::Four) {
+            unsafe {
+                filter_horizontal_4_high_avx2(edge, stride, thresholds, bit_depth);
+            }
+            return;
+        }
+        let reach = if matches!(width, FilterWidth::Sixteen) {
+            8
+        } else {
+            4
+        };
+        let zero = _mm256_setzero_si256();
+        let mut samples = [zero; 16];
+        for offset in 0..reach * 2 {
+            samples[8 - reach + offset] =
+                unsafe { load_high_row(edge, stride, offset as isize - reach as isize) };
+        }
+        unsafe {
+            filter_wide_high(&mut samples, width, thresholds, bit_depth);
+        }
+        for offset in 0..reach * 2 {
+            unsafe {
+                store_high_row(
+                    edge,
+                    stride,
+                    offset as isize - reach as isize,
+                    samples[8 - reach + offset],
+                );
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn filter_vertical_high_avx2(
+        edge: *mut u16,
+        stride: usize,
+        width: FilterWidth,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        if matches!(width, FilterWidth::Four) {
+            unsafe {
+                filter_vertical_4_high_avx2(edge, stride, thresholds, bit_depth);
+            }
+            return;
+        }
+        let reach = if matches!(width, FilterWidth::Sixteen) {
+            8
+        } else {
+            4
+        };
+        let mut low_rows = [_mm_setzero_si128(); 8];
+        let mut high_rows = [_mm_setzero_si128(); 8];
+        for row in 0..8 {
+            let row_edge = unsafe { edge.add(row * stride) };
+            low_rows[row] = unsafe { _mm_loadu_si128(row_edge.sub(reach).cast::<__m128i>()) };
+            if reach == 8 {
+                high_rows[row] = unsafe { _mm_loadu_si128(row_edge.cast::<__m128i>()) };
+            }
+        }
+        let low_columns = unsafe { transpose_8x8_u16(low_rows) };
+        let zero = _mm256_setzero_si256();
+        let mut samples = [zero; 16];
+        for (index, column) in low_columns.into_iter().enumerate() {
+            samples[8 - reach + index] = _mm256_cvtepu16_epi32(column);
+        }
+        if reach == 8 {
+            let high_columns = unsafe { transpose_8x8_u16(high_rows) };
+            for (index, column) in high_columns.into_iter().enumerate() {
+                samples[8 + index] = _mm256_cvtepu16_epi32(column);
+            }
+        }
+        unsafe {
+            filter_wide_high(&mut samples, width, thresholds, bit_depth);
+        }
+        let mut low_columns = [_mm_setzero_si128(); 8];
+        for (column, samples) in low_columns.iter_mut().zip(&samples[8 - reach..16 - reach]) {
+            *column = unsafe { pack_high(*samples) };
+        }
+        let low_rows = unsafe { transpose_8x8_u16(low_columns) };
+        let high_rows = if reach == 8 {
+            let mut high_columns = [_mm_setzero_si128(); 8];
+            for (column, samples) in high_columns.iter_mut().zip(&samples[8..16]) {
+                *column = unsafe { pack_high(*samples) };
+            }
+            Some(unsafe { transpose_8x8_u16(high_columns) })
+        } else {
+            None
+        };
+        for row in 0..8 {
+            let row_edge = unsafe { edge.add(row * stride) };
+            unsafe {
+                _mm_storeu_si128(row_edge.sub(reach).cast::<__m128i>(), low_rows[row]);
+            }
+            if let Some(high_rows) = high_rows {
+                unsafe {
+                    _mm_storeu_si128(row_edge.cast::<__m128i>(), high_rows[row]);
+                }
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn filter_horizontal_4_high_avx2(
+        edge: *mut u16,
+        stride: usize,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        let p3 = unsafe { load_high_row(edge, stride, -4) };
+        let p2 = unsafe { load_high_row(edge, stride, -3) };
+        let p1 = unsafe { load_high_row(edge, stride, -2) };
+        let p0 = unsafe { load_high_row(edge, stride, -1) };
+        let q0 = unsafe { load_high_row(edge, stride, 0) };
+        let q1 = unsafe { load_high_row(edge, stride, 1) };
+        let q2 = unsafe { load_high_row(edge, stride, 2) };
+        let q3 = unsafe { load_high_row(edge, stride, 3) };
+        let (p1, p0, q0, q1) =
+            unsafe { filter4_high(p3, p2, p1, p0, q0, q1, q2, q3, thresholds, bit_depth) };
+        unsafe {
+            store_high_row(edge, stride, -2, p1);
+            store_high_row(edge, stride, -1, p0);
+            store_high_row(edge, stride, 0, q0);
+            store_high_row(edge, stride, 1, q1);
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn filter_vertical_4_high_avx2(
+        edge: *mut u16,
+        stride: usize,
+        thresholds: Thresholds,
+        bit_depth: BitDepth,
+    ) {
+        let mut columns = [[0i32; 8]; 8];
+        for row in 0..8 {
+            let row_edge = unsafe { edge.add(row * stride) };
+            for (column, values) in columns.iter_mut().enumerate() {
+                values[row] = i32::from(unsafe { *row_edge.offset(column as isize - 4) });
+            }
+        }
+        let load_column =
+            |column: &[i32; 8]| unsafe { _mm256_loadu_si256(column.as_ptr().cast::<__m256i>()) };
+        let (p1, p0, q0, q1) = unsafe {
+            filter4_high(
+                load_column(&columns[0]),
+                load_column(&columns[1]),
+                load_column(&columns[2]),
+                load_column(&columns[3]),
+                load_column(&columns[4]),
+                load_column(&columns[5]),
+                load_column(&columns[6]),
+                load_column(&columns[7]),
+                thresholds,
+                bit_depth,
+            )
+        };
+        let mut filtered = [[0i32; 8]; 4];
+        for (values, vector) in filtered.iter_mut().zip([p1, p0, q0, q1]) {
+            unsafe {
+                _mm256_storeu_si256(values.as_mut_ptr().cast::<__m256i>(), vector);
+            }
+        }
+        for row in 0..8 {
+            let row_edge = unsafe { edge.add(row * stride) };
+            for (column, values) in filtered.iter().enumerate() {
+                unsafe {
+                    *row_edge.offset(column as isize - 2) = values[row] as u16;
+                }
+            }
         }
     }
 }
@@ -1191,7 +1839,10 @@ fn round_shift3<T: LoopSample>(value: i32) -> T {
 
 #[cfg(test)]
 mod tests {
-    use super::{FilterWidth, Thresholds, filter_samples, filter_vertical, thresholds};
+    use super::{
+        FilterWidth, Thresholds, filter_horizontal_high, filter_horizontal_scalar, filter_samples,
+        filter_vertical, filter_vertical_high, filter_vertical_scalar, thresholds,
+    };
     use crate::BitDepth;
 
     #[test]
@@ -1228,6 +1879,96 @@ mod tests {
             BitDepth::Ten,
         );
         assert_eq!(&samples[5..11], &[402, 404, 406, 410, 412, 414]);
+    }
+
+    #[test]
+    fn high_bit_depth_fast_paths_match_scalar() {
+        const STRIDE: usize = 24;
+        const HEIGHT: usize = 16;
+        let mut state = 0x7a31_9d2bu32;
+        for bit_depth in [BitDepth::Ten, BitDepth::Twelve] {
+            let shift = u32::from(bit_depth.bits() - 8);
+            let max_sample = u32::from(bit_depth.max_sample());
+            for level in [9, 19, 63] {
+                for width in [FilterWidth::Four, FilterWidth::Eight, FilterWidth::Sixteen] {
+                    for iteration in 0..200 {
+                        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                        let mut source = [0u16; STRIDE * HEIGHT];
+                        let base = 32 + state % (max_sample - 64);
+                        for (index, sample) in source.iter_mut().enumerate() {
+                            let variation = match iteration % 3 {
+                                0 => i32::from(index % STRIDE >= 8) << (shift + 1),
+                                1 => i32::from(index / STRIDE >= 8) << (shift + 1),
+                                _ => {
+                                    state =
+                                        state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                                    ((state >> 28) as i32 - 8) << shift
+                                }
+                            };
+                            *sample = (base as i32 + variation).clamp(0, max_sample as i32) as u16;
+                        }
+
+                        let mut scalar = source;
+                        let mut fast = source;
+                        filter_vertical_scalar(
+                            &mut scalar,
+                            STRIDE,
+                            STRIDE,
+                            8,
+                            4,
+                            8,
+                            width,
+                            thresholds(level, 0),
+                            bit_depth,
+                        );
+                        filter_vertical_high(
+                            &mut fast,
+                            STRIDE,
+                            STRIDE,
+                            8,
+                            4,
+                            8,
+                            width,
+                            thresholds(level, 0),
+                            bit_depth,
+                        );
+                        assert_eq!(
+                            fast, scalar,
+                            "vertical {bit_depth:?}, {width:?}, level {level}"
+                        );
+
+                        let mut scalar = source;
+                        let mut fast = source;
+                        filter_horizontal_scalar(
+                            &mut scalar,
+                            STRIDE,
+                            HEIGHT,
+                            4,
+                            8,
+                            8,
+                            width,
+                            thresholds(level, 0),
+                            bit_depth,
+                        );
+                        filter_horizontal_high(
+                            &mut fast,
+                            STRIDE,
+                            HEIGHT,
+                            4,
+                            8,
+                            8,
+                            width,
+                            thresholds(level, 0),
+                            bit_depth,
+                        );
+                        assert_eq!(
+                            fast, scalar,
+                            "horizontal {bit_depth:?}, {width:?}, level {level}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

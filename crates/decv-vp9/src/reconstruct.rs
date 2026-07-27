@@ -460,7 +460,7 @@ impl IntraPicture {
             let PicturePlanes::High(target_planes) = &mut self.planes else {
                 unreachable!("high-bit-depth picture requires word storage");
             };
-            predict_inter_scalar(
+            predict_inter_high(
                 source,
                 source_stride,
                 source_width,
@@ -761,14 +761,14 @@ impl IntraPicture {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn predict_inter_scalar<T: Sample>(
-    source: &[T],
+fn predict_inter_high(
+    source: &[u16],
     source_stride: usize,
     source_width: usize,
     source_height: usize,
     reference_width: usize,
     reference_height: usize,
-    target: &mut [T],
+    target: &mut [u16],
     target_stride: usize,
     current_width: usize,
     current_height: usize,
@@ -800,12 +800,154 @@ fn predict_inter_scalar<T: Sample>(
     let start_y_q4 = scale(y as i64 * 16, y_scale) + scale(i64::from(motion_row_q4), y_scale);
     let x_step_q4 = scale(16, x_scale);
     let y_step_q4 = scale(16, y_scale);
-    let sample = |source_x: i64, source_y: i64| -> T {
+    let sample = |source_x: i64, source_y: i64| -> u16 {
         let source_x = source_x.clamp(0, source_width.saturating_sub(1) as i64) as usize;
         let source_y = source_y.clamp(0, source_height.saturating_sub(1) as i64) as usize;
         source[source_y * source_stride + source_x]
     };
-    let clip = |value: i32| T::from_u32(value.clamp(0, i32::from(max_sample)) as u32);
+    let clip = |value: i32| value.clamp(0, i32::from(max_sample)) as u16;
+
+    if !scaled && motion_column_q4 & 15 == 0 && motion_row_q4 & 15 == 0 {
+        let origin_x = x as i64 + i64::from(motion_column_q4 >> 4);
+        let origin_y = y as i64 + i64::from(motion_row_q4 >> 4);
+        let source_in_bounds = origin_x >= 0
+            && origin_y >= 0
+            && origin_x as usize + output_width <= source_width
+            && origin_y as usize + output_height <= source_height;
+        if source_in_bounds {
+            let source_x = origin_x as usize;
+            let source_y = origin_y as usize;
+            for row in 0..output_height {
+                let source_start = (source_y + row) * source_stride + source_x;
+                let target_start = (y + row) * target_stride + target_x;
+                write_prediction_row_high(
+                    &mut target[target_start..target_start + output_width],
+                    &source[source_start..source_start + output_width],
+                    average,
+                );
+            }
+        } else {
+            for row in 0..output_height {
+                for column in 0..output_width {
+                    let prediction = sample(origin_x + column as i64, origin_y + row as i64);
+                    let index = (y + row) * target_stride + target_x + column;
+                    write_prediction(&mut target[index], prediction, average);
+                }
+            }
+        }
+        return;
+    }
+
+    if !scaled {
+        let integer_x = motion_column_q4 >> 4;
+        let integer_y = motion_row_q4 >> 4;
+        let phase_x = (motion_column_q4 & 15) as usize;
+        let phase_y = (motion_row_q4 & 15) as usize;
+        let filter_x = &kernel[phase_x * 8..phase_x * 8 + 8];
+        let filter_y = &kernel[phase_y * 8..phase_y * 8 + 8];
+        let origin_x = x as i32 + integer_x;
+        let origin_y = y as i32 + integer_y;
+
+        match (phase_x == 0, phase_y == 0) {
+            (true, true) => unreachable!("integer-pel prediction returned above"),
+            (false, true)
+                if origin_x >= 3
+                    && origin_y >= 0
+                    && origin_x as usize + output_width + 4 <= source_width
+                    && origin_y as usize + output_height <= source_height =>
+            {
+                let source_x = origin_x as usize - 3;
+                let source_y = origin_y as usize;
+                let mut predictions = [0u16; 64];
+                for row in 0..output_height {
+                    let source_start = (source_y + row) * source_stride + source_x;
+                    convolve_8_horizontal_row_high(
+                        &source[source_start..source_start + output_width + 7],
+                        &mut predictions[..output_width],
+                        filter_x,
+                        max_sample,
+                    );
+                    let target_start = (y + row) * target_stride + target_x;
+                    write_prediction_row_high(
+                        &mut target[target_start..target_start + output_width],
+                        &predictions[..output_width],
+                        average,
+                    );
+                }
+                return;
+            }
+            (true, false)
+                if origin_x >= 0
+                    && origin_y >= 3
+                    && origin_x as usize + output_width <= source_width
+                    && origin_y as usize + output_height + 4 <= source_height =>
+            {
+                let source_x = origin_x as usize;
+                let source_y = origin_y as usize - 3;
+                let mut predictions = [0u16; 64];
+                for row in 0..output_height {
+                    let source_start = (source_y + row) * source_stride + source_x;
+                    convolve_8_vertical_row_high(
+                        source,
+                        source_start,
+                        source_stride,
+                        &mut predictions[..output_width],
+                        filter_y,
+                        max_sample,
+                    );
+                    let target_start = (y + row) * target_stride + target_x;
+                    write_prediction_row_high(
+                        &mut target[target_start..target_start + output_width],
+                        &predictions[..output_width],
+                        average,
+                    );
+                }
+                return;
+            }
+            (false, false)
+                if origin_x >= 3
+                    && origin_y >= 3
+                    && origin_x as usize + output_width + 4 <= source_width
+                    && origin_y as usize + output_height + 4 <= source_height =>
+            {
+                const MAXIMUM_INTERMEDIATE_SAMPLES: usize = 64 * (64 + 7);
+                debug_assert!(output_width <= 64 && output_height <= 64);
+                let temporary_height = output_height + 7;
+                let source_x = origin_x as usize - 3;
+                let source_y = origin_y as usize - 3;
+                let mut temporary = [0u16; MAXIMUM_INTERMEDIATE_SAMPLES];
+                for row in 0..temporary_height {
+                    let source_start = (source_y + row) * source_stride + source_x;
+                    let target_start = row * output_width;
+                    convolve_8_horizontal_row_high(
+                        &source[source_start..source_start + output_width + 7],
+                        &mut temporary[target_start..target_start + output_width],
+                        filter_x,
+                        max_sample,
+                    );
+                }
+                let mut predictions = [0u16; 64];
+                for row in 0..output_height {
+                    convolve_8_vertical_row_high(
+                        &temporary,
+                        row * output_width,
+                        output_width,
+                        &mut predictions[..output_width],
+                        filter_y,
+                        max_sample,
+                    );
+                    let target_start = (y + row) * target_stride + target_x;
+                    write_prediction_row_high(
+                        &mut target[target_start..target_start + output_width],
+                        &predictions[..output_width],
+                        average,
+                    );
+                }
+                return;
+            }
+            _ => {}
+        }
+    }
 
     for row in 0..output_height {
         let source_y_q4 = start_y_q4 + row as i64 * y_step_q4;
@@ -823,7 +965,7 @@ fn predict_inter_scalar<T: Sample>(
                     let mut sum = 0i32;
                     for (tap, &coefficient) in filter_x.iter().enumerate() {
                         sum += i32::from(coefficient)
-                            * sample(integer_x + tap as i64 - 3, integer_y).to_u32() as i32;
+                            * i32::from(sample(integer_x + tap as i64 - 3, integer_y));
                     }
                     clip((sum + 64) >> 7)
                 }
@@ -831,7 +973,7 @@ fn predict_inter_scalar<T: Sample>(
                     let mut sum = 0i32;
                     for (tap, &coefficient) in filter_y.iter().enumerate() {
                         sum += i32::from(coefficient)
-                            * sample(integer_x, integer_y + tap as i64 - 3).to_u32() as i32;
+                            * i32::from(sample(integer_x, integer_y + tap as i64 - 3));
                     }
                     clip((sum + 64) >> 7)
                 }
@@ -843,8 +985,10 @@ fn predict_inter_scalar<T: Sample>(
                         for (horizontal_tap, &horizontal_coefficient) in filter_x.iter().enumerate()
                         {
                             horizontal_sum += i32::from(horizontal_coefficient)
-                                * sample(integer_x + horizontal_tap as i64 - 3, source_y).to_u32()
-                                    as i32;
+                                * i32::from(sample(
+                                    integer_x + horizontal_tap as i64 - 3,
+                                    source_y,
+                                ));
                         }
                         let horizontal =
                             ((horizontal_sum + 64) >> 7).clamp(0, i32::from(max_sample));
@@ -856,6 +1000,85 @@ fn predict_inter_scalar<T: Sample>(
             let index = (y + row) * target_stride + target_x + column;
             write_prediction(&mut target[index], prediction, average);
         }
+    }
+}
+
+#[inline(always)]
+fn convolve_8_high_scalar(samples: &[u16], coefficients: &[i16], max_sample: u16) -> u16 {
+    let mut sum = 0i32;
+    for index in 0..8 {
+        sum += i32::from(coefficients[index]) * i32::from(samples[index]);
+    }
+    ((sum + 64) >> 7).clamp(0, i32::from(max_sample)) as u16
+}
+
+fn convolve_8_horizontal_row_high(
+    source: &[u16],
+    target: &mut [u16],
+    coefficients: &[i16],
+    max_sample: u16,
+) {
+    debug_assert!(source.len() >= target.len() + 7 && coefficients.len() >= 8);
+    let mut offset = 0;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        let vectorized = target.len() / 8 * 8;
+        // SAFETY: runtime feature detection guarantees AVX2 and the slice
+        // lengths prove every eight-word load and store is in bounds.
+        unsafe {
+            x86::convolve_8_horizontal_high_avx2(
+                source.as_ptr(),
+                target.as_mut_ptr(),
+                vectorized,
+                coefficients.as_ptr(),
+                max_sample,
+            );
+        }
+        offset = vectorized;
+    }
+    for column in offset..target.len() {
+        target[column] =
+            convolve_8_high_scalar(&source[column..column + 8], coefficients, max_sample);
+    }
+}
+
+fn convolve_8_vertical_row_high(
+    samples: &[u16],
+    start: usize,
+    stride: usize,
+    target: &mut [u16],
+    coefficients: &[i16],
+    max_sample: u16,
+) {
+    debug_assert!(
+        coefficients.len() >= 8
+            && (target.is_empty() || start + 7 * stride + target.len() <= samples.len())
+    );
+    let mut offset = 0;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        let vectorized = target.len() / 8 * 8;
+        // SAFETY: runtime feature detection guarantees AVX2. The assertion
+        // above proves all eight source rows and the target range are valid.
+        unsafe {
+            x86::convolve_8_vertical_high_avx2(
+                samples.as_ptr().add(start),
+                stride,
+                target.as_mut_ptr(),
+                vectorized,
+                coefficients.as_ptr(),
+                max_sample,
+            );
+        }
+        offset = vectorized;
+    }
+    for column in offset..target.len() {
+        let mut sum = 0i32;
+        for index in 0..8 {
+            sum += i32::from(coefficients[index])
+                * i32::from(samples[start + index * stride + column]);
+        }
+        target[column] = ((sum + 64) >> 7).clamp(0, i32::from(max_sample)) as u16;
     }
 }
 
@@ -963,6 +1186,90 @@ fn convolve_8_vertical_row(
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn average_high_avx2(
+        target: *mut u16,
+        prediction: *const u16,
+        length: usize,
+    ) {
+        for offset in (0..length).step_by(16) {
+            let current = unsafe { _mm256_loadu_si256(target.add(offset).cast::<__m256i>()) };
+            let prediction =
+                unsafe { _mm256_loadu_si256(prediction.add(offset).cast::<__m256i>()) };
+            let average = _mm256_avg_epu16(current, prediction);
+            unsafe {
+                _mm256_storeu_si256(target.add(offset).cast::<__m256i>(), average);
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn convolve_8_horizontal_high_avx2(
+        source: *const u16,
+        target: *mut u16,
+        length: usize,
+        coefficients: *const i16,
+        max_sample: u16,
+    ) {
+        let rounding = _mm256_set1_epi32(64);
+        let zero = _mm256_setzero_si256();
+        let maximum = _mm256_set1_epi32(i32::from(max_sample));
+        for column in (0..length).step_by(8) {
+            let mut sum = _mm256_setzero_si256();
+            for tap in 0..8 {
+                let samples =
+                    unsafe { _mm_loadu_si128(source.add(column + tap).cast::<__m128i>()) };
+                let samples = _mm256_cvtepu16_epi32(samples);
+                let coefficient = _mm256_set1_epi32(i32::from(unsafe { *coefficients.add(tap) }));
+                sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(samples, coefficient));
+            }
+            sum = _mm256_srai_epi32::<7>(_mm256_add_epi32(sum, rounding));
+            sum = _mm256_min_epi32(_mm256_max_epi32(sum, zero), maximum);
+            let packed = _mm256_packus_epi32(sum, zero);
+            let packed = _mm256_permute4x64_epi64::<0xd8>(packed);
+            unsafe {
+                _mm_storeu_si128(
+                    target.add(column).cast::<__m128i>(),
+                    _mm256_castsi256_si128(packed),
+                );
+            }
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn convolve_8_vertical_high_avx2(
+        source: *const u16,
+        stride: usize,
+        target: *mut u16,
+        length: usize,
+        coefficients: *const i16,
+        max_sample: u16,
+    ) {
+        let rounding = _mm256_set1_epi32(64);
+        let zero = _mm256_setzero_si256();
+        let maximum = _mm256_set1_epi32(i32::from(max_sample));
+        for column in (0..length).step_by(8) {
+            let mut sum = _mm256_setzero_si256();
+            for tap in 0..8 {
+                let samples =
+                    unsafe { _mm_loadu_si128(source.add(tap * stride + column).cast::<__m128i>()) };
+                let samples = _mm256_cvtepu16_epi32(samples);
+                let coefficient = _mm256_set1_epi32(i32::from(unsafe { *coefficients.add(tap) }));
+                sum = _mm256_add_epi32(sum, _mm256_mullo_epi32(samples, coefficient));
+            }
+            sum = _mm256_srai_epi32::<7>(_mm256_add_epi32(sum, rounding));
+            sum = _mm256_min_epi32(_mm256_max_epi32(sum, zero), maximum);
+            let packed = _mm256_packus_epi32(sum, zero);
+            let packed = _mm256_permute4x64_epi64::<0xd8>(packed);
+            unsafe {
+                _mm_storeu_si128(
+                    target.add(column).cast::<__m128i>(),
+                    _mm256_castsi256_si128(packed),
+                );
+            }
+        }
+    }
 
     #[target_feature(enable = "avx2")]
     pub(super) unsafe fn convolve_8_horizontal_avx2(
@@ -1388,6 +1695,28 @@ fn write_prediction_row<T: Sample>(target: &mut [T], prediction: &[T], average: 
     }
 }
 
+fn write_prediction_row_high(target: &mut [u16], prediction: &[u16], average: bool) {
+    debug_assert_eq!(target.len(), prediction.len());
+    if !average {
+        target.copy_from_slice(prediction);
+        return;
+    }
+    let mut offset = 0;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        let vectorized = target.len() / 16 * 16;
+        // SAFETY: runtime feature detection guarantees AVX2 and both slices
+        // contain the complete vectorized range.
+        unsafe {
+            x86::average_high_avx2(target.as_mut_ptr(), prediction.as_ptr(), vectorized);
+        }
+        offset = vectorized;
+    }
+    for (target, &prediction) in target[offset..].iter_mut().zip(&prediction[offset..]) {
+        *target = avg2(*target, prediction);
+    }
+}
+
 fn avg3<T: Sample>(first: T, middle: T, last: T) -> T {
     T::from_u32((first.to_u32() + 2 * middle.to_u32() + last.to_u32() + 2) >> 2)
 }
@@ -1629,7 +1958,10 @@ fn intra_predict<T: Sample>(
 
 #[cfg(test)]
 mod tests {
-    use super::{IntraMode, IntraPicture, intra_predict};
+    use super::{
+        IntraMode, IntraPicture, convolve_8_high_scalar, convolve_8_horizontal_row_high,
+        convolve_8_vertical_row_high, intra_predict,
+    };
     use crate::{
         BitDepth, ChromaSubsampling,
         block::{TransformSize, TransformType},
@@ -1799,6 +2131,62 @@ mod tests {
                 52, 52, 56, 56, 60, 60, 64, 64, 52, 52, 56, 56, 60, 60, 64, 64
             ]
         );
+    }
+
+    #[test]
+    fn high_bit_depth_integer_inter_prediction_uses_exact_reference_samples() {
+        let mut reference = IntraPicture::new(4, 4, ChromaSubsampling::Cs420, BitDepth::Ten);
+        reference.planes_u16_mut()[0].copy_from_slice(&[
+            100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115,
+        ]);
+        let mut target = IntraPicture::new(4, 4, ChromaSubsampling::Cs420, BitDepth::Ten);
+        let mut nearest_kernel = [0i16; 128];
+        nearest_kernel[3] = 128;
+
+        target.predict_inter(&reference, 0, 0, 0, 4, 4, 0, 0, &nearest_kernel, false);
+
+        assert_eq!(target.plane_u16(0), reference.plane_u16(0));
+
+        target.planes_u16_mut()[0].fill(200);
+        target.predict_inter(&reference, 0, 0, 0, 4, 4, 0, 0, &nearest_kernel, true);
+        let expected: Vec<_> = reference
+            .plane_u16(0)
+            .unwrap()
+            .iter()
+            .map(|&sample| (200 + sample + 1) >> 1)
+            .collect();
+        assert_eq!(target.plane_u16(0).unwrap(), expected);
+    }
+
+    #[test]
+    fn high_bit_depth_row_convolution_matches_scalar_reference() {
+        let coefficients = [-1, 3, -7, 127, 8, -3, 1, 0];
+        let mut state = 0x7a31_49c2u32;
+        let mut source = [0u16; 71];
+        for sample in &mut source {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = ((state >> 16) & 0x0fff) as u16;
+        }
+        let expected: Vec<_> = (0..64)
+            .map(|column| convolve_8_high_scalar(&source[column..column + 8], &coefficients, 4095))
+            .collect();
+        let mut actual = [0u16; 64];
+        convolve_8_horizontal_row_high(&source, &mut actual, &coefficients, 4095);
+        assert_eq!(actual.as_slice(), expected);
+
+        let mut source = [0u16; 8 * 64];
+        for sample in &mut source {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            *sample = ((state >> 16) & 0x0fff) as u16;
+        }
+        let expected: Vec<_> = (0..64)
+            .map(|column| {
+                let samples = std::array::from_fn::<_, 8, _>(|row| source[row * 64 + column]);
+                convolve_8_high_scalar(&samples, &coefficients, 4095)
+            })
+            .collect();
+        convolve_8_vertical_row_high(&source, 0, 64, &mut actual, &coefficients, 4095);
+        assert_eq!(actual.as_slice(), expected);
     }
 
     #[test]
