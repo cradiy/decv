@@ -53,6 +53,12 @@ pub enum PixelFormat {
     I422,
     I440,
     I444,
+    /// Planar YUV stored as native-endian `u16` samples.
+    PlanarYuv16 {
+        bit_depth: u8,
+        subsampling_x: u8,
+        subsampling_y: u8,
+    },
     P010,
 }
 
@@ -62,13 +68,23 @@ impl PixelFormat {
         match self {
             Self::Nv12 | Self::P010 => 2,
             Self::Bgra8 | Self::Rgba8 => 1,
-            Self::I420 | Self::I422 | Self::I440 | Self::I444 => 3,
+            Self::I420 | Self::I422 | Self::I440 | Self::I444 | Self::PlanarYuv16 { .. } => 3,
         }
     }
 
     #[inline]
     pub const fn is_chroma_subsampled_420(self) -> bool {
-        matches!(self, Self::Nv12 | Self::I420 | Self::P010)
+        matches!(
+            self,
+            Self::Nv12
+                | Self::I420
+                | Self::P010
+                | Self::PlanarYuv16 {
+                    subsampling_x: 1,
+                    subsampling_y: 1,
+                    ..
+                }
+        )
     }
 
     #[inline]
@@ -78,6 +94,11 @@ impl PixelFormat {
             Self::I422 => Some((1, 0)),
             Self::I440 => Some((0, 1)),
             Self::I444 => Some((0, 0)),
+            Self::PlanarYuv16 {
+                subsampling_x,
+                subsampling_y,
+                ..
+            } => Some((subsampling_x, subsampling_y)),
             Self::Bgra8 | Self::Rgba8 => None,
         }
     }
@@ -113,6 +134,17 @@ impl VideoFormat {
     }
 
     pub fn validate(self) -> Result<()> {
+        if let PixelFormat::PlanarYuv16 {
+            bit_depth,
+            subsampling_x,
+            subsampling_y,
+        } = self.pixel_format
+            && (!(9..=16).contains(&bit_depth) || subsampling_x > 1 || subsampling_y > 1)
+        {
+            return Err(MediaError::InvalidVideoFormat(
+                "16-bit planar YUV layout has invalid depth or subsampling",
+            ));
+        }
         if self.coded_size.is_empty() {
             return Err(MediaError::InvalidVideoFormat(
                 "coded size must be non-zero",

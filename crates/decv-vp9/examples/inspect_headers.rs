@@ -96,9 +96,11 @@ fn main() -> Result<(), Box<dyn Error>> {
             if coded_frames <= 4 {
                 let segmentation = header.segmentation.as_ref();
                 println!(
-                    "frame={} sample={} type={:?} show={} existing={:?} size={:?} header={}/{} tiles={}x{} base_q={} loop={} segmentation={}/{}/{} refresh={:#04x} refs={:?} hp_mv={} ctx={}/reset{} refresh_ctx={} parallel={}",
+                    "frame={} sample={} profile={} color={:?} type={:?} show={} existing={:?} size={:?} header={}/{} tiles={}x{} base_q={} loop={} segmentation={}/{}/{} refresh={:#04x} refs={:?} hp_mv={} ctx={}/reset{} refresh_ctx={} parallel={}",
                     coded_frames - 1,
                     sample_index,
+                    header.profile,
+                    header.color,
                     header.frame_type,
                     header.show_frame,
                     header.show_existing_frame,

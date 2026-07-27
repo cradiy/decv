@@ -6,6 +6,7 @@ use crate::{
     bool_decoder::BoolDecoder,
     context::{CoefficientCounts, FrameCounts, ProbabilityContext},
     loop_filter::{FilterMode, FilterModeMap, apply_loop_filter},
+    quantization::dequant,
     reconstruct::IntraPicture,
     tables,
 };
@@ -942,7 +943,7 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
         let left_nonzero = (y..y + step).any(|row| self.left_coefficients[plane][row & 15] != 0);
         let initial_context = usize::from(above_nonzero) + usize::from(left_nonzero);
         let scan = scan_order(transform_size, transform_type);
-        let dequant = self.dequant(plane, segment_id);
+        let dequant = dequant(self.header, plane, usize::from(segment_id));
         let coefficients = decode_coefficient_tokens(
             &mut self.bits,
             &self.context.coefficient[transform_size as usize],
@@ -962,39 +963,6 @@ impl<'a, 'state> IntraTileDecoder<'a, 'state> {
             self.left_coefficients[plane][row & 15] = nonzero;
         }
         Ok(coefficients)
-    }
-
-    fn dequant(&self, plane: usize, segment_id: u8) -> [i32; 2] {
-        let quantization = self
-            .header
-            .quantization
-            .expect("decoded frame has quantization");
-        let mut qindex = i16::from(quantization.base_q_idx);
-        if let Some(segmentation) = &self.header.segmentation {
-            let alternate_q = segmentation.features[usize::from(segment_id)][0];
-            if segmentation.enabled && alternate_q.enabled {
-                qindex = if segmentation.absolute_values {
-                    alternate_q.value
-                } else {
-                    qindex + alternate_q.value
-                };
-            }
-        }
-        let qindex = qindex.clamp(0, 255);
-        let dc_delta = if plane == 0 {
-            quantization.y_dc_delta
-        } else {
-            quantization.uv_dc_delta
-        };
-        let ac_delta = if plane == 0 {
-            0
-        } else {
-            quantization.uv_ac_delta
-        };
-        [
-            i32::from(tables::DC_QUANT_8[quant_index(qindex, dc_delta)]),
-            i32::from(tables::AC_QUANT_8[quant_index(qindex, ac_delta)]),
-        ]
     }
 }
 
@@ -1028,10 +996,6 @@ pub(crate) fn floor_transform(width_4x4: usize) -> TransformSize {
     } else {
         TransformSize::Tx4x4
     }
-}
-
-fn quant_index(base: i16, delta: i8) -> usize {
-    usize::try_from((base + i16::from(delta)).clamp(0, 255)).unwrap()
 }
 
 pub(crate) fn read_intra_mode(

@@ -418,11 +418,19 @@ fn video_format(header: &FrameHeader) -> Result<VideoFormat> {
         };
         ColorInfo::new(range, matrix, primaries, transfer)
     });
-    let pixel_format = match header.chroma_subsampling() {
-        ChromaSubsampling::Cs420 => PixelFormat::I420,
-        ChromaSubsampling::Cs422 => PixelFormat::I422,
-        ChromaSubsampling::Cs440 => PixelFormat::I440,
-        ChromaSubsampling::Cs444 => PixelFormat::I444,
+    let subsampling = header.chroma_subsampling();
+    let pixel_format = match header.bit_depth() {
+        BitDepth::Eight => match subsampling {
+            ChromaSubsampling::Cs420 => PixelFormat::I420,
+            ChromaSubsampling::Cs422 => PixelFormat::I422,
+            ChromaSubsampling::Cs440 => PixelFormat::I440,
+            ChromaSubsampling::Cs444 => PixelFormat::I444,
+        },
+        depth @ (BitDepth::Ten | BitDepth::Twelve) => PixelFormat::PlanarYuv16 {
+            bit_depth: depth.bits(),
+            subsampling_x: subsampling.x_shift() as u8,
+            subsampling_y: subsampling.y_shift() as u8,
+        },
     };
     let format = VideoFormat::new(
         coded,

@@ -489,6 +489,28 @@ fn visible_plane_layout(
         (PixelFormat::I422, 1 | 2) if (x | width) & 1 == 0 => Some((y, x / 2, width / 2, height)),
         (PixelFormat::I440, 1 | 2) if (y | height) & 1 == 0 => Some((y / 2, x, width, height / 2)),
         (PixelFormat::I444, 1 | 2) => Some((y, x, width, height)),
+        (
+            PixelFormat::PlanarYuv16 {
+                subsampling_x,
+                subsampling_y,
+                ..
+            },
+            plane @ 0..=2,
+        ) => {
+            let subsampling_x = usize::from(subsampling_x) * usize::from(plane != 0);
+            let subsampling_y = usize::from(subsampling_y) * usize::from(plane != 0);
+            let x_alignment = (1 << subsampling_x) - 1;
+            let y_alignment = (1 << subsampling_y) - 1;
+            if (x | width) & x_alignment != 0 || (y | height) & y_alignment != 0 {
+                return None;
+            }
+            Some((
+                y >> subsampling_y,
+                (x >> subsampling_x).checked_mul(2)?,
+                (width >> subsampling_x).checked_mul(2)?,
+                height >> subsampling_y,
+            ))
+        }
         (PixelFormat::P010, 0) => Some((y, x.checked_mul(2)?, width.checked_mul(2)?, height)),
         (PixelFormat::P010, 1) if (x | y | width | height) & 1 == 0 => {
             Some((y / 2, x.checked_mul(2)?, width.checked_mul(2)?, height / 2))
@@ -536,6 +558,18 @@ mod tests {
         );
         assert_eq!(
             visible_plane_layout(PixelFormat::I444, rect, 1),
+            Some((2, 4, 64, 32))
+        );
+        assert_eq!(
+            visible_plane_layout(
+                PixelFormat::PlanarYuv16 {
+                    bit_depth: 10,
+                    subsampling_x: 1,
+                    subsampling_y: 0,
+                },
+                rect,
+                2,
+            ),
             Some((2, 4, 64, 32))
         );
         assert_eq!(

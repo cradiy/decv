@@ -5,6 +5,7 @@ use crate::{
     bool_decoder::BoolDecoder,
     context::{FrameCounts, MotionVectorComponentCounts, MotionVectorCounts, ProbabilityContext},
     loop_filter::{FilterMode, FilterModeMap, apply_loop_filter},
+    quantization::dequant,
     reconstruct::IntraPicture,
     tables,
     tile::{
@@ -2101,38 +2102,6 @@ fn mode_context_offsets(size: BlockSize) -> [(isize, isize); 2] {
         BlockSize::B64x64 => [(-1, 3), (3, -1)],
         _ => [(-1, 0), (0, -1)],
     }
-}
-
-fn dequant(header: &FrameHeader, plane: usize, segment_id: usize) -> [i32; 2] {
-    let quantization = header.quantization.expect("frame quantization");
-    let mut qindex = i16::from(quantization.base_q_idx);
-    if let Some(segmentation) = &header.segmentation {
-        let alternate = segmentation.features[segment_id][0];
-        if segmentation.enabled && alternate.enabled {
-            qindex = if segmentation.absolute_values {
-                alternate.value
-            } else {
-                qindex + alternate.value
-            };
-        }
-    }
-    let qindex = qindex.clamp(0, 255);
-    let dc_delta = if plane == 0 {
-        quantization.y_dc_delta
-    } else {
-        quantization.uv_dc_delta
-    };
-    let ac_delta = if plane == 0 {
-        0
-    } else {
-        quantization.uv_ac_delta
-    };
-    let dc = usize::try_from((qindex + i16::from(dc_delta)).clamp(0, 255)).unwrap();
-    let ac = usize::try_from((qindex + i16::from(ac_delta)).clamp(0, 255)).unwrap();
-    [
-        i32::from(tables::DC_QUANT_8[dc]),
-        i32::from(tables::AC_QUANT_8[ac]),
-    ]
 }
 
 fn intra_inter_context(above: Option<ModeInfo>, left: Option<ModeInfo>) -> usize {

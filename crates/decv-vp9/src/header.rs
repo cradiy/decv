@@ -32,6 +32,11 @@ impl BitDepth {
             Self::Twelve => 12,
         }
     }
+
+    #[inline]
+    pub const fn max_sample(self) -> u16 {
+        (1u16 << self.bits()) - 1
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,6 +216,11 @@ pub struct FrameHeader {
 }
 
 impl FrameHeader {
+    #[inline]
+    pub(crate) fn bit_depth(&self) -> BitDepth {
+        self.color.map_or(BitDepth::Eight, |color| color.bit_depth)
+    }
+
     #[inline]
     pub(crate) fn chroma_subsampling(&self) -> ChromaSubsampling {
         self.color

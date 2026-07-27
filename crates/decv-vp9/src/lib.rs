@@ -13,6 +13,8 @@ mod header;
 mod inter;
 mod inverse_transform;
 mod loop_filter;
+mod quant_tables_high;
+mod quantization;
 mod reconstruct;
 mod superframe;
 mod tables;

@@ -288,6 +288,23 @@ fn validate_cpu_frame(frame: &CpuFrame, format: VideoFormat) -> Result<()> {
             validate_plane(&frame.planes[1], chroma.width, chroma.height)?;
             validate_plane(&frame.planes[2], chroma.width, chroma.height)?;
         }
+        PixelFormat::PlanarYuv16 {
+            subsampling_x,
+            subsampling_y,
+            ..
+        } => {
+            let luma_row_bytes = size
+                .width
+                .checked_mul(2)
+                .ok_or(MediaError::IntegerOverflow)?;
+            validate_plane(&frame.planes[0], luma_row_bytes, size.height)?;
+            let chroma_width = (size.width >> subsampling_x)
+                .checked_mul(2)
+                .ok_or(MediaError::IntegerOverflow)?;
+            let chroma_height = size.height >> subsampling_y;
+            validate_plane(&frame.planes[1], chroma_width, chroma_height)?;
+            validate_plane(&frame.planes[2], chroma_width, chroma_height)?;
+        }
         PixelFormat::P010 => {
             let row_bytes = size
                 .width
@@ -446,6 +463,33 @@ mod tests {
             storage: FrameStorage::Cpu(CpuFrame::new(
                 (0..3).map(|_| CpuPlane::new(vec![0; 8], 0, 4, 2)).collect(),
             )),
+        };
+        assert_eq!(frame.validate(), Ok(()));
+    }
+
+    #[test]
+    fn validates_high_bit_depth_planar_storage() {
+        let format = VideoFormat {
+            coded_size: Size::new(4, 2),
+            visible_rect: Rect::new(0, 0, 4, 2),
+            display_size: Size::new(4, 2),
+            pixel_format: PixelFormat::PlanarYuv16 {
+                bit_depth: 10,
+                subsampling_x: 1,
+                subsampling_y: 0,
+            },
+            color: ColorInfo::default(),
+        };
+        let frame = DecodedVideoFrame {
+            id: 3,
+            pts: None,
+            duration: None,
+            format,
+            storage: FrameStorage::Cpu(CpuFrame::new(vec![
+                CpuPlane::new(vec![0; 16], 0, 8, 2),
+                CpuPlane::new(vec![0; 8], 0, 4, 2),
+                CpuPlane::new(vec![0; 8], 0, 4, 2),
+            ])),
         };
         assert_eq!(frame.validate(), Ok(()));
     }
